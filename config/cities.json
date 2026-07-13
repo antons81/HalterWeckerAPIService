@@ -1,11 +1,12 @@
 [
-  {"id":"wuppertal","name":"Wuppertal","latitude":51.2562,"longitude":7.1508,"radiusMeters":18000},
-  {"id":"berlin","name":"Berlin","latitude":52.5200,"longitude":13.4050,"radiusMeters":30000},
-  {"id":"hamburg","name":"Hamburg","latitude":53.5511,"longitude":9.9937,"radiusMeters":25000},
-  {"id":"munchen","name":"München","latitude":48.1351,"longitude":11.5820,"radiusMeters":23000},
-  {"id":"koln","name":"Köln","latitude":50.9375,"longitude":6.9603,"radiusMeters":18000},
-  {"id":"dusseldorf","name":"Düsseldorf","latitude":51.2277,"longitude":6.7735,"radiusMeters":18000},
-  {"id":"neuss","name":"Neuss","latitude":51.2042,"longitude":6.6879,"radiusMeters":12000},
-  {"id":"frankfurt-am-main","name":"Frankfurt am Main","latitude":50.1109,"longitude":8.6821,"radiusMeters":18000},
-  {"id":"stuttgart","name":"Stuttgart","latitude":48.7758,"longitude":9.1829,"radiusMeters":18000}
+  {"id":"wuppertal","name":"Wuppertal","aliases":[],"latitude":51.2562,"longitude":7.1508,"radiusMeters":18000},
+  {"id":"berlin","name":"Berlin","aliases":[],"latitude":52.5200,"longitude":13.4050,"radiusMeters":30000},
+  {"id":"hamburg","name":"Hamburg","aliases":[],"latitude":53.5511,"longitude":9.9937,"radiusMeters":25000},
+  {"id":"munchen","name":"München","aliases":["Muenchen","Munich"],"latitude":48.1351,"longitude":11.5820,"radiusMeters":23000},
+  {"id":"koln","name":"Köln","aliases":["Koeln","Cologne"],"latitude":50.9375,"longitude":6.9603,"radiusMeters":18000},
+  {"id":"dusseldorf","name":"Düsseldorf","aliases":["Duesseldorf"],"latitude":51.2277,"longitude":6.7735,"radiusMeters":18000},
+  {"id":"neuss","name":"Neuss","aliases":[],"latitude":51.2042,"longitude":6.6879,"radiusMeters":12000},
+  {"id":"velbert","name":"Velbert","aliases":[],"latitude":51.3406,"longitude":7.0434,"radiusMeters":12000},
+  {"id":"frankfurt-am-main","name":"Frankfurt am Main","aliases":["Frankfurt"],"latitude":50.1109,"longitude":8.6821,"radiusMeters":18000},
+  {"id":"stuttgart","name":"Stuttgart","aliases":[],"latitude":48.7758,"longitude":9.1829,"radiusMeters":18000}
 ]

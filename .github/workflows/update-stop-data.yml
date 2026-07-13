@@ -22,8 +22,11 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+      - name: Validate configuration
+        run: test -n "${{ vars.GTFS_URL }}"
       - name: Build city packages
         run: python scripts/build_stop_packages.py --gtfs-url "${{ vars.GTFS_URL }}"
+      - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
           path: docs
