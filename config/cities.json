@@ -14,6 +14,7 @@
   {"id":"munster","name":"Münster","aliases":["Muenster"],"latitude":51.9607,"longitude":7.6261,"radiusMeters":20000,"transitRadar":[{"adapter":"dbRegioBusNRW","region":{"minimumLongitude":7.45,"minimumLatitude":51.83,"maximumLongitude":7.80,"maximumLatitude":52.10}},{"adapter":"stadtwerkeMuenster","isEnabled":true}]},
   {"id":"bielefeld","name":"Bielefeld","aliases":[],"latitude":52.0302,"longitude":8.5325,"radiusMeters":18000,"transitRadar":{"adapter":"dbRegioBusNRW","region":{"minimumLongitude":8.35,"minimumLatitude":51.90,"maximumLongitude":8.75,"maximumLatitude":52.15}}},
   {"id":"paderborn","name":"Paderborn","aliases":[],"latitude":51.7189,"longitude":8.7575,"radiusMeters":16000,"transitRadar":{"adapter":"dbRegioBusNRW","region":{"minimumLongitude":8.55,"minimumLatitude":51.60,"maximumLongitude":8.95,"maximumLatitude":51.85}}},
+  {"id":"schaumburg","name":"Schaumburg","aliases":["Stadthagen","Bückeburg","Bueckeburg","Rinteln","Bad Nenndorf","Obernkirchen","Nienstädt","Nienstaedt","Lindhorst","Rodenberg","Auetal","Hagenburg","Lauenau"],"latitude":52.3232,"longitude":9.2032,"radiusMeters":45000,"transitRadar":{"adapter":"shgMobil","isEnabled":true}},
   {"id":"frankfurt-am-main","name":"Frankfurt am Main","aliases":["Frankfurt"],"latitude":50.1109,"longitude":8.6821,"radiusMeters":18000},
   {"id":"stuttgart","name":"Stuttgart","aliases":[],"latitude":48.7758,"longitude":9.1829,"radiusMeters":18000}
 ]
