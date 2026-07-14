@@ -2,6 +2,13 @@ name: Update stop data
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "config/**"
+      - "scripts/**"
+      - ".github/workflows/update-stop-data.yml"
   schedule:
     - cron: "17 3 * * *"
 
