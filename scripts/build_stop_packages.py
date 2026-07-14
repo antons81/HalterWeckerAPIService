@@ -11,12 +11,12 @@ import math
 import re
 import urllib.request
 import zipfile
-from datetime import date
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 EARTH_RADIUS_METERS = 6_371_000
 CITY_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-SUPPORTED_TRANSIT_RADAR_ADAPTERS = {"dbRegioBusNRW", "shgMobil", "stadtwerkeMuenster"}
+SUPPORTED_TRANSIT_RADAR_ADAPTERS = {"dbRegioBusNRW", "shgMobil", "stadtwerkeMuenster", "vbb"}
 
 
 def normalized(value: str) -> str:
@@ -30,14 +30,19 @@ def distance_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float
     ))
 
 
-def load_stops(url: str) -> list[dict[str, str]]:
+def load_gtfs_archive(url: str) -> zipfile.ZipFile:
     request = urllib.request.Request(
         url,
         headers={"User-Agent": "HalteWeckerStopPipeline/1.0"}
     )
     with urllib.request.urlopen(request, timeout=180) as response:
-        archive = zipfile.ZipFile(io.BytesIO(response.read()))
-    with archive.open("stops.txt") as file:
+        return zipfile.ZipFile(io.BytesIO(response.read()))
+
+
+def load_table(archive: zipfile.ZipFile, filename: str) -> list[dict[str, str]]:
+    if filename not in archive.namelist():
+        return []
+    with archive.open(filename) as file:
         return list(csv.DictReader(io.TextIOWrapper(file, encoding="utf-8-sig")))
 
 
@@ -151,6 +156,10 @@ def validate_transit_radar_provider(
             raise ValueError(f"Invalid SHG Mobil configuration for {city_id}")
         return
 
+    if adapter == "vbb":
+        if city_id != "berlin" or not isinstance(region, dict):
+            raise ValueError(f"Invalid VBB configuration for {city_id}")
+
     if not isinstance(region, dict):
         raise ValueError(f"Invalid transit radar region for {city_id}")
 
@@ -193,6 +202,8 @@ def transit_radar_manifest(cities: list[dict[str, object]]) -> dict[str, object]
                 provider_id = "shg-mobil-schaumburg"
             elif adapter == "stadtwerkeMuenster":
                 provider_id = "stadtwerke-muenster"
+            elif adapter == "vbb":
+                provider_id = "vbb-berlin"
             else:
                 raise ValueError(f"Unsupported transit radar adapter for {city_id}")
 
@@ -223,15 +234,139 @@ def transit_radar_manifest(cities: list[dict[str, object]]) -> dict[str, object]
     return {"schemaVersion": 1, "cities": radar_cities}
 
 
+def parse_gtfs_time(value: str) -> int:
+    hours, minutes, seconds = (int(part) for part in value.split(":"))
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def build_vbb_network_index(archive: zipfile.ZipFile, output: Path) -> None:
+    stops = {row["stop_id"]: row for row in load_table(archive, "stops.txt") if row.get("stop_id")}
+    berlin_stop_ids = set()
+    for stop_id, row in stops.items():
+        try:
+            latitude, longitude = float(row["stop_lat"]), float(row["stop_lon"])
+        except (KeyError, ValueError):
+            continue
+        if 52.3383 <= latitude <= 52.6755 and 13.0884 <= longitude <= 13.7612:
+            berlin_stop_ids.add(stop_id)
+
+    stop_times = load_table(archive, "stop_times.txt")
+    berlin_trip_ids = {row["trip_id"] for row in stop_times if row.get("stop_id") in berlin_stop_ids}
+    times_by_trip: dict[str, list[dict[str, str]]] = {}
+    used_stop_ids = set()
+    for row in stop_times:
+        trip_id = row.get("trip_id", "")
+        if trip_id not in berlin_trip_ids:
+            continue
+        times_by_trip.setdefault(trip_id, []).append(row)
+        used_stop_ids.add(row.get("stop_id", ""))
+
+    routes = {row["route_id"]: row for row in load_table(archive, "routes.txt") if row.get("route_id")}
+    trip_templates = []
+    for row in load_table(archive, "trips.txt"):
+        trip_id = row.get("trip_id", "")
+        trip_times = times_by_trip.get(trip_id)
+        if not trip_times:
+            continue
+        route = routes.get(row.get("route_id", ""), {})
+        trip_times.sort(key=lambda item: int(item.get("stop_sequence", "0")))
+        try:
+            compact_times = [{
+                "stopID": item["stop_id"],
+                "arrivalSeconds": parse_gtfs_time(item["arrival_time"]),
+                "departureSeconds": parse_gtfs_time(item["departure_time"])
+            } for item in trip_times]
+        except (KeyError, ValueError):
+            continue
+        service_id = row.get("service_id", "")
+        trip_templates.append({
+            "id": trip_id,
+            "routeID": row.get("route_id", ""),
+            "lineName": route.get("route_short_name") or route.get("route_long_name") or row.get("route_id", ""),
+            "directionName": row.get("trip_headsign", ""),
+            "serviceID": service_id,
+            "stopTimes": compact_times
+        })
+
+    calendar_dates: dict[str, dict[str, list[str]]] = {}
+    for row in load_table(archive, "calendar_dates.txt"):
+        service_id = row.get("service_id", "")
+        key = "addedDates" if row.get("exception_type") == "1" else "removedDates"
+        calendar_dates.setdefault(service_id, {"addedDates": [], "removedDates": []})[key].append(row.get("date", ""))
+
+    calendar_by_id = {row["service_id"]: row for row in load_table(archive, "calendar.txt") if row.get("service_id")}
+
+    def service_is_active(service_id: str, service_date: date) -> bool:
+        date_key = service_date.strftime("%Y%m%d")
+        exceptions = calendar_dates.get(service_id, {"addedDates": [], "removedDates": []})
+        if date_key in exceptions["removedDates"]:
+            return False
+        if date_key in exceptions["addedDates"]:
+            return True
+        row = calendar_by_id.get(service_id)
+        if not row or not row.get("start_date", "") <= date_key <= row.get("end_date", ""):
+            return False
+        weekday = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")[service_date.weekday()]
+        return row.get(weekday) == "1"
+
+    first_target_date = date.today()
+    target_dates = {first_target_date + timedelta(days=offset) for offset in range(3)}
+    packages: dict[str, list[dict[str, object]]] = {}
+    for day_offset in range(-1, 3):
+        service_date = first_target_date + timedelta(days=day_offset)
+        service_midnight = datetime.combine(service_date, time.min)
+        for template in trip_templates:
+            if not service_is_active(str(template["serviceID"]), service_date):
+                continue
+            trip_stop_times = template["stopTimes"]
+            if not trip_stop_times:
+                continue
+            start = service_midnight + timedelta(seconds=int(trip_stop_times[0]["arrivalSeconds"]))
+            end = service_midnight + timedelta(seconds=int(trip_stop_times[-1]["departureSeconds"]))
+            hour = start.replace(minute=0, second=0, microsecond=0)
+            while hour <= end:
+                if hour.date() in target_dates:
+                    key = hour.strftime("%Y%m%d-%H")
+                    trip = {key: value for key, value in template.items() if key != "serviceID"}
+                    trip["serviceDate"] = service_date.strftime("%Y%m%d")
+                    packages.setdefault(key, []).append(trip)
+                hour += timedelta(hours=1)
+
+    transit_output = output / "transit" / "vbb"
+    transit_output.mkdir(parents=True, exist_ok=True)
+    for key, trips in packages.items():
+        package_stop_ids = {
+            stop_time["stopID"] for trip in trips for stop_time in trip["stopTimes"]
+        }
+        compact_stops = []
+        for stop_id in package_stop_ids:
+            row = stops.get(str(stop_id))
+            if not row:
+                continue
+            try:
+                compact_stops.append({"id": stop_id, "latitude": float(row["stop_lat"]), "longitude": float(row["stop_lon"])})
+            except (KeyError, ValueError):
+                continue
+        payload = {"version": date.today().isoformat(), "stops": compact_stops, "trips": trips}
+        (transit_output / f"{key}.json").write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--gtfs-url", required=True)
+    parser.add_argument(
+        "--vbb-gtfs-url",
+        default="https://unternehmen.vbb.de/fileadmin/user_upload/VBB/Dokumente/API-Datensaetze/gtfs-mastscharf/GTFS.zip"
+    )
     parser.add_argument("--cities", default="config/cities.json")
     parser.add_argument("--output", default="docs/data")
     args = parser.parse_args()
 
     cities = load_cities(Path(args.cities))
-    stops = canonicalize(load_stops(args.gtfs_url))
+    archive = load_gtfs_archive(args.gtfs_url)
+    stops = canonicalize(load_table(archive, "stops.txt"))
     output = Path(args.output)
     packages = output / "stops"
     packages.mkdir(parents=True, exist_ok=True)
@@ -272,6 +407,7 @@ def main() -> None:
         json.dumps(transit_radar_manifest(cities), ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
+    build_vbb_network_index(load_gtfs_archive(args.vbb_gtfs_url), output)
     print(f"Built {len(manifest)} city packages from {len(stops)} canonical stops.")
 
 
