@@ -7,6 +7,13 @@
   {"id":"dusseldorf","name":"Düsseldorf","aliases":["Duesseldorf"],"latitude":51.2277,"longitude":6.7735,"radiusMeters":18000},
   {"id":"neuss","name":"Neuss","aliases":[],"latitude":51.2042,"longitude":6.6879,"radiusMeters":12000},
   {"id":"velbert","name":"Velbert","aliases":[],"latitude":51.3406,"longitude":7.0434,"radiusMeters":12000},
+  {"id":"wesel","name":"Wesel","aliases":[],"latitude":51.6587,"longitude":6.6176,"radiusMeters":14000},
+  {"id":"grevenbroich","name":"Grevenbroich","aliases":[],"latitude":51.0910,"longitude":6.5827,"radiusMeters":14000},
+  {"id":"dormagen","name":"Dormagen","aliases":[],"latitude":51.0937,"longitude":6.8420,"radiusMeters":14000},
+  {"id":"viersen","name":"Viersen","aliases":[],"latitude":51.2555,"longitude":6.3965,"radiusMeters":14000},
+  {"id":"munster","name":"Münster","aliases":["Muenster"],"latitude":51.9607,"longitude":7.6261,"radiusMeters":20000},
+  {"id":"bielefeld","name":"Bielefeld","aliases":[],"latitude":52.0302,"longitude":8.5325,"radiusMeters":18000},
+  {"id":"paderborn","name":"Paderborn","aliases":[],"latitude":51.7189,"longitude":8.7575,"radiusMeters":16000},
   {"id":"frankfurt-am-main","name":"Frankfurt am Main","aliases":["Frankfurt"],"latitude":50.1109,"longitude":8.6821,"radiusMeters":18000},
   {"id":"stuttgart","name":"Stuttgart","aliases":[],"latitude":48.7758,"longitude":9.1829,"radiusMeters":18000}
 ]
