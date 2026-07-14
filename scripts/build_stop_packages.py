@@ -9,13 +9,23 @@ import io
 import json
 import math
 import re
+import unicodedata
 import urllib.request
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import zipfile
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 EARTH_RADIUS_METERS = 6_371_000
 CITY_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+BKG_MUNICIPALITIES_URL = (
+    "https://sgx.geodatenzentrum.de/wfs_vg250"
+    "?service=WFS&version=2.0.0&request=GetFeature"
+    "&typeNames=vg250:vg250_gem&srsName=EPSG:4326"
+    "&outputFormat=application/json"
+)
+BKG_PAGE_SIZE = 2_000
+SPATIAL_GRID_SIZE_DEGREES = 0.25
 SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "dbRegioBusNRW",
     "shgMobil",
@@ -29,6 +39,12 @@ def normalized(value: str) -> str:
     return value.lower().replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss").strip()
 
 
+def identifier_component(value: str) -> str:
+    folded = unicodedata.normalize("NFKD", normalized(value))
+    ascii_value = folded.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", "-", ascii_value).strip("-") or "gemeinde"
+
+
 def distance_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     lat1, lon1, lat2, lon2 = map(math.radians, (lat1, lon1, lat2, lon2))
     return 2 * EARTH_RADIUS_METERS * math.asin(math.sqrt(
@@ -37,12 +53,241 @@ def distance_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float
 
 
 def load_gtfs_archive(url: str) -> zipfile.ZipFile:
+    parsed_url = urlsplit(url)
+    if parsed_url.scheme in ("", "file"):
+        path = Path(parsed_url.path if parsed_url.scheme == "file" else url)
+        return zipfile.ZipFile(path)
+
     request = urllib.request.Request(
         url,
         headers={"User-Agent": "HalteWeckerStopPipeline/1.0"}
     )
     with urllib.request.urlopen(request, timeout=180) as response:
         return zipfile.ZipFile(io.BytesIO(response.read()))
+
+
+def paged_url(url: str, start_index: int) -> str:
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.update({"count": str(BKG_PAGE_SIZE), "startIndex": str(start_index)})
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def load_municipality_features(source: str) -> list[dict[str, object]]:
+    parsed_source = urlsplit(source)
+    if parsed_source.scheme in ("", "file"):
+        path = Path(parsed_source.path if parsed_source.scheme == "file" else source)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        features = payload.get("features", [])
+        if not isinstance(features, list):
+            raise ValueError("Municipality GeoJSON must contain a features array.")
+        return features
+
+    features: list[dict[str, object]] = []
+    start_index = 0
+    expected_count: int | None = None
+    while expected_count is None or start_index < expected_count:
+        request = urllib.request.Request(
+            paged_url(source, start_index),
+            headers={"User-Agent": "HalteWeckerStopPipeline/1.0"}
+        )
+        with urllib.request.urlopen(request, timeout=180) as response:
+            payload = json.load(response)
+
+        page = payload.get("features", [])
+        if not isinstance(page, list):
+            raise ValueError("Municipality WFS response must contain a features array.")
+        if expected_count is None:
+            expected_count = int(payload.get("numberMatched", len(page)))
+        features.extend(page)
+        if not page:
+            break
+        start_index += len(page)
+
+    if expected_count is not None and len(features) != expected_count:
+        raise ValueError(
+            f"Municipality WFS returned {len(features)} of {expected_count} features."
+        )
+    return features
+
+
+def valid_bbox(value: object) -> tuple[float, float, float, float] | None:
+    if not isinstance(value, list) or len(value) != 4:
+        return None
+    try:
+        minimum_longitude, minimum_latitude, maximum_longitude, maximum_latitude = (
+            float(component) for component in value
+        )
+    except (TypeError, ValueError):
+        return None
+    if minimum_longitude > maximum_longitude or minimum_latitude > maximum_latitude:
+        return None
+    return minimum_longitude, minimum_latitude, maximum_longitude, maximum_latitude
+
+
+def load_municipalities(source: str) -> list[dict[str, object]]:
+    municipalities = []
+    seen_codes: set[str] = set()
+    for feature in load_municipality_features(source):
+        if not isinstance(feature, dict):
+            continue
+        properties = feature.get("properties")
+        geometry = feature.get("geometry")
+        bbox = valid_bbox(feature.get("bbox"))
+        if not isinstance(properties, dict) or not isinstance(geometry, dict) or bbox is None:
+            continue
+
+        code = str(properties.get("ags", "")).strip()
+        name = str(properties.get("gen", "")).strip()
+        state = str(properties.get("lkz", "")).strip()
+        if not code or not name or code in seen_codes:
+            continue
+        if geometry.get("type") not in ("Polygon", "MultiPolygon"):
+            continue
+
+        municipalities.append({
+            "code": code,
+            "name": name,
+            "state": state,
+            "bbox": bbox,
+            "geometry": geometry
+        })
+        seen_codes.add(code)
+
+    if not municipalities:
+        raise ValueError("No valid German municipalities were loaded from BKG.")
+    return municipalities
+
+
+def grid_coordinate(value: float) -> int:
+    return math.floor(value / SPATIAL_GRID_SIZE_DEGREES)
+
+
+def municipality_spatial_index(
+    municipalities: list[dict[str, object]]
+) -> dict[tuple[int, int], list[int]]:
+    index: dict[tuple[int, int], list[int]] = {}
+    for municipality_index, municipality in enumerate(municipalities):
+        minimum_longitude, minimum_latitude, maximum_longitude, maximum_latitude = municipality["bbox"]
+        for longitude_cell in range(
+            grid_coordinate(float(minimum_longitude)),
+            grid_coordinate(float(maximum_longitude)) + 1
+        ):
+            for latitude_cell in range(
+                grid_coordinate(float(minimum_latitude)),
+                grid_coordinate(float(maximum_latitude)) + 1
+            ):
+                index.setdefault((longitude_cell, latitude_cell), []).append(municipality_index)
+    return index
+
+
+def point_is_on_segment(
+    longitude: float,
+    latitude: float,
+    start: list[float],
+    end: list[float]
+) -> bool:
+    start_longitude, start_latitude = float(start[0]), float(start[1])
+    end_longitude, end_latitude = float(end[0]), float(end[1])
+    cross_product = (
+        (latitude - start_latitude) * (end_longitude - start_longitude)
+        - (longitude - start_longitude) * (end_latitude - start_latitude)
+    )
+    if abs(cross_product) > 1e-10:
+        return False
+    return (
+        min(start_longitude, end_longitude) - 1e-10
+        <= longitude
+        <= max(start_longitude, end_longitude) + 1e-10
+        and min(start_latitude, end_latitude) - 1e-10
+        <= latitude
+        <= max(start_latitude, end_latitude) + 1e-10
+    )
+
+
+def point_is_in_ring(longitude: float, latitude: float, ring: object) -> bool:
+    if not isinstance(ring, list) or len(ring) < 4:
+        return False
+
+    inside = False
+    previous = ring[-1]
+    for current in ring:
+        if not isinstance(previous, list) or not isinstance(current, list):
+            previous = current
+            continue
+        if len(previous) < 2 or len(current) < 2:
+            previous = current
+            continue
+        if point_is_on_segment(longitude, latitude, previous, current):
+            return True
+
+        previous_longitude, previous_latitude = float(previous[0]), float(previous[1])
+        current_longitude, current_latitude = float(current[0]), float(current[1])
+        crosses_latitude = (current_latitude > latitude) != (previous_latitude > latitude)
+        if crosses_latitude:
+            intersection = (
+                (previous_longitude - current_longitude)
+                * (latitude - current_latitude)
+                / (previous_latitude - current_latitude)
+                + current_longitude
+            )
+            if longitude < intersection:
+                inside = not inside
+        previous = current
+    return inside
+
+
+def point_is_in_polygon(longitude: float, latitude: float, polygon: object) -> bool:
+    if not isinstance(polygon, list) or not polygon:
+        return False
+    if not point_is_in_ring(longitude, latitude, polygon[0]):
+        return False
+    return not any(point_is_in_ring(longitude, latitude, hole) for hole in polygon[1:])
+
+
+def point_is_in_geometry(longitude: float, latitude: float, geometry: object) -> bool:
+    if not isinstance(geometry, dict):
+        return False
+    coordinates = geometry.get("coordinates")
+    if geometry.get("type") == "Polygon":
+        return point_is_in_polygon(longitude, latitude, coordinates)
+    if geometry.get("type") == "MultiPolygon" and isinstance(coordinates, list):
+        return any(point_is_in_polygon(longitude, latitude, polygon) for polygon in coordinates)
+    return False
+
+
+def municipality_for_coordinate(
+    latitude: float,
+    longitude: float,
+    municipalities: list[dict[str, object]],
+    spatial_index: dict[tuple[int, int], list[int]]
+) -> dict[str, object] | None:
+    candidates = spatial_index.get(
+        (grid_coordinate(longitude), grid_coordinate(latitude)),
+        []
+    )
+    matches = []
+    for candidate_index in candidates:
+        municipality = municipalities[candidate_index]
+        minimum_longitude, minimum_latitude, maximum_longitude, maximum_latitude = municipality["bbox"]
+        if not (
+            float(minimum_longitude) <= longitude <= float(maximum_longitude)
+            and float(minimum_latitude) <= latitude <= float(maximum_latitude)
+        ):
+            continue
+        if point_is_in_geometry(longitude, latitude, municipality["geometry"]):
+            matches.append(municipality)
+
+    if not matches:
+        return None
+    return min(
+        matches,
+        key=lambda municipality: (
+            float(municipality["bbox"][2]) - float(municipality["bbox"][0])
+        ) * (
+            float(municipality["bbox"][3]) - float(municipality["bbox"][1])
+        )
+    )
 
 
 def load_table(archive: zipfile.ZipFile, filename: str) -> list[dict[str, str]]:
@@ -426,24 +671,117 @@ def build_vbb_network_indexes(
             )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--gtfs-url", required=True)
-    parser.add_argument(
-        "--vbb-gtfs-url",
-        default="https://unternehmen.vbb.de/fileadmin/user_upload/VBB/Dokumente/API-Datensaetze/gtfs-mastscharf/GTFS.zip"
-    )
-    parser.add_argument("--cities", default="config/cities.json")
-    parser.add_argument("--output", default="docs/data")
-    args = parser.parse_args()
+def configured_municipality_codes(
+    cities: list[dict[str, object]],
+    municipalities: list[dict[str, object]],
+    spatial_index: dict[tuple[int, int], list[int]]
+) -> dict[str, str]:
+    result = {}
+    for city in cities:
+        municipality = municipality_for_coordinate(
+            float(city["latitude"]),
+            float(city["longitude"]),
+            municipalities,
+            spatial_index
+        )
+        if municipality is None:
+            continue
 
-    cities = load_cities(Path(args.cities))
-    archive = load_gtfs_archive(args.gtfs_url)
-    stops = canonicalize(load_table(archive, "stops.txt"))
-    output = Path(args.output)
-    packages = output / "stops"
-    packages.mkdir(parents=True, exist_ok=True)
+        configured_names = {
+            normalized(str(name))
+            for name in [city["name"], *city.get("aliases", [])]
+        }
+        if normalized(str(municipality["name"])) in configured_names:
+            result[str(municipality["code"])] = str(city["id"])
+    return result
+
+
+def municipality_stop_packages(
+    stops: list[dict[str, object]],
+    municipalities: list[dict[str, object]],
+    spatial_index: dict[tuple[int, int], list[int]]
+) -> tuple[dict[str, list[dict[str, object]]], int]:
+    packages: dict[str, list[dict[str, object]]] = {}
+    skipped_stop_count = 0
+    for stop in stops:
+        municipality = municipality_for_coordinate(
+            float(stop["latitude"]),
+            float(stop["longitude"]),
+            municipalities,
+            spatial_index
+        )
+        if municipality is None:
+            skipped_stop_count += 1
+            continue
+        packages.setdefault(str(municipality["code"]), []).append(stop)
+    return packages, skipped_stop_count
+
+
+def write_stop_package(
+    packages_directory: Path,
+    city_id: str,
+    stops: list[dict[str, object]]
+) -> str:
+    filename = f"{city_id}.json"
+    stops.sort(key=lambda stop: (str(stop["searchName"]), str(stop["id"])))
+    (packages_directory / filename).write_text(
+        json.dumps(stops, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8"
+    )
+    return filename
+
+
+def build_stop_packages(
+    stops: list[dict[str, object]],
+    cities: list[dict[str, object]],
+    municipalities: list[dict[str, object]],
+    output: Path
+) -> tuple[list[dict[str, object]], int]:
+    packages_directory = output / "stops"
+    packages_directory.mkdir(parents=True, exist_ok=True)
+    spatial_index = municipality_spatial_index(municipalities)
+    packages_by_code, skipped_stop_count = municipality_stop_packages(
+        stops,
+        municipalities,
+        spatial_index
+    )
+    configured_codes = configured_municipality_codes(
+        cities,
+        municipalities,
+        spatial_index
+    )
+    municipalities_by_code = {
+        str(municipality["code"]): municipality for municipality in municipalities
+    }
+    duplicate_name_counts: dict[str, int] = {}
+    for code in packages_by_code:
+        municipality = municipalities_by_code[code]
+        key = normalized(str(municipality["name"]))
+        duplicate_name_counts[key] = duplicate_name_counts.get(key, 0) + 1
+
     manifest = []
+    for code, municipality_stops in packages_by_code.items():
+        if code in configured_codes:
+            continue
+        municipality = municipalities_by_code[code]
+        base_name = str(municipality["name"])
+        has_duplicate_name = duplicate_name_counts[normalized(base_name)] > 1
+        display_name = (
+            f'{base_name} ({municipality["state"]})'
+            if has_duplicate_name and municipality["state"]
+            else base_name
+        )
+        aliases = [base_name] if display_name != base_name else []
+        city_id = f"{identifier_component(base_name)}-{code.lower()}"
+        filename = write_stop_package(packages_directory, city_id, municipality_stops)
+        manifest.append({
+            "id": city_id,
+            "name": display_name,
+            "aliases": aliases,
+            "stopCount": len(municipality_stops),
+            "url": f"stops/{filename}"
+        })
+
     for city in cities:
         city_stops = [
             stop for stop in stops
@@ -454,19 +792,46 @@ def main() -> None:
                 float(city["longitude"])
             ) <= float(city["radiusMeters"])
         ]
-        city_stops.sort(key=lambda stop: (str(stop["searchName"]), str(stop["id"])))
         if not city_stops:
             raise ValueError(f'No stops found for configured city {city["id"]}.')
 
-        filename = f'{city["id"]}.json'
-        (packages / filename).write_text(json.dumps(city_stops, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        city_id = str(city["id"])
+        filename = write_stop_package(packages_directory, city_id, city_stops)
         manifest.append({
-            "id": city["id"],
+            "id": city_id,
             "name": city["name"],
             "aliases": city.get("aliases", []),
             "stopCount": len(city_stops),
             "url": f"stops/{filename}"
         })
+
+    manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
+    return manifest, skipped_stop_count
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gtfs-url", required=True)
+    parser.add_argument(
+        "--vbb-gtfs-url",
+        default="https://unternehmen.vbb.de/fileadmin/user_upload/VBB/Dokumente/API-Datensaetze/gtfs-mastscharf/GTFS.zip"
+    )
+    parser.add_argument("--cities", default="config/cities.json")
+    parser.add_argument("--municipalities-url", default=BKG_MUNICIPALITIES_URL)
+    parser.add_argument("--output", default="docs/data")
+    args = parser.parse_args()
+
+    cities = load_cities(Path(args.cities))
+    archive = load_gtfs_archive(args.gtfs_url)
+    stops = canonicalize(load_table(archive, "stops.txt"))
+    municipalities = load_municipalities(args.municipalities_url)
+    output = Path(args.output)
+    manifest, skipped_stop_count = build_stop_packages(
+        stops,
+        cities,
+        municipalities,
+        output
+    )
     (output / "cities.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     (output / "manifest.json").write_text(
         json.dumps(
@@ -480,8 +845,23 @@ def main() -> None:
         json.dumps(transit_radar_manifest(cities), ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
+    (output / "attributions.json").write_text(
+        json.dumps(
+            [{
+                "name": "Bundesamt für Kartographie und Geodäsie (BKG)",
+                "license": "Datenlizenz Deutschland – Namensnennung – Version 2.0",
+                "url": "https://gdz.bkg.bund.de/index.php/default/open-data/wfs-verwaltungsgebiete-1-250-000-stand-01-01-wfs-vg250.html"
+            }],
+            ensure_ascii=False,
+            indent=2
+        ),
+        encoding="utf-8"
+    )
     build_vbb_network_indexes(load_gtfs_archive(args.vbb_gtfs_url), output, cities)
-    print(f"Built {len(manifest)} city packages from {len(stops)} canonical stops.")
+    print(
+        f"Built {len(manifest)} city packages from {len(stops)} canonical stops; "
+        f"skipped {skipped_stop_count} stops outside German municipalities."
+    )
 
 
 if __name__ == "__main__":

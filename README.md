@@ -8,12 +8,15 @@ Static GTFS pipeline for HalteWecker.
 2. In **Settings → Pages**, choose **GitHub Actions** as the publishing source.
 3. Run **Update stop data** manually once.
 
-The workflow runs on the first day of each month and publishes:
+The workflow runs every day and publishes:
 
 - `data/manifest.json`
 - `data/cities.json`
 - `data/stops/{cityId}.json`
+- `data/attributions.json`
 
 Each stop has `id`, `name`, `latitude`, `longitude`, and `searchName` fields. The iOS app validates downloaded JSON and later imports it into its local SQLite FTS index.
 
-The initial city assignment uses a radius around each configured city center. Before nationwide release it should be replaced by an administrative-boundary spatial join.
+The pipeline downloads the official BKG VG250 municipality boundaries and assigns every German stop to its municipality. Only municipalities containing at least one stop are published. Stable automatic city IDs contain the municipality's official AGS code. Cities in `config/cities.json` keep their existing IDs, aliases, larger configured radii, and Transit Radar configuration.
+
+Municipality boundaries are provided by the Bundesamt für Kartographie und Geodäsie under Datenlizenz Deutschland – Namensnennung – Version 2.0. Generated data includes `data/attributions.json` with the required source information.
