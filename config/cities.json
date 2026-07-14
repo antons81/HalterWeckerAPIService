@@ -1,5 +1,5 @@
 [
-  {"id":"wuppertal","name":"Wuppertal","aliases":[],"latitude":51.2562,"longitude":7.1508,"radiusMeters":18000},
+  {"id":"wuppertal","name":"Wuppertal","aliases":[],"latitude":51.2562,"longitude":7.1508,"radiusMeters":18000,"transitRadar":{"adapter":"dbRegioBusNRW","region":{"minimumLongitude":7.0,"minimumLatitude":51.2,"maximumLongitude":7.3,"maximumLatitude":51.32}}},
   {"id":"berlin","name":"Berlin","aliases":[],"latitude":52.5200,"longitude":13.4050,"radiusMeters":30000},
   {"id":"hamburg","name":"Hamburg","aliases":[],"latitude":53.5511,"longitude":9.9937,"radiusMeters":25000},
   {"id":"munchen","name":"München","aliases":["Muenchen","Munich"],"latitude":48.1351,"longitude":11.5820,"radiusMeters":23000},
