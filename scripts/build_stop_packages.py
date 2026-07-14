@@ -16,7 +16,13 @@ from pathlib import Path
 
 EARTH_RADIUS_METERS = 6_371_000
 CITY_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-SUPPORTED_TRANSIT_RADAR_ADAPTERS = {"dbRegioBusNRW", "shgMobil", "stadtwerkeMuenster", "vbb"}
+SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
+    "dbRegioBusNRW",
+    "shgMobil",
+    "stadtwerkeMuenster",
+    "swu",
+    "vbb"
+}
 
 
 def normalized(value: str) -> str:
@@ -151,6 +157,11 @@ def validate_transit_radar_provider(
             raise ValueError(f"Invalid Stadtwerke Münster configuration for {city_id}")
         return
 
+    if adapter == "swu":
+        if city_id != "ulm" or region is not None:
+            raise ValueError(f"Invalid SWU configuration for {city_id}")
+        return
+
     if adapter == "shgMobil":
         if city_id != "schaumburg" or region is not None:
             raise ValueError(f"Invalid SHG Mobil configuration for {city_id}")
@@ -202,6 +213,8 @@ def transit_radar_manifest(cities: list[dict[str, object]]) -> dict[str, object]
                 provider_id = "shg-mobil-schaumburg"
             elif adapter == "stadtwerkeMuenster":
                 provider_id = "stadtwerke-muenster"
+            elif adapter == "swu":
+                provider_id = "swu-ulm"
             elif adapter == "vbb":
                 provider_id = "vbb-berlin"
             else:
