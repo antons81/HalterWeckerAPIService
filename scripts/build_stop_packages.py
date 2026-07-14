@@ -168,7 +168,7 @@ def validate_transit_radar_provider(
         return
 
     if adapter == "vbb":
-        if city_id != "berlin" or not isinstance(region, dict):
+        if not isinstance(region, dict):
             raise ValueError(f"Invalid VBB configuration for {city_id}")
 
     if not isinstance(region, dict):
@@ -216,7 +216,7 @@ def transit_radar_manifest(cities: list[dict[str, object]]) -> dict[str, object]
             elif adapter == "swu":
                 provider_id = "swu-ulm"
             elif adapter == "vbb":
-                provider_id = "vbb-berlin"
+                provider_id = f"vbb-{city_id}"
             else:
                 raise ValueError(f"Unsupported transit radar adapter for {city_id}")
 
@@ -252,31 +252,42 @@ def parse_gtfs_time(value: str) -> int:
     return hours * 3600 + minutes * 60 + seconds
 
 
-def build_vbb_network_index(archive: zipfile.ZipFile, output: Path) -> None:
-    stops = {row["stop_id"]: row for row in load_table(archive, "stops.txt") if row.get("stop_id")}
-    berlin_stop_ids = set()
+def build_vbb_city_network_index(
+    stops: dict[str, dict[str, str]],
+    stop_times: list[dict[str, str]],
+    routes: dict[str, dict[str, str]],
+    trips: list[dict[str, str]],
+    calendar_date_rows: list[dict[str, str]],
+    calendar_rows: list[dict[str, str]],
+    output: Path,
+    city_id: str,
+    region: dict[str, object]
+) -> None:
+    region_stop_ids = set()
     for stop_id, row in stops.items():
         try:
             latitude, longitude = float(row["stop_lat"]), float(row["stop_lon"])
         except (KeyError, ValueError):
             continue
-        if 52.3383 <= latitude <= 52.6755 and 13.0884 <= longitude <= 13.7612:
-            berlin_stop_ids.add(stop_id)
+        if (
+            float(region["minimumLatitude"]) <= latitude <= float(region["maximumLatitude"])
+            and float(region["minimumLongitude"]) <= longitude <= float(region["maximumLongitude"])
+        ):
+            region_stop_ids.add(stop_id)
 
-    stop_times = load_table(archive, "stop_times.txt")
-    berlin_trip_ids = {row["trip_id"] for row in stop_times if row.get("stop_id") in berlin_stop_ids}
+    region_trip_ids = {
+        row["trip_id"] for row in stop_times
+        if row.get("stop_id") in region_stop_ids
+    }
     times_by_trip: dict[str, list[dict[str, str]]] = {}
-    used_stop_ids = set()
     for row in stop_times:
         trip_id = row.get("trip_id", "")
-        if trip_id not in berlin_trip_ids:
+        if trip_id not in region_trip_ids:
             continue
         times_by_trip.setdefault(trip_id, []).append(row)
-        used_stop_ids.add(row.get("stop_id", ""))
 
-    routes = {row["route_id"]: row for row in load_table(archive, "routes.txt") if row.get("route_id")}
     trip_templates = []
-    for row in load_table(archive, "trips.txt"):
+    for row in trips:
         trip_id = row.get("trip_id", "")
         trip_times = times_by_trip.get(trip_id)
         if not trip_times:
@@ -302,12 +313,14 @@ def build_vbb_network_index(archive: zipfile.ZipFile, output: Path) -> None:
         })
 
     calendar_dates: dict[str, dict[str, list[str]]] = {}
-    for row in load_table(archive, "calendar_dates.txt"):
+    for row in calendar_date_rows:
         service_id = row.get("service_id", "")
         key = "addedDates" if row.get("exception_type") == "1" else "removedDates"
         calendar_dates.setdefault(service_id, {"addedDates": [], "removedDates": []})[key].append(row.get("date", ""))
 
-    calendar_by_id = {row["service_id"]: row for row in load_table(archive, "calendar.txt") if row.get("service_id")}
+    calendar_by_id = {
+        row["service_id"]: row for row in calendar_rows if row.get("service_id")
+    }
 
     def service_is_active(service_id: str, service_date: date) -> bool:
         date_key = service_date.strftime("%Y%m%d")
@@ -345,8 +358,12 @@ def build_vbb_network_index(archive: zipfile.ZipFile, output: Path) -> None:
                     packages.setdefault(key, []).append(trip)
                 hour += timedelta(hours=1)
 
-    transit_output = output / "transit" / "vbb"
-    transit_output.mkdir(parents=True, exist_ok=True)
+    transit_outputs = [output / "transit" / "vbb" / city_id]
+    if city_id == "berlin":
+        transit_outputs.append(output / "transit" / "vbb")
+    for transit_output in transit_outputs:
+        transit_output.mkdir(parents=True, exist_ok=True)
+
     for key, trips in packages.items():
         package_stop_ids = {
             stop_time["stopID"] for trip in trips for stop_time in trip["stopTimes"]
@@ -361,9 +378,52 @@ def build_vbb_network_index(archive: zipfile.ZipFile, output: Path) -> None:
             except (KeyError, ValueError):
                 continue
         payload = {"version": date.today().isoformat(), "stops": compact_stops, "trips": trips}
-        (transit_output / f"{key}.json").write_text(
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
-        )
+        encoded_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        for transit_output in transit_outputs:
+            (transit_output / f"{key}.json").write_text(
+                encoded_payload,
+                encoding="utf-8"
+            )
+
+
+def build_vbb_network_indexes(
+    archive: zipfile.ZipFile,
+    output: Path,
+    cities: list[dict[str, object]]
+) -> None:
+    stops = {
+        row["stop_id"]: row
+        for row in load_table(archive, "stops.txt")
+        if row.get("stop_id")
+    }
+    stop_times = load_table(archive, "stop_times.txt")
+    routes = {
+        row["route_id"]: row
+        for row in load_table(archive, "routes.txt")
+        if row.get("route_id")
+    }
+    trips = load_table(archive, "trips.txt")
+    calendar_date_rows = load_table(archive, "calendar_dates.txt")
+    calendar_rows = load_table(archive, "calendar.txt")
+
+    for city in cities:
+        transit_radar = city.get("transitRadar")
+        if transit_radar is None:
+            continue
+        for configuration in transit_radar_configurations(transit_radar):
+            if configuration.get("adapter") != "vbb":
+                continue
+            build_vbb_city_network_index(
+                stops=stops,
+                stop_times=stop_times,
+                routes=routes,
+                trips=trips,
+                calendar_date_rows=calendar_date_rows,
+                calendar_rows=calendar_rows,
+                output=output,
+                city_id=str(city["id"]),
+                region=configuration["region"]
+            )
 
 
 def main() -> None:
@@ -420,7 +480,7 @@ def main() -> None:
         json.dumps(transit_radar_manifest(cities), ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
-    build_vbb_network_index(load_gtfs_archive(args.vbb_gtfs_url), output)
+    build_vbb_network_indexes(load_gtfs_archive(args.vbb_gtfs_url), output, cities)
     print(f"Built {len(manifest)} city packages from {len(stops)} canonical stops.")
 
 
