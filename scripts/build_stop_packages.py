@@ -28,6 +28,7 @@ BKG_PAGE_SIZE = 2_000
 SPATIAL_GRID_SIZE_DEGREES = 0.25
 SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "dbRegioBusNRW",
+    "ivantoMQTT",
     "ruhrbahn",
     "shgMobil",
     "stadtwerkeMuenster",
@@ -417,6 +418,11 @@ def validate_transit_radar_provider(
         if not isinstance(region, dict):
             raise ValueError(f"Invalid VBB configuration for {city_id}")
 
+    if adapter == "ivantoMQTT":
+        agency = configuration.get("agency")
+        if agency not in {"evag", "heag", "vku", "wvg"}:
+            raise ValueError(f"Invalid Ivanto MQTT agency for {city_id}")
+
     if not isinstance(region, dict):
         raise ValueError(f"Invalid transit radar region for {city_id}")
 
@@ -455,6 +461,13 @@ def transit_radar_manifest(cities: list[dict[str, object]]) -> dict[str, object]
             adapter = str(provider_configuration["adapter"])
             if adapter == "dbRegioBusNRW":
                 provider_id = f"db-regio-bus-nrw-{city_id}"
+            elif adapter == "ivantoMQTT":
+                agency = str(provider_configuration["agency"])
+                provider_id = (
+                    f"ruhrbahn-{city_id}"
+                    if agency == "evag"
+                    else f"ivanto-{agency}-{city_id}"
+                )
             elif adapter == "ruhrbahn":
                 provider_id = f"ruhrbahn-{city_id}"
             elif adapter == "shgMobil":
@@ -479,6 +492,9 @@ def transit_radar_manifest(cities: list[dict[str, object]]) -> dict[str, object]
             region = provider_configuration.get("region")
             if isinstance(region, dict):
                 provider["region"] = region
+            agency = provider_configuration.get("agency")
+            if isinstance(agency, str):
+                provider["agency"] = agency
             providers.append(provider)
 
         radar_cities.append({
