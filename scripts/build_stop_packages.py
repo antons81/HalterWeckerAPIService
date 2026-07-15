@@ -33,7 +33,8 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "shgMobil",
     "stadtwerkeMuenster",
     "swu",
-    "vbb"
+    "vbb",
+    "vrrEFA"
 }
 
 
@@ -414,6 +415,16 @@ def validate_transit_radar_provider(
             raise ValueError(f"Invalid SHG Mobil configuration for {city_id}")
         return
 
+    if adapter == "vrrEFA":
+        efa_path = configuration.get("efaPath")
+        if (
+            region is not None
+            or not isinstance(efa_path, str)
+            or not CITY_ID_PATTERN.fullmatch(efa_path)
+        ):
+            raise ValueError(f"Invalid VRR EFA configuration for {city_id}")
+        return
+
     if adapter == "vbb":
         if not isinstance(region, dict):
             raise ValueError(f"Invalid VBB configuration for {city_id}")
@@ -478,16 +489,27 @@ def transit_radar_manifest(cities: list[dict[str, object]]) -> dict[str, object]
                 provider_id = "swu-ulm"
             elif adapter == "vbb":
                 provider_id = f"vbb-{city_id}"
+            elif adapter == "vrrEFA":
+                provider_id = f"vrr-efa-{city_id}"
             else:
                 raise ValueError(f"Unsupported transit radar adapter for {city_id}")
 
+            is_departure_provider = adapter == "vrrEFA"
             provider = {
                 "providerID": provider_id,
                 "adapter": adapter,
                 "isEnabled": provider_configuration.get("isEnabled", True),
                 "isExperimental": True,
-                "features": ["liveVehicles", "realtimeDelay"],
-                "statusMessage": f'Live-Radar für {city["name"]}'
+                "features": (
+                    ["realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"]
+                    if is_departure_provider
+                    else ["liveVehicles", "realtimeDelay"]
+                ),
+                "statusMessage": (
+                    f'Live-Abfahrten für {city["name"]}'
+                    if is_departure_provider
+                    else f'Live-Radar für {city["name"]}'
+                )
             }
             region = provider_configuration.get("region")
             if isinstance(region, dict):
@@ -495,6 +517,9 @@ def transit_radar_manifest(cities: list[dict[str, object]]) -> dict[str, object]
             agency = provider_configuration.get("agency")
             if isinstance(agency, str):
                 provider["agency"] = agency
+            efa_path = provider_configuration.get("efaPath")
+            if isinstance(efa_path, str):
+                provider["efaPath"] = efa_path
             providers.append(provider)
 
         radar_cities.append({
