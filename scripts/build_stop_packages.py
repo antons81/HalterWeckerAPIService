@@ -28,6 +28,7 @@ BKG_PAGE_SIZE = 2_000
 SPATIAL_GRID_SIZE_DEGREES = 0.25
 SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "dbRegioBusNRW",
+    "ruhrbahn",
     "shgMobil",
     "stadtwerkeMuenster",
     "swu",
@@ -454,6 +455,8 @@ def transit_radar_manifest(cities: list[dict[str, object]]) -> dict[str, object]
             adapter = str(provider_configuration["adapter"])
             if adapter == "dbRegioBusNRW":
                 provider_id = f"db-regio-bus-nrw-{city_id}"
+            elif adapter == "ruhrbahn":
+                provider_id = f"ruhrbahn-{city_id}"
             elif adapter == "shgMobil":
                 provider_id = "shg-mobil-schaumburg"
             elif adapter == "stadtwerkeMuenster":
@@ -538,6 +541,8 @@ def build_vbb_city_network_index(
         if not trip_times:
             continue
         route = routes.get(row.get("route_id", ""), {})
+        route_type_value = route.get("route_type", "").strip()
+        route_type = int(route_type_value) if route_type_value.isdigit() else None
         trip_times.sort(key=lambda item: int(item.get("stop_sequence", "0")))
         try:
             compact_times = [{
@@ -552,6 +557,7 @@ def build_vbb_city_network_index(
             "id": trip_id,
             "routeID": row.get("route_id", ""),
             "lineName": route.get("route_short_name") or route.get("route_long_name") or row.get("route_id", ""),
+            "routeType": route_type,
             "directionName": row.get("trip_headsign", ""),
             "serviceID": service_id,
             "stopTimes": compact_times

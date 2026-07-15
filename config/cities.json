@@ -6,6 +6,8 @@
   {"id":"munchen","name":"München","aliases":["Muenchen","Munich"],"latitude":48.1351,"longitude":11.5820,"radiusMeters":23000},
   {"id":"koln","name":"Köln","aliases":["Koeln","Cologne"],"latitude":50.9375,"longitude":6.9603,"radiusMeters":18000},
   {"id":"dusseldorf","name":"Düsseldorf","aliases":["Duesseldorf"],"latitude":51.2277,"longitude":6.7735,"radiusMeters":18000},
+  {"id":"essen","name":"Essen","aliases":[],"latitude":51.4556,"longitude":7.0116,"radiusMeters":18000,"transitRadar":{"adapter":"ruhrbahn","isEnabled":true,"region":{"minimumLongitude":6.89,"minimumLatitude":51.34,"maximumLongitude":7.14,"maximumLatitude":51.54}}},
+  {"id":"mulheim-an-der-ruhr","name":"Mülheim an der Ruhr","aliases":["Muelheim an der Ruhr"],"latitude":51.4275,"longitude":6.8825,"radiusMeters":14000,"transitRadar":{"adapter":"ruhrbahn","isEnabled":true,"region":{"minimumLongitude":6.77,"minimumLatitude":51.34,"maximumLongitude":7.02,"maximumLatitude":51.50}}},
   {"id":"neuss","name":"Neuss","aliases":[],"latitude":51.2042,"longitude":6.6879,"radiusMeters":12000},
   {"id":"velbert","name":"Velbert","aliases":[],"latitude":51.3406,"longitude":7.0434,"radiusMeters":12000,"transitRadar":{"adapter":"dbRegioBusNRW","region":{"minimumLongitude":6.93,"minimumLatitude":51.27,"maximumLongitude":7.18,"maximumLatitude":51.40}}},
   {"id":"wesel","name":"Wesel","aliases":[],"latitude":51.6587,"longitude":6.6176,"radiusMeters":14000,"transitRadar":{"adapter":"dbRegioBusNRW","region":{"minimumLongitude":6.45,"minimumLatitude":51.55,"maximumLongitude":6.80,"maximumLatitude":51.75}}},
