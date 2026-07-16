@@ -20,6 +20,48 @@ from build_stop_packages import (
 
 
 class CityLineCatalogTests(unittest.TestCase):
+    def test_configured_city_keeps_legacy_municipality_package_url(self) -> None:
+        municipalities = [municipality(
+            code="09564000",
+            name="Nürnberg",
+            minimum_longitude=10.98,
+            minimum_latitude=49.33,
+            maximum_longitude=11.28,
+            maximum_latitude=49.59
+        )]
+        cities = [{
+            "id": "nurnberg",
+            "name": "Nürnberg",
+            "aliases": ["Nuernberg"],
+            "latitude": 49.4521,
+            "longitude": 11.0767,
+            "radiusMeters": 18_000
+        }]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory)
+            manifest, _, _ = build_stop_packages(
+                stops=[stop("nuernberg-stop", "Nürnberg Hbf", 49.446, 11.082)],
+                cities=cities,
+                municipalities=municipalities,
+                output=output
+            )
+            current = json.loads(
+                (output / "stops" / "nurnberg.json").read_text(encoding="utf-8")
+            )
+            legacy = json.loads(
+                (output / "stops" / "nurnberg-09564000.json")
+                .read_text(encoding="utf-8")
+            )
+            transliterated_legacy = json.loads(
+                (output / "stops" / "nuernberg-09564000.json")
+                .read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(manifest[0]["id"], "nurnberg")
+        self.assertEqual(current, legacy)
+        self.assertEqual(current, transliterated_legacy)
+
     def test_vag_provider_is_enabled_only_when_gateway_is_configured(self) -> None:
         cities = [{
             "id": "nurnberg",

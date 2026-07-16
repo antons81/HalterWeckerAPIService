@@ -1100,6 +1100,21 @@ def build_stop_packages(
             if municipality_code is not None
             else city_stops
         )
+        if municipality_code is not None:
+            municipality = municipalities_by_code[municipality_code]
+            legacy_city_ids = {
+                (
+                    f'{identifier_component(str(municipality["name"]))}-'
+                    f'{municipality_code.lower()}'
+                ),
+                f'{city_id}-{municipality_code.lower()}'
+            }
+            for legacy_city_id in legacy_city_ids - {city_id}:
+                write_stop_package(
+                    packages_directory,
+                    legacy_city_id,
+                    packages_by_code[municipality_code]
+                )
         manifest.append({
             "id": city_id,
             "name": city["name"],
