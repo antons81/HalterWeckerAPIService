@@ -873,6 +873,9 @@ def build_stop_packages(
         municipalities,
         spatial_index
     )
+    configured_code_by_city_id = {
+        city_id: code for code, city_id in configured_codes.items()
+    }
     municipalities_by_code = {
         str(municipality["code"]): municipality for municipality in municipalities
     }
@@ -922,7 +925,7 @@ def build_stop_packages(
 
         city_id = str(city["id"])
         filename = write_stop_package(packages_directory, city_id, city_stops)
-        municipality_code = configured_codes.get(city_id)
+        municipality_code = configured_code_by_city_id.get(city_id)
         package_stops_by_city_id[city_id] = (
             packages_by_code.get(municipality_code, city_stops)
             if municipality_code is not None

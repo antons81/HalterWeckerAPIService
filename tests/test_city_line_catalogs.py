@@ -8,10 +8,60 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from build_stop_packages import build_city_line_catalogs, build_lines_by_stop_id
+from build_stop_packages import (
+    build_city_line_catalogs,
+    build_lines_by_stop_id,
+    build_stop_packages
+)
 
 
 class CityLineCatalogTests(unittest.TestCase):
+    def test_configured_city_line_scope_uses_municipality_not_search_radius(self) -> None:
+        municipalities = [
+            municipality(
+                code="velbert-code",
+                name="Velbert",
+                minimum_longitude=7.00,
+                minimum_latitude=51.30,
+                maximum_longitude=7.10,
+                maximum_latitude=51.40
+            ),
+            municipality(
+                code="essen-code",
+                name="Essen",
+                minimum_longitude=6.90,
+                minimum_latitude=51.40,
+                maximum_longitude=7.00,
+                maximum_latitude=51.50
+            )
+        ]
+        stops = [
+            stop("velbert-stop", "Velbert ZOB", 51.35, 7.05),
+            stop("essen-stop", "Essen Werden", 51.45, 6.95)
+        ]
+        cities = [{
+            "id": "velbert",
+            "name": "Velbert",
+            "aliases": [],
+            "latitude": 51.35,
+            "longitude": 7.05,
+            "radiusMeters": 30_000,
+            "transitRadar": {"adapter": "dbRegioBusNRW"}
+        }]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, _, package_stops = build_stop_packages(
+                stops=stops,
+                cities=cities,
+                municipalities=municipalities,
+                output=Path(temporary_directory)
+            )
+
+        self.assertEqual(
+            [item["id"] for item in package_stops["velbert"]],
+            ["velbert-stop"]
+        )
+
     def test_builds_catalog_from_routes_serving_city_stops(self) -> None:
         stop_rows = [
             {"stop_id": "velbert", "stop_name": "Velbert ZOB"},
@@ -86,6 +136,45 @@ class CityLineCatalogTests(unittest.TestCase):
 
         self.assertEqual(payload["cityID"], "velbert")
         self.assertEqual([line["names"][0] for line in payload["lines"]], ["169"])
+
+
+def stop(stop_id: str, name: str, latitude: float, longitude: float) -> dict:
+    return {
+        "id": stop_id,
+        "name": name,
+        "latitude": latitude,
+        "longitude": longitude,
+        "searchName": name.lower()
+    }
+
+
+def municipality(
+    code: str,
+    name: str,
+    minimum_longitude: float,
+    minimum_latitude: float,
+    maximum_longitude: float,
+    maximum_latitude: float
+) -> dict:
+    ring = [
+        [minimum_longitude, minimum_latitude],
+        [maximum_longitude, minimum_latitude],
+        [maximum_longitude, maximum_latitude],
+        [minimum_longitude, maximum_latitude],
+        [minimum_longitude, minimum_latitude]
+    ]
+    return {
+        "code": code,
+        "name": name,
+        "state": "05",
+        "bbox": [
+            minimum_longitude,
+            minimum_latitude,
+            maximum_longitude,
+            maximum_latitude
+        ],
+        "geometry": {"type": "Polygon", "coordinates": [ring]}
+    }
 
 
 if __name__ == "__main__":
