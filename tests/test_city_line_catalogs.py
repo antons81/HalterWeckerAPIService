@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
 import json
+import io
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 import sys
 
@@ -11,11 +13,99 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from build_stop_packages import (
     build_city_line_catalogs,
     build_lines_by_stop_id,
-    build_stop_packages
+    build_rnv_assets,
+    build_stop_packages,
+    transit_radar_manifest
 )
 
 
 class CityLineCatalogTests(unittest.TestCase):
+    def test_vag_provider_is_enabled_only_when_gateway_is_configured(self) -> None:
+        cities = [{
+            "id": "nurnberg",
+            "name": "Nürnberg",
+            "latitude": 49.4521,
+            "longitude": 11.0767,
+            "transitRadar": {
+                "adapter": "vagPuls",
+                "isEnabled": False,
+                "region": {
+                    "minimumLongitude": 10.98,
+                    "minimumLatitude": 49.33,
+                    "maximumLongitude": 11.28,
+                    "maximumLatitude": 49.59
+                }
+            }
+        }]
+
+        disabled = transit_radar_manifest(cities)
+        enabled = transit_radar_manifest(
+            cities,
+            vag_gateway_url="https://api.example.com"
+        )
+
+        disabled_provider = disabled["cities"][0]["providers"][0]
+        enabled_provider = enabled["cities"][0]["providers"][0]
+        self.assertFalse(disabled_provider["isEnabled"])
+        self.assertNotIn("gatewayURL", disabled_provider)
+        self.assertTrue(enabled_provider["isEnabled"])
+        self.assertEqual(
+            enabled_provider["gatewayURL"],
+            "https://api.example.com"
+        )
+
+    def test_rnv_assets_cover_every_municipality_with_an_rnv_stop(self) -> None:
+        archive_data = io.BytesIO()
+        with zipfile.ZipFile(archive_data, "w") as archive:
+            archive.writestr(
+                "stops.txt",
+                "stop_id,stop_name,stop_lat,stop_lon\n"
+                "ma-stop,Mannheim Paradeplatz,49.4875,8.4660\n"
+            )
+            archive.writestr(
+                "routes.txt",
+                "route_id,route_short_name,route_long_name,route_type\n"
+                "route-5,5,Weinheim - Mannheim,0\n"
+            )
+            archive.writestr(
+                "trips.txt",
+                "route_id,service_id,trip_id,trip_headsign\n"
+                "route-5,weekday,trip-5,Weinheim\n"
+            )
+        archive_data.seek(0)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            availability, city_ids = build_rnv_assets(
+                archive=zipfile.ZipFile(archive_data),
+                output=Path(temporary_directory),
+                manifest=[{
+                    "id": "mannheim-08222000",
+                    "name": "Mannheim",
+                    "aliases": []
+                }],
+                cities=[],
+                municipalities=[municipality(
+                    code="08222000",
+                    name="Mannheim",
+                    minimum_longitude=8.3,
+                    minimum_latitude=49.3,
+                    maximum_longitude=8.7,
+                    maximum_latitude=49.7
+                )],
+                gateway_url=""
+            )
+            network = json.loads(
+                (Path(temporary_directory) / "transit" / "rnv" / "network.json")
+                .read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(city_ids, {"mannheim-08222000"})
+        self.assertEqual(availability[0]["appCityID"], "mannheim-08222000")
+        self.assertFalse(availability[0]["providers"][0]["isEnabled"])
+        self.assertNotIn("gatewayURL", availability[0]["providers"][0])
+        self.assertEqual(network["routes"][0]["shortName"], "5")
+        self.assertEqual(network["trips"][0]["routeID"], "route-5")
+
     def test_configured_city_line_scope_uses_municipality_not_search_radius(self) -> None:
         municipalities = [
             municipality(

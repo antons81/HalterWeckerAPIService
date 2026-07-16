@@ -34,6 +34,8 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "shgMobil",
     "stadtwerkeMuenster",
     "swu",
+    "vagPuls",
+    "rnv",
     "vbb",
     "vrrEFA"
 }
@@ -491,6 +493,9 @@ def validate_transit_radar_provider(
             raise ValueError(f"Invalid SHG Mobil configuration for {city_id}")
         return
 
+    if adapter == "vagPuls" and city_id != "nurnberg":
+        raise ValueError(f"Invalid VAG PULS configuration for {city_id}")
+
     if adapter == "vrrEFA":
         efa_path = configuration.get("efaPath")
         if (
@@ -504,6 +509,11 @@ def validate_transit_radar_provider(
     if adapter == "vbb":
         if not isinstance(region, dict):
             raise ValueError(f"Invalid VBB configuration for {city_id}")
+
+    if adapter == "rnv":
+        gateway_url = configuration.get("gatewayURL")
+        if not isinstance(gateway_url, str) or not gateway_url.startswith("https://"):
+            raise ValueError(f"Invalid rnv gateway URL for {city_id}")
 
     if adapter == "ivantoMQTT":
         agency = configuration.get("agency")
@@ -535,7 +545,11 @@ def validate_transit_radar_provider(
         raise ValueError(f"Transit radar region misses the center of {city_id}")
 
 
-def transit_radar_manifest(cities: list[dict[str, object]]) -> dict[str, object]:
+def transit_radar_manifest(
+    cities: list[dict[str, object]],
+    additional_cities: list[dict[str, object]] | None = None,
+    vag_gateway_url: str = ""
+) -> dict[str, object]:
     radar_cities = []
     for city in cities:
         configuration = city.get("transitRadar")
@@ -563,6 +577,10 @@ def transit_radar_manifest(cities: list[dict[str, object]]) -> dict[str, object]
                 provider_id = "stadtwerke-muenster"
             elif adapter == "swu":
                 provider_id = "swu-ulm"
+            elif adapter == "vagPuls":
+                provider_id = "vag-puls-nurnberg"
+            elif adapter == "rnv":
+                provider_id = f"rnv-{city_id}"
             elif adapter == "vbb":
                 provider_id = f"vbb-{city_id}"
             elif adapter == "vrrEFA":
@@ -571,10 +589,13 @@ def transit_radar_manifest(cities: list[dict[str, object]]) -> dict[str, object]
                 raise ValueError(f"Unsupported transit radar adapter for {city_id}")
 
             is_departure_provider = adapter == "vrrEFA"
+            is_enabled = provider_configuration.get("isEnabled", True)
+            if adapter == "vagPuls":
+                is_enabled = bool(vag_gateway_url)
             provider = {
                 "providerID": provider_id,
                 "adapter": adapter,
-                "isEnabled": provider_configuration.get("isEnabled", True),
+                "isEnabled": is_enabled,
                 "isExperimental": True,
                 "features": (
                     ["realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"]
@@ -596,6 +617,11 @@ def transit_radar_manifest(cities: list[dict[str, object]]) -> dict[str, object]
             efa_path = provider_configuration.get("efaPath")
             if isinstance(efa_path, str):
                 provider["efaPath"] = efa_path
+            gateway_url = provider_configuration.get("gatewayURL")
+            if adapter == "vagPuls" and vag_gateway_url:
+                gateway_url = vag_gateway_url
+            if isinstance(gateway_url, str):
+                provider["gatewayURL"] = gateway_url
             providers.append(provider)
 
         radar_cities.append({
@@ -609,7 +635,25 @@ def transit_radar_manifest(cities: list[dict[str, object]]) -> dict[str, object]
             "providers": providers
         })
 
-    return {"schemaVersion": 1, "cities": radar_cities}
+    cities_by_id = {str(city["appCityID"]): city for city in radar_cities}
+    for additional_city in additional_cities or []:
+        app_city_id = str(additional_city["appCityID"])
+        existing = cities_by_id.get(app_city_id)
+        if existing is None:
+            cities_by_id[app_city_id] = additional_city
+            continue
+        existing_provider_ids = {
+            str(provider["providerID"]) for provider in existing["providers"]
+        }
+        existing["providers"].extend(
+            provider for provider in additional_city["providers"]
+            if str(provider["providerID"]) not in existing_provider_ids
+        )
+
+    return {
+        "schemaVersion": 1,
+        "cities": sorted(cities_by_id.values(), key=lambda city: str(city["appCityID"]))
+    }
 
 
 def parse_gtfs_time(value: str) -> int:
@@ -794,6 +838,131 @@ def build_vbb_network_indexes(
             )
 
 
+def build_rnv_assets(
+    archive: zipfile.ZipFile,
+    output: Path,
+    manifest: list[dict[str, object]],
+    cities: list[dict[str, object]],
+    municipalities: list[dict[str, object]],
+    gateway_url: str
+) -> tuple[list[dict[str, object]], set[str]]:
+    """Build one regional route index and availability entries for every served municipality."""
+    stop_rows = load_table(archive, "stops.txt")
+    rnv_stops = canonicalize(stop_rows)
+    routes = []
+    for route in load_table(archive, "routes.txt"):
+        route_id = route.get("route_id", "").strip()
+        if not route_id:
+            continue
+        try:
+            route_type = int(route.get("route_type", "3"))
+        except ValueError:
+            route_type = 3
+        routes.append({
+            "id": route_id,
+            "shortName": route.get("route_short_name", "").strip(),
+            "longName": route.get("route_long_name", "").strip(),
+            "routeType": route_type
+        })
+
+    trips = []
+    for trip in load_table(archive, "trips.txt"):
+        trip_id = trip.get("trip_id", "").strip()
+        route_id = trip.get("route_id", "").strip()
+        if not trip_id or not route_id:
+            continue
+        trips.append({
+            "id": trip_id,
+            "routeID": route_id,
+            "directionName": trip.get("trip_headsign", "").strip()
+        })
+
+    rnv_directory = output / "transit" / "rnv"
+    rnv_directory.mkdir(parents=True, exist_ok=True)
+    (rnv_directory / "network.json").write_text(
+        json.dumps(
+            {
+                "version": date.today().isoformat(),
+                "routes": routes,
+                "trips": trips
+            },
+            ensure_ascii=False,
+            separators=(",", ":")
+        ),
+        encoding="utf-8"
+    )
+
+    spatial_index = municipality_spatial_index(municipalities)
+    configured_codes = configured_municipality_codes(
+        cities,
+        municipalities,
+        spatial_index
+    )
+    city_ids_in_manifest = {str(city["id"]) for city in manifest}
+    city_id_by_code = dict(configured_codes)
+    for municipality in municipalities:
+        code = str(municipality["code"])
+        automatic_city_id = (
+            f'{identifier_component(str(municipality["name"]))}-{code.lower()}'
+        )
+        if automatic_city_id in city_ids_in_manifest:
+            city_id_by_code[code] = automatic_city_id
+
+    coordinates_by_city_id: dict[str, list[tuple[float, float]]] = {}
+    for stop in rnv_stops:
+        latitude = float(stop["latitude"])
+        longitude = float(stop["longitude"])
+        municipality = municipality_for_coordinate(
+            latitude,
+            longitude,
+            municipalities,
+            spatial_index
+        )
+        if municipality is None:
+            continue
+        city_id = city_id_by_code.get(str(municipality["code"]))
+        if city_id is None or city_id not in city_ids_in_manifest:
+            continue
+        coordinates_by_city_id.setdefault(city_id, []).append((latitude, longitude))
+
+    manifest_by_id = {str(city["id"]): city for city in manifest}
+    availability_cities = []
+    for city_id, coordinates in sorted(coordinates_by_city_id.items()):
+        city = manifest_by_id[city_id]
+        latitudes = [coordinate[0] for coordinate in coordinates]
+        longitudes = [coordinate[1] for coordinate in coordinates]
+        padding = 0.015
+        region = {
+            "minimumLongitude": min(longitudes) - padding,
+            "minimumLatitude": min(latitudes) - padding,
+            "maximumLongitude": max(longitudes) + padding,
+            "maximumLatitude": max(latitudes) + padding
+        }
+        provider = {
+            "providerID": f"rnv-{city_id}",
+            "adapter": "rnv",
+            "isEnabled": bool(gateway_url),
+            "isExperimental": True,
+            "features": ["liveVehicles", "realtimeDelay"],
+            "statusMessage": f'Live-Radar für {city["name"]}',
+            "region": region
+        }
+        if gateway_url:
+            provider["gatewayURL"] = gateway_url
+        availability_cities.append({
+            "cityID": f"{city_id}-de",
+            "appCityID": city_id,
+            "name": city["name"],
+            "center": {
+                "latitude": sum(latitudes) / len(latitudes),
+                "longitude": sum(longitudes) / len(longitudes)
+            },
+            "providers": [provider]
+        })
+
+    return availability_cities, set(coordinates_by_city_id)
+
+
 def configured_municipality_codes(
     cities: list[dict[str, object]],
     municipalities: list[dict[str, object]],
@@ -974,9 +1143,11 @@ def build_city_line_catalogs(
     manifest: list[dict[str, object]],
     package_stops_by_city_id: dict[str, list[dict[str, object]]],
     lines_by_stop_id: dict[str, dict[str, dict[str, object]]],
-    cities: list[dict[str, object]]
+    cities: list[dict[str, object]],
+    additional_city_ids: set[str] | None = None
 ) -> None:
     included_city_ids = radar_city_ids(manifest, cities)
+    included_city_ids.update(additional_city_ids or set())
     directory = output / "transit" / "city-lines"
     directory.mkdir(parents=True, exist_ok=True)
 
@@ -1013,6 +1184,12 @@ def main() -> None:
         "--vbb-gtfs-url",
         default="https://unternehmen.vbb.de/fileadmin/user_upload/VBB/Dokumente/API-Datensaetze/gtfs-mastscharf/GTFS.zip"
     )
+    parser.add_argument(
+        "--rnv-gtfs-url",
+        default="https://gtfs-sandbox-dds.rnv-online.de/latest/gtfs.zip"
+    )
+    parser.add_argument("--rnv-gateway-url", default="")
+    parser.add_argument("--vag-gateway-url", default="")
     parser.add_argument("--cities", default="config/cities.json")
     parser.add_argument("--municipalities-url", default=BKG_MUNICIPALITIES_URL)
     parser.add_argument("--output", default="docs/data")
@@ -1030,7 +1207,16 @@ def main() -> None:
         municipalities,
         output
     )
+    rnv_cities, rnv_city_ids = build_rnv_assets(
+        archive=load_gtfs_archive(args.rnv_gtfs_url),
+        output=output,
+        manifest=manifest,
+        cities=cities,
+        municipalities=municipalities,
+        gateway_url=args.rnv_gateway_url.strip()
+    )
     included_city_ids = radar_city_ids(manifest, cities)
+    included_city_ids.update(rnv_city_ids)
     included_stop_ids = {
         str(stop["id"])
         for city_id in included_city_ids
@@ -1053,16 +1239,31 @@ def main() -> None:
         encoding="utf-8"
     )
     (output / "transit-radar-cities.json").write_text(
-        json.dumps(transit_radar_manifest(cities), ensure_ascii=False, indent=2),
+        json.dumps(
+            transit_radar_manifest(
+                cities,
+                additional_cities=rnv_cities,
+                vag_gateway_url=args.vag_gateway_url.strip()
+            ),
+            ensure_ascii=False,
+            indent=2
+        ),
         encoding="utf-8"
     )
     (output / "attributions.json").write_text(
         json.dumps(
-            [{
-                "name": "Bundesamt für Kartographie und Geodäsie (BKG)",
-                "license": "Datenlizenz Deutschland – Namensnennung – Version 2.0",
-                "url": "https://gdz.bkg.bund.de/index.php/default/open-data/wfs-verwaltungsgebiete-1-250-000-stand-01-01-wfs-vg250.html"
-            }],
+            [
+                {
+                    "name": "Bundesamt für Kartographie und Geodäsie (BKG)",
+                    "license": "Datenlizenz Deutschland – Namensnennung – Version 2.0",
+                    "url": "https://gdz.bkg.bund.de/index.php/default/open-data/wfs-verwaltungsgebiete-1-250-000-stand-01-01-wfs-vg250.html"
+                },
+                {
+                    "name": "Rhein-Neckar-Verkehr GmbH (rnv)",
+                    "license": "Datenlizenz Deutschland – Namensnennung – Version 2.0",
+                    "url": "https://www.rnv-online.de/unternehmen/open-data/"
+                }
+            ],
             ensure_ascii=False,
             indent=2
         ),
@@ -1073,7 +1274,8 @@ def main() -> None:
         manifest=manifest,
         package_stops_by_city_id=package_stops_by_city_id,
         lines_by_stop_id=lines_by_stop_id,
-        cities=cities
+        cities=cities,
+        additional_city_ids=rnv_city_ids
     )
     build_vbb_network_indexes(load_gtfs_archive(args.vbb_gtfs_url), output, cities)
     print(

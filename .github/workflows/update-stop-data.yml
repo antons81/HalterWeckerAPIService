@@ -32,7 +32,13 @@ jobs:
       - name: Validate configuration
         run: test -n "${{ vars.GTFS_URL }}"
       - name: Build city packages
-        run: python scripts/build_stop_packages.py --gtfs-url "${{ vars.GTFS_URL }}"
+        env:
+          SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+        run: >-
+          python scripts/build_stop_packages.py
+          --gtfs-url "${{ vars.GTFS_URL }}"
+          --rnv-gateway-url "${{ vars.RNV_GATEWAY_URL }}"
+          --vag-gateway-url "${{ vars.VAG_GATEWAY_URL }}"
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
