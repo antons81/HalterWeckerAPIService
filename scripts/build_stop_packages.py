@@ -15,6 +15,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import zipfile
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from typing import Iterable
 
 EARTH_RADIUS_METERS = 6_371_000
 CITY_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -300,6 +301,16 @@ def load_table(archive: zipfile.ZipFile, filename: str) -> list[dict[str, str]]:
         return list(csv.DictReader(io.TextIOWrapper(file, encoding="utf-8-sig")))
 
 
+def iter_table(
+    archive: zipfile.ZipFile,
+    filename: str
+) -> Iterable[dict[str, str]]:
+    if filename not in archive.namelist():
+        return
+    with archive.open(filename) as file:
+        yield from csv.DictReader(io.TextIOWrapper(file, encoding="utf-8-sig"))
+
+
 def canonicalize(rows: list[dict[str, str]]) -> list[dict[str, object]]:
     by_id = {row["stop_id"]: row for row in rows if row.get("stop_id")}
     unique: dict[tuple[str, int, int], dict[str, object]] = {}
@@ -318,6 +329,71 @@ def canonicalize(rows: list[dict[str, str]]) -> list[dict[str, object]]:
             "longitude": longitude, "searchName": normalized(name)
         })
     return list(unique.values())
+
+
+def canonical_stop_id_by_stop_id(
+    rows: list[dict[str, str]]
+) -> dict[str, str]:
+    by_id = {row["stop_id"]: row for row in rows if row.get("stop_id")}
+    return {
+        stop_id: (by_id.get(row.get("parent_station", "")) or row)["stop_id"]
+        for stop_id, row in by_id.items()
+    }
+
+
+def line_names(route: dict[str, str]) -> list[str]:
+    names = []
+    for key in ("route_short_name", "route_long_name"):
+        value = route.get(key, "").strip()
+        if value and value not in names:
+            names.append(value)
+    return names
+
+
+def build_lines_by_stop_id(
+    stop_rows: list[dict[str, str]],
+    stop_times: Iterable[dict[str, str]],
+    trips: list[dict[str, str]],
+    routes: list[dict[str, str]],
+    included_stop_ids: set[str] | None = None
+) -> dict[str, dict[str, dict[str, object]]]:
+    canonical_ids = canonical_stop_id_by_stop_id(stop_rows)
+    route_by_id = {
+        row["route_id"]: row for row in routes if row.get("route_id")
+    }
+    route_id_by_trip_id = {
+        row["trip_id"]: row.get("route_id", "")
+        for row in trips if row.get("trip_id")
+    }
+    lines_by_stop_id: dict[str, dict[str, dict[str, object]]] = {}
+
+    for stop_time in stop_times:
+        canonical_stop_id = canonical_ids.get(stop_time.get("stop_id", ""))
+        if (
+            included_stop_ids is not None
+            and canonical_stop_id not in included_stop_ids
+        ):
+            continue
+        route_id = route_id_by_trip_id.get(stop_time.get("trip_id", ""), "")
+        route = route_by_id.get(route_id)
+        if canonical_stop_id is None or route is None:
+            continue
+
+        names = line_names(route)
+        if not names:
+            continue
+
+        route_type_value = route.get("route_type", "").strip()
+        line: dict[str, object] = {
+            "routeID": route_id,
+            "agencyID": route.get("agency_id", "").strip() or None,
+            "names": names
+        }
+        if route_type_value.isdigit():
+            line["routeType"] = int(route_type_value)
+        lines_by_stop_id.setdefault(canonical_stop_id, {})[route_id] = line
+
+    return lines_by_stop_id
 
 
 def load_cities(path: Path) -> list[dict[str, object]]:
@@ -783,7 +859,7 @@ def build_stop_packages(
     cities: list[dict[str, object]],
     municipalities: list[dict[str, object]],
     output: Path
-) -> tuple[list[dict[str, object]], int]:
+) -> tuple[list[dict[str, object]], int, dict[str, list[dict[str, object]]]]:
     packages_directory = output / "stops"
     packages_directory.mkdir(parents=True, exist_ok=True)
     spatial_index = municipality_spatial_index(municipalities)
@@ -807,6 +883,7 @@ def build_stop_packages(
         duplicate_name_counts[key] = duplicate_name_counts.get(key, 0) + 1
 
     manifest = []
+    package_stops_by_city_id: dict[str, list[dict[str, object]]] = {}
     for code, municipality_stops in packages_by_code.items():
         if code in configured_codes:
             continue
@@ -821,6 +898,7 @@ def build_stop_packages(
         aliases = [base_name] if display_name != base_name else []
         city_id = f"{identifier_component(base_name)}-{code.lower()}"
         filename = write_stop_package(packages_directory, city_id, municipality_stops)
+        package_stops_by_city_id[city_id] = municipality_stops
         manifest.append({
             "id": city_id,
             "name": display_name,
@@ -844,6 +922,12 @@ def build_stop_packages(
 
         city_id = str(city["id"])
         filename = write_stop_package(packages_directory, city_id, city_stops)
+        municipality_code = configured_codes.get(city_id)
+        package_stops_by_city_id[city_id] = (
+            packages_by_code.get(municipality_code, city_stops)
+            if municipality_code is not None
+            else city_stops
+        )
         manifest.append({
             "id": city_id,
             "name": city["name"],
@@ -853,7 +937,70 @@ def build_stop_packages(
         })
 
     manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
-    return manifest, skipped_stop_count
+    return manifest, skipped_stop_count, package_stops_by_city_id
+
+
+def radar_coverage_names(cities: list[dict[str, object]]) -> set[str]:
+    result = set()
+    for city in cities:
+        if city.get("transitRadar") is None:
+            continue
+        result.update(
+            normalized(str(name))
+            for name in [city["name"], *city.get("aliases", [])]
+        )
+    return result
+
+
+def radar_city_ids(
+    manifest: list[dict[str, object]],
+    cities: list[dict[str, object]]
+) -> set[str]:
+    coverage_names = radar_coverage_names(cities)
+    result = set()
+    for city in manifest:
+        names = {normalized(str(city["name"]))}
+        names.update(normalized(str(alias)) for alias in city.get("aliases", []))
+        if not names.isdisjoint(coverage_names):
+            result.add(str(city["id"]))
+    return result
+
+
+def build_city_line_catalogs(
+    output: Path,
+    manifest: list[dict[str, object]],
+    package_stops_by_city_id: dict[str, list[dict[str, object]]],
+    lines_by_stop_id: dict[str, dict[str, dict[str, object]]],
+    cities: list[dict[str, object]]
+) -> None:
+    included_city_ids = radar_city_ids(manifest, cities)
+    directory = output / "transit" / "city-lines"
+    directory.mkdir(parents=True, exist_ok=True)
+
+    for city in manifest:
+        if str(city["id"]) not in included_city_ids:
+            continue
+
+        lines: dict[str, dict[str, object]] = {}
+        for stop in package_stops_by_city_id.get(str(city["id"]), []):
+            lines.update(lines_by_stop_id.get(str(stop["id"]), {}))
+
+        sorted_lines = sorted(
+            lines.values(),
+            key=lambda line: (
+                normalized(str(line["names"][0])),
+                str(line["routeID"])
+            )
+        )
+        payload = {
+            "version": date.today().isoformat(),
+            "cityID": city["id"],
+            "lines": sorted_lines
+        }
+        (directory / f'{city["id"]}.json').write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8"
+        )
 
 
 def main() -> None:
@@ -870,14 +1017,28 @@ def main() -> None:
 
     cities = load_cities(Path(args.cities))
     archive = load_gtfs_archive(args.gtfs_url)
-    stops = canonicalize(load_table(archive, "stops.txt"))
+    stop_rows = load_table(archive, "stops.txt")
+    stops = canonicalize(stop_rows)
     municipalities = load_municipalities(args.municipalities_url)
     output = Path(args.output)
-    manifest, skipped_stop_count = build_stop_packages(
+    manifest, skipped_stop_count, package_stops_by_city_id = build_stop_packages(
         stops,
         cities,
         municipalities,
         output
+    )
+    included_city_ids = radar_city_ids(manifest, cities)
+    included_stop_ids = {
+        str(stop["id"])
+        for city_id in included_city_ids
+        for stop in package_stops_by_city_id.get(city_id, [])
+    }
+    lines_by_stop_id = build_lines_by_stop_id(
+        stop_rows=stop_rows,
+        stop_times=iter_table(archive, "stop_times.txt"),
+        trips=load_table(archive, "trips.txt"),
+        routes=load_table(archive, "routes.txt"),
+        included_stop_ids=included_stop_ids
     )
     (output / "cities.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     (output / "manifest.json").write_text(
@@ -903,6 +1064,13 @@ def main() -> None:
             indent=2
         ),
         encoding="utf-8"
+    )
+    build_city_line_catalogs(
+        output=output,
+        manifest=manifest,
+        package_stops_by_city_id=package_stops_by_city_id,
+        lines_by_stop_id=lines_by_stop_id,
+        cities=cities
     )
     build_vbb_network_indexes(load_gtfs_archive(args.vbb_gtfs_url), output, cities)
     print(
