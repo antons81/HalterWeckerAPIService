@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""Aggregate VVO departures and expose computed vehicle positions.
+"""Expose estimated VVO vehicle positions using the VVO EFA API.
 
-This gateway implements estimated live tracking for VVO Dresden.
-VVO WebAPI provides realtime departures with delays, but not live vehicle coordinates.
-The gateway:
-1. Polls /dm endpoint for active departures
-2. Fetches /dm/trip details to get stop sequence
-3. Interpolates vehicle positions between consecutive stops
-4. Marks all positions as "scheduleEstimate" - this is NOT real GPS tracking
+Upstream:
+    https://efa.vvo-online.de/VMSSL3/
 
-Note: VVO uses GK4 (Gauss-Kruger zone 4) integer coordinates in WebAPI responses.
-This gateway relies on VVO_STOPS.JSON catalog for WGS84 coordinates.
+The VVO EFA API provides stop search, departures, realtime timestamps, delays,
+platforms and line metadata. It does not provide vehicle GPS coordinates.
+
+This gateway therefore exposes conservative schedule estimates:
+1. Poll XML_DM_REQUEST for a configurable set of VVO stops.
+2. Read scheduled and realtime departure timestamps.
+3. Place each active departure at its stop coordinate from VVO_STOPS.JSON.
+4. Mark every position as "scheduleEstimate".
+
+The response shape remains compatible with the HalteWecker transit-radar backend:
+    GET /health
+    GET /vvo/vehicles.json
 """
 
 from __future__ import annotations
@@ -19,326 +24,391 @@ import json
 import os
 import threading
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 
+VVO_EFA_BASE_URL = "https://efa.vvo-online.de/VMSSL3/"
 VVO_STOPS_CATALOG_URL = "https://www.vvo-online.de/open_data/VVO_STOPS.JSON"
-VVO_API_BASE_URL = "https://www.vvo-online.de/webapi"
+VVO_TIMEZONE = ZoneInfo("Europe/Berlin")
 
-# Cache VVO stop catalog globally
+DEFAULT_MAJOR_STOPS = (
+    "33000028",  # Dresden Hauptbahnhof
+    "33000029",  # Dresden-Neustadt
+    "33000001",  # Dresden Postplatz
+    "33000005",  # Dresden Wiener Platz / central area, verify against catalog
+)
+
 _stops_catalog: dict[str, dict[str, Any]] = {}
 _stops_catalog_lock = threading.Lock()
 _stops_catalog_last_fetch = 0.0
-_stops_catalog_ttl = 3600  # 1 hour
+_stops_catalog_ttl = 3600.0
 
 
 @dataclass(frozen=True)
 class VVOGatewayConfiguration:
-    base_url: str = VVO_API_BASE_URL
+    base_url: str = VVO_EFA_BASE_URL
     host: str = "0.0.0.0"
     port: int = 8082
-    snapshot_ttl_seconds: float = 15
-    trip_detail_ttl_seconds: float = 120
-    maximum_detail_requests_per_refresh: int = 24
+    snapshot_ttl_seconds: float = 15.0
+    departures_per_stop: int = 30
+    active_window_before_minutes: int = 3
+    active_window_after_minutes: int = 20
+    stop_ids: tuple[str, ...] = DEFAULT_MAJOR_STOPS
 
     @classmethod
     def from_environment(cls) -> "VVOGatewayConfiguration":
+        raw_stop_ids = os.environ.get("VVO_STOP_IDS", "")
+        stop_ids = tuple(
+            item.strip()
+            for item in raw_stop_ids.split(",")
+            if item.strip()
+        ) or DEFAULT_MAJOR_STOPS
+
         return cls(
             base_url=os.environ.get(
-                "VVO_BASE_URL", VVO_API_BASE_URL
-            ).rstrip("/"),
+                "VVO_BASE_URL",
+                VVO_EFA_BASE_URL,
+            ).rstrip("/") + "/",
             host=os.environ.get("VVO_GATEWAY_HOST", "0.0.0.0"),
             port=int(os.environ.get("VVO_GATEWAY_PORT", "8082")),
             snapshot_ttl_seconds=float(
                 os.environ.get("VVO_SNAPSHOT_TTL_SECONDS", "15")
             ),
-            trip_detail_ttl_seconds=float(
-                os.environ.get("VVO_TRIP_DETAIL_TTL_SECONDS", "120")
+            departures_per_stop=int(
+                os.environ.get("VVO_DEPARTURES_PER_STOP", "30")
             ),
-            maximum_detail_requests_per_refresh=int(
-                os.environ.get("VVO_MAX_DETAIL_REQUESTS_PER_REFRESH", "24")
+            active_window_before_minutes=int(
+                os.environ.get("VVO_ACTIVE_WINDOW_BEFORE_MINUTES", "3")
             ),
+            active_window_after_minutes=int(
+                os.environ.get("VVO_ACTIVE_WINDOW_AFTER_MINUTES", "20")
+            ),
+            stop_ids=stop_ids,
         )
 
 
-class VVOAPIClient:
-    """Low-level client for VVO WebAPI."""
+class VVOEFAClient:
+    """Small client for VVO's EFA RapidJSON departure monitor."""
 
     def __init__(self, base_url: str):
         self.base_url = base_url
 
-    def fetch_departures(self, stop_id: str, limit: int = 50) -> dict[str, Any]:
-        """Fetch departures from /dm endpoint."""
-        url = f"{self.base_url}/dm?stopid={urllib.parse.quote(stop_id)}&Limit={limit}"
+    def fetch_departures(
+        self,
+        stop_id: str,
+        *,
+        limit: int,
+        now: datetime,
+    ) -> dict[str, Any]:
+        local_now = now.astimezone(VVO_TIMEZONE)
+        params = {
+            "outputFormat": "RapidJSON",
+            "stateless": "1",
+            "type_dm": "any",
+            "name_dm": stop_id,
+            "mode": "direct",
+            "useRealtime": "1",
+            "limit": str(limit),
+            "language": "de",
+            "coordOutputFormat": "WGS84",
+            "itdDateYear": str(local_now.year),
+            "itdDateMonth": str(local_now.month),
+            "itdDateDay": str(local_now.day),
+            "itdTimeHour": str(local_now.hour),
+            "itdTimeMinute": str(local_now.minute),
+        }
+        endpoint = urllib.parse.urljoin(
+            self.base_url,
+            "XML_DM_REQUEST",
+        )
+        url = f"{endpoint}?{urllib.parse.urlencode(params)}"
         request = urllib.request.Request(
             url,
             headers={
-                "Accept": "application/json",
-                "User-Agent": "HalteWeckerVVOGateway/1.0",
+                "Accept": "application/json,text/plain,*/*",
+                "User-Agent": "HalteWeckerVVOGateway/2.0",
             },
         )
-        with urllib.request.urlopen(request, timeout=25) as response:
-            return json.load(response)
 
-    def fetch_trip_details(self, stop_id: str, departure_id: str, time: str) -> dict[str, Any]:
-        """Fetch trip details from /dm/trip endpoint."""
-        url = f"{self.base_url}/dm/trip?stopid={urllib.parse.quote(stop_id)}&id={urllib.parse.quote(departure_id)}&time={urllib.parse.quote(time)}"
-        request = urllib.request.Request(
-            url,
-            headers={
-                "Accept": "application/json",
-                "User-Agent": "HalteWeckerVVOGateway/1.0",
-            },
-        )
         with urllib.request.urlopen(request, timeout=25) as response:
-            return json.load(response)
+            raw = response.read()
+        return json.loads(raw.decode("utf-8-sig"))
 
 
 def _fetch_stops_catalog() -> dict[str, dict[str, Any]]:
-    """Fetch VVO stop catalog from remote URL."""
     global _stops_catalog, _stops_catalog_last_fetch
-    
+
     with _stops_catalog_lock:
         now = time.time()
-        if _stops_catalog and now - _stops_catalog_last_fetch < _stops_catalog_ttl:
+        if (
+            _stops_catalog
+            and now - _stops_catalog_last_fetch < _stops_catalog_ttl
+        ):
             return _stops_catalog
-        
+
+        request = urllib.request.Request(
+            VVO_STOPS_CATALOG_URL,
+            headers={"User-Agent": "HalteWeckerVVOGateway/2.0"},
+        )
         try:
-            request = urllib.request.Request(
-                VVO_STOPS_CATALOG_URL,
-                headers={"User-Agent": "HalteWeckerVVOGateway/1.0"},
-            )
             with urllib.request.urlopen(request, timeout=30) as response:
                 data = json.load(response)
-            
-            # Build catalog indexed by WebAPI ID
+
             catalog: dict[str, dict[str, Any]] = {}
+            if not isinstance(data, list):
+                raise ValueError("VVO stop catalog is not a JSON array")
+
             for stop in data:
-                web_api_id = str(stop.get("id", "")).strip()
-                if web_api_id:
-                    catalog[web_api_id] = stop
-            
+                if not isinstance(stop, dict):
+                    continue
+                stop_id = str(
+                    stop.get("id")
+                    or stop.get("Id")
+                    or stop.get("stopID")
+                    or ""
+                ).strip()
+                if stop_id:
+                    catalog[stop_id] = stop
+
+            if not catalog:
+                raise ValueError("VVO stop catalog is empty")
+
             _stops_catalog = catalog
             _stops_catalog_last_fetch = now
             return catalog
-        except Exception as e:
-            print(f"Failed to fetch VVO stop catalog: {e}")
+        except Exception as error:
+            print(f"[VVO] Stop catalog fetch failed: {error}")
             if _stops_catalog:
                 return _stops_catalog
             raise
 
 
-def get_stop_coordinates(stop_id: str) -> tuple[float, float] | None:
-    """Get WGS84 coordinates for a stop from the catalog."""
-    catalog = _fetch_stops_catalog()
-    stop = catalog.get(str(stop_id))
-    if stop:
-        try:
-            lat = float(stop.get("y", stop.get("latitude", 0)))
-            lon = float(stop.get("x", stop.get("longitude", 0)))
-            if -90 <= lat <= 90 and -180 <= lon <= 180:
-                return (lat, lon)
-        except (ValueError, TypeError):
-            pass
-    return None
-
-
-def parse_vvo_timestamp(ts: str | None) -> datetime | None:
-    """Parse VVO timestamp in format YYYYMMDDHHmmss."""
-    if not ts or len(ts) < 14:
-        return None
+def _float_value(value: Any) -> float | None:
     try:
-        year = int(ts[0:4])
-        month = int(ts[4:6])
-        day = int(ts[6:8])
-        hour = int(ts[8:10])
-        minute = int(ts[10:12])
-        second = int(ts[12:14])
-        return datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
-    except (ValueError, IndexError):
+        return float(value)
+    except (TypeError, ValueError):
         return None
 
 
-def effective_time(stop: dict[str, Any]) -> datetime | None:
-    """Get effective time (realtime if available, otherwise scheduled)."""
-    realtime = stop.get("RealTime") or stop.get("realtime")
-    scheduled = stop.get("Time") or stop.get("time")
-    
-    if realtime:
-        rt = parse_vvo_timestamp(str(realtime))
-        if rt:
-            return rt
-    
-    if scheduled:
-        st = parse_vvo_timestamp(str(scheduled))
-        if st:
-            return st
-    
-    return None
+def get_stop_coordinates(stop_id: str) -> tuple[float, float] | None:
+    stop = _fetch_stops_catalog().get(str(stop_id))
+    if not stop:
+        return None
+
+    latitude = _float_value(
+        stop.get("y")
+        or stop.get("latitude")
+        or stop.get("lat")
+    )
+    longitude = _float_value(
+        stop.get("x")
+        or stop.get("longitude")
+        or stop.get("lon")
+        or stop.get("lng")
+    )
+    if (
+        latitude is None
+        or longitude is None
+        or not -90 <= latitude <= 90
+        or not -180 <= longitude <= 180
+    ):
+        return None
+    return latitude, longitude
 
 
-def compute_interpolated_position(
-    stops: list[dict[str, Any]],
-    now: datetime,
-) -> tuple[float, float, int | None] | None:
-    """Compute vehicle position by interpolating between stops.
-    
-    Returns (latitude, longitude, delay_seconds) or None if position cannot be determined.
-    """
-    if not stops:
+def _dictionary(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _string(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def parse_efa_datetime(value: Any) -> datetime | None:
+    """Parse EFA dateTime/realDateTime dictionaries in Europe/Berlin."""
+    data = _dictionary(value)
+    if not data:
         return None
-    
-    # Filter stops with valid times
-    valid_stops = []
-    for stop in stops:
-        et = effective_time(stop)
-        if et is not None:
-            valid_stops.append((stop, et))
-    
-    if not valid_stops:
+
+    try:
+        year = int(data["year"])
+        month = int(data["month"])
+        day = int(data["day"])
+        hour = int(data.get("hour", 0))
+        minute = int(data.get("minute", 0))
+        second = int(data.get("second", 0))
+        local = datetime(
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            tzinfo=VVO_TIMEZONE,
+        )
+        return local.astimezone(timezone.utc)
+    except (KeyError, TypeError, ValueError):
         return None
-    
-    # Sort by effective time
-    valid_stops.sort(key=lambda x: x[1])
-    
-    # Check if now is before first stop
-    first_stop, first_time = valid_stops[0]
-    if now <= first_time:
-        coords = get_stop_coordinates(str(first_stop.get("Id", first_stop.get("id", ""))))
-        if coords:
-            return (coords[0], coords[1], None)
+
+
+def _departure_list(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract departures from common EFA RapidJSON response variants."""
+    candidates = (
+        payload.get("departureList"),
+        _dictionary(payload.get("stopEvents")).get("departure"),
+        _dictionary(payload.get("dm")).get("departureList"),
+    )
+    for candidate in candidates:
+        if isinstance(candidate, list):
+            return [item for item in candidate if isinstance(item, dict)]
+    return []
+
+
+def _transport_mode(serving_line: dict[str, Any]) -> str:
+    raw_class = (
+        serving_line.get("motType")
+        or serving_line.get("class")
+        or serving_line.get("productClass")
+    )
+    try:
+        transport_class = int(raw_class)
+    except (TypeError, ValueError):
+        transport_class = None
+
+    if transport_class in {0, 1, 13, 15, 16}:
+        return "regionalTrain"
+    if transport_class in {2, 3}:
+        return "subway"
+    if transport_class == 4:
+        return "tram"
+    if transport_class in {5, 6, 7, 8, 11}:
+        return "bus"
+    if transport_class == 9:
+        return "ferry"
+
+    name = _string(
+        serving_line.get("name"),
+        serving_line.get("number"),
+        serving_line.get("symbol"),
+    ).lower()
+    if name.startswith("s"):
+        return "suburbanTrain"
+    if name.startswith(("re", "rb", "ic", "ice", "ec")):
+        return "regionalTrain"
+    return "unknown"
+
+
+def _delay_seconds(
+    scheduled: datetime | None,
+    realtime: datetime | None,
+) -> int | None:
+    if scheduled is None or realtime is None:
         return None
-    
-    # Check if now is after last stop
-    last_stop, last_time = valid_stops[-1]
-    if now > last_time:
-        coords = get_stop_coordinates(str(last_stop.get("Id", last_stop.get("id", ""))))
-        if coords:
-            return (coords[0], coords[1], None)
-        return None
-    
-    # Find segment where now falls
-    for i in range(len(valid_stops) - 1):
-        current_stop, current_time = valid_stops[i]
-        next_stop, next_time = valid_stops[i + 1]
-        
-        if current_time <= now <= next_time:
-            # Found the segment
-            progress = min(1.0, max(0.0, (now - current_time) / (next_time - current_time)))
-            
-            start_coords = get_stop_coordinates(str(current_stop.get("Id", current_stop.get("id", ""))))
-            end_coords = get_stop_coordinates(str(next_stop.get("Id", next_stop.get("id", ""))))
-            
-            if start_coords and end_coords:
-                latitude = start_coords[0] + (end_coords[0] - start_coords[0]) * progress
-                longitude = start_coords[1] + (end_coords[1] - start_coords[1]) * progress
-                
-                # Calculate delay from departure
-                delay_seconds = None
-                scheduled = parse_vvo_timestamp(str(current_stop.get("Time", current_stop.get("time", ""))))
-                realtime = parse_vvo_timestamp(str(current_stop.get("RealTime", current_stop.get("realtime", ""))))
-                if scheduled and realtime:
-                    delay = int((realtime - scheduled).total_seconds())
-                    delay_seconds = delay if delay != 0 else None
-                
-                return (latitude, longitude, delay_seconds)
-    
-    return None
+    delay = int((realtime - scheduled).total_seconds())
+    return delay if delay != 0 else None
 
 
 def compute_vehicle(
     departure: dict[str, Any],
-    trip_details: dict[str, Any],
+    *,
+    requested_stop_id: str,
     now: datetime,
+    before_window: timedelta,
+    after_window: timedelta,
 ) -> dict[str, Any] | None:
-    """Compute a single vehicle from departure and trip details."""
-    line_name = str(departure.get("LineName", "")).strip()
-    direction = str(departure.get("Direction", "")).strip()
-    mot = str(departure.get("Mot", "")).lower()
-    
+    serving_line = _dictionary(departure.get("servingLine"))
+    scheduled = parse_efa_datetime(
+        departure.get("dateTime")
+        or departure.get("scheduledDateTime")
+    )
+    realtime = parse_efa_datetime(
+        departure.get("realDateTime")
+        or departure.get("realtimeDateTime")
+    )
+    effective = realtime or scheduled
+    if effective is None:
+        return None
+
+    if effective < now - before_window or effective > now + after_window:
+        return None
+
+    stop_id = _string(
+        departure.get("stopID"),
+        departure.get("stopId"),
+        _dictionary(departure.get("location")).get("id"),
+        requested_stop_id,
+    )
+    coordinates = get_stop_coordinates(stop_id)
+    if coordinates is None and stop_id != requested_stop_id:
+        coordinates = get_stop_coordinates(requested_stop_id)
+    if coordinates is None:
+        return None
+
+    line_name = _string(
+        serving_line.get("number"),
+        serving_line.get("name"),
+        serving_line.get("symbol"),
+        departure.get("lineName"),
+    )
     if not line_name:
         return None
-    
-    # Map VVO MOT to standard mode
-    mode_map = {
-        "bus": "bus",
-        "tram": "tram",
-        "strassenbahn": "tram",
-        "u-bahn": "subway",
-        "ubahn": "subway",
-        "s-bahn": "suburbanTrain",
-        "sbahn": "suburbanTrain",
-        "regional": "regionalTrain",
-        "ferry": "ferry",
-        "faehre": "ferry",
-    }
-    mode = mode_map.get(mot, "unknown")
-    
-    departure_id = str(departure.get("Id", departure.get("id", "")))
-    stop_id = str(departure.get("stopid", ""))
-    
-    if not departure_id:
+
+    direction = _string(
+        serving_line.get("direction"),
+        serving_line.get("directionFrom"),
+        departure.get("direction"),
+    )
+    trip_id = _string(
+        serving_line.get("stateless"),
+        serving_line.get("id"),
+        departure.get("tripID"),
+        departure.get("tripId"),
+        departure.get("id"),
+    )
+    if not trip_id:
+        timestamp = int(effective.timestamp())
+        trip_id = f"{stop_id}-{line_name}-{timestamp}"
+
+    cancelled = bool(
+        departure.get("cancelled")
+        or departure.get("isCancelled")
+        or _string(departure.get("state")).lower()
+        in {"cancelled", "canceled", "abgesagt"}
+    )
+    if cancelled:
         return None
-    
-    # Get stops from trip details
-    stops = trip_details.get("Stops", [])
-    if not isinstance(stops, list):
-        return None
-    
-    position = compute_interpolated_position(stops, now)
-    if position is None:
-        # Fallback: use departure stop coordinates
-        coords = get_stop_coordinates(stop_id)
-        if coords:
-            # Try to calculate delay
-            delay_seconds = None
-            scheduled = parse_vvo_timestamp(str(departure.get("ScheduledTime", departure.get("scheduledTime", ""))))
-            realtime = parse_vvo_timestamp(str(departure.get("RealTime", departure.get("realtime", ""))))
-            if scheduled and realtime:
-                delay = int((realtime - scheduled).total_seconds())
-                delay_seconds = delay if delay != 0 else None
-            
-            return {
-                "id": f"vvo-{departure_id}",
-                "tripID": departure_id,
-                "lineName": line_name,
-                "directionName": direction,
-                "latitude": coords[0],
-                "longitude": coords[1],
-                "delaySeconds": delay_seconds,
-                "mode": mode,
-            }
-        return None
-    
-    latitude, longitude, delay_seconds = position
-    
+
+    latitude, longitude = coordinates
     return {
-        "id": f"vvo-{departure_id}",
-        "tripID": departure_id,
+        "id": f"vvo-{trip_id}",
+        "tripID": trip_id,
         "lineName": line_name,
         "directionName": direction,
         "latitude": latitude,
         "longitude": longitude,
-        "delaySeconds": delay_seconds,
-        "mode": mode,
+        "delaySeconds": _delay_seconds(scheduled, realtime),
+        "mode": _transport_mode(serving_line),
     }
 
 
 class VVOVehicleService:
-    """Main service that aggregates departures and computes vehicle positions."""
-
     def __init__(
         self,
         configuration: VVOGatewayConfiguration,
-        client: VVOAPIClient,
+        client: VVOEFAClient,
         monotonic_clock: Callable[[], float] = time.monotonic,
     ):
         self.configuration = configuration
@@ -347,130 +417,136 @@ class VVOVehicleService:
         self._lock = threading.Lock()
         self._snapshot: dict[str, Any] | None = None
         self._snapshot_expires_at = 0.0
-        self._trip_details: dict[str, tuple[float, dict[str, Any]]] = {}
-        # Track active stops and their departures
-        self._active_stops: dict[str, list[dict[str, Any]]] = {}
 
     def snapshot(self, now: datetime | None = None) -> dict[str, Any]:
         with self._lock:
             monotonic_now = self.monotonic_clock()
-            if self._snapshot is not None and monotonic_now < self._snapshot_expires_at:
+            if (
+                self._snapshot is not None
+                and monotonic_now < self._snapshot_expires_at
+            ):
                 return self._snapshot
 
             timestamp = now or datetime.now(timezone.utc)
-            self._snapshot = self._refresh(timestamp, monotonic_now)
+            snapshot = self._refresh(timestamp)
+            self._snapshot = snapshot
             self._snapshot_expires_at = (
                 monotonic_now + self.configuration.snapshot_ttl_seconds
             )
-            return self._snapshot
+            return snapshot
 
-    def _refresh(
-        self,
-        now: datetime,
-        monotonic_now: float,
-    ) -> dict[str, Any]:
-        """Refresh vehicle data by fetching departures and trip details."""
-        # For MVP, we fetch departures from a set of major stops in Dresden
-        # In production, this should be configurable or use a stop catalog
-        major_stops = [
-            "33000028",  # Dresden Hauptbahnhof
-            "33000029",  # Dresden-Neustadt
-            "33000001",  # Dresden Postplatz
-            "33000005",  # Dresden Konstante Straße
-        ]
-        
-        vehicles: list[dict[str, Any]] = []
+    def _refresh(self, now: datetime) -> dict[str, Any]:
+        vehicles_by_id: dict[str, dict[str, Any]] = {}
         dropped = 0
-        seen_trip_ids = set()
-        
-        for stop_id in major_stops:
+        upstream_errors: list[str] = []
+        before_window = timedelta(
+            minutes=self.configuration.active_window_before_minutes
+        )
+        after_window = timedelta(
+            minutes=self.configuration.active_window_after_minutes
+        )
+
+        for stop_id in self.configuration.stop_ids:
             try:
-                departures_response = self.client.fetch_departures(stop_id, limit=20)
-                departures = departures_response.get("Departures", [])
-            except Exception as e:
-                print(f"Failed to fetch departures for stop {stop_id}: {e}")
+                payload = self.client.fetch_departures(
+                    stop_id,
+                    limit=self.configuration.departures_per_stop,
+                    now=now,
+                )
+                departures = _departure_list(payload)
+            except Exception as error:
+                message = f"{stop_id}: {type(error).__name__}: {error}"
+                print(f"[VVO] Departure fetch failed: {message}")
+                upstream_errors.append(message)
                 continue
-            
+
             for departure in departures:
-                if not isinstance(departure, dict):
-                    continue
-                
-                # Skip cancelled departures
-                state = str(departure.get("State", "")).lower()
-                if "cancelled" in state or "abgesagt" in state:
-                    continue
-                
-                departure_id = str(departure.get("Id", "")).strip()
-                scheduled_time = str(departure.get("ScheduledTime", "")).strip()
-                
-                if not departure_id or not scheduled_time:
-                    continue
-                
-                # Check if we've already processed this trip
-                if departure_id in seen_trip_ids:
-                    continue
-                seen_trip_ids.add(departure_id)
-                
-                # Get scheduled date
-                scheduled_dt = parse_vvo_timestamp(scheduled_time)
-                if scheduled_dt is None:
-                    continue
-                
-                # Skip past departures (more than 10 minutes ago)
-                if now - scheduled_dt > timedelta(minutes=10):
-                    continue
-                
-                # Try to get trip details
-                try:
-                    trip_response = self.client.fetch_trip_details(
-                        stop_id, departure_id, scheduled_time
-                    )
-                except Exception as e:
-                    print(f"Failed to fetch trip details for {departure_id}: {e}")
-                    dropped += 1
-                    continue
-                
-                vehicle = compute_vehicle(departure, trip_response, now)
+                vehicle = compute_vehicle(
+                    departure,
+                    requested_stop_id=stop_id,
+                    now=now,
+                    before_window=before_window,
+                    after_window=after_window,
+                )
                 if vehicle is None:
                     dropped += 1
-                else:
-                    vehicles.append(vehicle)
-        
-        vehicles.sort(key=lambda v: (v.get("lineName", ""), v.get("id", "")))
-        
+                    continue
+                vehicles_by_id[vehicle["id"]] = vehicle
+
+        vehicles = sorted(
+            vehicles_by_id.values(),
+            key=lambda item: (
+                item.get("lineName", ""),
+                item.get("directionName", ""),
+                item.get("id", ""),
+            ),
+        )
+
         return {
             "updatedAt": now.astimezone(timezone.utc)
-                .replace(microsecond=0)
-                .isoformat()
-                .replace("+00:00", "Z"),
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
             "positionSource": "scheduleEstimate",
             "vehicles": vehicles,
             "droppedItemCount": dropped,
+            "upstreamErrorCount": len(upstream_errors),
         }
 
 
-def make_handler(service: VVOVehicleService) -> type[BaseHTTPRequestHandler]:
+def make_handler(
+    service: VVOVehicleService,
+) -> type[BaseHTTPRequestHandler]:
     class VVOGatewayHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            if self.path == "/health":
+            path = urllib.parse.urlsplit(self.path).path
+            if path == "/health":
                 self._send_json(HTTPStatus.OK, {"status": "ok"})
                 return
-            if self.path != "/vvo/vehicles.json":
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            if path != "/vvo/vehicles.json":
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"error": "not_found"},
+                )
                 return
+
             try:
                 self._send_json(HTTPStatus.OK, service.snapshot())
             except Exception as error:
-                self.log_error("VVO upstream request failed: %s", error)
+                self.log_error(
+                    "VVO upstream request failed: %s",
+                    error,
+                )
                 self._send_json(
                     HTTPStatus.BAD_GATEWAY,
                     {"error": "vvo_upstream_unavailable"},
                 )
 
-        def _send_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
-            data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        def log_message(self, format: str, *args: Any) -> None:
+            print(
+                "%s - - [%s] %s"
+                % (
+                    self.address_string(),
+                    self.log_date_time_string(),
+                    format % args,
+                )
+            )
+
+        def _send_json(
+            self,
+            status: HTTPStatus,
+            payload: dict[str, Any],
+        ) -> None:
+            data = json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
             self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header(
+                "Content-Type",
+                "application/json; charset=utf-8",
+            )
             self.send_header("Cache-Control", "public, max-age=10")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
@@ -481,12 +557,20 @@ def make_handler(service: VVOVehicleService) -> type[BaseHTTPRequestHandler]:
 
 def main() -> None:
     configuration = VVOGatewayConfiguration.from_environment()
-    service = VVOVehicleService(configuration, VVOAPIClient(configuration.base_url))
+    service = VVOVehicleService(
+        configuration,
+        VVOEFAClient(configuration.base_url),
+    )
     server = ThreadingHTTPServer(
         (configuration.host, configuration.port),
         make_handler(service),
     )
-    print(f"VVO Gateway listening on {configuration.host}:{configuration.port}")
+    print(
+        "VVO EFA gateway listening on "
+        f"{configuration.host}:{configuration.port}"
+    )
+    print(f"VVO EFA base URL: {configuration.base_url}")
+    print(f"Configured stops: {', '.join(configuration.stop_ids)}")
     server.serve_forever()
 
 
