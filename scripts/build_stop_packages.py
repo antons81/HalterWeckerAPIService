@@ -642,6 +642,8 @@ def transit_radar_manifest(
             gateway_url = provider_configuration.get("gatewayURL")
             if adapter == "vagPuls" and vag_gateway_url:
                 gateway_url = vag_gateway_url
+            if adapter == "vvo" and vvo_gateway_url:
+                gateway_url = vvo_gateway_url
             if isinstance(gateway_url, str):
                 provider["gatewayURL"] = gateway_url
             providers.append(provider)
