@@ -26,5 +26,5 @@
   {"id":"frankfurt-am-main","name":"Frankfurt am Main","aliases":["Frankfurt"],"latitude":50.1109,"longitude":8.6821,"radiusMeters":18000},
   {"id":"stuttgart","name":"Stuttgart","aliases":[],"latitude":48.7758,"longitude":9.1829,"radiusMeters":18000},
   {"id":"ulm","name":"Ulm","aliases":["Neu-Ulm","Neu Ulm"],"latitude":48.4011,"longitude":9.9876,"radiusMeters":20000,"transitRadar":{"adapter":"swu","isEnabled":true}},
-  {"cityID":"dresden-de","appCityID":"dresden","name":"Dresden", "aliases":["Meißen","Pirna", "Oberelbe region"], "center":{"latitude":51.0504,"longitude":13.7373},"providers":[{"providerID":"vvo-dresden","adapter":"vvo","isEnabled":true,"isExperimental":true,"features":["liveVehicles","realtimeDelay"],"statusMessage":"Live-Radar für Dresden","region":{"minimumLongitude":13.5,"minimumLatitude":50.8,"maximumLongitude":14.0,"maximumLatitude":51.3},"efaPath":"vvo"}]}
+  {"cityID":"dresden-de","appCityID":"dresden","name":"Dresden", "center":{"latitude":51.0504,"longitude":13.7373},"providers":[{"providerID":"vvo-dresden","adapter":"vvo","isEnabled":true,"isExperimental":true,"features":["liveVehicles","realtimeDelay"],"statusMessage":"Live-Radar für Dresden","region":{"minimumLongitude":13.5,"minimumLatitude":50.8,"maximumLongitude":14.0,"maximumLatitude":51.3},"efaPath":"vvo"}]}
 ]
