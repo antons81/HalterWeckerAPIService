@@ -55,3 +55,22 @@ python services/vag_gateway.py
 The service listens on port `8081` by default and exposes `/vag/vehicles.json`. Set the repository variable `VAG_GATEWAY_URL` to its public HTTPS base URL. The next stop-data build then enables Nürnberg without requiring an app update. Do not point every app installation directly at the VAG detail endpoints; the shared gateway is responsible for request coalescing and upstream load control.
 
 Municipality boundaries are provided by the Bundesamt für Kartographie und Geodäsie under Datenlizenz Deutschland – Namensnennung – Version 2.0. Generated data includes `data/attributions.json` with the required source information.
+
+## Dresden computed Live Radar (VVO)
+
+VVO WebAPI provides realtime departures and delays, but not current vehicle coordinates. `services/vvo_gateway.py` fetches departures from `/dm` endpoint, gets trip details from `/dm/trip` endpoint, caches stop catalog from VVO_STOPS.JSON, and interpolates vehicle positions between consecutive stops. The output is explicitly marked as `scheduleEstimate`; it must not be presented as raw GPS.
+
+Run the gateway with:
+
+```bash
+python services/vvo_gateway.py
+```
+
+The service listens on port `8082` by default and exposes `/vvo/vehicles.json`. Set the repository variable `VVO_GATEWAY_URL` to its public HTTPS base URL. The gateway:
+- Fetches departures from major Dresden stops
+- Uses VVO_STOPS.JSON for WGS84 coordinates (VVO WebAPI returns GK4)
+- Implements linear interpolation between stops
+- Supports realtime delay information
+- Caches stop catalog and trip details
+
+Dresden (`dresden-de`) is added to `config/cities.json` with the `vvo` adapter but remains disabled by default until `VVO_GATEWAY_URL` is configured.
