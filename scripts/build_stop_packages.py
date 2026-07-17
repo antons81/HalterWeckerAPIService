@@ -588,7 +588,13 @@ def transit_radar_manifest(
             else:
                 raise ValueError(f"Unsupported transit radar adapter for {city_id}")
 
-            is_departure_provider = adapter == "vrrEFA"
+            is_departure_provider = (
+                adapter == "vrrEFA"
+                or (
+                    adapter == "vbb"
+                    and bool(provider_configuration.get("supportsDepartures", False))
+                )
+            )
             is_enabled = provider_configuration.get("isEnabled", True)
             if adapter == "vagPuls":
                 is_enabled = bool(vag_gateway_url)
@@ -598,12 +604,22 @@ def transit_radar_manifest(
                 "isEnabled": is_enabled,
                 "isExperimental": True,
                 "features": (
-                    ["realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"]
+                    [
+                        "liveVehicles",
+                        "realtimeDepartures",
+                        "firstDepartures",
+                        "stopLookup",
+                        "realtimeDelay"
+                    ]
+                    if adapter == "vbb" and is_departure_provider
+                    else ["realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"]
                     if is_departure_provider
                     else ["liveVehicles", "realtimeDelay"]
                 ),
                 "statusMessage": (
-                    f'Live-Abfahrten für {city["name"]}'
+                    f'Live-Radar und Live-Abfahrten für {city["name"]}'
+                    if adapter == "vbb" and is_departure_provider
+                    else f'Live-Abfahrten für {city["name"]}'
                     if is_departure_provider
                     else f'Live-Radar für {city["name"]}'
                 )
@@ -708,6 +724,7 @@ def build_vbb_city_network_index(
         try:
             compact_times = [{
                 "stopID": item["stop_id"],
+                "stopSequence": int(item.get("stop_sequence", "0")),
                 "arrivalSeconds": parse_gtfs_time(item["arrival_time"]),
                 "departureSeconds": parse_gtfs_time(item["departure_time"])
             } for item in trip_times]
@@ -786,7 +803,12 @@ def build_vbb_city_network_index(
             if not row:
                 continue
             try:
-                compact_stops.append({"id": stop_id, "latitude": float(row["stop_lat"]), "longitude": float(row["stop_lon"])})
+                compact_stops.append({
+                    "id": stop_id,
+                    "name": row.get("stop_name", ""),
+                    "latitude": float(row["stop_lat"]),
+                    "longitude": float(row["stop_lon"])
+                })
             except (KeyError, ValueError):
                 continue
         payload = {"version": date.today().isoformat(), "stops": compact_stops, "trips": trips}

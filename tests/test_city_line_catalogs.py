@@ -96,6 +96,39 @@ class CityLineCatalogTests(unittest.TestCase):
             "https://api.example.com"
         )
 
+    def test_vbb_departure_features_are_enabled_explicitly(self) -> None:
+        cities = [{
+            "id": "berlin",
+            "name": "Berlin",
+            "latitude": 52.52,
+            "longitude": 13.405,
+            "transitRadar": {
+                "adapter": "vbb",
+                "isEnabled": True,
+                "supportsDepartures": True,
+                "region": {
+                    "minimumLongitude": 13.08,
+                    "minimumLatitude": 52.33,
+                    "maximumLongitude": 13.77,
+                    "maximumLatitude": 52.68
+                }
+            }
+        }]
+
+        provider = transit_radar_manifest(cities)["cities"][0]["providers"][0]
+
+        self.assertEqual(provider["providerID"], "vbb-berlin")
+        self.assertEqual(
+            provider["features"],
+            [
+                "liveVehicles",
+                "realtimeDepartures",
+                "firstDepartures",
+                "stopLookup",
+                "realtimeDelay"
+            ]
+        )
+
     def test_rnv_assets_cover_every_municipality_with_an_rnv_stop(self) -> None:
         archive_data = io.BytesIO()
         with zipfile.ZipFile(archive_data, "w") as archive:
