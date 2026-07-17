@@ -601,9 +601,9 @@ def transit_radar_manifest(
             )
             is_enabled = provider_configuration.get("isEnabled", True)
             if adapter == "vagPuls":
-                is_enabled = bool(vag_gateway_url)
+                is_enabled = True
             if adapter == "vvo":
-                is_enabled = bool(vvo_gateway_url)
+                is_enabled = True
             provider = {
                 "providerID": provider_id,
                 "adapter": adapter,
