@@ -37,7 +37,8 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "vagPuls",
     "rnv",
     "vbb",
-    "vrrEFA"
+    "vrrEFA",
+    "vvo"
 }
 
 
@@ -548,7 +549,8 @@ def validate_transit_radar_provider(
 def transit_radar_manifest(
     cities: list[dict[str, object]],
     additional_cities: list[dict[str, object]] | None = None,
-    vag_gateway_url: str = ""
+    vag_gateway_url: str = "",
+    vvo_gateway_url: str = ""
 ) -> dict[str, object]:
     radar_cities = []
     for city in cities:
@@ -585,6 +587,8 @@ def transit_radar_manifest(
                 provider_id = f"vbb-{city_id}"
             elif adapter == "vrrEFA":
                 provider_id = f"vrr-efa-{city_id}"
+            elif adapter == "vvo":
+                provider_id = f"vvo-{city_id}"
             else:
                 raise ValueError(f"Unsupported transit radar adapter for {city_id}")
 
@@ -598,6 +602,8 @@ def transit_radar_manifest(
             is_enabled = provider_configuration.get("isEnabled", True)
             if adapter == "vagPuls":
                 is_enabled = bool(vag_gateway_url)
+            if adapter == "vvo":
+                is_enabled = bool(vvo_gateway_url)
             provider = {
                 "providerID": provider_id,
                 "adapter": adapter,
@@ -1227,6 +1233,7 @@ def main() -> None:
     )
     parser.add_argument("--rnv-gateway-url", default="")
     parser.add_argument("--vag-gateway-url", default="")
+    parser.add_argument("--vvo-gateway-url", default="")
     parser.add_argument("--cities", default="config/cities.json")
     parser.add_argument("--municipalities-url", default=BKG_MUNICIPALITIES_URL)
     parser.add_argument("--output", default="docs/data")
@@ -1280,7 +1287,8 @@ def main() -> None:
             transit_radar_manifest(
                 cities,
                 additional_cities=rnv_cities,
-                vag_gateway_url=args.vag_gateway_url.strip()
+                vag_gateway_url=args.vag_gateway_url.strip(),
+                vvo_gateway_url=args.vvo_gateway_url.strip()
             ),
             ensure_ascii=False,
             indent=2
