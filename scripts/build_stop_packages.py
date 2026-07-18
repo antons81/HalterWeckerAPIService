@@ -43,6 +43,18 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "vrrEFA",
     "vvo"
 }
+STATIC_TRANSIT_RADAR_PROVIDERS = {
+    "rheinbahn-duesseldorf": {
+        "cityID": "dusseldorf",
+        "features": {
+            "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"
+        }
+    },
+    "wsw-wuppertal": {
+        "cityID": "wuppertal",
+        "features": {"liveVehicles", "realtimeDelay"}
+    }
+}
 
 
 def normalized(value: str) -> str:
@@ -477,6 +489,19 @@ def validate_transit_radar_provider(
     adapter = configuration.get("adapter")
     region = configuration.get("region")
     is_enabled = configuration.get("isEnabled", True)
+    if adapter is None:
+        provider_id = configuration.get("providerID")
+        static_provider = STATIC_TRANSIT_RADAR_PROVIDERS.get(provider_id)
+        features = configuration.get("features")
+        if (
+            static_provider is None
+            or static_provider["cityID"] != city_id
+            or not isinstance(features, list)
+            or set(features) != static_provider["features"]
+            or configuration.get("region") is not None
+        ):
+            raise ValueError(f"Invalid static transit radar provider for {city_id}")
+        return
     if adapter not in SUPPORTED_TRANSIT_RADAR_ADAPTERS:
         raise ValueError(f"Invalid transit radar adapter for {city_id}")
     if not isinstance(is_enabled, bool):
@@ -510,6 +535,12 @@ def validate_transit_radar_provider(
         }[adapter]
         if efa_path != expected_path:
             raise ValueError(f"Invalid {adapter} configuration for {city_id}")
+        radar_stops = configuration.get("radarStops")
+        supports_live_vehicles = bool(configuration.get("supportsLiveVehicles", False))
+        if supports_live_vehicles:
+            validate_efa_radar_stops(city_id, radar_stops, region)
+        elif radar_stops is not None:
+            raise ValueError(f"Unexpected EFA radar stops for {city_id}")
         if region is None:
             return
 
@@ -552,6 +583,36 @@ def validate_transit_radar_provider(
         raise ValueError(f"Transit radar region misses the center of {city_id}")
 
 
+def validate_efa_radar_stops(
+    city_id: str,
+    radar_stops: object,
+    region: object
+) -> None:
+    if not isinstance(region, dict):
+        raise ValueError(f"Missing EFA radar region for {city_id}")
+    if not isinstance(radar_stops, list) or not 1 <= len(radar_stops) <= 24:
+        raise ValueError(f"Invalid EFA radar stops for {city_id}")
+
+    stop_ids: set[str] = set()
+    for stop in radar_stops:
+        if not isinstance(stop, dict):
+            raise ValueError(f"Invalid EFA radar stop for {city_id}")
+        stop_id = stop.get("id")
+        latitude = stop.get("latitude")
+        longitude = stop.get("longitude")
+        if (
+            not isinstance(stop_id, str)
+            or not stop_id.strip()
+            or stop_id in stop_ids
+            or not isinstance(latitude, (int, float))
+            or not isinstance(longitude, (int, float))
+            or not region["minimumLatitude"] <= latitude <= region["maximumLatitude"]
+            or not region["minimumLongitude"] <= longitude <= region["maximumLongitude"]
+        ):
+            raise ValueError(f"Invalid EFA radar stop for {city_id}")
+        stop_ids.add(stop_id)
+
+
 def transit_radar_manifest(
     cities: list[dict[str, object]],
     additional_cities: list[dict[str, object]] | None = None,
@@ -566,8 +627,17 @@ def transit_radar_manifest(
         city_id = str(city["id"])
         providers = []
         for provider_configuration in transit_radar_configurations(configuration):
-            adapter = str(provider_configuration["adapter"])
-            if adapter == "dbRegioBusNRW":
+            validate_transit_radar_provider(
+                city_id,
+                float(city["latitude"]),
+                float(city["longitude"]),
+                provider_configuration
+            )
+            adapter_value = provider_configuration.get("adapter")
+            adapter = str(adapter_value) if adapter_value is not None else None
+            if adapter is None:
+                provider_id = str(provider_configuration["providerID"])
+            elif adapter == "dbRegioBusNRW":
                 provider_id = f"db-regio-bus-nrw-{city_id}"
             elif adapter == "ivantoMQTT":
                 agency = str(provider_configuration["agency"])
@@ -603,37 +673,41 @@ def transit_radar_manifest(
             else:
                 raise ValueError(f"Unsupported transit radar adapter for {city_id}")
 
-            supports_departures = bool(
-                provider_configuration.get(
-                    "supportsDepartures",
-                    adapter in {"vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "vvo"}
+            if adapter is None:
+                features = list(provider_configuration["features"])
+                supports_live_vehicles = "liveVehicles" in features
+                supports_departures = "realtimeDepartures" in features
+            else:
+                supports_departures = bool(
+                    provider_configuration.get(
+                        "supportsDepartures",
+                        adapter in {"vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "vvo"}
+                    )
                 )
-            )
-            supports_live_vehicles = bool(
-                provider_configuration.get(
-                    "supportsLiveVehicles",
-                    adapter != "vrrEFA"
+                supports_live_vehicles = bool(
+                    provider_configuration.get(
+                        "supportsLiveVehicles",
+                        adapter != "vrrEFA"
+                    )
                 )
-            )
-            supports_realtime_delay = bool(
-                provider_configuration.get("supportsRealtimeDelay", True)
-            )
-            features = []
-            if supports_live_vehicles:
-                features.append("liveVehicles")
-            if supports_departures:
-                features.extend([
-                    "realtimeDepartures",
-                    "firstDepartures",
-                    "stopLookup"
-                ])
-            if supports_realtime_delay:
-                features.append("realtimeDelay")
+                supports_realtime_delay = bool(
+                    provider_configuration.get("supportsRealtimeDelay", True)
+                )
+                features = []
+                if supports_live_vehicles:
+                    features.append("liveVehicles")
+                if supports_departures:
+                    features.extend([
+                        "realtimeDepartures",
+                        "firstDepartures",
+                        "stopLookup"
+                    ])
+                if supports_realtime_delay:
+                    features.append("realtimeDelay")
 
             is_enabled = provider_configuration.get("isEnabled", True)
             provider = {
                 "providerID": provider_id,
-                "adapter": adapter,
                 "isEnabled": is_enabled,
                 "isExperimental": True,
                 "features": features,
@@ -645,6 +719,8 @@ def transit_radar_manifest(
                     else f'Live-Radar für {city["name"]}'
                 )
             }
+            if adapter is not None:
+                provider["adapter"] = adapter
             region = provider_configuration.get("region")
             if isinstance(region, dict):
                 provider["region"] = region
@@ -654,6 +730,9 @@ def transit_radar_manifest(
             efa_path = provider_configuration.get("efaPath")
             if isinstance(efa_path, str):
                 provider["efaPath"] = efa_path
+            radar_stops = provider_configuration.get("radarStops")
+            if isinstance(radar_stops, list):
+                provider["radarStops"] = radar_stops
             gateway_url = provider_configuration.get("gatewayURL")
             if adapter == "vagPuls" and vag_gateway_url:
                 gateway_url = vag_gateway_url

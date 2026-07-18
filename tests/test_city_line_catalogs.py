@@ -143,8 +143,13 @@ class CityLineCatalogTests(unittest.TestCase):
             "longitude": 7.4633,
             "transitRadar": {
                 "adapter": "vrrEFA",
-                "efaPath": "vrr-efa",
+                "efaPath": "static03",
                 "supportsLiveVehicles": True,
+                "radarStops": [{
+                    "id": "20002007",
+                    "latitude": 51.361965,
+                    "longitude": 7.461802
+                }],
                 "region": {
                     "minimumLongitude": 7.30,
                     "minimumLatitude": 51.25,
@@ -185,6 +190,11 @@ class CityLineCatalogTests(unittest.TestCase):
                     "adapter": adapter,
                     "efaPath": path,
                     "supportsLiveVehicles": True,
+                    "radarStops": [{
+                        "id": "central-stop",
+                        "latitude": 49.0,
+                        "longitude": 9.0
+                    }],
                     "region": {
                         "minimumLongitude": 8.8,
                         "minimumLatitude": 48.8,
@@ -211,6 +221,50 @@ class CityLineCatalogTests(unittest.TestCase):
             providers["kvvEFA"]["providerID"],
             "kvv-efa-karlsruhe-08212000"
         )
+        self.assertEqual(
+            providers["kvvEFA"]["radarStops"][0]["id"],
+            "central-stop"
+        )
+
+    def test_live_efa_provider_requires_valid_radar_stops(self) -> None:
+        city = {
+            "id": "karlsruhe-08212000",
+            "name": "Karlsruhe",
+            "latitude": 49.0,
+            "longitude": 9.0,
+            "transitRadar": {
+                "adapter": "kvvEFA",
+                "efaPath": "sl3-alone",
+                "supportsLiveVehicles": True,
+                "region": {
+                    "minimumLongitude": 8.8,
+                    "minimumLatitude": 48.8,
+                    "maximumLongitude": 9.2,
+                    "maximumLatitude": 49.2
+                }
+            }
+        }
+
+        with self.assertRaisesRegex(ValueError, "Invalid EFA radar stops"):
+            transit_radar_manifest([city])
+
+    def test_static_provider_is_published_without_adapter(self) -> None:
+        cities = [{
+            "id": "wuppertal",
+            "name": "Wuppertal",
+            "latitude": 51.2562,
+            "longitude": 7.1508,
+            "transitRadar": {
+                "providerID": "wsw-wuppertal",
+                "features": ["liveVehicles", "realtimeDelay"]
+            }
+        }]
+
+        provider = transit_radar_manifest(cities)["cities"][0]["providers"][0]
+
+        self.assertEqual(provider["providerID"], "wsw-wuppertal")
+        self.assertNotIn("adapter", provider)
+        self.assertEqual(provider["features"], ["liveVehicles", "realtimeDelay"])
 
     def test_dusseldorf_vrr_provider_is_live_only(self) -> None:
         cities = [{
@@ -220,9 +274,14 @@ class CityLineCatalogTests(unittest.TestCase):
             "longitude": 6.7735,
             "transitRadar": {
                 "adapter": "vrrEFA",
-                "efaPath": "vrr-efa",
+                "efaPath": "static03",
                 "supportsDepartures": False,
                 "supportsLiveVehicles": True,
+                "radarStops": [{
+                    "id": "20018235",
+                    "latitude": 51.220253,
+                    "longitude": 6.792997
+                }],
                 "region": {
                     "minimumLongitude": 6.60,
                     "minimumLatitude": 51.10,
