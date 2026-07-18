@@ -549,8 +549,7 @@ def validate_transit_radar_provider(
 def transit_radar_manifest(
     cities: list[dict[str, object]],
     additional_cities: list[dict[str, object]] | None = None,
-    vag_gateway_url: str = "",
-    vvo_gateway_url: str = ""
+    vag_gateway_url: str = ""
 ) -> dict[str, object]:
     radar_cities = []
     for city in cities:
@@ -646,8 +645,6 @@ def transit_radar_manifest(
             gateway_url = provider_configuration.get("gatewayURL")
             if adapter == "vagPuls" and vag_gateway_url:
                 gateway_url = vag_gateway_url
-            if adapter == "vvo" and vvo_gateway_url:
-                gateway_url = vvo_gateway_url
             if isinstance(gateway_url, str):
                 provider["gatewayURL"] = gateway_url
             providers.append(provider)
@@ -1239,7 +1236,6 @@ def main() -> None:
     )
     parser.add_argument("--rnv-gateway-url", default="")
     parser.add_argument("--vag-gateway-url", default="")
-    parser.add_argument("--vvo-gateway-url", default="")
     parser.add_argument("--cities", default="config/cities.json")
     parser.add_argument("--municipalities-url", default=BKG_MUNICIPALITIES_URL)
     parser.add_argument("--output", default="docs/data")
@@ -1293,8 +1289,7 @@ def main() -> None:
             transit_radar_manifest(
                 cities,
                 additional_cities=rnv_cities,
-                vag_gateway_url=args.vag_gateway_url.strip(),
-                vvo_gateway_url=args.vvo_gateway_url.strip()
+                vag_gateway_url=args.vag_gateway_url.strip()
             ),
             ensure_ascii=False,
             indent=2

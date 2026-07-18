@@ -39,7 +39,6 @@ jobs:
           --gtfs-url "${{ vars.GTFS_URL }}"
           --rnv-gateway-url "${{ vars.RNV_GATEWAY_URL }}"
           --vag-gateway-url "${{ vars.VAG_GATEWAY_URL }}"
-          --vvo-gateway-url "${{ vars.VVO_GATEWAY_URL }}"
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

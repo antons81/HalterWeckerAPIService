@@ -96,7 +96,7 @@ class CityLineCatalogTests(unittest.TestCase):
             "https://api.example.com"
         )
 
-    def test_vvo_departures_are_available_without_gateway(self) -> None:
+    def test_vvo_radar_and_departures_are_available_without_gateway(self) -> None:
         cities = [{
             "id": "dresden",
             "name": "Dresden",
@@ -117,11 +117,7 @@ class CityLineCatalogTests(unittest.TestCase):
             }
         }]
 
-        without_gateway = transit_radar_manifest(cities)
-        with_gateway = transit_radar_manifest(
-            cities,
-            vvo_gateway_url="https://api.example.com"
-        )
+        manifest = transit_radar_manifest(cities)
 
         expected_features = [
             "liveVehicles",
@@ -131,16 +127,12 @@ class CityLineCatalogTests(unittest.TestCase):
             "realtimeDelay"
         ]
         self.assertEqual(
-            without_gateway["cities"][0]["providers"][0]["features"],
+            manifest["cities"][0]["providers"][0]["features"],
             expected_features
         )
         self.assertNotIn(
             "gatewayURL",
-            without_gateway["cities"][0]["providers"][0]
-        )
-        self.assertEqual(
-            with_gateway["cities"][0]["providers"][0]["gatewayURL"],
-            "https://api.example.com"
+            manifest["cities"][0]["providers"][0]
         )
 
     def test_vbb_departure_features_are_enabled_explicitly(self) -> None:
