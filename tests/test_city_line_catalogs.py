@@ -135,6 +135,64 @@ class CityLineCatalogTests(unittest.TestCase):
             manifest["cities"][0]["providers"][0]
         )
 
+    def test_vrr_efa_can_publish_schedule_radar_without_gateway(self) -> None:
+        cities = [{
+            "id": "hagen-05914000",
+            "name": "Hagen",
+            "latitude": 51.3671,
+            "longitude": 7.4633,
+            "transitRadar": {
+                "adapter": "vrrEFA",
+                "efaPath": "vrr-efa",
+                "supportsLiveVehicles": True,
+                "region": {
+                    "minimumLongitude": 7.30,
+                    "minimumLatitude": 51.25,
+                    "maximumLongitude": 7.65,
+                    "maximumLatitude": 51.50
+                }
+            }
+        }]
+
+        provider = transit_radar_manifest(cities)["cities"][0]["providers"][0]
+
+        self.assertEqual(
+            provider["features"],
+            [
+                "liveVehicles",
+                "realtimeDepartures",
+                "firstDepartures",
+                "stopLookup",
+                "realtimeDelay"
+            ]
+        )
+        self.assertNotIn("gatewayURL", provider)
+        self.assertEqual(provider["region"]["minimumLongitude"], 7.30)
+
+    def test_dusseldorf_vrr_provider_is_live_only(self) -> None:
+        cities = [{
+            "id": "dusseldorf",
+            "name": "Düsseldorf",
+            "latitude": 51.2277,
+            "longitude": 6.7735,
+            "transitRadar": {
+                "adapter": "vrrEFA",
+                "efaPath": "vrr-efa",
+                "supportsDepartures": False,
+                "supportsLiveVehicles": True,
+                "region": {
+                    "minimumLongitude": 6.60,
+                    "minimumLatitude": 51.10,
+                    "maximumLongitude": 6.95,
+                    "maximumLatitude": 51.35
+                }
+            }
+        }]
+
+        provider = transit_radar_manifest(cities)["cities"][0]["providers"][0]
+
+        self.assertEqual(provider["features"], ["liveVehicles", "realtimeDelay"])
+
     def test_vbb_departure_features_are_enabled_explicitly(self) -> None:
         cities = [{
             "id": "berlin",

@@ -500,12 +500,12 @@ def validate_transit_radar_provider(
     if adapter == "vrrEFA":
         efa_path = configuration.get("efaPath")
         if (
-            region is not None
-            or not isinstance(efa_path, str)
+            not isinstance(efa_path, str)
             or not CITY_ID_PATTERN.fullmatch(efa_path)
         ):
             raise ValueError(f"Invalid VRR EFA configuration for {city_id}")
-        return
+        if region is None:
+            return
 
     if adapter == "vbb":
         if not isinstance(region, dict):
