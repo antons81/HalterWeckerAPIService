@@ -73,4 +73,4 @@ The service listens on port `8082` by default and exposes `/vvo/vehicles.json`. 
 - Supports realtime delay information
 - Caches stop catalog and trip details
 
-Dresden (`dresden-de`) is added to `config/cities.json` with the `vvo` adapter but remains disabled by default until `VVO_GATEWAY_URL` is configured.
+Dresden (`dresden-de`) is added to `config/cities.json` with the `vvo` adapter and is enabled when `VVO_GATEWAY_URL` is configured in the publishing workflow.
