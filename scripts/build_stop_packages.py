@@ -37,6 +37,9 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "vagPuls",
     "rnv",
     "vbb",
+    "kvvEFA",
+    "hvvEFA",
+    "vvsEFA",
     "vrrEFA",
     "vvo"
 }
@@ -497,13 +500,16 @@ def validate_transit_radar_provider(
     if adapter == "vagPuls" and city_id != "nurnberg":
         raise ValueError(f"Invalid VAG PULS configuration for {city_id}")
 
-    if adapter == "vrrEFA":
+    if adapter in {"vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA"}:
         efa_path = configuration.get("efaPath")
-        if (
-            not isinstance(efa_path, str)
-            or not CITY_ID_PATTERN.fullmatch(efa_path)
-        ):
-            raise ValueError(f"Invalid VRR EFA configuration for {city_id}")
+        expected_path = {
+            "vrrEFA": "static03",
+            "kvvEFA": "sl3-alone",
+            "hvvEFA": "efa",
+            "vvsEFA": "mngvvs"
+        }[adapter]
+        if efa_path != expected_path:
+            raise ValueError(f"Invalid {adapter} configuration for {city_id}")
         if region is None:
             return
 
@@ -584,6 +590,12 @@ def transit_radar_manifest(
                 provider_id = f"rnv-{city_id}"
             elif adapter == "vbb":
                 provider_id = f"vbb-{city_id}"
+            elif adapter == "kvvEFA":
+                provider_id = f"kvv-efa-{city_id}"
+            elif adapter == "hvvEFA":
+                provider_id = f"hvv-efa-{city_id}"
+            elif adapter == "vvsEFA":
+                provider_id = f"vvs-efa-{city_id}"
             elif adapter == "vrrEFA":
                 provider_id = f"vrr-efa-{city_id}"
             elif adapter == "vvo":
@@ -594,7 +606,7 @@ def transit_radar_manifest(
             supports_departures = bool(
                 provider_configuration.get(
                     "supportsDepartures",
-                    adapter in {"vrrEFA", "vvo"}
+                    adapter in {"vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "vvo"}
                 )
             )
             supports_live_vehicles = bool(

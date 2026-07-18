@@ -169,6 +169,49 @@ class CityLineCatalogTests(unittest.TestCase):
         self.assertNotIn("gatewayURL", provider)
         self.assertEqual(provider["region"]["minimumLongitude"], 7.30)
 
+    def test_regional_efa_adapters_publish_full_feature_set_without_gateway(self) -> None:
+        providers = {}
+        for adapter, path, city_id in (
+            ("kvvEFA", "sl3-alone", "karlsruhe-08212000"),
+            ("hvvEFA", "efa", "hamburg"),
+            ("vvsEFA", "mngvvs", "stuttgart")
+        ):
+            cities = [{
+                "id": city_id,
+                "name": city_id,
+                "latitude": 49.0,
+                "longitude": 9.0,
+                "transitRadar": {
+                    "adapter": adapter,
+                    "efaPath": path,
+                    "supportsLiveVehicles": True,
+                    "region": {
+                        "minimumLongitude": 8.8,
+                        "minimumLatitude": 48.8,
+                        "maximumLongitude": 9.2,
+                        "maximumLatitude": 49.2
+                    }
+                }
+            }]
+            providers[adapter] = transit_radar_manifest(cities)["cities"][0]["providers"][0]
+
+        for provider in providers.values():
+            self.assertEqual(
+                provider["features"],
+                [
+                    "liveVehicles",
+                    "realtimeDepartures",
+                    "firstDepartures",
+                    "stopLookup",
+                    "realtimeDelay"
+                ]
+            )
+            self.assertNotIn("gatewayURL", provider)
+        self.assertEqual(
+            providers["kvvEFA"]["providerID"],
+            "kvv-efa-karlsruhe-08212000"
+        )
+
     def test_dusseldorf_vrr_provider_is_live_only(self) -> None:
         cities = [{
             "id": "dusseldorf",
