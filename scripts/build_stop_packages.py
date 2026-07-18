@@ -592,37 +592,45 @@ def transit_radar_manifest(
             else:
                 raise ValueError(f"Unsupported transit radar adapter for {city_id}")
 
-            is_departure_provider = (
-                adapter == "vrrEFA"
-                or (
-                    adapter == "vbb"
-                    and bool(provider_configuration.get("supportsDepartures", False))
+            supports_departures = bool(
+                provider_configuration.get(
+                    "supportsDepartures",
+                    adapter in {"vrrEFA", "vvo"}
                 )
             )
+            supports_live_vehicles = bool(
+                provider_configuration.get(
+                    "supportsLiveVehicles",
+                    adapter != "vrrEFA"
+                )
+            )
+            supports_realtime_delay = bool(
+                provider_configuration.get("supportsRealtimeDelay", True)
+            )
+            features = []
+            if supports_live_vehicles:
+                features.append("liveVehicles")
+            if supports_departures:
+                features.extend([
+                    "realtimeDepartures",
+                    "firstDepartures",
+                    "stopLookup"
+                ])
+            if supports_realtime_delay:
+                features.append("realtimeDelay")
+
             is_enabled = provider_configuration.get("isEnabled", True)
             provider = {
                 "providerID": provider_id,
                 "adapter": adapter,
                 "isEnabled": is_enabled,
                 "isExperimental": True,
-                "features": (
-                    [
-                        "liveVehicles",
-                        "realtimeDepartures",
-                        "firstDepartures",
-                        "stopLookup",
-                        "realtimeDelay"
-                    ]
-                    if adapter == "vbb" and is_departure_provider
-                    else ["realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"]
-                    if is_departure_provider
-                    else ["liveVehicles", "realtimeDelay"]
-                ),
-                "statusMessage": (
+                "features": features,
+                "statusMessage": provider_configuration.get("statusMessage") or (
                     f'Live-Radar und Live-Abfahrten für {city["name"]}'
-                    if adapter == "vbb" and is_departure_provider
+                    if supports_live_vehicles and supports_departures
                     else f'Live-Abfahrten für {city["name"]}'
-                    if is_departure_provider
+                    if supports_departures
                     else f'Live-Radar für {city["name"]}'
                 )
             }

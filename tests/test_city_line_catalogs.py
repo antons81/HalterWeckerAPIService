@@ -62,7 +62,7 @@ class CityLineCatalogTests(unittest.TestCase):
         self.assertEqual(current, legacy)
         self.assertEqual(current, transliterated_legacy)
 
-    def test_vag_provider_is_enabled_only_when_gateway_is_configured(self) -> None:
+    def test_provider_enabled_state_comes_only_from_city_configuration(self) -> None:
         cities = [{
             "id": "nurnberg",
             "name": "Nürnberg",
@@ -90,9 +90,56 @@ class CityLineCatalogTests(unittest.TestCase):
         enabled_provider = enabled["cities"][0]["providers"][0]
         self.assertFalse(disabled_provider["isEnabled"])
         self.assertNotIn("gatewayURL", disabled_provider)
-        self.assertTrue(enabled_provider["isEnabled"])
+        self.assertFalse(enabled_provider["isEnabled"])
         self.assertEqual(
             enabled_provider["gatewayURL"],
+            "https://api.example.com"
+        )
+
+    def test_vvo_departures_are_available_without_gateway(self) -> None:
+        cities = [{
+            "id": "dresden",
+            "name": "Dresden",
+            "latitude": 51.0504,
+            "longitude": 13.7373,
+            "transitRadar": {
+                "adapter": "vvo",
+                "efaPath": "vvo",
+                "isEnabled": True,
+                "supportsLiveVehicles": True,
+                "supportsRealtimeDelay": True,
+                "region": {
+                    "minimumLongitude": 13.5,
+                    "minimumLatitude": 50.8,
+                    "maximumLongitude": 14.0,
+                    "maximumLatitude": 51.3
+                }
+            }
+        }]
+
+        without_gateway = transit_radar_manifest(cities)
+        with_gateway = transit_radar_manifest(
+            cities,
+            vvo_gateway_url="https://api.example.com"
+        )
+
+        expected_features = [
+            "liveVehicles",
+            "realtimeDepartures",
+            "firstDepartures",
+            "stopLookup",
+            "realtimeDelay"
+        ]
+        self.assertEqual(
+            without_gateway["cities"][0]["providers"][0]["features"],
+            expected_features
+        )
+        self.assertNotIn(
+            "gatewayURL",
+            without_gateway["cities"][0]["providers"][0]
+        )
+        self.assertEqual(
+            with_gateway["cities"][0]["providers"][0]["gatewayURL"],
             "https://api.example.com"
         )
 
