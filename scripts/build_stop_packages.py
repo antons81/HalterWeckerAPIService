@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Iterable
 
 EARTH_RADIUS_METERS = 6_371_000
+AUTO_EFA_RADAR_STOP_LIMIT = 12
 CITY_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 BKG_MUNICIPALITIES_URL = (
     "https://sgx.geodatenzentrum.de/wfs_vg250"
@@ -537,6 +538,13 @@ def validate_transit_radar_provider(
             raise ValueError(f"Invalid {adapter} configuration for {city_id}")
         radar_stops = configuration.get("radarStops")
         supports_live_vehicles = bool(configuration.get("supportsLiveVehicles", False))
+        auto_radar_stops = configuration.get("autoRadarStops", False)
+        if not isinstance(auto_radar_stops, bool):
+            raise ValueError(f"Invalid automatic EFA radar stops for {city_id}")
+        if auto_radar_stops:
+            if not supports_live_vehicles or radar_stops is not None or region is not None:
+                raise ValueError(f"Invalid automatic EFA radar configuration for {city_id}")
+            return
         if supports_live_vehicles:
             validate_efa_radar_stops(city_id, radar_stops, region)
         elif radar_stops is not None:
@@ -613,10 +621,132 @@ def validate_efa_radar_stops(
         stop_ids.add(stop_id)
 
 
+def automatic_transit_radar_region(
+    latitude: float,
+    longitude: float,
+    radius_meters: float
+) -> dict[str, float]:
+    latitude_delta = radius_meters / 111_320
+    longitude_scale = max(math.cos(math.radians(latitude)), 0.2)
+    longitude_delta = radius_meters / (111_320 * longitude_scale)
+    return {
+        "minimumLongitude": longitude - longitude_delta,
+        "minimumLatitude": latitude - latitude_delta,
+        "maximumLongitude": longitude + longitude_delta,
+        "maximumLatitude": latitude + latitude_delta
+    }
+
+
+def automatic_efa_radar_stops(
+    city_id: str,
+    city: dict[str, object],
+    stops: list[dict[str, object]],
+    lines_by_stop_id: dict[str, dict[str, dict[str, object]]]
+) -> tuple[dict[str, float], list[dict[str, object]]]:
+    latitude = float(city["latitude"])
+    longitude = float(city["longitude"])
+    radius_meters = float(city["radiusMeters"])
+    region = automatic_transit_radar_region(latitude, longitude, radius_meters)
+    candidates: list[dict[str, object]] = []
+    seen_stop_ids: set[str] = set()
+
+    for stop in stops:
+        stop_id = stop.get("id")
+        stop_latitude = stop.get("latitude")
+        stop_longitude = stop.get("longitude")
+        if (
+            not isinstance(stop_id, str)
+            or not stop_id.strip()
+            or stop_id in seen_stop_ids
+            or not isinstance(stop_latitude, (int, float))
+            or not isinstance(stop_longitude, (int, float))
+            or not region["minimumLatitude"] <= stop_latitude <= region["maximumLatitude"]
+            or not region["minimumLongitude"] <= stop_longitude <= region["maximumLongitude"]
+        ):
+            continue
+        seen_stop_ids.add(stop_id)
+        candidates.append({
+            "id": stop_id,
+            "latitude": float(stop_latitude),
+            "longitude": float(stop_longitude),
+            "lineCount": len(lines_by_stop_id.get(stop_id, {})),
+            "centerDistance": distance_meters(
+                latitude,
+                longitude,
+                float(stop_latitude),
+                float(stop_longitude)
+            )
+        })
+
+    if not candidates:
+        raise ValueError(f"No automatic EFA radar stops found for {city_id}")
+
+    candidates.sort(key=lambda item: (
+        -int(item["lineCount"]),
+        float(item["centerDistance"]),
+        str(item["id"])
+    ))
+    selected = [candidates.pop(0)]
+    while candidates and len(selected) < AUTO_EFA_RADAR_STOP_LIMIT:
+        def selection_score(candidate: dict[str, object]) -> tuple[float, int, str]:
+            minimum_distance = min(
+                distance_meters(
+                    float(candidate["latitude"]),
+                    float(candidate["longitude"]),
+                    float(existing["latitude"]),
+                    float(existing["longitude"])
+                )
+                for existing in selected
+            )
+            score = (
+                minimum_distance
+                + int(candidate["lineCount"]) * 1_200
+                - float(candidate["centerDistance"]) * 0.08
+            )
+            return score, int(candidate["lineCount"]), str(candidate["id"])
+
+        next_stop = max(candidates, key=selection_score)
+        candidates.remove(next_stop)
+        selected.append(next_stop)
+
+    radar_stops = [{
+        "id": str(stop["id"]),
+        "latitude": float(stop["latitude"]),
+        "longitude": float(stop["longitude"])
+    } for stop in selected]
+    return region, radar_stops
+
+
+def resolved_transit_radar_configuration(
+    city: dict[str, object],
+    configuration: dict[str, object],
+    package_stops_by_city_id: dict[str, list[dict[str, object]]] | None,
+    lines_by_stop_id: dict[str, dict[str, dict[str, object]]] | None
+) -> dict[str, object]:
+    resolved = dict(configuration)
+    if not resolved.pop("autoRadarStops", False):
+        return resolved
+
+    city_id = str(city["id"])
+    if package_stops_by_city_id is None:
+        raise ValueError(f"Missing stop packages for automatic EFA radar in {city_id}")
+    region, radar_stops = automatic_efa_radar_stops(
+        city_id=city_id,
+        city=city,
+        stops=package_stops_by_city_id.get(city_id, []),
+        lines_by_stop_id=lines_by_stop_id or {}
+    )
+    resolved["region"] = region
+    resolved["radarStops"] = radar_stops
+    return resolved
+
+
 def transit_radar_manifest(
     cities: list[dict[str, object]],
     additional_cities: list[dict[str, object]] | None = None,
-    vag_gateway_url: str = ""
+    vag_gateway_url: str = "",
+    package_stops_by_city_id: dict[str, list[dict[str, object]]] | None = None,
+    lines_by_stop_id: dict[str, dict[str, dict[str, object]]] | None = None
 ) -> dict[str, object]:
     radar_cities = []
     for city in cities:
@@ -626,7 +756,13 @@ def transit_radar_manifest(
 
         city_id = str(city["id"])
         providers = []
-        for provider_configuration in transit_radar_configurations(configuration):
+        for raw_provider_configuration in transit_radar_configurations(configuration):
+            provider_configuration = resolved_transit_radar_configuration(
+                city=city,
+                configuration=raw_provider_configuration,
+                package_stops_by_city_id=package_stops_by_city_id,
+                lines_by_stop_id=lines_by_stop_id
+            )
             validate_transit_radar_provider(
                 city_id,
                 float(city["latitude"]),
@@ -1380,7 +1516,9 @@ def main() -> None:
             transit_radar_manifest(
                 cities,
                 additional_cities=rnv_cities,
-                vag_gateway_url=args.vag_gateway_url.strip()
+                vag_gateway_url=args.vag_gateway_url.strip(),
+                package_stops_by_city_id=package_stops_by_city_id,
+                lines_by_stop_id=lines_by_stop_id
             ),
             ensure_ascii=False,
             indent=2

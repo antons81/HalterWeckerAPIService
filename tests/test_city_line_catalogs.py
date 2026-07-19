@@ -174,6 +174,72 @@ class CityLineCatalogTests(unittest.TestCase):
         self.assertNotIn("gatewayURL", provider)
         self.assertEqual(provider["region"]["minimumLongitude"], 7.30)
 
+    def test_vrr_efa_can_build_schedule_radar_stops_from_city_package(self) -> None:
+        cities = [{
+            "id": "bochum",
+            "name": "Bochum",
+            "latitude": 51.4818,
+            "longitude": 7.2162,
+            "radiusMeters": 18_000,
+            "transitRadar": {
+                "adapter": "vrrEFA",
+                "efaPath": "static03",
+                "supportsDepartures": True,
+                "supportsLiveVehicles": True,
+                "autoRadarStops": True
+            }
+        }]
+        city_stops = [
+            stop("central", "Bochum Hbf", 51.4789, 7.2220),
+            stop("west", "Bochum West", 51.4800, 7.1500),
+            stop("east", "Bochum Ost", 51.4850, 7.2800)
+        ]
+        lines_by_stop_id = {
+            "central": {
+                "line-1": {"routeID": "line-1"},
+                "line-2": {"routeID": "line-2"}
+            }
+        }
+
+        provider = transit_radar_manifest(
+            cities,
+            package_stops_by_city_id={"bochum": city_stops},
+            lines_by_stop_id=lines_by_stop_id
+        )["cities"][0]["providers"][0]
+
+        self.assertEqual(provider["radarStops"][0]["id"], "central")
+        self.assertEqual(len(provider["radarStops"]), 3)
+        self.assertLess(provider["region"]["minimumLatitude"], 51.4818)
+        self.assertGreater(provider["region"]["maximumLatitude"], 51.4818)
+        self.assertEqual(
+            provider["features"],
+            [
+                "liveVehicles",
+                "realtimeDepartures",
+                "firstDepartures",
+                "stopLookup",
+                "realtimeDelay"
+            ]
+        )
+
+    def test_automatic_efa_radar_requires_generated_stop_package(self) -> None:
+        cities = [{
+            "id": "bochum",
+            "name": "Bochum",
+            "latitude": 51.4818,
+            "longitude": 7.2162,
+            "radiusMeters": 18_000,
+            "transitRadar": {
+                "adapter": "vrrEFA",
+                "efaPath": "static03",
+                "supportsLiveVehicles": True,
+                "autoRadarStops": True
+            }
+        }]
+
+        with self.assertRaisesRegex(ValueError, "Missing stop packages"):
+            transit_radar_manifest(cities)
+
     def test_regional_efa_adapters_publish_full_feature_set_without_gateway(self) -> None:
         providers = {}
         for adapter, path, city_id in (
