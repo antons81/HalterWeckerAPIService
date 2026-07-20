@@ -43,7 +43,8 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "vvsEFA",
     "vrrEFA",
     "mvvEFA",
-    "vvo"
+    "vvo",
+    "vrs",
 }
 STATIC_TRANSIT_RADAR_PROVIDERS = {
     "rheinbahn-duesseldorf": {
@@ -810,6 +811,8 @@ def transit_radar_manifest(
                 provider_id = f"mvv-efa-{city_id}"
             elif adapter == "vvo":
                 provider_id = f"vvo-{city_id}"
+            elif adapter == "vrs":
+                provider_id = f"vrs-{city_id}"
             else:
                 raise ValueError(f"Unsupported transit radar adapter for {city_id}")
 
@@ -821,7 +824,7 @@ def transit_radar_manifest(
                 supports_departures = bool(
                     provider_configuration.get(
                         "supportsDepartures",
-                        adapter in {"vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo"}
+                        adapter in {"vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs"}
                     )
                 )
                 supports_live_vehicles = bool(
