@@ -42,6 +42,7 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "hvvEFA",
     "vvsEFA",
     "vrrEFA",
+    "mvvEFA",
     "vvo"
 }
 STATIC_TRANSIT_RADAR_PROVIDERS = {
@@ -526,13 +527,14 @@ def validate_transit_radar_provider(
     if adapter == "vagPuls" and city_id != "nurnberg":
         raise ValueError(f"Invalid VAG PULS configuration for {city_id}")
 
-    if adapter in {"vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA"}:
+    if adapter in {"vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA"}:
         efa_path = configuration.get("efaPath")
         expected_path = {
             "vrrEFA": "static03",
             "kvvEFA": "sl3-alone",
             "hvvEFA": "efa",
-            "vvsEFA": "mngvvs"
+            "vvsEFA": "mngvvs",
+            "mvvEFA": "ng"
         }[adapter]
         if efa_path != expected_path:
             raise ValueError(f"Invalid {adapter} configuration for {city_id}")
@@ -804,6 +806,8 @@ def transit_radar_manifest(
                 provider_id = f"vvs-efa-{city_id}"
             elif adapter == "vrrEFA":
                 provider_id = f"vrr-efa-{city_id}"
+            elif adapter == "mvvEFA":
+                provider_id = f"mvv-efa-{city_id}"
             elif adapter == "vvo":
                 provider_id = f"vvo-{city_id}"
             else:
@@ -817,7 +821,7 @@ def transit_radar_manifest(
                 supports_departures = bool(
                     provider_configuration.get(
                         "supportsDepartures",
-                        adapter in {"vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "vvo"}
+                        adapter in {"vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo"}
                     )
                 )
                 supports_live_vehicles = bool(
@@ -869,6 +873,9 @@ def transit_radar_manifest(
             radar_stops = provider_configuration.get("radarStops")
             if isinstance(radar_stops, list):
                 provider["radarStops"] = radar_stops
+            supports_coordinate_catalog = provider_configuration.get("supportsCoordinateCatalog")
+            if supports_coordinate_catalog is not None:
+                provider["supportsCoordinateCatalog"] = supports_coordinate_catalog
             gateway_url = provider_configuration.get("gatewayURL")
             if adapter == "vagPuls" and vag_gateway_url:
                 gateway_url = vag_gateway_url
