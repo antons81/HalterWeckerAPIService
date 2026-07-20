@@ -830,7 +830,7 @@ def transit_radar_manifest(
                 supports_live_vehicles = bool(
                     provider_configuration.get(
                         "supportsLiveVehicles",
-                        adapter != "vrrEFA"
+                        adapter not in {"vrrEFA", "vrs"}
                     )
                 )
                 supports_realtime_delay = bool(
