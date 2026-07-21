@@ -352,26 +352,41 @@ def canonicalize(rows: list[dict[str, str]]) -> list[dict[str, object]]:
     return list(unique.values())
 
 
-def swiss_stops(rows: Iterable[dict[str, str]]) -> tuple[list[dict[str, object]], dict[str, int]]:
-    """Keep every valid Swiss GTFS stop ID; do not canonicalize platforms."""
-    stops: list[dict[str, object]] = []
-    skipped = {"emptyID": 0, "emptyName": 0, "invalidCoordinate": 0}
+def swiss_stops(
+    rows: Iterable[dict[str, str]],
+    statistics: dict[str, int] | None = None
+) -> Iterable[dict[str, object]]:
+    """Stream valid Swiss GTFS stops without canonicalizing platform IDs."""
+    skipped = statistics if statistics is not None else {
+        "read": 0,
+        "emptyID": 0,
+        "emptyName": 0,
+        "invalidCoordinate": 0
+    }
     for row in rows:
+        skipped["read"] = skipped.get("read", 0) + 1
         stop_id = row.get("stop_id", "").strip()
         name = row.get("stop_name", "").strip()
         if not stop_id:
-            skipped["emptyID"] += 1; continue
+            skipped["emptyID"] = skipped.get("emptyID", 0) + 1
+            continue
         if not name:
-            skipped["emptyName"] += 1; continue
+            skipped["emptyName"] = skipped.get("emptyName", 0) + 1
+            continue
         try:
             latitude, longitude = float(row["stop_lat"]), float(row["stop_lon"])
             if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
                 raise ValueError
         except (KeyError, TypeError, ValueError):
-            skipped["invalidCoordinate"] += 1; continue
-        stops.append({"id": stop_id, "name": name, "latitude": latitude,
-                      "longitude": longitude, "searchName": normalized(name)})
-    return stops, skipped
+            skipped["invalidCoordinate"] = skipped.get("invalidCoordinate", 0) + 1
+            continue
+        yield {
+            "id": stop_id,
+            "name": name,
+            "latitude": latitude,
+            "longitude": longitude,
+            "searchName": normalized(name)
+        }
 
 
 def canonical_stop_id_by_stop_id(
@@ -1323,16 +1338,24 @@ def build_swiss_stop_packages(
     archive: zipfile.ZipFile, cities: list[dict[str, object]], output: Path
 ) -> list[dict[str, object]]:
     """Build configured Swiss radius packages using the existing JSON writer."""
-    rows = iter_table(archive, "stops.txt")
-    stops, _ = swiss_stops(rows)
+    for city in cities:
+        if city.get("packageMode") != "swiss":
+            raise ValueError(f'Swiss package mode is required for {city["id"]}.')
+
+    stops_by_city_id = {str(city["id"]): [] for city in cities}
+    for stop in swiss_stops(iter_table(archive, "stops.txt")):
+        for city in cities:
+            if distance_meters(
+                float(stop["latitude"]), float(stop["longitude"]),
+                float(city["latitude"]), float(city["longitude"])
+            ) <= float(city["radiusMeters"]):
+                stops_by_city_id[str(city["id"])].append(stop)
+
     packages_directory = output / "stops"
     packages_directory.mkdir(parents=True, exist_ok=True)
     manifest = []
     for city in cities:
-        city_stops = [stop for stop in stops if distance_meters(
-            float(stop["latitude"]), float(stop["longitude"]),
-            float(city["latitude"]), float(city["longitude"])
-        ) <= float(city["radiusMeters"])]
+        city_stops = stops_by_city_id[str(city["id"])]
         if not city_stops:
             raise ValueError(f'No stops found for configured city {city["id"]}.')
         filename = write_stop_package(packages_directory, str(city["id"]), city_stops)
