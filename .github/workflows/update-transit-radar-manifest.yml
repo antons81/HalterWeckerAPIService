@@ -1,0 +1,43 @@
+name: Update transit radar manifest
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "config/cities.json"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-radar
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - name: Build cities manifest
+        run: |
+          mkdir -p docs/data
+          python3 -c "
+          from scripts.build_stop_packages import load_cities, transit_radar_manifest
+          import json
+          cities = load_cities('config/cities.json')
+          manifest = transit_radar_manifest(cities)
+          import pathlib
+          pathlib.Path('docs/data/transit-radar-cities.json').write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
+          "
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+      - id: deployment
+        uses: actions/deploy-pages@v4
