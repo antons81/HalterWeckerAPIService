@@ -481,29 +481,124 @@
         },
         "radarStops": [
           {
-            "id": "25",
-            "latitude": 50.933,
-            "longitude": 6.94
+            "id": "5",
+            "latitude": 50.93847,
+            "longitude": 6.95969
           },
           {
-            "id": "2",
-            "latitude": 50.936,
-            "longitude": 6.948
+            "id": "67",
+            "latitude": 50.90627,
+            "longitude": 6.96378
           },
           {
-            "id": "8",
-            "latitude": 50.943,
-            "longitude": 6.959
+            "id": "242",
+            "latitude": 50.95467,
+            "longitude": 6.92123
           },
           {
-            "id": "28",
-            "latitude": 50.932,
-            "longitude": 6.94
+            "id": "108",
+            "latitude": 50.89172,
+            "longitude": 6.99658
           },
           {
-            "id": "4",
-            "latitude": 50.935,
-            "longitude": 6.946
+            "id": "178",
+            "latitude": 50.93745,
+            "longitude": 6.88924
+          },
+          {
+            "id": "609",
+            "latitude": 51.01317,
+            "longitude": 6.92427
+          },
+          {
+            "id": "293",
+            "latitude": 50.96329,
+            "longitude": 7.04968
+          },
+          {
+            "id": "639",
+            "latitude": 50.91386,
+            "longitude": 7.05901
+          },
+          {
+            "id": "4708",
+            "latitude": 50.84119,
+            "longitude": 6.91195
+          },
+          {
+            "id": "393",
+            "latitude": 51.01814,
+            "longitude": 6.88102
+          },
+          {
+            "id": "941",
+            "latitude": 51.03322,
+            "longitude": 6.89099
+          },
+          {
+            "id": "454",
+            "latitude": 50.89721,
+            "longitude": 7.07789
+          },
+          {
+            "id": "7509",
+            "latitude": 50.85986,
+            "longitude": 6.85498
+          },
+          {
+            "id": "4571",
+            "latitude": 51.06734,
+            "longitude": 7.00353
+          },
+          {
+            "id": "655",
+            "latitude": 50.95159,
+            "longitude": 7.10258
+          },
+          {
+            "id": "483",
+            "latitude": 50.85741,
+            "longitude": 7.08628
+          },
+          {
+            "id": "2890",
+            "latitude": 51.02332,
+            "longitude": 7.09175
+          },
+          {
+            "id": "348",
+            "latitude": 51.06376,
+            "longitude": 6.85541
+          },
+          {
+            "id": "4544",
+            "latitude": 50.90389,
+            "longitude": 6.78999
+          },
+          {
+            "id": "3309",
+            "latitude": 50.98694,
+            "longitude": 7.1378
+          },
+          {
+            "id": "3312",
+            "latitude": 50.98849,
+            "longitude": 7.14804
+          },
+          {
+            "id": "5695",
+            "latitude": 50.96675,
+            "longitude": 6.75407
+          },
+          {
+            "id": "7009",
+            "latitude": 50.87295,
+            "longitude": 6.74778
+          },
+          {
+            "id": "6016",
+            "latitude": 50.83405,
+            "longitude": 6.74767
           }
         ],
         "assURL": "https://apitest.vrs.de:4443/v1/ass",
