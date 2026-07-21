@@ -55,7 +55,6 @@ jobs:
           echo "$ETAG" > .gtfs-cache-id
           echo "skipped=false" >> $GITHUB_OUTPUT
       - name: Build city packages
-        if: steps.check_gtfs.outputs.skipped != 'true'
         env:
           SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
         run: >-
@@ -64,6 +63,8 @@ jobs:
           --swiss-gtfs-url "${{ vars.SWISS_GTFS_URL }}"
           --rnv-gateway-url "${{ vars.RNV_GATEWAY_URL }}"
           --vag-gateway-url "${{ vars.VAG_GATEWAY_URL }}"
+      - name: Verify generated Pages content
+        run: test -d docs
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
