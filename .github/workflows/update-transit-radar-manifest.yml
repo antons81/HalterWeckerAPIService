@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - "config/cities.json"
+      - ".github/workflows/update-transit-radar-manifest.yml"
 
 permissions:
   contents: read
