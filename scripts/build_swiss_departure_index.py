@@ -11,8 +11,9 @@ import math
 import shutil
 import zipfile
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from build_stop_packages import load_gtfs_archive
 
@@ -32,6 +33,16 @@ def distance_meters(a_lat, a_lon, b_lat, b_lon):
 
 def filename(stop_id: str) -> str:
     return hashlib.sha256(stop_id.encode("utf-8")).hexdigest() + ".json"
+
+
+def service_active(service: dict | None, date: str) -> bool:
+    if not service:
+        return False
+    if date in service["exceptions"]:
+        return service["exceptions"][date] == 1
+    if not service["startDate"] <= date <= service["endDate"]:
+        return False
+    return bool(service["weekdays"][datetime.strptime(date, "%Y%m%d").weekday()])
 
 
 def main():
@@ -61,6 +72,10 @@ def main():
             calendar = {row["service_id"]: {"startDate": row["start_date"], "endDate": row["end_date"], "weekdays": [int(row[day]) for day in ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")], "exceptions": {}} for row in rows(archive, "calendar.txt")}
             for row in rows(archive, "calendar_dates.txt"):
                 calendar.setdefault(row["service_id"], {"startDate": "00000000", "endDate": "99999999", "weekdays": [0] * 7, "exceptions": {}})["exceptions"][row["date"]] = int(row["exception_type"])
+            departure_dates = [
+                (datetime.now(ZoneInfo("Europe/Zurich")).date() + timedelta(days=offset)).strftime("%Y%m%d")
+                for offset in (-1, 0, 1)
+            ]
             departures = defaultdict(list)
             relevant_trips = set()
             for row in rows(archive, "stop_times.txt"):
@@ -72,7 +87,10 @@ def main():
                     continue
                 route = routes.get(trip.get("route_id"), {})
                 relevant_trips.add(row["trip_id"])
-                departures[stop_id].append({"tripId": row["trip_id"], "routeId": trip.get("route_id", ""), "line": route.get("route_short_name") or route.get("route_long_name") or trip.get("route_id", ""), "destination": trip.get("trip_headsign") or "", "departureTime": row["departure_time"], "service": calendar.get(trip.get("service_id")), "transportType": transport_type(route.get("route_type"))})
+                service = calendar.get(trip.get("service_id"))
+                for service_date in departure_dates:
+                    if service_active(service, service_date):
+                        departures[stop_id].append({"tripId": row["trip_id"], "routeId": trip.get("route_id", ""), "line": route.get("route_short_name") or route.get("route_long_name") or trip.get("route_id", ""), "destination": trip.get("trip_headsign") or "", "departureTime": row["departure_time"], "serviceDate": service_date, "transportType": transport_type(route.get("route_type"))})
             terminals = {}
             for row in rows(archive, "stop_times.txt"):
                 if row.get("trip_id") in relevant_trips:
