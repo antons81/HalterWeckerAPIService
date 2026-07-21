@@ -63,6 +63,12 @@ jobs:
           --swiss-gtfs-url "${{ vars.SWISS_GTFS_URL }}"
           --rnv-gateway-url "${{ vars.RNV_GATEWAY_URL }}"
           --vag-gateway-url "${{ vars.VAG_GATEWAY_URL }}"
+      - name: Build Swiss departure static index
+        env:
+          SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+        run: >-
+          python scripts/build_swiss_departure_index.py
+          --gtfs-url "${{ vars.SWISS_GTFS_URL }}"
       - name: Verify generated Pages content
         run: test -d docs
       - uses: actions/configure-pages@v5
