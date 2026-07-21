@@ -749,7 +749,8 @@ def transit_radar_manifest(
     additional_cities: list[dict[str, object]] | None = None,
     vag_gateway_url: str = "",
     package_stops_by_city_id: dict[str, list[dict[str, object]]] | None = None,
-    lines_by_stop_id: dict[str, dict[str, dict[str, object]]] | None = None
+    lines_by_stop_id: dict[str, dict[str, dict[str, object]]] | None = None,
+    skip_auto_radar_stops: bool = False,
 ) -> dict[str, object]:
     radar_cities = []
     for city in cities:
@@ -760,6 +761,8 @@ def transit_radar_manifest(
         city_id = str(city["id"])
         providers = []
         for raw_provider_configuration in transit_radar_configurations(configuration):
+            if skip_auto_radar_stops and raw_provider_configuration.get("autoRadarStops"):
+                continue
             provider_configuration = resolved_transit_radar_configuration(
                 city=city,
                 configuration=raw_provider_configuration,

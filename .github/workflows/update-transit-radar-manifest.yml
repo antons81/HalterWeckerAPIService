@@ -29,13 +29,16 @@ jobs:
       - name: Build cities manifest
         run: |
           mkdir -p docs/data
-          python3 -c "
+          python3 << 'PYEOF'
           from scripts.build_stop_packages import load_cities, transit_radar_manifest
           import json, pathlib
-          cities = load_cities(pathlib.Path('config/cities.json'))
-          manifest = transit_radar_manifest(cities)
-          pathlib.Path('docs/data/transit-radar-cities.json').write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
-          "
+
+          cities = load_cities(pathlib.Path("config/cities.json"))
+          manifest = transit_radar_manifest(cities, skip_auto_radar_stops=True)
+          pathlib.Path("docs/data/transit-radar-cities.json").write_text(
+              json.dumps(manifest, indent=2, ensure_ascii=False)
+          )
+          PYEOF
       - uses: actions/upload-pages-artifact@v3
         with:
           path: docs
