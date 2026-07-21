@@ -1,0 +1,5 @@
+[
+  {"id":"zurich","name":"Zürich","aliases":[],"latitude":47.3769,"longitude":8.5417,"radiusMeters":20000,"packageMode":"swiss"},
+  {"id":"bern","name":"Bern","aliases":[],"latitude":46.9480,"longitude":7.4474,"radiusMeters":15000,"packageMode":"swiss"},
+  {"id":"basel","name":"Basel","aliases":[],"latitude":47.5596,"longitude":7.5886,"radiusMeters":15000,"packageMode":"swiss"}
+]

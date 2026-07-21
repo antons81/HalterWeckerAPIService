@@ -352,6 +352,28 @@ def canonicalize(rows: list[dict[str, str]]) -> list[dict[str, object]]:
     return list(unique.values())
 
 
+def swiss_stops(rows: Iterable[dict[str, str]]) -> tuple[list[dict[str, object]], dict[str, int]]:
+    """Keep every valid Swiss GTFS stop ID; do not canonicalize platforms."""
+    stops: list[dict[str, object]] = []
+    skipped = {"emptyID": 0, "emptyName": 0, "invalidCoordinate": 0}
+    for row in rows:
+        stop_id = row.get("stop_id", "").strip()
+        name = row.get("stop_name", "").strip()
+        if not stop_id:
+            skipped["emptyID"] += 1; continue
+        if not name:
+            skipped["emptyName"] += 1; continue
+        try:
+            latitude, longitude = float(row["stop_lat"]), float(row["stop_lon"])
+            if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            skipped["invalidCoordinate"] += 1; continue
+        stops.append({"id": stop_id, "name": name, "latitude": latitude,
+                      "longitude": longitude, "searchName": normalized(name)})
+    return stops, skipped
+
+
 def canonical_stop_id_by_stop_id(
     rows: list[dict[str, str]]
 ) -> dict[str, str]:
@@ -431,6 +453,7 @@ def load_cities(path: Path) -> list[dict[str, object]]:
         longitude = city.get("longitude")
         radius = city.get("radiusMeters")
         transit_radar = city.get("transitRadar")
+        package_mode = city.get("packageMode", "german")
 
         if not isinstance(city_id, str) or not CITY_ID_PATTERN.fullmatch(city_id):
             raise ValueError(f"Invalid city id: {city_id!r}")
@@ -446,6 +469,8 @@ def load_cities(path: Path) -> list[dict[str, object]]:
             raise ValueError(f"Invalid longitude for {city_id}")
         if not isinstance(radius, (int, float)) or radius <= 0:
             raise ValueError(f"Invalid radius for {city_id}")
+        if package_mode not in {"german", "swiss"}:
+            raise ValueError(f"Invalid package mode for {city_id}: {package_mode!r}")
         if transit_radar is not None:
             validate_transit_radar(city_id, latitude, longitude, transit_radar)
 
@@ -1294,6 +1319,29 @@ def write_stop_package(
     return filename
 
 
+def build_swiss_stop_packages(
+    archive: zipfile.ZipFile, cities: list[dict[str, object]], output: Path
+) -> list[dict[str, object]]:
+    """Build configured Swiss radius packages using the existing JSON writer."""
+    rows = iter_table(archive, "stops.txt")
+    stops, _ = swiss_stops(rows)
+    packages_directory = output / "stops"
+    packages_directory.mkdir(parents=True, exist_ok=True)
+    manifest = []
+    for city in cities:
+        city_stops = [stop for stop in stops if distance_meters(
+            float(stop["latitude"]), float(stop["longitude"]),
+            float(city["latitude"]), float(city["longitude"])
+        ) <= float(city["radiusMeters"])]
+        if not city_stops:
+            raise ValueError(f'No stops found for configured city {city["id"]}.')
+        filename = write_stop_package(packages_directory, str(city["id"]), city_stops)
+        manifest.append({"id": city["id"], "name": city["name"],
+                         "aliases": city.get("aliases", []), "stopCount": len(city_stops),
+                         "url": f"stops/{filename}"})
+    return manifest
+
+
 def build_stop_packages(
     stops: list[dict[str, object]],
     cities: list[dict[str, object]],
@@ -1479,6 +1527,8 @@ def main() -> None:
     parser.add_argument("--cities", default="config/cities.json")
     parser.add_argument("--municipalities-url", default=BKG_MUNICIPALITIES_URL)
     parser.add_argument("--output", default="docs/data")
+    parser.add_argument("--swiss-gtfs-url", default="")
+    parser.add_argument("--swiss-cities", default="config/swiss-cities.json")
     args = parser.parse_args()
 
     cities = load_cities(Path(args.cities))
@@ -1493,6 +1543,12 @@ def main() -> None:
         municipalities,
         output
     )
+    if args.swiss_gtfs_url.strip():
+        swiss_cities = load_cities(Path(args.swiss_cities))
+        manifest.extend(build_swiss_stop_packages(
+            load_gtfs_archive(args.swiss_gtfs_url), swiss_cities, output
+        ))
+        manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
     rnv_cities, rnv_city_ids = build_rnv_assets(
         archive=load_gtfs_archive(args.rnv_gtfs_url),
         output=output,

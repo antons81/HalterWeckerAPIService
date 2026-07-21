@@ -35,7 +35,7 @@ jobs:
           path: .gtfs-cache-id
           key: gtfs-version
       - name: Validate configuration
-        run: test -n "${{ vars.GTFS_URL }}"
+        run: test -n "${{ vars.GTFS_URL }}" && test -n "${{ vars.SWISS_GTFS_URL }}"
       - name: Check if GTFS data has changed
         id: check_gtfs
         env:
@@ -61,6 +61,7 @@ jobs:
         run: >-
           python scripts/build_stop_packages.py
           --gtfs-url "${{ vars.GTFS_URL }}"
+          --swiss-gtfs-url "${{ vars.SWISS_GTFS_URL }}"
           --rnv-gateway-url "${{ vars.RNV_GATEWAY_URL }}"
           --vag-gateway-url "${{ vars.VAG_GATEWAY_URL }}"
       - uses: actions/configure-pages@v5
