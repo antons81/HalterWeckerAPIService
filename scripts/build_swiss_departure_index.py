@@ -9,12 +9,12 @@ import hashlib
 import json
 import math
 import shutil
-import tempfile
-import urllib.request
 import zipfile
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+
+from build_stop_packages import load_gtfs_archive
 
 
 def rows(archive: zipfile.ZipFile, name: str):
@@ -45,10 +45,7 @@ def main():
     shutil.rmtree(output, ignore_errors=True)
     (output / "stops").mkdir(parents=True)
     cities = json.loads(Path(args.cities).read_text())
-    with tempfile.TemporaryDirectory() as temporary:
-        archive_path = Path(temporary) / "swiss-gtfs.zip"
-        urllib.request.urlretrieve(args.gtfs_url, archive_path)
-        with zipfile.ZipFile(archive_path) as archive:
+    with load_gtfs_archive(args.gtfs_url) as archive:
             feed_info = next(rows(archive, "feed_info.txt"), {}) if "feed_info.txt" in archive.namelist() else {}
             all_stops = {row["stop_id"]: row for row in rows(archive, "stops.txt") if row.get("stop_id")}
             selected = {}
