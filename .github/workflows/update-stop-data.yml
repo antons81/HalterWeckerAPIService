@@ -28,9 +28,34 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+      - name: Restore GTFS ETag cache
+        uses: actions/cache@v4
+        id: cache
+        with:
+          path: .gtfs-cache-id
+          key: gtfs-version
       - name: Validate configuration
         run: test -n "${{ vars.GTFS_URL }}"
+      - name: Check if GTFS data has changed
+        id: check_gtfs
+        env:
+          SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+        run: |
+          GTFS_URL="${{ vars.GTFS_URL }}"
+          ETAG=$(curl -sI --max-time 10 "$GTFS_URL" | grep -i 'etag\|last-modified' | tr '\n' ' ' || true)
+          echo "etag=$ETAG" >> $GITHUB_OUTPUT
+          if [ -f .gtfs-cache-id ]; then
+            PREV=$(cat .gtfs-cache-id)
+            if [ "$ETAG" = "$PREV" ] && [ -n "$ETAG" ]; then
+              echo "skipped=true" >> $GITHUB_OUTPUT
+              echo "GTFS unchanged, skipping rebuild"
+              exit 0
+            fi
+          fi
+          echo "$ETAG" > .gtfs-cache-id
+          echo "skipped=false" >> $GITHUB_OUTPUT
       - name: Build city packages
+        if: steps.check_gtfs.outputs.skipped != 'true'
         env:
           SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
         run: >-
