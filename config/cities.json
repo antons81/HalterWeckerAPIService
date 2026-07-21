@@ -506,7 +506,8 @@
             "longitude": 6.946
           }
         ],
-        "assURL": "https://apitest.vrs.de:4443/v1/ass"
+        "assURL": "https://apitest.vrs.de:4443/v1/ass",
+        "supportsLiveVehicles": true
       }
     ]
   },
