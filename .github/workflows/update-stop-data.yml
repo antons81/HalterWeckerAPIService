@@ -42,7 +42,10 @@ jobs:
           SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
         run: |
           GTFS_URL="${{ vars.GTFS_URL }}"
-          ETAG=$(curl -sI --max-time 10 "$GTFS_URL" | grep -i 'etag\|last-modified' | tr '\n' ' ' || true)
+          SWISS_GTFS_URL="${{ vars.SWISS_GTFS_URL }}"
+          GERMAN_ETAG=$(curl -sI --max-time 10 "$GTFS_URL" | grep -i 'etag\|last-modified' | tr '\n' ' ' || true)
+          SWISS_ETAG=$(curl -sI --max-time 10 "$SWISS_GTFS_URL" | grep -i 'etag\|last-modified' | tr '\n' ' ' || true)
+          ETAG="german:$GERMAN_ETAG|swiss:$SWISS_ETAG"
           echo "etag=$ETAG" >> $GITHUB_OUTPUT
           if [ -f .gtfs-cache-id ]; then
             PREV=$(cat .gtfs-cache-id)

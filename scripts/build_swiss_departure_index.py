@@ -110,7 +110,22 @@ def main():
 
 
 def transport_type(route_type: str | None):
-    return {"0": "tram", "1": "subway", "2": "train", "3": "bus", "4": "ferry"}.get(route_type or "")
+    try:
+        value = int(route_type or "")
+    except ValueError:
+        return None
+
+    if value == 0 or 900 <= value < 1_000:
+        return "tram"
+    if value == 1 or 400 <= value < 500:
+        return "subway"
+    if value == 2 or 100 <= value < 200:
+        return "train"
+    if value == 3 or 700 <= value < 800:
+        return "bus"
+    if value == 4 or 1_000 <= value < 1_100:
+        return "ferry"
+    return None
 
 
 if __name__ == "__main__":
