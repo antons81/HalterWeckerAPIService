@@ -45,6 +45,7 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "mvvEFA",
     "vvo",
     "vrs",
+    "rmvHafas",
 }
 STATIC_TRANSIT_RADAR_PROVIDERS = {
     "rheinbahn-duesseldorf": {
@@ -565,6 +566,11 @@ def validate_transit_radar_provider(
             raise ValueError(f"Invalid SHG Mobil configuration for {city_id}")
         return
 
+    if adapter == "rmvHafas":
+        if region is not None:
+            raise ValueError(f"RMV HAFAS does not use a radar region for {city_id}")
+        return
+
     if adapter == "vagPuls" and city_id != "nurnberg":
         raise ValueError(f"Invalid VAG PULS configuration for {city_id}")
 
@@ -856,6 +862,8 @@ def transit_radar_manifest(
                 provider_id = f"vvo-{city_id}"
             elif adapter == "vrs":
                 provider_id = f"vrs-{city_id}"
+            elif adapter == "rmvHafas":
+                provider_id = "rmv-hafas"
             else:
                 raise ValueError(f"Unsupported transit radar adapter for {city_id}")
 
@@ -867,13 +875,13 @@ def transit_radar_manifest(
                 supports_departures = bool(
                     provider_configuration.get(
                         "supportsDepartures",
-                        adapter in {"vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs"}
+                        adapter in {"vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas"}
                     )
                 )
                 supports_live_vehicles = bool(
                     provider_configuration.get(
                         "supportsLiveVehicles",
-                        adapter not in {"vrrEFA", "vrs"}
+                        adapter not in {"vrrEFA", "vrs", "rmvHafas"}
                     )
                 )
                 supports_realtime_delay = bool(

@@ -118,17 +118,20 @@
     "latitude": 49.8728,
     "longitude": 8.6512,
     "radiusMeters": 18000,
-    "transitRadar": {
-      "adapter": "ivantoMQTT",
-      "agency": "heag",
-      "isEnabled": true,
-      "region": {
-        "minimumLongitude": 8.35,
-        "minimumLatitude": 49.6,
-        "maximumLongitude": 9.05,
-        "maximumLatitude": 50.2
-      }
-    }
+    "transitRadar": [
+      {
+        "adapter": "ivantoMQTT",
+        "agency": "heag",
+        "isEnabled": true,
+        "region": {
+          "minimumLongitude": 8.35,
+          "minimumLatitude": 49.6,
+          "maximumLongitude": 9.05,
+          "maximumLatitude": 50.2
+        }
+      },
+      {"adapter":"rmvHafas","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":false,"supportsRealtimeDelay":true,"statusMessage":"RMV-Abfahrten"}
+    ]
   },
   {
     "id": "hamburg",
@@ -1268,7 +1271,8 @@
     ],
     "latitude": 50.1109,
     "longitude": 8.6821,
-    "radiusMeters": 18000
+    "radiusMeters": 18000,
+    "transitRadar": {"adapter":"rmvHafas","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":false,"supportsRealtimeDelay":true,"statusMessage":"RMV-Abfahrten"}
   },
   {
     "id": "freising",
@@ -1848,5 +1852,13 @@
         "maximumLatitude": 51.24
       }
     }
-  }
+  },
+  {"id":"bad-homburg-vor-der-hohe","name":"Bad Homburg vor der Höhe","aliases":["Bad Homburg"],"latitude":50.226,"longitude":8.619,"radiusMeters":18000,"transitRadar":{"adapter":"rmvHafas","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":false,"supportsRealtimeDelay":true,"statusMessage":"RMV-Abfahrten"}},
+  {"id":"fulda","name":"Fulda","aliases":[],"latitude":50.5558,"longitude":9.6808,"radiusMeters":18000,"transitRadar":{"adapter":"rmvHafas","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":false,"supportsRealtimeDelay":true,"statusMessage":"RMV-Abfahrten"}},
+  {"id":"giessen","name":"Gießen","aliases":["Giessen"],"latitude":50.5841,"longitude":8.6784,"radiusMeters":18000,"transitRadar":{"adapter":"rmvHafas","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":false,"supportsRealtimeDelay":true,"statusMessage":"RMV-Abfahrten"}},
+  {"id":"hanau","name":"Hanau","aliases":[],"latitude":50.1269,"longitude":8.928,"radiusMeters":18000,"transitRadar":{"adapter":"rmvHafas","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":false,"supportsRealtimeDelay":true,"statusMessage":"RMV-Abfahrten"}},
+  {"id":"marburg","name":"Marburg","aliases":[],"latitude":50.807,"longitude":8.7705,"radiusMeters":18000,"transitRadar":{"adapter":"rmvHafas","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":false,"supportsRealtimeDelay":true,"statusMessage":"RMV-Abfahrten"}},
+  {"id":"offenbach-am-main","name":"Offenbach am Main","aliases":["Offenbach"],"latitude":50.0956,"longitude":8.7761,"radiusMeters":18000,"transitRadar":{"adapter":"rmvHafas","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":false,"supportsRealtimeDelay":true,"statusMessage":"RMV-Abfahrten"}},
+  {"id":"ruesselsheim-am-main","name":"Rüsselsheim am Main","aliases":["Ruesselsheim","Rüsselsheim"],"latitude":49.9896,"longitude":8.4227,"radiusMeters":18000,"transitRadar":{"adapter":"rmvHafas","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":false,"supportsRealtimeDelay":true,"statusMessage":"RMV-Abfahrten"}},
+  {"id":"wiesbaden","name":"Wiesbaden","aliases":[],"latitude":50.0782,"longitude":8.2398,"radiusMeters":18000,"transitRadar":{"adapter":"rmvHafas","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":false,"supportsRealtimeDelay":true,"statusMessage":"RMV-Abfahrten"}}
 ]
