@@ -43,9 +43,11 @@ jobs:
         run: |
           GTFS_URL="${{ vars.GTFS_URL }}"
           SWISS_GTFS_URL="${{ vars.SWISS_GTFS_URL }}"
+          NL_GTFS_URL="${{ vars.NL_GTFS_URL }}"
           GERMAN_ETAG=$(curl -sI --max-time 10 "$GTFS_URL" | grep -i 'etag\|last-modified' | tr '\n' ' ' || true)
           SWISS_ETAG=$(curl -sI --max-time 10 "$SWISS_GTFS_URL" | grep -i 'etag\|last-modified' | tr '\n' ' ' || true)
-          ETAG="german:$GERMAN_ETAG|swiss:$SWISS_ETAG"
+          NL_ETAG=$(curl -sI --max-time 10 "$NL_GTFS_URL" | grep -i 'etag\|last-modified' | tr '\n' ' ' || true)
+          ETAG="german:$GERMAN_ETAG|swiss:$SWISS_ETAG|nl:$NL_ETAG"
           echo "etag=$ETAG" >> $GITHUB_OUTPUT
           if [ -f .gtfs-cache-id ]; then
             PREV=$(cat .gtfs-cache-id)
@@ -64,6 +66,7 @@ jobs:
           python scripts/build_stop_packages.py
           --gtfs-url "${{ vars.GTFS_URL }}"
           --swiss-gtfs-url "${{ vars.SWISS_GTFS_URL }}"
+          --nl-gtfs-url "${{ vars.NL_GTFS_URL }}"
           --rnv-gateway-url "${{ vars.RNV_GATEWAY_URL }}"
           --vag-gateway-url "${{ vars.VAG_GATEWAY_URL }}"
       - name: Build Swiss departure static index

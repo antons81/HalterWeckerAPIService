@@ -46,6 +46,7 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "vvo",
     "vrs",
     "rmvHafas",
+    "netherlands",
 }
 STATIC_TRANSIT_RADAR_PROVIDERS = {
     "rheinbahn-duesseldorf": {
@@ -571,6 +572,9 @@ def validate_transit_radar_provider(
             raise ValueError(f"RMV HAFAS does not use a radar region for {city_id}")
         return
 
+    if adapter == "netherlands":
+        return
+
     if adapter == "vagPuls" and city_id != "nurnberg":
         raise ValueError(f"Invalid VAG PULS configuration for {city_id}")
 
@@ -864,6 +868,8 @@ def transit_radar_manifest(
                 provider_id = f"vrs-{city_id}"
             elif adapter == "rmvHafas":
                 provider_id = "rmv-hafas"
+            elif adapter == "netherlands":
+                provider_id = f"netherlands-{city_id}"
             else:
                 raise ValueError(f"Unsupported transit radar adapter for {city_id}")
 
@@ -875,7 +881,7 @@ def transit_radar_manifest(
                 supports_departures = bool(
                     provider_configuration.get(
                         "supportsDepartures",
-                        adapter in {"vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas"}
+                        adapter in {"vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "netherlands"}
                     )
                 )
                 supports_live_vehicles = bool(
@@ -938,7 +944,9 @@ def transit_radar_manifest(
             providers.append(provider)
 
         radar_cities.append({
-            "cityID": f"{city_id}-de",
+            "cityID": f"{city_id}-nl" if any(
+                p.get("adapter") == "netherlands" for p in providers
+            ) else f"{city_id}-de",
             "appCityID": city_id,
             "name": city["name"],
             "center": {
@@ -1373,6 +1381,59 @@ def build_swiss_stop_packages(
     return manifest
 
 
+def nl_city_ids(cities: list[dict[str, object]]) -> set[str]:
+    ids: set[str] = set()
+    for city in cities:
+        tr = city.get("transitRadar")
+        if isinstance(tr, dict) and tr.get("adapter") == "netherlands":
+            ids.add(str(city["id"]))
+        elif isinstance(tr, list):
+            for p in tr:
+                if isinstance(p, dict) and p.get("adapter") == "netherlands":
+                    ids.add(str(city["id"]))
+                    break
+    return ids
+
+
+def build_nl_stop_packages(
+    archive: zipfile.ZipFile, cities: list[dict[str, object]], output: Path
+) -> list[dict[str, object]]:
+    nl_ids = nl_city_ids(cities)
+    if not nl_ids:
+        return []
+
+    nl_cities = [c for c in cities if str(c["id"]) in nl_ids]
+    for city in nl_cities:
+        if city.get("packageMode") is not None:
+            raise ValueError(f'Dutch cities must not set packageMode for {city["id"]}.')
+
+    stops_by_city_id = {str(city["id"]): [] for city in nl_cities}
+    for stop in swiss_stops(iter_table(archive, "stops.txt")):
+        for city in nl_cities:
+            if distance_meters(
+                float(stop["latitude"]), float(stop["longitude"]),
+                float(city["latitude"]), float(city["longitude"])
+            ) <= float(city["radiusMeters"]):
+                stops_by_city_id[str(city["id"])].append(stop)
+
+    packages_directory = output / "stops"
+    packages_directory.mkdir(parents=True, exist_ok=True)
+    manifest = []
+    for city in nl_cities:
+        city_stops = stops_by_city_id[str(city["id"])]
+        if not city_stops:
+            raise ValueError(f'No stops found for configured Dutch city {city["id"]}.')
+        filename = write_stop_package(packages_directory, str(city["id"]), city_stops)
+        manifest.append({
+            "id": city["id"],
+            "name": city["name"],
+            "aliases": city.get("aliases", []),
+            "stopCount": len(city_stops),
+            "url": f"stops/{filename}"
+        })
+    return manifest
+
+
 def build_stop_packages(
     stops: list[dict[str, object]],
     cities: list[dict[str, object]],
@@ -1560,6 +1621,8 @@ def main() -> None:
     parser.add_argument("--output", default="docs/data")
     parser.add_argument("--swiss-gtfs-url", default="")
     parser.add_argument("--swiss-cities", default="config/swiss-cities.json")
+    parser.add_argument("--nl-gtfs-url", default="")
+    parser.add_argument("--nl-cities", default="config/cities.json")
     args = parser.parse_args()
 
     cities = load_cities(Path(args.cities))
@@ -1578,6 +1641,12 @@ def main() -> None:
         swiss_cities = load_cities(Path(args.swiss_cities))
         manifest.extend(build_swiss_stop_packages(
             load_gtfs_archive(args.swiss_gtfs_url), swiss_cities, output
+        ))
+        manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
+    if args.nl_gtfs_url.strip():
+        nl_cities = load_cities(Path(args.nl_cities))
+        manifest.extend(build_nl_stop_packages(
+            load_gtfs_archive(args.nl_gtfs_url), nl_cities, output
         ))
         manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
     rnv_cities, rnv_city_ids = build_rnv_assets(
