@@ -1507,6 +1507,83 @@ def build_nl_route_index(
         )
 
 
+def build_nl_departure_index(
+    archive: zipfile.ZipFile, cities: list[dict[str, object]], output: Path
+) -> None:
+    nl_ids = nl_city_ids(cities)
+    if not nl_ids:
+        return
+
+    today_str = date.today().strftime("%Y%m%d")
+    active_service_ids = set()
+    for row in iter_table(archive, "calendar_dates.txt"):
+        if row.get("date") == today_str and row.get("exception_type") == "1":
+            active_service_ids.add(str(row["service_id"]))
+
+    if not active_service_ids:
+        print("[NL-Departures] no active service IDs for today, skipping")
+        return
+
+    routes = {str(row["route_id"]): row for row in load_table(archive, "routes.txt")}
+    trip_meta: dict[str, dict[str, str]] = {}
+    for trip in iter_table(archive, "trips.txt"):
+        sid = str(trip.get("service_id", ""))
+        tid = str(trip.get("trip_id", ""))
+        if sid in active_service_ids and tid:
+            trip_meta[tid] = {
+                "route_id": str(trip.get("route_id", "")),
+                "headsign": str(trip.get("trip_headsign", "") or ""),
+                "direction_id": str(trip.get("direction_id", "0")),
+            }
+
+    stop_deps: dict[str, list[tuple[str, str]]] = {}
+    for st in iter_table(archive, "stop_times.txt"):
+        tid = str(st.get("trip_id", ""))
+        dep_time = st.get("departure_time", "").strip()
+        if tid in trip_meta and dep_time:
+            stop_id = str(st.get("stop_id", ""))
+            stop_deps.setdefault(stop_id, []).append((dep_time, tid))
+
+    nl_cities = [c for c in cities if str(c["id"]) in nl_ids]
+    packages_directory = output / "stops"
+    departures_directory = output / "departures"
+    departures_directory.mkdir(parents=True, exist_ok=True)
+
+    for city in nl_cities:
+        city_id = str(city["id"])
+        stop_path = packages_directory / f"{city_id}.json"
+        if not stop_path.exists():
+            continue
+        city_stops = json.loads(stop_path.read_text(encoding="utf-8"))
+        city_stop_ids = {str(s["id"]) for s in city_stops}
+
+        departures_by_stop: dict[str, list[dict[str, object]]] = {}
+        for sid in city_stop_ids:
+            deps = stop_deps.get(sid, [])
+            if not deps:
+                continue
+            deps.sort(key=lambda x: x[0])
+            departures_by_stop[sid] = [
+                {
+                    "t": tid,
+                    "r": trip_meta[tid]["route_id"],
+                    "h": trip_meta[tid]["headsign"],
+                    "d": trip_meta[tid]["direction_id"],
+                    "p": dep_time,
+                }
+                for dep_time, tid in deps
+            ]
+
+        payload = {
+            "generatedAt": today_str,
+            "stops": departures_by_stop,
+        }
+        (departures_directory / f"{city_id}.json").write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8"
+        )
+
+
 def build_stop_packages(
     stops: list[dict[str, object]],
     cities: list[dict[str, object]],
@@ -1721,6 +1798,7 @@ def main() -> None:
         nl_archive = load_gtfs_archive(args.nl_gtfs_url)
         manifest.extend(build_nl_stop_packages(nl_archive, nl_cities, output))
         build_nl_route_index(nl_archive, nl_cities, output)
+        build_nl_departure_index(nl_archive, nl_cities, output)
         manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
     rnv_cities, rnv_city_ids = build_rnv_assets(
         archive=load_gtfs_archive(args.rnv_gtfs_url),
