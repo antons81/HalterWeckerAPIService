@@ -1447,11 +1447,16 @@ def build_nl_route_index(
         return
 
     trip_routes: dict[str, str] = {}
+    trip_headsigns: dict[str, tuple[str, str]] = {}
     for trip in iter_table(archive, "trips.txt"):
         rid = str(trip.get("route_id", ""))
         tid = str(trip.get("trip_id", ""))
         if rid in routes and tid:
             trip_routes[tid] = rid
+            headsign = str(trip.get("trip_headsign", "") or "")
+            dir_id = str(trip.get("direction_id", "0"))
+            if headsign:
+                trip_headsigns[tid] = (dir_id, headsign)
 
     stop_route_ids: dict[str, set[str]] = {}
     for st in iter_table(archive, "stop_times.txt"):
@@ -1474,7 +1479,7 @@ def build_nl_route_index(
         city_stops = json.loads(stop_path.read_text(encoding="utf-8"))
         city_stop_ids = {str(s["id"]) for s in city_stops}
 
-        city_routes: dict[str, dict[str, str]] = {}
+        city_routes: dict[str, dict[str, object]] = {}
         for sid in city_stop_ids:
             for rid in stop_route_ids.get(sid, set()):
                 if rid not in city_routes:
@@ -1484,7 +1489,17 @@ def build_nl_route_index(
                         "long_name": str(r.get("route_long_name", "")),
                         "type": str(r.get("route_type", "3")),
                         "agency": str(r.get("agency_id", "")),
+                        "headsigns": {},
                     }
+        # Populate headsigns from trips
+        for tid, (dir_id, headsign) in trip_headsigns.items():
+            rid = trip_routes.get(tid)
+            if rid and rid in city_routes:
+                entry = city_routes[rid]
+                if isinstance(entry, dict):
+                    hs = entry.setdefault("headsigns", {})
+                    if isinstance(hs, dict) and dir_id not in hs:
+                        hs[dir_id] = headsign
 
         (routes_directory / f"{city_id}.json").write_text(
             json.dumps(city_routes, ensure_ascii=False, separators=(",", ":")),
