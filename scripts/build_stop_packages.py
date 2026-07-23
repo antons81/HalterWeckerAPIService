@@ -1835,12 +1835,12 @@ def main() -> None:
         )
         lines_by_stop_id.update(nl_lines)
         included_city_ids.update(nl_ids)
-            for city_id in nl_ids:
-                stop_path = output / "stops" / f"{city_id}.json"
-                if stop_path.exists():
-                    stops = json.loads(stop_path.read_text(encoding="utf-8"))
-                    package_stops_by_city_id[city_id] = stops
-                    package_stops_by_city_id[f"{city_id}-nl"] = stops
+        for city_id in nl_ids:
+            stop_path = output / "stops" / f"{city_id}.json"
+            if stop_path.exists():
+                stops = json.loads(stop_path.read_text(encoding="utf-8"))
+                package_stops_by_city_id[city_id] = stops
+                package_stops_by_city_id[f"{city_id}-nl"] = stops
     (output / "cities.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     (output / "manifest.json").write_text(
         json.dumps(
