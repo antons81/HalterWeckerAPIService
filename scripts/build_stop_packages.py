@@ -456,6 +456,49 @@ def build_lines_by_stop_id(
     return lines_by_stop_id
 
 
+def build_lines_by_stop_id_noncanonical(
+    stop_rows: list[dict[str, str]],
+    stop_times: Iterable[dict[str, str]],
+    trips: list[dict[str, str]],
+    routes: list[dict[str, str]],
+    included_stop_ids: set[str] | None = None
+) -> dict[str, dict[str, dict[str, object]]]:
+    """Variant that preserves raw stop IDs, for feeds where stop packages use raw IDs."""
+    route_by_id = {
+        row["route_id"]: row for row in routes if row.get("route_id")
+    }
+    route_id_by_trip_id = {
+        row["trip_id"]: row.get("route_id", "")
+        for row in trips if row.get("trip_id")
+    }
+    lines_by_stop_id: dict[str, dict[str, dict[str, object]]] = {}
+
+    for stop_time in stop_times:
+        stop_id = stop_time.get("stop_id", "")
+        if included_stop_ids is not None and stop_id not in included_stop_ids:
+            continue
+        route_id = route_id_by_trip_id.get(stop_time.get("trip_id", ""), "")
+        route = route_by_id.get(route_id)
+        if not stop_id or route is None:
+            continue
+
+        names = line_names(route)
+        if not names:
+            continue
+
+        route_type_value = route.get("route_type", "").strip()
+        line: dict[str, object] = {
+            "routeID": route_id,
+            "agencyID": route.get("agency_id", "").strip() or None,
+            "names": names
+        }
+        if route_type_value.isdigit():
+            line["routeType"] = int(route_type_value)
+        lines_by_stop_id.setdefault(stop_id, {})[route_id] = line
+
+    return lines_by_stop_id
+
+
 def load_cities(path: Path) -> list[dict[str, object]]:
     cities = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(cities, list) or not cities:
@@ -1826,7 +1869,7 @@ def main() -> None:
         nl_archive = load_gtfs_archive(args.nl_gtfs_url)
         nl_stop_rows = list(iter_table(nl_archive, "stops.txt"))
         nl_ids = nl_city_ids(load_cities(Path(args.nl_cities)))
-        nl_lines = build_lines_by_stop_id(
+        nl_lines = build_lines_by_stop_id_noncanonical(
             stop_rows=nl_stop_rows,
             stop_times=iter_table(nl_archive, "stop_times.txt"),
             trips=load_table(nl_archive, "trips.txt"),
