@@ -108,6 +108,35 @@ def main():
                 manifest["stops"][stop_id] = name
             (output / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, separators=(",", ":")))
 
+            # Also generate city-level compact index for iOS client (like Netherlands pattern)
+            city_output = Path("docs/data/departures")
+            city_output.mkdir(parents=True, exist_ok=True)
+            for city in cities:
+                city_id = city["id"]
+                city_lat = city["latitude"]
+                city_lon = city["longitude"]
+                city_radius = city["radiusMeters"]
+                city_stops: dict[str, list[dict]] = {}
+                for stop_id, stop in selected.items():
+                    try:
+                        lat, lon = float(stop["stop_lat"]), float(stop["stop_lon"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if distance_meters(lat, lon, city_lat, city_lon) <= city_radius:
+                        items = departures.get(stop_id, [])
+                        if items:
+                            stop_key = stop_id.split(":")[-1] if ":" in stop_id else stop_id
+                            city_stops[stop_key] = [
+                                {"t": d["tripId"], "r": d["routeId"], "h": d["destination"] or d["line"],
+                                 "d": trips.get(d["tripId"], {}).get("direction_id", "0"),
+                                 "p": d["departureTime"]}
+                                for d in items
+                            ]
+                payload = {"generatedAt": generated, "stops": city_stops}
+                (city_output / f"{city_id}.json").write_text(
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                )
+
 
 def transport_type(route_type: str | None):
     try:
