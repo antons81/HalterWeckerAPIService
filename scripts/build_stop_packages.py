@@ -1703,12 +1703,9 @@ def main() -> None:
         manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
     if args.nl_gtfs_url.strip():
         nl_cities = load_cities(Path(args.nl_cities))
-        manifest.extend(build_nl_stop_packages(
-            load_gtfs_archive(args.nl_gtfs_url), nl_cities, output
-        ))
-        build_nl_route_index(
-            load_gtfs_archive(args.nl_gtfs_url), nl_cities, output
-        )
+        nl_archive = load_gtfs_archive(args.nl_gtfs_url)
+        manifest.extend(build_nl_stop_packages(nl_archive, nl_cities, output))
+        build_nl_route_index(nl_archive, nl_cities, output)
         manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
     rnv_cities, rnv_city_ids = build_rnv_assets(
         archive=load_gtfs_archive(args.rnv_gtfs_url),
@@ -1732,6 +1729,24 @@ def main() -> None:
         routes=load_table(archive, "routes.txt"),
         included_stop_ids=included_stop_ids
     )
+    if args.nl_gtfs_url.strip():
+        nl_archive = load_gtfs_archive(args.nl_gtfs_url)
+        nl_stop_rows = list(iter_table(nl_archive, "stops.txt"))
+        nl_ids = nl_city_ids(load_cities(Path(args.nl_cities)))
+        nl_lines = build_lines_by_stop_id(
+            stop_rows=nl_stop_rows,
+            stop_times=iter_table(nl_archive, "stop_times.txt"),
+            trips=load_table(nl_archive, "trips.txt"),
+            routes=load_table(nl_archive, "routes.txt"),
+            included_stop_ids={str(s["id"]) for s in swiss_stops(nl_stop_rows)}
+        )
+        lines_by_stop_id.update(nl_lines)
+        included_city_ids.update(nl_ids)
+        for city_id in nl_ids:
+            if city_id not in package_stops_by_city_id:
+                stop_path = output / "stops" / f"{city_id}.json"
+                if stop_path.exists():
+                    package_stops_by_city_id[city_id] = json.loads(stop_path.read_text(encoding="utf-8"))
     (output / "cities.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     (output / "manifest.json").write_text(
         json.dumps(
