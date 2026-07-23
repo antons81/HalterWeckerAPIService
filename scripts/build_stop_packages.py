@@ -1434,6 +1434,64 @@ def build_nl_stop_packages(
     return manifest
 
 
+def build_nl_route_index(
+    archive: zipfile.ZipFile, cities: list[dict[str, object]], output: Path
+) -> None:
+    nl_ids = nl_city_ids(cities)
+    if not nl_ids:
+        return
+
+    routes = {str(row["route_id"]): row for row in load_table(archive, "routes.txt")
+              if row.get("route_id") and row.get("route_short_name")}
+    if not routes:
+        return
+
+    trip_routes: dict[str, str] = {}
+    for trip in iter_table(archive, "trips.txt"):
+        rid = str(trip.get("route_id", ""))
+        tid = str(trip.get("trip_id", ""))
+        if rid in routes and tid:
+            trip_routes[tid] = rid
+
+    stop_route_ids: dict[str, set[str]] = {}
+    for st in iter_table(archive, "stop_times.txt"):
+        sid = str(st.get("stop_id", ""))
+        tid = str(st.get("trip_id", ""))
+        rid = trip_routes.get(tid)
+        if sid and rid:
+            stop_route_ids.setdefault(sid, set()).add(rid)
+
+    nl_cities = [c for c in cities if str(c["id"]) in nl_ids]
+    packages_directory = output / "stops"
+    routes_directory = output / "routes"
+    routes_directory.mkdir(parents=True, exist_ok=True)
+
+    for city in nl_cities:
+        city_id = str(city["id"])
+        stop_path = packages_directory / f"{city_id}.json"
+        if not stop_path.exists():
+            continue
+        city_stops = json.loads(stop_path.read_text(encoding="utf-8"))
+        city_stop_ids = {str(s["id"]) for s in city_stops}
+
+        city_routes: dict[str, dict[str, str]] = {}
+        for sid in city_stop_ids:
+            for rid in stop_route_ids.get(sid, set()):
+                if rid not in city_routes:
+                    r = routes[rid]
+                    city_routes[rid] = {
+                        "short_name": str(r.get("route_short_name", "")),
+                        "long_name": str(r.get("route_long_name", "")),
+                        "type": str(r.get("route_type", "3")),
+                        "agency": str(r.get("agency_id", "")),
+                    }
+
+        (routes_directory / f"{city_id}.json").write_text(
+            json.dumps(city_routes, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8"
+        )
+
+
 def build_stop_packages(
     stops: list[dict[str, object]],
     cities: list[dict[str, object]],
@@ -1648,6 +1706,9 @@ def main() -> None:
         manifest.extend(build_nl_stop_packages(
             load_gtfs_archive(args.nl_gtfs_url), nl_cities, output
         ))
+        build_nl_route_index(
+            load_gtfs_archive(args.nl_gtfs_url), nl_cities, output
+        )
         manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
     rnv_cities, rnv_city_ids = build_rnv_assets(
         archive=load_gtfs_archive(args.rnv_gtfs_url),
