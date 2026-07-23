@@ -1065,15 +1065,21 @@
     "latitude": 51.0937,
     "longitude": 6.842,
     "radiusMeters": 14000,
-    "transitRadar": {
-      "adapter": "dbRegioBusNRW",
-      "region": {
-        "minimumLongitude": 6.7,
-        "minimumLatitude": 51.0,
-        "maximumLongitude": 6.98,
-        "maximumLatitude": 51.2
+    "transitRadar": [
+      {
+        "adapter": "dbRegioBusNRW",
+        "region": {
+          "minimumLongitude": 6.7,
+          "minimumLatitude": 51.0,
+          "maximumLongitude": 6.98,
+          "maximumLatitude": 51.2
+        }
+      },
+      {
+        "adapter": "vrrEFA",
+        "efaPath": "static03"
       }
-    }
+    ]
   },
   {
     "id": "viersen",
