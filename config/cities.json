@@ -130,7 +130,14 @@
           "maximumLatitude": 50.2
         }
       },
-      {"adapter":"rmvHafas","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":false,"supportsRealtimeDelay":true,"statusMessage":"RMV-Abfahrten"}
+      {
+        "adapter": "rmvHafas",
+        "isEnabled": true,
+        "supportsDepartures": true,
+        "supportsLiveVehicles": false,
+        "supportsRealtimeDelay": true,
+        "statusMessage": "RMV-Abfahrten"
+      }
     ]
   },
   {
@@ -1278,7 +1285,14 @@
     "latitude": 50.1109,
     "longitude": 8.6821,
     "radiusMeters": 18000,
-    "transitRadar": {"adapter":"rmvHafas","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":false,"supportsRealtimeDelay":true,"statusMessage":"RMV-Abfahrten"}
+    "transitRadar": {
+      "adapter": "rmvHafas",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "supportsLiveVehicles": false,
+      "supportsRealtimeDelay": true,
+      "statusMessage": "RMV-Abfahrten"
+    }
   },
   {
     "id": "freising",
@@ -1308,80 +1322,85 @@
     }
   },
   {
-    "id": "karlsruhe-08212000",
+    "id": "karlsruhe",
     "name": "Karlsruhe",
     "aliases": [],
     "latitude": 49.0069,
     "longitude": 8.4037,
     "radiusMeters": 18000,
-    "transitRadar": {
-      "adapter": "kvvEFA",
-      "efaPath": "sl3-alone",
-      "supportsLiveVehicles": true,
-      "radarStops": [
-        {
-          "id": "7000090",
-          "latitude": 48.993349,
-          "longitude": 8.401036
-        },
-        {
-          "id": "7000089",
-          "latitude": 48.994369,
-          "longitude": 8.39967
-        },
-        {
-          "id": "7000088",
-          "latitude": 48.991746,
-          "longitude": 8.40126
-        },
-        {
-          "id": "7001003",
-          "latitude": 49.009656,
-          "longitude": 8.402383
-        },
-        {
-          "id": "7000037",
-          "latitude": 49.009827,
-          "longitude": 8.394873
-        },
-        {
-          "id": "7000003",
-          "latitude": 49.00909,
-          "longitude": 8.417834
-        },
-        {
-          "id": "7000039",
-          "latitude": 49.010705,
-          "longitude": 8.384246
-        },
-        {
-          "id": "7000071",
-          "latitude": 49.005455,
-          "longitude": 8.40223
-        },
-        {
-          "id": "7000080",
-          "latitude": 49.008855,
-          "longitude": 8.410073
-        },
-        {
-          "id": "7000065",
-          "latitude": 48.999385,
-          "longitude": 8.385998
-        },
-        {
-          "id": "7000402",
-          "latitude": 49.013792,
-          "longitude": 8.430464
+    "transitRadar": [
+      {
+        "adapter": "kvvEFA",
+        "efaPath": "sl3-alone",
+        "supportsLiveVehicles": true,
+        "radarStops": [
+          {
+            "id": "7000090",
+            "latitude": 48.993349,
+            "longitude": 8.401036
+          },
+          {
+            "id": "7000089",
+            "latitude": 48.994369,
+            "longitude": 8.39967
+          },
+          {
+            "id": "7000088",
+            "latitude": 48.991746,
+            "longitude": 8.40126
+          },
+          {
+            "id": "7001003",
+            "latitude": 49.009656,
+            "longitude": 8.402383
+          },
+          {
+            "id": "7000037",
+            "latitude": 49.009827,
+            "longitude": 8.394873
+          },
+          {
+            "id": "7000003",
+            "latitude": 49.00909,
+            "longitude": 8.417834
+          },
+          {
+            "id": "7000039",
+            "latitude": 49.010705,
+            "longitude": 8.384246
+          },
+          {
+            "id": "7000071",
+            "latitude": 49.005455,
+            "longitude": 8.40223
+          },
+          {
+            "id": "7000080",
+            "latitude": 49.008855,
+            "longitude": 8.410073
+          },
+          {
+            "id": "7000065",
+            "latitude": 48.999385,
+            "longitude": 8.385998
+          },
+          {
+            "id": "7000402",
+            "latitude": 49.013792,
+            "longitude": 8.430464
+          }
+        ],
+        "region": {
+          "minimumLongitude": 8.25,
+          "minimumLatitude": 48.92,
+          "maximumLongitude": 8.55,
+          "maximumLatitude": 49.1
         }
-      ],
-      "region": {
-        "minimumLongitude": 8.25,
-        "minimumLatitude": 48.92,
-        "maximumLongitude": 8.55,
-        "maximumLatitude": 49.1
+      },
+      {
+        "adapter": "bwTrias"
       }
-    }
+    ]
   },
   {
     "id": "rastatt-08216043",
@@ -1573,54 +1592,59 @@
     "latitude": 48.7758,
     "longitude": 9.1829,
     "radiusMeters": 18000,
-    "transitRadar": {
-      "adapter": "vvsEFA",
-      "efaPath": "mngvvs",
-      "supportsLiveVehicles": true,
-      "radarStops": [
-        {
-          "id": "5006118",
-          "latitude": 48.783386,
-          "longitude": 9.180229
-        },
-        {
-          "id": "5006115",
-          "latitude": 48.784731,
-          "longitude": 9.183173
-        },
-        {
-          "id": "5006112",
-          "latitude": 48.78316,
-          "longitude": 9.181126
-        },
-        {
-          "id": "5006075",
-          "latitude": 48.776278,
-          "longitude": 9.182911
-        },
-        {
-          "id": "5006333",
-          "latitude": 48.80128,
-          "longitude": 9.217469
-        },
-        {
-          "id": "5006002",
-          "latitude": 48.726981,
-          "longitude": 9.113913
-        },
-        {
-          "id": "5000107",
-          "latitude": 48.832229,
-          "longitude": 9.170598
+    "transitRadar": [
+      {
+        "adapter": "vvsEFA",
+        "efaPath": "mngvvs",
+        "supportsLiveVehicles": true,
+        "radarStops": [
+          {
+            "id": "5006118",
+            "latitude": 48.783386,
+            "longitude": 9.180229
+          },
+          {
+            "id": "5006115",
+            "latitude": 48.784731,
+            "longitude": 9.183173
+          },
+          {
+            "id": "5006112",
+            "latitude": 48.78316,
+            "longitude": 9.181126
+          },
+          {
+            "id": "5006075",
+            "latitude": 48.776278,
+            "longitude": 9.182911
+          },
+          {
+            "id": "5006333",
+            "latitude": 48.80128,
+            "longitude": 9.217469
+          },
+          {
+            "id": "5006002",
+            "latitude": 48.726981,
+            "longitude": 9.113913
+          },
+          {
+            "id": "5000107",
+            "latitude": 48.832229,
+            "longitude": 9.170598
+          }
+        ],
+        "region": {
+          "minimumLongitude": 8.95,
+          "minimumLatitude": 48.65,
+          "maximumLongitude": 9.35,
+          "maximumLatitude": 48.9
         }
-      ],
-      "region": {
-        "minimumLongitude": 8.95,
-        "minimumLatitude": 48.65,
-        "maximumLongitude": 9.35,
-        "maximumLatitude": 48.9
+      },
+      {
+        "adapter": "bwTrias"
       }
-    }
+    ]
   },
   {
     "id": "esslingen-am-neckar-08116019",
@@ -1780,10 +1804,15 @@
     "latitude": 48.4011,
     "longitude": 9.9876,
     "radiusMeters": 20000,
-    "transitRadar": {
-      "adapter": "swu",
-      "isEnabled": true
-    }
+    "transitRadar": [
+      {
+        "adapter": "swu",
+        "isEnabled": true
+      },
+      {
+        "adapter": "bwTrias"
+      }
+    ]
   },
   {
     "id": "dresden",
@@ -1859,19 +1888,375 @@
       }
     }
   },
-  {"id":"bad-homburg-vor-der-hohe","name":"Bad Homburg vor der Höhe","aliases":["Bad Homburg"],"latitude":50.226,"longitude":8.619,"radiusMeters":18000,"transitRadar":{"adapter":"rmvHafas","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":false,"supportsRealtimeDelay":true,"statusMessage":"RMV-Abfahrten"}},
-  {"id":"fulda","name":"Fulda","aliases":[],"latitude":50.5558,"longitude":9.6808,"radiusMeters":18000,"transitRadar":{"adapter":"rmvHafas","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":false,"supportsRealtimeDelay":true,"statusMessage":"RMV-Abfahrten"}},
-  {"id":"giessen","name":"Gießen","aliases":["Giessen"],"latitude":50.5841,"longitude":8.6784,"radiusMeters":18000,"transitRadar":{"adapter":"rmvHafas","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":false,"supportsRealtimeDelay":true,"statusMessage":"RMV-Abfahrten"}},
-  {"id":"hanau","name":"Hanau","aliases":[],"latitude":50.1269,"longitude":8.928,"radiusMeters":18000,"transitRadar":{"adapter":"rmvHafas","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":false,"supportsRealtimeDelay":true,"statusMessage":"RMV-Abfahrten"}},
-  {"id":"marburg","name":"Marburg","aliases":[],"latitude":50.807,"longitude":8.7705,"radiusMeters":18000,"transitRadar":{"adapter":"rmvHafas","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":false,"supportsRealtimeDelay":true,"statusMessage":"RMV-Abfahrten"}},
-  {"id":"offenbach-am-main","name":"Offenbach am Main","aliases":["Offenbach"],"latitude":50.0956,"longitude":8.7761,"radiusMeters":18000,"transitRadar":{"adapter":"rmvHafas","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":false,"supportsRealtimeDelay":true,"statusMessage":"RMV-Abfahrten"}},
-  {"id":"ruesselsheim-am-main","name":"Rüsselsheim am Main","aliases":["Ruesselsheim","Rüsselsheim"],"latitude":49.9896,"longitude":8.4227,"radiusMeters":18000,"transitRadar":{"adapter":"rmvHafas","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":false,"supportsRealtimeDelay":true,"statusMessage":"RMV-Abfahrten"}},
-  {"id":"wiesbaden","name":"Wiesbaden","aliases":[],"latitude":50.0782,"longitude":8.2398,"radiusMeters":18000,"transitRadar":{"adapter":"rmvHafas","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":false,"supportsRealtimeDelay":true,"statusMessage":"RMV-Abfahrten"}},
-  {"id":"amsterdam","name":"Amsterdam","aliases":[],"latitude":52.3676,"longitude":4.9041,"radiusMeters":20000,"transitRadar":{"adapter":"netherlands","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":true,"supportsRealtimeDelay":true,"statusMessage":"Live-Radar und Live-Abfahrten für Amsterdam"}},
-  {"id":"rotterdam","name":"Rotterdam","aliases":[],"latitude":51.9244,"longitude":4.4777,"radiusMeters":20000,"transitRadar":{"adapter":"netherlands","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":true,"supportsRealtimeDelay":true,"statusMessage":"Live-Radar und Live-Abfahrten für Rotterdam"}},
-  {"id":"utrecht","name":"Utrecht","aliases":[],"latitude":52.0907,"longitude":5.1214,"radiusMeters":18000,"transitRadar":{"adapter":"netherlands","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":true,"supportsRealtimeDelay":true,"statusMessage":"Live-Radar und Live-Abfahrten für Utrecht"}},
-  {"id":"den-haag","name":"Den Haag","aliases":["The Hague","'s-Gravenhage"],"latitude":52.0705,"longitude":4.3007,"radiusMeters":18000,"transitRadar":{"adapter":"netherlands","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":true,"supportsRealtimeDelay":true,"statusMessage":"Live-Radar und Live-Abfahrten für Den Haag"}},
-  {"id":"eindhoven","name":"Eindhoven","aliases":[],"latitude":51.4416,"longitude":5.4697,"radiusMeters":18000,"transitRadar":{"adapter":"netherlands","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":true,"supportsRealtimeDelay":true,"statusMessage":"Live-Radar und Live-Abfahrten für Eindhoven"}},
-  {"id":"groningen","name":"Groningen","aliases":[],"latitude":53.2194,"longitude":6.5665,"radiusMeters":18000,"transitRadar":{"adapter":"netherlands","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":true,"supportsRealtimeDelay":true,"statusMessage":"Live-Radar und Live-Abfahrten für Groningen"}},
-  {"id":"maastricht","name":"Maastricht","aliases":[],"latitude":50.8514,"longitude":5.6910,"radiusMeters":15000,"transitRadar":{"adapter":"netherlands","isEnabled":true,"supportsDepartures":true,"supportsLiveVehicles":true,"supportsRealtimeDelay":true,"statusMessage":"Live-Radar und Live-Abfahrten für Maastricht"}}
+  {
+    "id": "bad-homburg-vor-der-hohe",
+    "name": "Bad Homburg vor der Höhe",
+    "aliases": [
+      "Bad Homburg"
+    ],
+    "latitude": 50.226,
+    "longitude": 8.619,
+    "radiusMeters": 18000,
+    "transitRadar": {
+      "adapter": "rmvHafas",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "supportsLiveVehicles": false,
+      "supportsRealtimeDelay": true,
+      "statusMessage": "RMV-Abfahrten"
+    }
+  },
+  {
+    "id": "fulda",
+    "name": "Fulda",
+    "aliases": [],
+    "latitude": 50.5558,
+    "longitude": 9.6808,
+    "radiusMeters": 18000,
+    "transitRadar": {
+      "adapter": "rmvHafas",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "supportsLiveVehicles": false,
+      "supportsRealtimeDelay": true,
+      "statusMessage": "RMV-Abfahrten"
+    }
+  },
+  {
+    "id": "giessen",
+    "name": "Gießen",
+    "aliases": [
+      "Giessen"
+    ],
+    "latitude": 50.5841,
+    "longitude": 8.6784,
+    "radiusMeters": 18000,
+    "transitRadar": {
+      "adapter": "rmvHafas",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "supportsLiveVehicles": false,
+      "supportsRealtimeDelay": true,
+      "statusMessage": "RMV-Abfahrten"
+    }
+  },
+  {
+    "id": "hanau",
+    "name": "Hanau",
+    "aliases": [],
+    "latitude": 50.1269,
+    "longitude": 8.928,
+    "radiusMeters": 18000,
+    "transitRadar": {
+      "adapter": "rmvHafas",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "supportsLiveVehicles": false,
+      "supportsRealtimeDelay": true,
+      "statusMessage": "RMV-Abfahrten"
+    }
+  },
+  {
+    "id": "marburg",
+    "name": "Marburg",
+    "aliases": [],
+    "latitude": 50.807,
+    "longitude": 8.7705,
+    "radiusMeters": 18000,
+    "transitRadar": {
+      "adapter": "rmvHafas",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "supportsLiveVehicles": false,
+      "supportsRealtimeDelay": true,
+      "statusMessage": "RMV-Abfahrten"
+    }
+  },
+  {
+    "id": "offenbach-am-main",
+    "name": "Offenbach am Main",
+    "aliases": [
+      "Offenbach"
+    ],
+    "latitude": 50.0956,
+    "longitude": 8.7761,
+    "radiusMeters": 18000,
+    "transitRadar": {
+      "adapter": "rmvHafas",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "supportsLiveVehicles": false,
+      "supportsRealtimeDelay": true,
+      "statusMessage": "RMV-Abfahrten"
+    }
+  },
+  {
+    "id": "ruesselsheim-am-main",
+    "name": "Rüsselsheim am Main",
+    "aliases": [
+      "Ruesselsheim",
+      "Rüsselsheim"
+    ],
+    "latitude": 49.9896,
+    "longitude": 8.4227,
+    "radiusMeters": 18000,
+    "transitRadar": {
+      "adapter": "rmvHafas",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "supportsLiveVehicles": false,
+      "supportsRealtimeDelay": true,
+      "statusMessage": "RMV-Abfahrten"
+    }
+  },
+  {
+    "id": "wiesbaden",
+    "name": "Wiesbaden",
+    "aliases": [],
+    "latitude": 50.0782,
+    "longitude": 8.2398,
+    "radiusMeters": 18000,
+    "transitRadar": {
+      "adapter": "rmvHafas",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "supportsLiveVehicles": false,
+      "supportsRealtimeDelay": true,
+      "statusMessage": "RMV-Abfahrten"
+    }
+  },
+  {
+    "id": "amsterdam",
+    "name": "Amsterdam",
+    "aliases": [],
+    "latitude": 52.3676,
+    "longitude": 4.9041,
+    "radiusMeters": 20000,
+    "transitRadar": {
+      "adapter": "netherlands",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "supportsLiveVehicles": true,
+      "supportsRealtimeDelay": true,
+      "statusMessage": "Live-Radar und Live-Abfahrten für Amsterdam"
+    }
+  },
+  {
+    "id": "rotterdam",
+    "name": "Rotterdam",
+    "aliases": [],
+    "latitude": 51.9244,
+    "longitude": 4.4777,
+    "radiusMeters": 20000,
+    "transitRadar": {
+      "adapter": "netherlands",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "supportsLiveVehicles": true,
+      "supportsRealtimeDelay": true,
+      "statusMessage": "Live-Radar und Live-Abfahrten für Rotterdam"
+    }
+  },
+  {
+    "id": "utrecht",
+    "name": "Utrecht",
+    "aliases": [],
+    "latitude": 52.0907,
+    "longitude": 5.1214,
+    "radiusMeters": 18000,
+    "transitRadar": {
+      "adapter": "netherlands",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "supportsLiveVehicles": true,
+      "supportsRealtimeDelay": true,
+      "statusMessage": "Live-Radar und Live-Abfahrten für Utrecht"
+    }
+  },
+  {
+    "id": "den-haag",
+    "name": "Den Haag",
+    "aliases": [
+      "The Hague",
+      "'s-Gravenhage"
+    ],
+    "latitude": 52.0705,
+    "longitude": 4.3007,
+    "radiusMeters": 18000,
+    "transitRadar": {
+      "adapter": "netherlands",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "supportsLiveVehicles": true,
+      "supportsRealtimeDelay": true,
+      "statusMessage": "Live-Radar und Live-Abfahrten für Den Haag"
+    }
+  },
+  {
+    "id": "eindhoven",
+    "name": "Eindhoven",
+    "aliases": [],
+    "latitude": 51.4416,
+    "longitude": 5.4697,
+    "radiusMeters": 18000,
+    "transitRadar": {
+      "adapter": "netherlands",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "supportsLiveVehicles": true,
+      "supportsRealtimeDelay": true,
+      "statusMessage": "Live-Radar und Live-Abfahrten für Eindhoven"
+    }
+  },
+  {
+    "id": "groningen",
+    "name": "Groningen",
+    "aliases": [],
+    "latitude": 53.2194,
+    "longitude": 6.5665,
+    "radiusMeters": 18000,
+    "transitRadar": {
+      "adapter": "netherlands",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "supportsLiveVehicles": true,
+      "supportsRealtimeDelay": true,
+      "statusMessage": "Live-Radar und Live-Abfahrten für Groningen"
+    }
+  },
+  {
+    "id": "maastricht",
+    "name": "Maastricht",
+    "aliases": [],
+    "latitude": 50.8514,
+    "longitude": 5.691,
+    "radiusMeters": 15000,
+    "transitRadar": {
+      "adapter": "netherlands",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "supportsLiveVehicles": true,
+      "supportsRealtimeDelay": true,
+      "statusMessage": "Live-Radar und Live-Abfahrten für Maastricht"
+    }
+  },
+  {
+    "id": "mannheim",
+    "name": "Mannheim",
+    "aliases": [],
+    "latitude": 49.4797,
+    "longitude": 8.4699,
+    "radiusMeters": 18000,
+    "transitRadar": [
+      {
+        "adapter": "bwTrias"
+      }
+    ]
+  },
+  {
+    "id": "heidelberg",
+    "name": "Heidelberg",
+    "aliases": [],
+    "latitude": 49.4043,
+    "longitude": 8.6762,
+    "radiusMeters": 15000,
+    "transitRadar": [
+      {
+        "adapter": "bwTrias"
+      }
+    ]
+  },
+  {
+    "id": "freiburg-im-breisgau",
+    "name": "Freiburg im Breisgau",
+    "aliases": [
+      "Freiburg"
+    ],
+    "latitude": 47.9975,
+    "longitude": 7.8409,
+    "radiusMeters": 18000,
+    "transitRadar": [
+      {
+        "adapter": "bwTrias"
+      }
+    ]
+  },
+  {
+    "id": "reutlingen",
+    "name": "Reutlingen",
+    "aliases": [],
+    "latitude": 48.4964,
+    "longitude": 9.2095,
+    "radiusMeters": 15000,
+    "transitRadar": [
+      {
+        "adapter": "bwTrias"
+      }
+    ]
+  },
+  {
+    "id": "heilbronn",
+    "name": "Heilbronn",
+    "aliases": [],
+    "latitude": 49.1429,
+    "longitude": 9.208,
+    "radiusMeters": 15000,
+    "transitRadar": [
+      {
+        "adapter": "bwTrias"
+      }
+    ]
+  },
+  {
+    "id": "pforzheim",
+    "name": "Pforzheim",
+    "aliases": [],
+    "latitude": 48.8939,
+    "longitude": 8.7033,
+    "radiusMeters": 15000,
+    "transitRadar": [
+      {
+        "adapter": "bwTrias"
+      }
+    ]
+  },
+  {
+    "id": "konstanz",
+    "name": "Konstanz",
+    "aliases": [],
+    "latitude": 47.6587,
+    "longitude": 9.1773,
+    "radiusMeters": 15000,
+    "transitRadar": [
+      {
+        "adapter": "bwTrias"
+      }
+    ]
+  },
+  {
+    "id": "baden-baden",
+    "name": "Baden-Baden",
+    "aliases": [],
+    "latitude": 48.761,
+    "longitude": 8.24,
+    "radiusMeters": 15000,
+    "transitRadar": [
+      {
+        "adapter": "bwTrias"
+      }
+    ]
+  },
+  {
+    "id": "tuebingen",
+    "name": "Tübingen",
+    "aliases": [],
+    "latitude": 48.5162,
+    "longitude": 9.0556,
+    "radiusMeters": 15000,
+    "transitRadar": [
+      {
+        "adapter": "bwTrias"
+      }
+    ]
+  }
 ]

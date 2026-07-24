@@ -29,6 +29,7 @@ BKG_MUNICIPALITIES_URL = (
 BKG_PAGE_SIZE = 2_000
 SPATIAL_GRID_SIZE_DEGREES = 0.25
 SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
+    "bwTrias",
     "dbRegioBusNRW",
     "ivantoMQTT",
     "ruhrbahn",
@@ -595,6 +596,15 @@ def validate_transit_radar_provider(
     if not isinstance(is_enabled, bool):
         raise ValueError(f"Invalid transit radar availability for {city_id}")
 
+    if adapter == "bwTrias":
+        if region is not None:
+            raise ValueError(f"bwTrias does not use a radar region for {city_id}")
+        if configuration.get("radarStops") is not None:
+            raise ValueError(f"bwTrias does not use radar stops for {city_id}")
+        if configuration.get("efaPath") is not None:
+            raise ValueError(f"bwTrias does not use an EFA path for {city_id}")
+        return
+
     if adapter == "stadtwerkeMuenster":
         if city_id != "munster" or region is not None:
             raise ValueError(f"Invalid Stadtwerke Münster configuration for {city_id}")
@@ -913,6 +923,8 @@ def transit_radar_manifest(
                 provider_id = "rmv-hafas"
             elif adapter == "netherlands":
                 provider_id = f"netherlands-{city_id}"
+            elif adapter == "bwTrias":
+                provider_id = "bw-trias"
             else:
                 raise ValueError(f"Unsupported transit radar adapter for {city_id}")
 
@@ -924,13 +936,13 @@ def transit_radar_manifest(
                 supports_departures = bool(
                     provider_configuration.get(
                         "supportsDepartures",
-                        adapter in {"vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "netherlands"}
+                        adapter in {"bwTrias", "vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "netherlands"}
                     )
                 )
                 supports_live_vehicles = bool(
                     provider_configuration.get(
                         "supportsLiveVehicles",
-                        adapter not in {"vrrEFA", "vrs", "rmvHafas"}
+                        adapter not in {"bwTrias", "vrrEFA", "vrs", "rmvHafas"}
                     )
                 )
                 supports_realtime_delay = bool(
