@@ -696,8 +696,31 @@
         "adapter": "vrrEFA",
         "efaPath": "static03",
         "supportsDepartures": true,
-        "supportsLiveVehicles": false,
-        "statusMessage": "Live-Abfahrten für Mülheim an der Ruhr"
+        "supportsLiveVehicles": true,
+        "statusMessage": "Live-Abfahrten für Mülheim an der Ruhr",
+        "region": {
+          "minimumLongitude": 6.8,
+          "minimumLatitude": 51.38,
+          "maximumLongitude": 6.95,
+          "maximumLatitude": 51.48
+        },
+        "radarStops": [
+          {
+            "id": "20015225",
+            "latitude": 51.4314,
+            "longitude": 6.8865
+          },
+          {
+            "id": "20015002",
+            "latitude": 51.429,
+            "longitude": 6.882
+          },
+          {
+            "id": "20015501",
+            "latitude": 51.432,
+            "longitude": 6.888
+          }
+        ]
       }
     ]
   },
@@ -1120,7 +1143,26 @@
       },
       {
         "adapter": "vrrEFA",
-        "efaPath": "static03"
+        "efaPath": "static03",
+        "supportsLiveVehicles": true,
+        "region": {
+          "minimumLongitude": 6.75,
+          "minimumLatitude": 51.05,
+          "maximumLongitude": 6.9,
+          "maximumLatitude": 51.15
+        },
+        "radarStops": [
+          {
+            "id": "20020268",
+            "latitude": 51.0938,
+            "longitude": 6.8403
+          },
+          {
+            "id": "20020314",
+            "latitude": 51.076,
+            "longitude": 6.778
+          }
+        ]
       }
     ]
   },
