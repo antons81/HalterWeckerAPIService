@@ -643,8 +643,31 @@
         "adapter": "vrrEFA",
         "efaPath": "static03",
         "supportsDepartures": true,
-        "supportsLiveVehicles": false,
-        "statusMessage": "Live-Abfahrten für Essen"
+        "supportsLiveVehicles": true,
+        "statusMessage": "Live-Abfahrten für Essen",
+        "region": {
+          "minimumLongitude": 6.88,
+          "minimumLatitude": 51.35,
+          "maximumLongitude": 7.14,
+          "maximumLatitude": 51.55
+        },
+        "radarStops": [
+          {
+            "id": "20009289",
+            "latitude": 51.4514,
+            "longitude": 7.0135
+          },
+          {
+            "id": "20009252",
+            "latitude": 51.4556,
+            "longitude": 7.0116
+          },
+          {
+            "id": "20009137",
+            "latitude": 51.4608,
+            "longitude": 7.0038
+          }
+        ]
       }
     ]
   },
@@ -1043,8 +1066,21 @@
         "adapter": "vrrEFA",
         "efaPath": "static03",
         "supportsDepartures": true,
-        "supportsLiveVehicles": false,
-        "statusMessage": "Live-Abfahrten für Wesel"
+        "supportsLiveVehicles": true,
+        "statusMessage": "Live-Abfahrten für Wesel",
+        "region": {
+          "minimumLongitude": 6.52,
+          "minimumLatitude": 51.59,
+          "maximumLongitude": 6.72,
+          "maximumLatitude": 51.7
+        },
+        "radarStops": [
+          {
+            "id": "20009270",
+            "latitude": 51.6585,
+            "longitude": 6.6204
+          }
+        ]
       }
     ]
   },
@@ -1109,8 +1145,21 @@
         "adapter": "vrrEFA",
         "efaPath": "static03",
         "supportsDepartures": true,
-        "supportsLiveVehicles": false,
-        "statusMessage": "Live-Abfahrten für Viersen"
+        "supportsLiveVehicles": true,
+        "statusMessage": "Live-Abfahrten für Viersen",
+        "region": {
+          "minimumLongitude": 6.28,
+          "minimumLatitude": 51.2,
+          "maximumLongitude": 6.5,
+          "maximumLatitude": 51.31
+        },
+        "radarStops": [
+          {
+            "id": "20009260",
+            "latitude": 51.2545,
+            "longitude": 6.3918
+          }
+        ]
       }
     ]
   },
