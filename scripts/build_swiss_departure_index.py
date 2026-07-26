@@ -109,7 +109,7 @@ def main():
             (output / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, separators=(",", ":")))
 
             # Also generate city-level compact index for iOS client (like Netherlands pattern)
-            city_output = Path("docs/data/departures")
+            city_output = output.parent / "departures"
             city_output.mkdir(parents=True, exist_ok=True)
             for city in cities:
                 city_id = city["id"]
