@@ -13,3 +13,9 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    networks:
+      - haltewecker
+
+networks:
+  haltewecker:
+    external: true
