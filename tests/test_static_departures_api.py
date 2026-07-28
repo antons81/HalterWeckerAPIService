@@ -37,6 +37,7 @@ def write_database(path: Path, version: str, valid: bool = True) -> None:
                 canonical_stop_id TEXT
             );
             CREATE TABLE city_stops (city_id TEXT NOT NULL, stop_id TEXT NOT NULL, PRIMARY KEY (city_id, stop_id));
+            CREATE TABLE city_aliases (alias_city_id TEXT PRIMARY KEY, canonical_city_id TEXT NOT NULL);
             CREATE TABLE routes (route_id TEXT PRIMARY KEY, short_name TEXT NOT NULL, long_name TEXT NOT NULL);
             CREATE TABLE trips (
                 trip_id TEXT PRIMARY KEY,
@@ -87,6 +88,8 @@ def write_database(path: Path, version: str, valid: bool = True) -> None:
             ],
         )
         db.execute("INSERT INTO city_stops VALUES ('dresden', 'stop-parent')")
+        db.execute("INSERT INTO city_stops VALUES ('koln', 'stop-parent')")
+        db.execute("INSERT INTO city_aliases VALUES ('koeln', 'koln')")
         db.execute("INSERT INTO routes VALUES ('route-1', '7', 'Line 7')")
         db.execute("INSERT INTO trips VALUES ('trip-1', 'service-1', 'route-1', 'Weixdorf', '0', 'terminal')")
         db.execute("INSERT INTO active_services VALUES ('service-1', '20260728')")
@@ -211,6 +214,10 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                 self.assertEqual(board[0]["scheduledTime"], "23:55:00")
                 self.assertEqual(board[0]["platform"], "1")
                 self.assertFalse(board[0]["isRealtime"])
+                aliased = server.get("/static-departures/lines?cityID=koeln&stopID=stop-parent")
+                self.assertEqual(aliased["cityID"], "koln")
+                self.assertEqual(aliased["requestedCityID"], "koeln")
+                self.assertEqual(aliased["lines"][0]["line"], "7")
 
     def test_parallel_reads_continue_during_symlink_swap(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

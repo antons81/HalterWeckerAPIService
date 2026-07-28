@@ -12,8 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from build_german_departure_index import (
-    DEFAULT_TIMEZONE, connect, load_gtfs_archive, populate_active_services,
-    populate_gtfs, resolve_canonical_stops, service_window,
+    DEFAULT_TIMEZONE, connect, load_city_aliases, load_gtfs_archive,
+    populate_active_services, populate_gtfs, resolve_canonical_stops, service_window,
     update_terminal_stops,
 )
 from build_stop_packages import (
@@ -90,7 +90,7 @@ def populate_german_city_memberships(
 
 
 def validate(connection: sqlite3.Connection) -> None:
-    required = ("raw_stops", "city_stops", "routes", "trips", "stop_times", "active_services")
+    required = ("raw_stops", "city_stops", "city_aliases", "routes", "trips", "stop_times", "active_services")
     tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if not set(required).issubset(tables):
         raise ValueError("Static departures database is incomplete.")
@@ -98,6 +98,23 @@ def validate(connection: sqlite3.Connection) -> None:
         raise ValueError("Static departures database contains no city stop memberships.")
     if connection.execute("SELECT COUNT(*) FROM active_services").fetchone()[0] == 0:
         raise ValueError("Static departures database contains no active services.")
+
+
+def populate_city_aliases(
+    connection: sqlite3.Connection,
+    aliases: dict[str, str],
+    city_ids: set[str]
+) -> None:
+    for alias, target in aliases.items():
+        if alias in city_ids and alias != target:
+            raise ValueError(f"City ID alias conflicts with a canonical city ID: {alias}")
+        if target not in city_ids:
+            raise ValueError(f"City ID alias target is absent from German city memberships: {alias} -> {target}")
+    connection.executemany(
+        "INSERT INTO city_aliases(alias_city_id, canonical_city_id) VALUES (?, ?)",
+        sorted(aliases.items())
+    )
+    connection.commit()
 
 
 def main() -> None:
@@ -108,6 +125,7 @@ def main() -> None:
     parser.add_argument("--days", type=int, default=15)
     parser.add_argument("--cities", default=str(REPOSITORY_ROOT / "config" / "cities.json"))
     parser.add_argument("--swiss-cities", default=str(REPOSITORY_ROOT / "config" / "swiss-cities.json"))
+    parser.add_argument("--city-id-aliases", default=str(REPOSITORY_ROOT / "config" / "city-id-aliases.json"))
     args = parser.parse_args()
     next_path = Path(args.next)
     next_path.parent.mkdir(parents=True, exist_ok=True)
@@ -126,10 +144,15 @@ def main() -> None:
             populate_active_services(connection, dates)
             update_terminal_stops(connection)
             connection.executescript("""
+                CREATE TABLE city_aliases (
+                    alias_city_id TEXT PRIMARY KEY,
+                    canonical_city_id TEXT NOT NULL
+                ) WITHOUT ROWID;
                 CREATE INDEX raw_stops_by_canonical ON raw_stops(canonical_stop_id, stop_id);
                 CREATE INDEX stop_times_by_stop ON stop_times(raw_stop_id, trip_id, departure_seconds);
                 CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
             """)
+            populate_city_aliases(connection, load_city_aliases(Path(args.city_id_aliases)), city_ids)
             version = str(uuid.uuid4())
             connection.executemany("INSERT INTO metadata VALUES (?, ?)", (
                 ("schemaVersion", "1"), ("databaseVersion", version),

@@ -67,6 +67,18 @@ class Database:
             finally:
                 cursor.close()
 
+    def resolve_city(self, city_id: str) -> str:
+        with self.lock:
+            cursor = self._connection().execute(
+                "SELECT canonical_city_id FROM city_aliases WHERE alias_city_id=?",
+                (city_id,)
+            )
+            try:
+                row = cursor.fetchone()
+            finally:
+                cursor.close()
+            return str(row[0]) if row else city_id
+
     def lines(self, stop_id: str) -> list[dict[str, str | None]]:
         with self.lock:
             cursor = self._connection().execute(
@@ -170,10 +182,14 @@ class Handler(BaseHTTPRequestHandler):
             city, stop = query.get("cityID", [None])[0], query.get("stopID", [None])[0]
             if not city or not stop:
                 return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "cityID and stopID are required"})
-            if not self.database.city_has_stop(city, stop):
+            resolved_city = self.database.resolve_city(city)
+            if not self.database.city_has_stop(resolved_city, stop):
                 return self.send_json(HTTPStatus.NOT_FOUND, {"error": "unknown cityID/stopID"})
             if parsed.path == "/static-departures/lines":
-                return self.send_json(HTTPStatus.OK, {"cityID": city, "stopID": stop, "lines": self.database.lines(stop)})
+                payload = {"cityID": resolved_city, "stopID": stop, "lines": self.database.lines(stop)}
+                if resolved_city != city:
+                    payload["requestedCityID"] = city
+                return self.send_json(HTTPStatus.OK, payload)
             if parsed.path == "/static-departures/board":
                 limit = bounded_limit(query.get("limit", [None])[0])
                 from_date = parse_iso_boundary(query.get("from", [None])[0])
@@ -185,7 +201,10 @@ class Handler(BaseHTTPRequestHandler):
                         if (from_date is None or departure_datetime(item) >= from_date)
                         and (to_date is None or departure_datetime(item) <= to_date)
                     ][:limit]
-                return self.send_json(HTTPStatus.OK, {"cityID": city, "stopID": stop, "departures": departures})
+                payload = {"cityID": resolved_city, "stopID": stop, "departures": departures}
+                if resolved_city != city:
+                    payload["requestedCityID"] = city
+                return self.send_json(HTTPStatus.OK, payload)
             return self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
         except Exception as error:
             self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(error)})
