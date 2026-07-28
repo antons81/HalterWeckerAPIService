@@ -137,7 +137,6 @@ def main() -> None:
                 ("timezone", DEFAULT_TIMEZONE),
             ))
             validate(connection)
-            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             connection.commit()
         finally:
             connection.close()

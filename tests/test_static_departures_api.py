@@ -220,6 +220,7 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
             write_database(second, "second")
             current.symlink_to(first.name)
             with StaticDeparturesHTTPServer(current, ttl=0) as server:
+                self.assertEqual(server.get("/static-departures/meta")["databaseVersion"], "first")
                 results: list[str] = []
 
                 def fetch_meta() -> str:
@@ -234,8 +235,8 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                     for future in futures:
                         results.append(future.result(timeout=5))
 
-                self.assertIn("first", results)
                 self.assertIn("second", results)
+                self.assertEqual(server.get("/static-departures/meta")["databaseVersion"], "second")
 
 
 if __name__ == "__main__":
