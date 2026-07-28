@@ -1,0 +1,15 @@
+services:
+  static-departures-api:
+    build:
+      context: ..
+      dockerfile: services/static-departures.Dockerfile
+    container_name: static-departures-api
+    environment:
+      DEPARTURES_DATABASE: /data/departures-current.sqlite
+      PORT: "8080"
+    volumes:
+      - /srv/haltewecker/data:/data:ro
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
