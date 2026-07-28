@@ -126,6 +126,7 @@ def main() -> None:
             populate_active_services(connection, dates)
             update_terminal_stops(connection)
             connection.executescript("""
+                CREATE INDEX raw_stops_by_canonical ON raw_stops(canonical_stop_id, stop_id);
                 CREATE INDEX stop_times_by_stop ON stop_times(raw_stop_id, trip_id, departure_seconds);
                 CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
             """)
