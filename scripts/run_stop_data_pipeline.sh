@@ -16,11 +16,23 @@ cd "$REPO"
 rm -rf "$STAGING" "$ROLLBACK"
 mkdir -p "$STAGING"
 
-python3 "$REPO/scripts/build_stop_packages.py" \
+if ! python3 "$REPO/scripts/build_stop_packages.py" \
   --gtfs-url "$GTFS_URL" \
   --swiss-gtfs-url "$SWISS_GTFS_URL" \
   --nl-gtfs-url "$NL_GTFS_URL" \
-  --output "$BUILD_DIR"
+  --output "$BUILD_DIR"; then
+  test -d "$CURRENT"
+  echo "Dutch GTFS build failed; preserving the last published Dutch assets."
+  rm -rf "$BUILD_DIR"
+  python3 "$REPO/scripts/build_stop_packages.py" \
+    --gtfs-url "$GTFS_URL" \
+    --swiss-gtfs-url "$SWISS_GTFS_URL" \
+    --output "$BUILD_DIR"
+  python3 "$REPO/scripts/preserve_nl_assets.py" \
+    --current "$CURRENT" \
+    --output "$BUILD_DIR" \
+    --cities "$REPO/config/cities.json"
+fi
 
 python3 "$REPO/scripts/build_swiss_departure_index.py" \
   --gtfs-url "$SWISS_GTFS_URL" \
