@@ -625,6 +625,11 @@ def validate_transit_radar_provider(
         if region is not None:
             raise ValueError(f"RMV HAFAS does not use a radar region for {city_id}")
         return
+    
+    if adapter == "avvHafas":
+        if region is not None:
+            raise ValueError(f"AVV HAFAS does not use a radar region for {city_id}")
+        return
 
     if adapter == "netherlands":
         return
@@ -922,6 +927,8 @@ def transit_radar_manifest(
                 provider_id = f"vrs-{city_id}"
             elif adapter == "rmvHafas":
                 provider_id = "rmv-hafas"
+            elif adapter == "avvHafas":
+                provider_id = "avv-hafas"
             elif adapter == "netherlands":
                 provider_id = f"netherlands-{city_id}"
             elif adapter == "bwTrias":
@@ -937,7 +944,7 @@ def transit_radar_manifest(
                 supports_departures = bool(
                     provider_configuration.get(
                         "supportsDepartures",
-                        adapter in {"bwTrias", "vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "netherlands"}
+                        adapter in {"bwTrias", "vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "avvHafas", "netherlands"}
                     )
                 )
                 supports_live_vehicles = bool(
