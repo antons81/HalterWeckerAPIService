@@ -1848,6 +1848,7 @@ def main() -> None:
             load_gtfs_archive(args.swiss_gtfs_url), swiss_cities, output
         ))
         manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
+    nl_archive: zipfile.ZipFile | None = None
     if args.nl_gtfs_url.strip():
         nl_cities = load_cities(Path(args.nl_cities))
         nl_archive = load_gtfs_archive(args.nl_gtfs_url)
@@ -1877,8 +1878,7 @@ def main() -> None:
         routes=load_table(archive, "routes.txt"),
         included_stop_ids=included_stop_ids
     )
-    if args.nl_gtfs_url.strip():
-        nl_archive = load_gtfs_archive(args.nl_gtfs_url)
+    if nl_archive is not None:
         nl_stop_rows = list(iter_table(nl_archive, "stops.txt"))
         nl_ids = nl_city_ids(load_cities(Path(args.nl_cities)))
         nl_lines = build_lines_by_stop_id_noncanonical(
