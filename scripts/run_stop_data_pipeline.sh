@@ -46,16 +46,9 @@ python3 "$REPO/scripts/build_swiss_departure_index.py" \
   --gtfs-url "$SWISS_GTFS_URL" \
   --output "$BUILD_DIR/swiss-static"
 
-python3 "$REPO/scripts/build_german_departure_index.py" \
-  --gtfs-url "$GTFS_URL" \
-  --output "$BUILD_DIR" \
-  --city-id-aliases "$REPO/config/city-id-aliases.json"
-
 test -f "$BUILD_DIR/manifest.json"
 test -f "$BUILD_DIR/transit-radar-cities.json"
 test -f "$BUILD_DIR/swiss-static/manifest.json"
-test -f "$BUILD_DIR/departures-manifest.json"
-python3 -m json.tool "$BUILD_DIR/departures-manifest.json" >/dev/null
 
 # Do not replace or remove the last working published dataset before the complete
 # staged build has passed all builders and manifest validation.
