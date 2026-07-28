@@ -47,6 +47,7 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "vvo",
     "vrs",
     "rmvHafas",
+    "avvHafas",
     "netherlands",
 }
 STATIC_TRANSIT_RADAR_PROVIDERS = {
