@@ -11,6 +11,8 @@ ROLLBACK="$DATA_ROOT/temp/current-rollback"
 
 source /etc/haltewecker-stop-data.env
 
+cd "$REPO"
+
 rm -rf "$STAGING" "$ROLLBACK"
 mkdir -p "$STAGING"
 
