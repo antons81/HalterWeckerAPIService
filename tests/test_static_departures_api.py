@@ -88,6 +88,7 @@ def write_database(path: Path, version: str, valid: bool = True) -> None:
             ],
         )
         db.execute("INSERT INTO city_stops VALUES ('dresden', 'stop-parent')")
+        db.execute("INSERT INTO city_stops VALUES ('dresden', 'terminal')")
         db.execute("INSERT INTO city_stops VALUES ('koln', 'stop-parent')")
         db.execute("INSERT INTO city_aliases VALUES ('koeln', 'koln')")
         db.execute("INSERT INTO routes VALUES ('route-1', '7', 'Line 7')")
@@ -214,6 +215,13 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                 self.assertEqual(board[0]["scheduledTime"], "23:55:00")
                 self.assertEqual(board[0]["platform"], "1")
                 self.assertFalse(board[0]["isRealtime"])
+                overnight = server.get(
+                    "/static-departures/board?cityID=dresden&stopID=terminal"
+                    "&from=2026-07-29T01:00:00%2B02:00&to=2026-07-29T01:10:00%2B02:00&limit=1"
+                )["departures"]
+                self.assertEqual(len(overnight), 1)
+                self.assertEqual(overnight[0]["serviceDate"], "2026-07-28")
+                self.assertEqual(overnight[0]["scheduledTime"], "25:05:00")
                 aliased = server.get("/static-departures/lines?cityID=koeln&stopID=stop-parent")
                 self.assertEqual(aliased["cityID"], "koln")
                 self.assertEqual(aliased["requestedCityID"], "koeln")

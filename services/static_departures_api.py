@@ -101,7 +101,15 @@ class Database:
                 cursor.close()
         return [{"routeID": route_id, "line": line, "direction": direction or None} for route_id, line, direction in rows]
 
-    def board(self, stop_id: str, limit: int) -> list[dict[str, object]]:
+    def board(
+        self,
+        stop_id: str,
+        limit: int,
+        from_date: datetime | None = None,
+        to_date: datetime | None = None
+    ) -> list[dict[str, object]]:
+        service_from = (from_date.date() - timedelta(days=1)).strftime("%Y%m%d") if from_date else "00000000"
+        service_to = to_date.date().strftime("%Y%m%d") if to_date else "99999999"
         with self.lock:
             cursor = self._connection().execute(
                 """
@@ -115,11 +123,11 @@ class Database:
                 JOIN active_services a ON a.service_id=t.service_id
                 LEFT JOIN routes r ON r.route_id=t.route_id
                 LEFT JOIN raw_stops AS destination_stops ON destination_stops.stop_id=t.terminal_stop_id
-                WHERE rs.canonical_stop_id=?
+                WHERE rs.canonical_stop_id=? AND a.service_date BETWEEN ? AND ?
                 ORDER BY a.service_date,s.departure_seconds,t.trip_id,s.stop_sequence
                 LIMIT ?
                 """,
-                (stop_id, limit)
+                (stop_id, service_from, service_to, limit)
             )
             try:
                 rows = cursor.fetchall()
@@ -194,7 +202,7 @@ class Handler(BaseHTTPRequestHandler):
                 limit = bounded_limit(query.get("limit", [None])[0])
                 from_date = parse_iso_boundary(query.get("from", [None])[0])
                 to_date = parse_iso_boundary(query.get("to", [None])[0])
-                departures = self.database.board(stop, 100 if from_date or to_date else limit)
+                departures = self.database.board(stop, 1000 if from_date or to_date else limit, from_date, to_date)
                 if from_date or to_date:
                     departures = [
                         item for item in departures
