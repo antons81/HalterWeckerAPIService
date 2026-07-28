@@ -16,13 +16,21 @@ cd "$REPO"
 rm -rf "$STAGING" "$ROLLBACK"
 mkdir -p "$STAGING"
 
-if ! python3 "$REPO/scripts/build_stop_packages.py" \
+if [ "${FORCE_PRESERVE_NL:-0}" = "1" ]; then
+  BUILD_WITHOUT_NL=1
+elif ! python3 "$REPO/scripts/build_stop_packages.py" \
   --gtfs-url "$GTFS_URL" \
   --swiss-gtfs-url "$SWISS_GTFS_URL" \
   --nl-gtfs-url "$NL_GTFS_URL" \
   --output "$BUILD_DIR"; then
+  BUILD_WITHOUT_NL=1
+else
+  BUILD_WITHOUT_NL=0
+fi
+
+if [ "$BUILD_WITHOUT_NL" = "1" ]; then
   test -d "$CURRENT"
-  echo "Dutch GTFS build failed; preserving the last published Dutch assets."
+  echo "Preserving the last published Dutch assets."
   rm -rf "$BUILD_DIR"
   python3 "$REPO/scripts/build_stop_packages.py" \
     --gtfs-url "$GTFS_URL" \
