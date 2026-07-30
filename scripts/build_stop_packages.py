@@ -51,6 +51,13 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "oebb",
     "netherlands",
 }
+SUPPORTED_TRANSIT_RADAR_FEATURES = {
+    "liveVehicles",
+    "realtimeDepartures",
+    "firstDepartures",
+    "stopLookup",
+    "realtimeDelay",
+}
 STATIC_TRANSIT_RADAR_PROVIDERS = {
     "rheinbahn-duesseldorf": {
         "cityID": "dusseldorf",
@@ -595,6 +602,15 @@ def validate_transit_radar_provider(
         return
     if adapter not in SUPPORTED_TRANSIT_RADAR_ADAPTERS:
         raise ValueError(f"Invalid transit radar adapter for {city_id}")
+    explicit_features = configuration.get("features")
+    if explicit_features is not None:
+        if (
+            not isinstance(explicit_features, list)
+            or not all(isinstance(feature, str) for feature in explicit_features)
+            or len(explicit_features) != len(set(explicit_features))
+            or not set(explicit_features).issubset(SUPPORTED_TRANSIT_RADAR_FEATURES)
+        ):
+            raise ValueError(f"Invalid transit radar features for {city_id}")
     if not isinstance(is_enabled, bool):
         raise ValueError(f"Invalid transit radar availability for {city_id}")
 
@@ -944,7 +960,12 @@ def transit_radar_manifest(
             else:
                 raise ValueError(f"Unsupported transit radar adapter for {city_id}")
 
-            if adapter is None:
+            explicit_features = provider_configuration.get("features")
+            if explicit_features is not None:
+                features = list(explicit_features)
+                supports_live_vehicles = "liveVehicles" in features
+                supports_departures = "realtimeDepartures" in features
+            elif adapter is None:
                 features = list(provider_configuration["features"])
                 supports_live_vehicles = "liveVehicles" in features
                 supports_departures = "realtimeDepartures" in features
