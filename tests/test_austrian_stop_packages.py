@@ -18,6 +18,8 @@ class AustrianStopPackageTests(unittest.TestCase):
         wien = next(city for city in manifest["cities"] if city["appCityID"] == "wien")
         self.assertEqual(wien["cityID"], "wien-at")
         self.assertEqual(wien["providers"][0]["providerID"], "oebb")
+        self.assertFalse(wien["providers"][0]["isExperimental"])
+        self.assertEqual(wien["providers"][0]["features"], ["realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"])
         self.assertNotIn("liveVehicles", wien["providers"][0]["features"])
 
     def test_austrian_gtfs_mode_writes_radius_package(self) -> None:

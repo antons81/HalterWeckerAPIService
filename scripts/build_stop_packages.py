@@ -1001,7 +1001,7 @@ def transit_radar_manifest(
             provider = {
                 "providerID": provider_id,
                 "isEnabled": is_enabled,
-                "isExperimental": True,
+                "isExperimental": bool(provider_configuration.get("isExperimental", True)),
                 "features": features,
                 "statusMessage": provider_configuration.get("statusMessage") or (
                     f'Live-Radar und Live-Abfahrten für {city["name"]}'
