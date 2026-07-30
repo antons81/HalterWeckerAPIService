@@ -12,6 +12,7 @@ from urllib.request import urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from import_static_departures_database import populate_german_city_memberships
 from static_departures_api import Database, Handler
 from swap_static_departures_database import activate_database
 
@@ -195,6 +196,45 @@ class StaticDeparturesDatabaseTests(unittest.TestCase):
                 database.close()
 
 
+class StaticDeparturesImportTests(unittest.TestCase):
+    def test_known_package_stop_is_registered_without_matching_gtfs_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stop_data = root / "stop-data"
+            (stop_data / "stops").mkdir(parents=True)
+            (stop_data / "manifest.json").write_text(
+                json.dumps({
+                    "cities": [{
+                        "id": "ennepetal-05954008",
+                        "url": "stops/ennepetal-05954008.json"
+                    }]
+                }),
+                encoding="utf-8"
+            )
+            (stop_data / "stops" / "ennepetal-05954008.json").write_text(
+                json.dumps([{"id": "545562", "name": "Ennepetal, Seniorenheim"}]),
+                encoding="utf-8"
+            )
+            database = sqlite3.connect(root / "departures.sqlite")
+            try:
+                database.execute(
+                    "CREATE TABLE city_stops (city_id TEXT NOT NULL, stop_id TEXT NOT NULL, "
+                    "PRIMARY KEY (city_id, stop_id))"
+                )
+
+                city_ids = populate_german_city_memberships(database, stop_data, set())
+
+                self.assertEqual(city_ids, {"ennepetal-05954008"})
+                self.assertEqual(
+                    database.execute(
+                        "SELECT city_id, stop_id FROM city_stops"
+                    ).fetchall(),
+                    [("ennepetal-05954008", "545562")]
+                )
+            finally:
+                database.close()
+
+
 class StaticDeparturesEndpointTests(unittest.TestCase):
     def test_health_meta_lines_and_board(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -226,6 +266,28 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                 self.assertEqual(aliased["cityID"], "koln")
                 self.assertEqual(aliased["requestedCityID"], "koeln")
                 self.assertEqual(aliased["lines"][0]["line"], "7")
+
+    def test_known_stop_without_scheduled_departures_returns_empty_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "current.sqlite"
+            write_database(path, "endpoint")
+            database = sqlite3.connect(path)
+            try:
+                database.execute(
+                    "INSERT INTO city_stops VALUES ('ennepetal-05954008', '545562')"
+                )
+                database.commit()
+            finally:
+                database.close()
+
+            with StaticDeparturesHTTPServer(path) as server:
+                board = server.get(
+                    "/static-departures/board?cityID=ennepetal-05954008&stopID=545562"
+                )
+
+            self.assertEqual(board["cityID"], "ennepetal-05954008")
+            self.assertEqual(board["stopID"], "545562")
+            self.assertEqual(board["departures"], [])
 
     def test_parallel_reads_continue_during_symlink_swap(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

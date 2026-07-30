@@ -31,19 +31,6 @@ def configured_external_city_ids(cities_path: Path, swiss_cities_path: Path) -> 
     return excluded
 
 
-def available_canonical_stop_ids(connection: sqlite3.Connection) -> set[str]:
-    return {
-        str(row[0])
-        for row in connection.execute(
-            """
-            SELECT DISTINCT canonical_stop_id
-            FROM raw_stops
-            WHERE canonical_stop_id IS NOT NULL AND canonical_stop_id <> ''
-            """
-        )
-    }
-
-
 def populate_german_city_memberships(
     connection: sqlite3.Connection,
     stop_data: Path,
@@ -55,7 +42,6 @@ def populate_german_city_memberships(
     if not isinstance(cities, list):
         raise ValueError("Stop manifest must contain a cities array.")
 
-    available_stop_ids = available_canonical_stop_ids(connection)
     city_ids: set[str] = set()
     for city in cities:
         if not isinstance(city, dict) or not isinstance(city.get("id"), str):
@@ -75,11 +61,9 @@ def populate_german_city_memberships(
             {
                 str(stop["id"])
                 for stop in package
-                if isinstance(stop, dict) and stop.get("id") and str(stop["id"]) in available_stop_ids
+                if isinstance(stop, dict) and stop.get("id")
             }
         )
-        if not stop_ids:
-            continue
         connection.executemany(
             "INSERT OR IGNORE INTO city_stops(city_id, stop_id) VALUES (?, ?)",
             ((city_id, stop_id) for stop_id in stop_ids),
