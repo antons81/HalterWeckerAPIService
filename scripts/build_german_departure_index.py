@@ -168,7 +168,12 @@ def populate_stop_packages(connection: sqlite3.Connection, output: Path) -> set[
     return city_ids
 
 
-def populate_gtfs(connection: sqlite3.Connection, archive: zipfile.ZipFile) -> None:
+def populate_gtfs(
+    connection: sqlite3.Connection,
+    archive: zipfile.ZipFile,
+    *,
+    identifier_prefix: str = "",
+) -> None:
     required = {"stops.txt", "routes.txt", "trips.txt", "stop_times.txt"}
     missing = required - set(archive.namelist())
     if missing:
@@ -185,14 +190,14 @@ def populate_gtfs(connection: sqlite3.Connection, archive: zipfile.ZipFile) -> N
     connection.executemany(
         "INSERT INTO routes(route_id, short_name, long_name) VALUES (?, ?, ?)",
         (
-            (row["route_id"].strip(), row.get("route_short_name", "").strip(), row.get("route_long_name", "").strip())
+            (identifier_prefix + row["route_id"].strip(), row.get("route_short_name", "").strip(), row.get("route_long_name", "").strip())
             for row in gtfs_rows(archive, "routes.txt") if row.get("route_id", "").strip()
         ),
     )
     connection.executemany(
         "INSERT INTO trips(trip_id, service_id, route_id, headsign, direction_id) VALUES (?, ?, ?, ?, ?)",
         (
-            (row["trip_id"].strip(), row.get("service_id", "").strip(), row.get("route_id", "").strip(), row.get("trip_headsign", "").strip(), row.get("direction_id", "").strip())
+            (identifier_prefix + row["trip_id"].strip(), identifier_prefix + row.get("service_id", "").strip(), identifier_prefix + row.get("route_id", "").strip(), row.get("trip_headsign", "").strip(), row.get("direction_id", "").strip())
             for row in gtfs_rows(archive, "trips.txt")
             if row.get("trip_id", "").strip() and row.get("service_id", "").strip()
         ),
@@ -200,13 +205,13 @@ def populate_gtfs(connection: sqlite3.Connection, archive: zipfile.ZipFile) -> N
     if "calendar.txt" in archive.namelist():
         connection.executemany(
             "INSERT INTO calendar VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ((row["service_id"].strip(), row.get("start_date", "").strip(), row.get("end_date", "").strip(), int(row.get("monday", "0") or 0), int(row.get("tuesday", "0") or 0), int(row.get("wednesday", "0") or 0), int(row.get("thursday", "0") or 0), int(row.get("friday", "0") or 0), int(row.get("saturday", "0") or 0), int(row.get("sunday", "0") or 0))
+            ((identifier_prefix + row["service_id"].strip(), row.get("start_date", "").strip(), row.get("end_date", "").strip(), int(row.get("monday", "0") or 0), int(row.get("tuesday", "0") or 0), int(row.get("wednesday", "0") or 0), int(row.get("thursday", "0") or 0), int(row.get("friday", "0") or 0), int(row.get("saturday", "0") or 0), int(row.get("sunday", "0") or 0))
              for row in gtfs_rows(archive, "calendar.txt") if row.get("service_id", "").strip()),
         )
     if "calendar_dates.txt" in archive.namelist():
         connection.executemany(
             "INSERT INTO calendar_dates VALUES (?, ?, ?)",
-            ((row["service_id"].strip(), row.get("date", "").strip(), int(row.get("exception_type", "0") or 0))
+            ((identifier_prefix + row["service_id"].strip(), row.get("date", "").strip(), int(row.get("exception_type", "0") or 0))
              for row in gtfs_rows(archive, "calendar_dates.txt") if row.get("service_id", "").strip() and row.get("date", "").strip()),
         )
 
@@ -222,7 +227,7 @@ def populate_gtfs(connection: sqlite3.Connection, archive: zipfile.ZipFile) -> N
             sequence = int(row.get("stop_sequence", "0") or 0)
         except ValueError:
             sequence = 0
-        batch.append((trip_id, raw_stop_id, departure_time, departure_seconds, sequence))
+        batch.append((identifier_prefix + trip_id, raw_stop_id, departure_time, departure_seconds, sequence))
         if len(batch) == 20_000:
             connection.executemany("INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)", batch)
             batch.clear()

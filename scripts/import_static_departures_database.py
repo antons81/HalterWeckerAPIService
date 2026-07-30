@@ -16,25 +16,30 @@ from build_german_departure_index import (
     populate_active_services, populate_gtfs, resolve_canonical_stops, service_window,
     update_terminal_stops,
 )
-from build_stop_packages import (
-    load_cities, nl_city_ids,
-)
+from build_stop_packages import load_cities, nl_city_ids
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 def configured_external_city_ids(cities_path: Path, swiss_cities_path: Path) -> set[str]:
-    excluded = nl_city_ids(load_cities(cities_path))
+    cities = load_cities(cities_path)
+    excluded = nl_city_ids(cities)
+    excluded.update(
+        str(city["id"])
+        for city in cities
+        if city.get("packageMode") == "austrian"
+    )
     if swiss_cities_path.exists():
         excluded.update(str(city["id"]) for city in load_cities(swiss_cities_path))
     return excluded
 
 
-def populate_german_city_memberships(
+def populate_city_memberships(
     connection: sqlite3.Connection,
     stop_data: Path,
-    excluded_city_ids: set[str]
+    included_city_ids: set[str] | None = None,
+    excluded_city_ids: set[str] | None = None,
 ) -> set[str]:
     manifest_path = stop_data / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -47,10 +52,12 @@ def populate_german_city_memberships(
         if not isinstance(city, dict) or not isinstance(city.get("id"), str):
             raise ValueError("Stop manifest contains an invalid city entry.")
         city_id = city["id"]
-        if city_id in excluded_city_ids:
+        if included_city_ids is not None and city_id not in included_city_ids:
+            continue
+        if excluded_city_ids and city_id in excluded_city_ids:
             continue
         if city_id in city_ids:
-            raise ValueError(f"Conflicting canonical German city ID in stop manifest: {city_id}")
+            raise ValueError(f"Conflicting canonical city ID in stop manifest: {city_id}")
         package_path = stop_data / str(city.get("url", ""))
         if not package_path.is_file():
             raise ValueError(f"Missing stop package for {city_id}: {package_path}")
@@ -71,6 +78,27 @@ def populate_german_city_memberships(
         city_ids.add(city_id)
     connection.commit()
     return city_ids
+
+
+def populate_german_city_memberships(
+    connection: sqlite3.Connection,
+    stop_data: Path,
+    excluded_city_ids: set[str]
+) -> set[str]:
+    return populate_city_memberships(
+        connection,
+        stop_data,
+        excluded_city_ids=excluded_city_ids,
+    )
+
+
+def configured_austrian_static_city_ids(cities_path: Path) -> set[str]:
+    return {
+        str(city["id"])
+        for city in load_cities(cities_path)
+        if city.get("packageMode") == "austrian"
+        and city.get("staticDepartures") is True
+    }
 
 
 def validate(connection: sqlite3.Connection) -> None:
@@ -104,6 +132,7 @@ def populate_city_aliases(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--gtfs-url", required=True)
+    parser.add_argument("--austrian-gtfs", default="")
     parser.add_argument("--stop-data", required=True, help="Read-only current stop dataset")
     parser.add_argument("--next", required=True)
     parser.add_argument("--days", type=int, default=15)
@@ -119,12 +148,24 @@ def main() -> None:
         connection = connect(next_path)
         try:
             populate_gtfs(connection, archive)
+            austrian_city_ids = configured_austrian_static_city_ids(Path(args.cities))
+            if args.austrian_gtfs:
+                with load_gtfs_archive(args.austrian_gtfs) as austrian_archive:
+                    populate_gtfs(connection, austrian_archive, identifier_prefix="vor:")
             resolve_canonical_stops(connection)
             city_ids = populate_german_city_memberships(
                 connection,
                 Path(args.stop_data),
                 configured_external_city_ids(Path(args.cities), Path(args.swiss_cities))
             )
+            if austrian_city_ids:
+                if not args.austrian_gtfs:
+                    raise ValueError("Austrian static departure cities require --austrian-gtfs.")
+                city_ids.update(populate_city_memberships(
+                    connection,
+                    Path(args.stop_data),
+                    included_city_ids=austrian_city_ids,
+                ))
             populate_active_services(connection, dates)
             update_terminal_stops(connection)
             connection.executescript("""
@@ -135,7 +176,16 @@ def main() -> None:
                 CREATE INDEX raw_stops_by_canonical ON raw_stops(canonical_stop_id, stop_id);
                 CREATE INDEX stop_times_by_stop ON stop_times(raw_stop_id, trip_id, departure_seconds);
                 CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
+                CREATE TABLE city_departure_modes (
+                    city_id TEXT PRIMARY KEY,
+                    mode TEXT NOT NULL,
+                    timezone TEXT NOT NULL
+                ) WITHOUT ROWID;
             """)
+            connection.executemany(
+                "INSERT INTO city_departure_modes(city_id, mode, timezone) VALUES (?, 'exact-stop-with-parent-fallback', 'Europe/Vienna')",
+                ((city_id,) for city_id in sorted(austrian_city_ids)),
+            )
             populate_city_aliases(connection, load_city_aliases(Path(args.city_id_aliases)), city_ids)
             version = str(uuid.uuid4())
             connection.executemany("INSERT INTO metadata VALUES (?, ?)", (

@@ -1502,6 +1502,44 @@ def build_austrian_stop_packages(
     return manifest
 
 
+def merge_manifest_entries(
+    manifest: list[dict[str, object]],
+    entries: list[dict[str, object]],
+    *,
+    source: str,
+    sources_by_city_id: dict[str, str],
+) -> None:
+    """Merge a source branch while preserving one canonical package per city ID."""
+    for entry in entries:
+        city_id = str(entry.get("id", ""))
+        if not city_id:
+            raise ValueError(f"Manifest entry from {source} has no city ID.")
+        previous_source = sources_by_city_id.get(city_id)
+        if previous_source is not None:
+            raise ValueError(
+                f"Duplicate canonical city ID {city_id!r}: "
+                f"{previous_source} and {source}."
+            )
+        manifest.append(entry)
+        sources_by_city_id[city_id] = source
+
+
+def validate_manifest_city_ids(
+    manifest: list[dict[str, object]],
+    sources_by_city_id: dict[str, str],
+) -> None:
+    seen: dict[str, str] = {}
+    for entry in manifest:
+        city_id = str(entry.get("id", ""))
+        source = sources_by_city_id.get(city_id, "an untracked manifest branch")
+        if city_id in seen:
+            raise ValueError(
+                f"Duplicate canonical city ID {city_id!r}: "
+                f"{seen[city_id]} and {source}."
+            )
+        seen[city_id] = source
+
+
 def nl_city_ids(cities: list[dict[str, object]]) -> set[str]:
     ids: set[str] = set()
     for city in cities:
@@ -1903,28 +1941,51 @@ def main() -> None:
     stops = canonicalize(stop_rows)
     municipalities = load_municipalities(args.municipalities_url)
     output = Path(args.output)
+    german_cities = [
+        city for city in cities
+        if city.get("packageMode", "german") == "german"
+    ]
     manifest, skipped_stop_count, package_stops_by_city_id = build_stop_packages(
         stops,
-        cities,
+        german_cities,
         municipalities,
         output
     )
+    manifest_sources = {
+        str(entry["id"]): "German GTFS branch (config/cities.json)"
+        for entry in manifest
+    }
     if args.swiss_gtfs_url.strip():
         swiss_cities = load_cities(Path(args.swiss_cities))
-        manifest.extend(build_swiss_stop_packages(
-            load_gtfs_archive(args.swiss_gtfs_url), swiss_cities, output
-        ))
+        merge_manifest_entries(
+            manifest,
+            build_swiss_stop_packages(
+                load_gtfs_archive(args.swiss_gtfs_url), swiss_cities, output
+            ),
+            source="Swiss GTFS branch (config/swiss-cities.json)",
+            sources_by_city_id=manifest_sources,
+        )
         manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
     if args.austrian_gtfs_url.strip():
-        manifest.extend(build_austrian_stop_packages(
-            load_gtfs_archive(args.austrian_gtfs_url), cities, output
-        ))
+        merge_manifest_entries(
+            manifest,
+            build_austrian_stop_packages(
+                load_gtfs_archive(args.austrian_gtfs_url), cities, output
+            ),
+            source="Austrian GTFS branch (config/cities.json)",
+            sources_by_city_id=manifest_sources,
+        )
         manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
     nl_archive: zipfile.ZipFile | None = None
     if args.nl_gtfs_url.strip():
         nl_cities = load_cities(Path(args.nl_cities))
         nl_archive = load_gtfs_archive(args.nl_gtfs_url)
-        manifest.extend(build_nl_stop_packages(nl_archive, nl_cities, output))
+        merge_manifest_entries(
+            manifest,
+            build_nl_stop_packages(nl_archive, nl_cities, output),
+            source="Netherlands GTFS branch (config/cities.json)",
+            sources_by_city_id=manifest_sources,
+        )
         build_nl_route_index(nl_archive, nl_cities, output)
         build_nl_departure_index(nl_archive, nl_cities, output)
         manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
@@ -1936,6 +1997,7 @@ def main() -> None:
         municipalities=municipalities,
         gateway_url=args.rnv_gateway_url.strip()
     )
+    validate_manifest_city_ids(manifest, manifest_sources)
     included_city_ids = radar_city_ids(manifest, cities)
     included_city_ids.update(rnv_city_ids)
     included_stop_ids = {

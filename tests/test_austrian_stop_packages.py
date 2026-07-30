@@ -8,19 +8,45 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from build_stop_packages import build_austrian_stop_packages, load_cities, transit_radar_manifest
+from build_stop_packages import (
+    build_austrian_stop_packages,
+    load_cities,
+    merge_manifest_entries,
+    transit_radar_manifest,
+)
 
 
 class AustrianStopPackageTests(unittest.TestCase):
-    def test_oebb_manifest_has_departures_without_live_vehicle_radar(self) -> None:
+    def test_wien_static_departures_are_not_advertised_as_oebb_realtime(self) -> None:
         cities = load_cities(Path(__file__).resolve().parents[1] / "config" / "cities.json")
         manifest = transit_radar_manifest(cities, skip_auto_radar_stops=True)
-        wien = next(city for city in manifest["cities"] if city["appCityID"] == "wien")
-        self.assertEqual(wien["cityID"], "wien-at")
-        self.assertEqual(wien["providers"][0]["providerID"], "oebb")
-        self.assertFalse(wien["providers"][0]["isExperimental"])
-        self.assertEqual(wien["providers"][0]["features"], ["realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"])
-        self.assertNotIn("liveVehicles", wien["providers"][0]["features"])
+        self.assertNotIn("wien", [city["appCityID"] for city in manifest["cities"]])
+        wien = next(city for city in cities if city["id"] == "wien")
+        self.assertTrue(wien["staticDepartures"])
+        self.assertNotIn("transitRadar", wien)
+        st_poelten = next(city for city in cities if city["id"] == "st-poelten")
+        self.assertEqual(st_poelten["transitRadar"]["adapter"], "oebb")
+        self.assertTrue(st_poelten["transitRadar"]["supportsRealtimeDelay"])
+
+    def test_manifest_merge_rejects_duplicate_city_id_with_sources(self) -> None:
+        manifest: list[dict[str, object]] = []
+        sources: dict[str, str] = {}
+        merge_manifest_entries(
+            manifest,
+            [{"id": "wien"}],
+            source="German GTFS branch (config/cities.json)",
+            sources_by_city_id=sources,
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "wien.*German GTFS branch.*Austrian GTFS branch",
+        ):
+            merge_manifest_entries(
+                manifest,
+                [{"id": "wien"}],
+                source="Austrian GTFS branch (config/cities.json)",
+                sources_by_city_id=sources,
+            )
 
     def test_austrian_gtfs_mode_writes_radius_package(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

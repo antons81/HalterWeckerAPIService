@@ -67,6 +67,21 @@ class Database:
             finally:
                 cursor.close()
 
+    def city_departure_mode(self, city_id: str) -> tuple[str, str]:
+        with self.lock:
+            try:
+                cursor = self._connection().execute(
+                    "SELECT mode, timezone FROM city_departure_modes WHERE city_id=?",
+                    (city_id,)
+                )
+            except sqlite3.OperationalError:
+                return "canonical", DEFAULT_TIMEZONE
+            try:
+                row = cursor.fetchone()
+            finally:
+                cursor.close()
+        return (str(row[0]), str(row[1])) if row else ("canonical", DEFAULT_TIMEZONE)
+
     def resolve_city(self, city_id: str) -> str:
         with self.lock:
             cursor = self._connection().execute(
@@ -79,10 +94,35 @@ class Database:
                 cursor.close()
             return str(row[0]) if row else city_id
 
-    def lines(self, stop_id: str) -> list[dict[str, str | None]]:
+    def _query_stop_id(self, city_id: str, stop_id: str) -> str:
+        mode, _ = self.city_departure_mode(city_id)
+        if mode != "exact-stop-with-parent-fallback":
+            return stop_id
         with self.lock:
             cursor = self._connection().execute(
-                """
+                "SELECT 1 FROM stop_times WHERE raw_stop_id=? LIMIT 1", (stop_id,)
+            )
+            try:
+                if cursor.fetchone() is not None:
+                    return stop_id
+            finally:
+                cursor.close()
+            cursor = self._connection().execute(
+                "SELECT parent_station FROM raw_stops WHERE stop_id=?", (stop_id,)
+            )
+            try:
+                row = cursor.fetchone()
+            finally:
+                cursor.close()
+        return str(row[0]) if row and row[0] else stop_id
+
+    def lines(self, city_id: str, stop_id: str) -> list[dict[str, str | None]]:
+        mode, _ = self.city_departure_mode(city_id)
+        query_stop_id = self._query_stop_id(city_id, stop_id)
+        stop_predicate = "s.raw_stop_id=?" if mode == "exact-stop-with-parent-fallback" else "rs.canonical_stop_id=?"
+        with self.lock:
+            cursor = self._connection().execute(
+                f"""
                 SELECT DISTINCT t.route_id,
                        COALESCE(NULLIF(r.short_name,''),NULLIF(r.long_name,''),t.route_id),
                        t.direction_id
@@ -90,10 +130,10 @@ class Database:
                 JOIN raw_stops rs ON rs.stop_id=s.raw_stop_id
                 JOIN trips t ON t.trip_id=s.trip_id
                 LEFT JOIN routes r ON r.route_id=t.route_id
-                WHERE rs.canonical_stop_id=?
+                WHERE {stop_predicate}
                 ORDER BY 2,1
                 """,
-                (stop_id,)
+                (query_stop_id,)
             )
             try:
                 rows = cursor.fetchall()
@@ -103,6 +143,7 @@ class Database:
 
     def board(
         self,
+        city_id: str,
         stop_id: str,
         limit: int,
         from_date: datetime | None = None,
@@ -110,9 +151,12 @@ class Database:
     ) -> list[dict[str, object]]:
         service_from = (from_date.date() - timedelta(days=1)).strftime("%Y%m%d") if from_date else "00000000"
         service_to = to_date.date().strftime("%Y%m%d") if to_date else "99999999"
+        mode, _ = self.city_departure_mode(city_id)
+        query_stop_id = self._query_stop_id(city_id, stop_id)
+        stop_predicate = "s.raw_stop_id=?" if mode == "exact-stop-with-parent-fallback" else "rs.canonical_stop_id=?"
         with self.lock:
             cursor = self._connection().execute(
-                """
+                f"""
                 SELECT a.service_date,s.departure_time,s.departure_seconds,t.trip_id,t.route_id,
                        COALESCE(NULLIF(r.short_name,''),NULLIF(r.long_name,''),t.route_id),
                        COALESCE(NULLIF(t.headsign,''),NULLIF(destination_stops.stop_name,''),'Unbekanntes Ziel'),
@@ -123,11 +167,11 @@ class Database:
                 JOIN active_services a ON a.service_id=t.service_id
                 LEFT JOIN routes r ON r.route_id=t.route_id
                 LEFT JOIN raw_stops AS destination_stops ON destination_stops.stop_id=t.terminal_stop_id
-                WHERE rs.canonical_stop_id=? AND a.service_date BETWEEN ? AND ?
+                WHERE {stop_predicate} AND a.service_date BETWEEN ? AND ?
                 ORDER BY a.service_date,s.departure_seconds,t.trip_id,s.stop_sequence
                 LIMIT ?
                 """,
-                (stop_id, service_from, service_to, limit)
+                (query_stop_id, service_from, service_to, limit)
             )
             try:
                 rows = cursor.fetchall()
@@ -149,18 +193,18 @@ class Database:
         ]
 
 
-def parse_iso_boundary(value: str | None) -> datetime | None:
+def parse_iso_boundary(value: str | None, timezone_name: str = DEFAULT_TIMEZONE) -> datetime | None:
     if not value:
         return None
     normalized = value.replace("Z", "+00:00")
     parsed = datetime.fromisoformat(normalized)
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
-    return parsed.astimezone(ZoneInfo(DEFAULT_TIMEZONE))
+        parsed = parsed.replace(tzinfo=ZoneInfo(timezone_name))
+    return parsed.astimezone(ZoneInfo(timezone_name))
 
 
-def departure_datetime(item: dict[str, object]) -> datetime:
-    service_date = datetime.fromisoformat(str(item["serviceDate"])).replace(tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+def departure_datetime(item: dict[str, object], timezone_name: str = DEFAULT_TIMEZONE) -> datetime:
+    service_date = datetime.fromisoformat(str(item["serviceDate"])).replace(tzinfo=ZoneInfo(timezone_name))
     hour, minute, second = (int(part) for part in str(item["scheduledTime"]).split(":"))
     return service_date + timedelta(hours=hour, minutes=minute, seconds=second)
 
@@ -194,20 +238,21 @@ class Handler(BaseHTTPRequestHandler):
             if not self.database.city_has_stop(resolved_city, stop):
                 return self.send_json(HTTPStatus.NOT_FOUND, {"error": "unknown cityID/stopID"})
             if parsed.path == "/static-departures/lines":
-                payload = {"cityID": resolved_city, "stopID": stop, "lines": self.database.lines(stop)}
+                payload = {"cityID": resolved_city, "stopID": stop, "lines": self.database.lines(resolved_city, stop)}
                 if resolved_city != city:
                     payload["requestedCityID"] = city
                 return self.send_json(HTTPStatus.OK, payload)
             if parsed.path == "/static-departures/board":
                 limit = bounded_limit(query.get("limit", [None])[0])
-                from_date = parse_iso_boundary(query.get("from", [None])[0])
-                to_date = parse_iso_boundary(query.get("to", [None])[0])
-                departures = self.database.board(stop, 1000 if from_date or to_date else limit, from_date, to_date)
+                _, timezone_name = self.database.city_departure_mode(resolved_city)
+                from_date = parse_iso_boundary(query.get("from", [None])[0], timezone_name)
+                to_date = parse_iso_boundary(query.get("to", [None])[0], timezone_name)
+                departures = self.database.board(resolved_city, stop, 1000 if from_date or to_date else limit, from_date, to_date)
                 if from_date or to_date:
                     departures = [
                         item for item in departures
-                        if (from_date is None or departure_datetime(item) >= from_date)
-                        and (to_date is None or departure_datetime(item) <= to_date)
+                        if (from_date is None or departure_datetime(item, timezone_name) >= from_date)
+                        and (to_date is None or departure_datetime(item, timezone_name) <= to_date)
                     ][:limit]
                 payload = {"cityID": resolved_city, "stopID": stop, "departures": departures}
                 if resolved_city != city:
