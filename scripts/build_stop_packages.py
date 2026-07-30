@@ -48,6 +48,7 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "vrs",
     "rmvHafas",
     "avvHafas",
+    "oebb",
     "netherlands",
 }
 STATIC_TRANSIT_RADAR_PROVIDERS = {
@@ -531,7 +532,7 @@ def load_cities(path: Path) -> list[dict[str, object]]:
             raise ValueError(f"Invalid longitude for {city_id}")
         if not isinstance(radius, (int, float)) or radius <= 0:
             raise ValueError(f"Invalid radius for {city_id}")
-        if package_mode not in {"german", "swiss"}:
+        if package_mode not in {"german", "swiss", "austrian"}:
             raise ValueError(f"Invalid package mode for {city_id}: {package_mode!r}")
         if transit_radar is not None:
             validate_transit_radar(city_id, latitude, longitude, transit_radar)
@@ -629,6 +630,11 @@ def validate_transit_radar_provider(
     if adapter == "avvHafas":
         if region is not None:
             raise ValueError(f"AVV HAFAS does not use a radar region for {city_id}")
+        return
+
+    if adapter == "oebb":
+        if region is not None:
+            raise ValueError(f"ÖBB does not use a radar region for {city_id}")
         return
 
     if adapter == "netherlands":
@@ -929,6 +935,8 @@ def transit_radar_manifest(
                 provider_id = "rmv-hafas"
             elif adapter == "avvHafas":
                 provider_id = "avv-hafas"
+            elif adapter == "oebb":
+                provider_id = "oebb"
             elif adapter == "netherlands":
                 provider_id = f"netherlands-{city_id}"
             elif adapter == "bwTrias":
@@ -944,13 +952,13 @@ def transit_radar_manifest(
                 supports_departures = bool(
                     provider_configuration.get(
                         "supportsDepartures",
-                        adapter in {"bwTrias", "vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "avvHafas", "netherlands"}
+                        adapter in {"bwTrias", "vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "avvHafas", "oebb", "netherlands"}
                     )
                 )
                 supports_live_vehicles = bool(
                     provider_configuration.get(
                         "supportsLiveVehicles",
-                        adapter not in {"bwTrias", "vrrEFA", "vrs", "rmvHafas"}
+                        adapter not in {"bwTrias", "vrrEFA", "vrs", "rmvHafas", "avvHafas", "oebb"}
                     )
                 )
                 supports_realtime_delay = bool(
@@ -1006,10 +1014,11 @@ def transit_radar_manifest(
                 provider["gatewayURL"] = gateway_url
             providers.append(provider)
 
+        country_suffix = "nl" if any(p.get("adapter") == "netherlands" for p in providers) else (
+            "at" if any(p.get("adapter") == "oebb" for p in providers) else "de"
+        )
         radar_cities.append({
-            "cityID": f"{city_id}-nl" if any(
-                p.get("adapter") == "netherlands" for p in providers
-            ) else f"{city_id}-de",
+            "cityID": f"{city_id}-{country_suffix}",
             "appCityID": city_id,
             "name": city["name"],
             "center": {
@@ -1444,6 +1453,34 @@ def build_swiss_stop_packages(
     return manifest
 
 
+def build_austrian_stop_packages(
+    archive: zipfile.ZipFile, cities: list[dict[str, object]], output: Path
+) -> list[dict[str, object]]:
+    """Build configured Austrian radius packages from official GTFS Schedule stops."""
+    austria_cities = [city for city in cities if city.get("packageMode") == "austrian"]
+    stops_by_city_id = {str(city["id"]): [] for city in austria_cities}
+    for stop in swiss_stops(iter_table(archive, "stops.txt")):
+        for city in austria_cities:
+            if distance_meters(
+                float(stop["latitude"]), float(stop["longitude"]),
+                float(city["latitude"]), float(city["longitude"])
+            ) <= float(city["radiusMeters"]):
+                stops_by_city_id[str(city["id"])].append(stop)
+
+    packages_directory = output / "stops"
+    packages_directory.mkdir(parents=True, exist_ok=True)
+    manifest = []
+    for city in austria_cities:
+        city_stops = stops_by_city_id[str(city["id"])]
+        if not city_stops:
+            raise ValueError(f'No Austrian GTFS stops found for configured city {city["id"]}.')
+        filename = write_stop_package(packages_directory, str(city["id"]), city_stops)
+        manifest.append({"id": city["id"], "name": city["name"],
+                         "aliases": city.get("aliases", []), "stopCount": len(city_stops),
+                         "url": f"stops/{filename}"})
+    return manifest
+
+
 def nl_city_ids(cities: list[dict[str, object]]) -> set[str]:
     ids: set[str] = set()
     for city in cities:
@@ -1833,6 +1870,7 @@ def main() -> None:
     parser.add_argument("--municipalities-url", default=BKG_MUNICIPALITIES_URL)
     parser.add_argument("--output", default="docs/data")
     parser.add_argument("--swiss-gtfs-url", default="")
+    parser.add_argument("--austrian-gtfs-url", default="")
     parser.add_argument("--swiss-cities", default="config/swiss-cities.json")
     parser.add_argument("--nl-gtfs-url", default="")
     parser.add_argument("--nl-cities", default="config/cities.json")
@@ -1854,6 +1892,11 @@ def main() -> None:
         swiss_cities = load_cities(Path(args.swiss_cities))
         manifest.extend(build_swiss_stop_packages(
             load_gtfs_archive(args.swiss_gtfs_url), swiss_cities, output
+        ))
+        manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
+    if args.austrian_gtfs_url.strip():
+        manifest.extend(build_austrian_stop_packages(
+            load_gtfs_archive(args.austrian_gtfs_url), cities, output
         ))
         manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
     nl_archive: zipfile.ZipFile | None = None

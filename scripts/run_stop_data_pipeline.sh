@@ -87,6 +87,7 @@ if [ "${FORCE_PRESERVE_NL:-0}" = "1" ]; then
 elif ! python3 "$REPO/scripts/build_stop_packages.py" \
   --gtfs-url "$GTFS_URL" \
   --swiss-gtfs-url "$SWISS_GTFS_URL" \
+  --austrian-gtfs-url "${AUSTRIAN_GTFS_URL:-}" \
   --nl-gtfs-url "$NL_GTFS_URL" \
   --output "$BUILD_DIR"; then
   BUILD_WITHOUT_NL=1
@@ -101,6 +102,7 @@ if [ "$BUILD_WITHOUT_NL" = "1" ]; then
   python3 "$REPO/scripts/build_stop_packages.py" \
     --gtfs-url "$GTFS_URL" \
     --swiss-gtfs-url "$SWISS_GTFS_URL" \
+    --austrian-gtfs-url "${AUSTRIAN_GTFS_URL:-}" \
     --output "$BUILD_DIR"
   python3 "$REPO/scripts/preserve_nl_assets.py" \
     --current "$CURRENT" \

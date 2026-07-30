@@ -36,6 +36,10 @@ The expected service state is `Result=success` and `ExecMainStatus=0`; the healt
 
 The pipeline downloads the official BKG VG250 municipality boundaries and assigns every German stop to its municipality. Only municipalities containing at least one stop are published. Stable automatic city IDs contain the municipality's official AGS code. Cities in `config/cities.json` keep their existing IDs, aliases, larger configured radii, and Transit Radar configuration.
 
+## Austria / ÖBB static stops
+
+Austria uses `packageMode: "austrian"` and an independent radius-package builder, so the German BKG municipality logic is unchanged. Set the `AUSTRIAN_GTFS_URL` repository variable to an authorised current GTFS Schedule download from [Mobilitätsdaten Österreich](https://mobilitaetsdaten.gv.at/daten/soll-fahrplandaten-gtfs). The configured Austrian cities then receive stop packages from the official feed on the next stop-data build. The schedule feed is static; it must not be used to manufacture live vehicle positions.
+
 City line catalogs are derived from the GTFS relationship `stop_times → trips → routes`. They contain only routes serving at least one stop inside the selected municipality. The iOS app uses these optional catalogs to scope regional realtime vehicle feeds to the selected city and falls back to the unfiltered live feed when no valid catalog is available.
 
 ## rnv regional Live Radar
