@@ -19,6 +19,21 @@ The workflow runs every day and publishes:
 
 Each stop has `id`, `name`, `latitude`, `longitude`, and `searchName` fields. The iOS app validates downloaded JSON and later imports it into its local SQLite FTS index.
 
+## Static departures synchronization
+
+`scripts/run_stop_data_pipeline.sh` publishes `/srv/haltewecker/data/current` atomically. Only after that replacement succeeds, it starts and waits for `haltewecker-static-departures.service`. The stop-data pipeline succeeds only when systemd reports both `Result=success` and `ExecMainStatus=0`; otherwise the stop release remains published but the pipeline exits non-zero and logs that static departures are not synchronized.
+
+The static-departures service remains the only SQLite rebuild path and keeps its `flock` serialization. The nightly `haltewecker-static-departures.timer` at 01:30 remains enabled as a fallback/recovery run. The stop-data pipeline also takes `/run/lock/haltewecker-stop-data.lock`, so overlapping publications cannot request competing rebuilds.
+
+The `deploy` user needs non-interactive permission for `systemctl start` and `systemctl show` on `haltewecker-static-departures.service`. Verify a completed synchronization with:
+
+```bash
+systemctl show haltewecker-static-departures.service -p Result -p ExecMainStatus
+curl -sS https://api.asoftlabs.app/static-departures/health
+```
+
+The expected service state is `Result=success` and `ExecMainStatus=0`; the health response exposes the active database version and generation time.
+
 The pipeline downloads the official BKG VG250 municipality boundaries and assigns every German stop to its municipality. Only municipalities containing at least one stop are published. Stable automatic city IDs contain the municipality's official AGS code. Cities in `config/cities.json` keep their existing IDs, aliases, larger configured radii, and Transit Radar configuration.
 
 City line catalogs are derived from the GTFS relationship `stop_times → trips → routes`. They contain only routes serving at least one stop inside the selected municipality. The iOS app uses these optional catalogs to scope regional realtime vehicle feeds to the selected city and falls back to the unfiltered live feed when no valid catalog is available.

@@ -1,6 +1,6 @@
 [Unit]
 Description=Build HalteWecker static departures SQLite database
-After=docker.service haltewecker-stop-data.service
+After=docker.service
 Requires=docker.service
 
 [Service]
