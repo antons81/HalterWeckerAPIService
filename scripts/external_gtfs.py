@@ -90,6 +90,10 @@ def validate_external_gtfs_source(
     if known_prefixes is not None and prefix in known_prefixes:
         raise ValueError(f"Duplicate external GTFS identifierPrefix: {prefix}")
 
+    country = source.get("country")
+    if not isinstance(country, str) or not country.strip():
+        raise ValueError(f"External GTFS source {source_id} is missing country.")
+
     stop_id_mode = source.get("stopIDMode", "exact")
     if stop_id_mode != "exact":
         raise ValueError(
@@ -260,6 +264,82 @@ def _stop_resolution_map(
     return resolve
 
 
+DUPLICATE_STOP_DISTANCE_METERS = 150.0
+
+
+def _load_served_platform_ids(archive: zipfile.ZipFile) -> set[str]:
+    """Stop ids that receive at least one stop_time in the timetable."""
+    served: set[str] = set()
+    for row in iter_table(archive, "stop_times.txt"):
+        stop_id = str(row.get("stop_id", "") or "").strip()
+        if stop_id:
+            served.add(stop_id)
+    return served
+
+
+def _consolidate_duplicate_stops(
+    public_stops: list[dict[str, object]],
+    served_platform_ids: set[str],
+    children_of: dict[str, list[str]],
+) -> list[dict[str, object]]:
+    """Drop unserved stops that share a name and near-identical coordinates
+    with a served twin, keeping only the served stop."""
+    if not public_stops:
+        return public_stops
+
+    served_by_id: dict[str, bool] = {}
+    for stop in public_stops:
+        stop_id = str(stop["id"])
+        served_by_id[stop_id] = stop_id in served_platform_ids or any(
+            child_id in served_platform_ids
+            for child_id in children_of.get(stop_id, ())
+        )
+
+    bins: dict[tuple[object, float, float], list[dict[str, object]]] = {}
+    for stop in public_stops:
+        key = (
+            stop["searchName"],
+            round(float(stop["latitude"]), 2),
+            round(float(stop["longitude"]), 2),
+        )
+        bins.setdefault(key, []).append(stop)
+
+    removed_ids: set[str] = set()
+    for group in bins.values():
+        served = [stop for stop in group if served_by_id[str(stop["id"])]]
+        unserved = [stop for stop in group if not served_by_id[str(stop["id"])]]
+        if not served or not unserved:
+            continue
+        for dead in unserved:
+            if any(
+                distance_meters(
+                    float(dead["latitude"]),
+                    float(dead["longitude"]),
+                    float(alive["latitude"]),
+                    float(alive["longitude"]),
+                ) <= DUPLICATE_STOP_DISTANCE_METERS
+                for alive in served
+            ):
+                removed_ids.add(str(dead["id"]))
+
+    if not removed_ids:
+        return public_stops
+    return [stop for stop in public_stops if str(stop["id"]) not in removed_ids]
+
+
+def _duplicate_bin_count(public_stops: list[dict[str, object]]) -> int:
+    """Largest number of public stops sharing a name and coarse location."""
+    bins: dict[tuple[object, float, float], int] = {}
+    for stop in public_stops:
+        key = (
+            stop["searchName"],
+            round(float(stop["latitude"]), 2),
+            round(float(stop["longitude"]), 2),
+        )
+        bins[key] = bins.get(key, 0) + 1
+    return max(bins.values(), default=0)
+
+
 def build_external_stop_packages(
     archive: zipfile.ZipFile,
     cities: list[dict[str, object]],
@@ -309,6 +389,9 @@ def build_external_stop_packages(
     packages_directory.mkdir(parents=True, exist_ok=True)
     manifest: list[dict[str, object]] = []
     package_stops: dict[str, list[dict[str, object]]] = {}
+    city_public: dict[str, list[dict[str, object]]] = {}
+    city_children: dict[str, dict[str, list[str]]] = {}
+    served_platform_ids: set[str] = _load_served_platform_ids(archive)
     for city in cities:
         city_id = str(city["id"])
         raw_stops = raw_by_city_id[city_id]
@@ -319,6 +402,12 @@ def build_external_stop_packages(
             for stop in raw_stops
             if stop["location_type"] == 1
         }
+        children: dict[str, list[str]] = {}
+        for stop in raw_stops:
+            parent_station = str(stop["parent_station"])
+            if parent_station:
+                children.setdefault(parent_station, []).append(str(stop["id"]))
+        city_children[city_id] = children
         public_stops: list[dict[str, object]] = []
         for stop in raw_stops:
             location_type = int(stop["location_type"])
@@ -327,8 +416,13 @@ def build_external_stop_packages(
                 # entrances, generic nodes, and boarding areas are not public stops
                 continue
             if location_type == 1:
-                # parent stations are always public stops
-                public_stops.append(stop)
+                # parent stations are public only when they (or a child) have stop_times
+                stop_id_str = str(stop["id"])
+                if stop_id_str in served_platform_ids or any(
+                    child_id in served_platform_ids
+                    for child_id in children.get(stop_id_str, [])
+                ):
+                    public_stops.append(stop)
                 continue
             # location_type == 0: keep only orphans whose parent is unavailable
             if parent_station and parent_station in parent_ids:
@@ -338,6 +432,21 @@ def build_external_stop_packages(
             raise ValueError(
                 f"No public stops found for configured external city {city_id}."
             )
+        city_public[city_id] = public_stops
+
+    has_potential_duplicates = any(
+        _duplicate_bin_count(stops) > 1 for stops in city_public.values()
+    )
+    if has_potential_duplicates:
+        for city_id, public_stops in city_public.items():
+            city_public[city_id] = _consolidate_duplicate_stops(
+                public_stops,
+                served_platform_ids,
+                city_children[city_id],
+            )
+
+    for city in cities:
+        city_id = str(city["id"])
         public_entries = [
             {
                 "id": stop["id"],
@@ -346,7 +455,7 @@ def build_external_stop_packages(
                 "longitude": stop["longitude"],
                 "searchName": stop["searchName"],
             }
-            for stop in public_stops
+            for stop in city_public[city_id]
         ]
         filename = write_stop_package(packages_directory, city_id, public_entries)
         package_stops[city_id] = public_entries
@@ -824,6 +933,7 @@ def process_external_gtfs_sources(
                         f"External GTFS source {source_id} "
                         f"({source.get('cities')})"
                     )
+                    entry_with_source["country"] = str(source["country"])
                     manifest_entries.append(entry_with_source)
                 package_stops_by_city_id.update(package_stops)
 

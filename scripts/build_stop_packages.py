@@ -1504,7 +1504,7 @@ def build_swiss_stop_packages(
         filename = write_stop_package(packages_directory, str(city["id"]), city_stops)
         manifest.append({"id": city["id"], "name": city["name"],
                          "aliases": city.get("aliases", []), "stopCount": len(city_stops),
-                         "url": f"stops/{filename}"})
+                         "url": f"stops/{filename}", "country": "CH"})
     return manifest
 
 
@@ -1532,7 +1532,7 @@ def build_austrian_stop_packages(
         filename = write_stop_package(packages_directory, str(city["id"]), city_stops)
         manifest.append({"id": city["id"], "name": city["name"],
                          "aliases": city.get("aliases", []), "stopCount": len(city_stops),
-                         "url": f"stops/{filename}"})
+                         "url": f"stops/{filename}", "country": "AT"})
     return manifest
 
 
@@ -1664,7 +1664,8 @@ def build_nl_stop_packages(
             "name": city["name"],
             "aliases": city.get("aliases", []),
             "stopCount": len(city_stops),
-            "url": f"stops/{filename}"
+            "url": f"stops/{filename}",
+            "country": "NL"
         })
     return manifest
 
@@ -1872,7 +1873,8 @@ def build_stop_packages(
             "name": display_name,
             "aliases": aliases,
             "stopCount": len(municipality_stops),
-            "url": f"stops/{filename}"
+            "url": f"stops/{filename}",
+            "country": "DE"
         })
 
     for city in cities:
@@ -1916,7 +1918,8 @@ def build_stop_packages(
             "name": city["name"],
             "aliases": city.get("aliases", []),
             "stopCount": len(city_stops),
-            "url": f"stops/{filename}"
+            "url": f"stops/{filename}",
+            "country": "DE"
         })
 
     manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))

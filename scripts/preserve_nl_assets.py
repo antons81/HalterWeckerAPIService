@@ -28,6 +28,7 @@ def preserve_nl_assets(current: Path, output: Path, cities_path: Path) -> None:
         city = previous_by_id.get(city_id)
         if city is None:
             raise ValueError(f"Cannot preserve Dutch city absent from current manifest: {city_id}")
+        city["country"] = "NL"
         if city_id not in next_ids:
             next_manifest["cities"].append(city)
         copy_if_present(current / "stops" / f"{city_id}.json", output / "stops" / f"{city_id}.json")

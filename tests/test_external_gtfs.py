@@ -81,6 +81,7 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
             "timezone": "Europe/Stockholm",
             "identifierPrefix": "se:",
             "stopIDMode": "exact",
+            "country": "SE",
         }
         with self.assertRaisesRegex(ValueError, "Duplicate external GTFS source id"):
             validate_external_gtfs_source(
@@ -113,6 +114,7 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
                     "timezone": "Europe/Stockholm",
                     "identifierPrefix": "se:",
                     "stopIDMode": "exact",
+                    "country": "SE",
                 },
                 {
                     "id": "sweden-b",
@@ -120,6 +122,7 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
                     "timezone": "Europe/Stockholm",
                     "identifierPrefix": "se-b:",
                     "stopIDMode": "exact",
+                    "country": "SE",
                 },
             ]
             (root / "sources.json").write_text(json.dumps(sources))
@@ -150,6 +153,7 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
             "timezone": "Not/AZone",
             "identifierPrefix": "se:",
             "stopIDMode": "exact",
+            "country": "SE",
         }
         with self.assertRaisesRegex(ValueError, "invalid timezone"):
             validate_external_gtfs_source(source, REPOSITORY_ROOT)
@@ -161,6 +165,7 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
             "timezone": "Europe/Stockholm",
             "identifierPrefix": "se:",
             "stopIDMode": "exact",
+            "country": "SE",
         }
         with self.assertRaisesRegex(ValueError, "city file does not exist"):
             validate_external_gtfs_source(source, REPOSITORY_ROOT)
@@ -449,6 +454,7 @@ class ExternalStopAndDepartureTests(unittest.TestCase):
                 "timezone": "Europe/Stockholm",
                 "identifierPrefix": "se:",
                 "stopIDMode": "exact",
+                "country": "SE",
                 "buildStops": True,
                 "buildRoutes": True,
                 "buildDepartures": True,

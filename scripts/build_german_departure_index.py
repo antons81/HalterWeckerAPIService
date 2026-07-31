@@ -173,6 +173,7 @@ def populate_gtfs(
     archive: zipfile.ZipFile,
     *,
     identifier_prefix: str = "",
+    stop_id_prefix: str = "",
 ) -> None:
     required = {"stops.txt", "routes.txt", "trips.txt", "stop_times.txt"}
     missing = required - set(archive.namelist())
@@ -182,7 +183,13 @@ def populate_gtfs(
     connection.executemany(
         "INSERT INTO raw_stops(stop_id, parent_station, stop_name, platform_code, source_order) VALUES (?, ?, ?, ?, ?)",
         (
-            (row["stop_id"].strip(), row.get("parent_station", "").strip(), row.get("stop_name", "").strip(), row.get("platform_code", "").strip(), index)
+            (
+                stop_id_prefix + row["stop_id"].strip(),
+                stop_id_prefix + row.get("parent_station", "").strip() if row.get("parent_station", "").strip() else "",
+                row.get("stop_name", "").strip(),
+                row.get("platform_code", "").strip(),
+                index,
+            )
             for index, row in enumerate(gtfs_rows(archive, "stops.txt"))
             if row.get("stop_id", "").strip()
         ),
@@ -227,7 +234,7 @@ def populate_gtfs(
             sequence = int(row.get("stop_sequence", "0") or 0)
         except ValueError:
             sequence = 0
-        batch.append((identifier_prefix + trip_id, raw_stop_id, departure_time, departure_seconds, sequence))
+        batch.append((identifier_prefix + trip_id, stop_id_prefix + raw_stop_id, departure_time, departure_seconds, sequence))
         if len(batch) == 20_000:
             connection.executemany("INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)", batch)
             batch.clear()

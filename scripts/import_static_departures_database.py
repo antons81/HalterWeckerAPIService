@@ -8,19 +8,46 @@ import json
 import os
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from build_german_departure_index import (
-    DEFAULT_TIMEZONE, connect, load_city_aliases, load_gtfs_archive,
+    DEFAULT_TIMEZONE, connect, load_city_aliases,
     populate_active_services, populate_gtfs, resolve_canonical_stops, service_window,
     update_terminal_stops,
 )
-from build_stop_packages import load_cities, nl_city_ids
-from external_gtfs import external_city_ids, load_external_gtfs_sources
+from build_stop_packages import load_cities, load_gtfs_archive, nl_city_ids
+from external_gtfs import (
+    authenticated_external_request,
+    external_city_ids,
+    load_external_cities,
+    load_external_gtfs_sources,
+    parse_external_gtfs_url_args,
+    validate_external_gtfs_source,
+)
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _external_window_timezone(
+    sources_path: Path,
+    url_by_provider: dict[str, str],
+) -> str:
+    """Pick the service-window timezone for an external import.
+
+    Prefers the configured timezone of the sole external provider; falls back
+    to the default Europe/Berlin window timezone otherwise.
+    """
+    sources = load_external_gtfs_sources(sources_path)
+    if len(url_by_provider) == 1:
+        provider_id = next(iter(url_by_provider))
+        for source in sources:
+            if str(source.get("id")) == provider_id:
+                timezone_name = source.get("timezone")
+                if isinstance(timezone_name, str) and timezone_name.strip():
+                    return timezone_name.strip()
+    return DEFAULT_TIMEZONE
 
 
 def configured_external_city_ids(cities_path: Path, swiss_cities_path: Path) -> set[str]:
@@ -138,21 +165,154 @@ def populate_city_aliases(
     connection.commit()
 
 
+def add_external_gtfs(
+    connection: sqlite3.Connection,
+    stop_data: Path,
+    url_by_provider: dict[str, str],
+    *,
+    repository_root: Path,
+    sources_path: Path,
+    dates: list[date],
+) -> set[str]:
+    """Augment an existing static departures database with external GTFS feeds.
+
+    External cities (e.g. stockholm) are exposed as canonical stop IDs, so the
+    board/lines queries resolve package parent stops to their child platforms
+    via raw_stops.canonical_stop_id. Per-city modes are written to
+    city_departure_modes with the source timezone. Returns the imported city IDs.
+    """
+    sources = load_external_gtfs_sources(sources_path)
+    sources_by_id = {str(source["id"]): source for source in sources}
+    unknown = sorted(set(url_by_provider) - set(sources_by_id))
+    if unknown:
+        raise ValueError(f"Unknown external GTFS sources: {', '.join(unknown)}")
+
+    imported_city_ids: set[str] = set()
+    for source_id in sorted(url_by_provider):
+        source = sources_by_id[source_id]
+        validate_external_gtfs_source(source, repository_root)
+        cities = load_external_cities(source, repository_root)
+        request_url, headers = authenticated_external_request(
+            source_id,
+            url_by_provider[source_id],
+            environ=os.environ,
+        )
+        with load_gtfs_archive(request_url, headers=headers) as archive:
+            populate_gtfs(
+                connection,
+                archive,
+                identifier_prefix=str(source["identifierPrefix"]),
+                stop_id_prefix=str(source["identifierPrefix"]),
+            )
+        imported_city_ids.update(str(city["id"]) for city in cities)
+
+    if not imported_city_ids:
+        return imported_city_ids
+
+    resolve_canonical_stops(connection)
+    populate_city_memberships(
+        connection,
+        stop_data,
+        included_city_ids=imported_city_ids,
+    )
+    populate_active_services(connection, dates)
+    update_terminal_stops(connection)
+
+    if "stop_id_prefix" not in {
+        row[1] for row in connection.execute("PRAGMA table_info(city_departure_modes)")
+    }:
+        connection.execute(
+            "ALTER TABLE city_departure_modes ADD COLUMN stop_id_prefix TEXT NOT NULL DEFAULT ''"
+        )
+    source_by_city: dict[str, str] = {}
+    for source_id in url_by_provider:
+        source = sources_by_id[source_id]
+        for city in load_external_cities(source, repository_root):
+            source_by_city[str(city["id"])] = source_id
+    connection.executemany(
+        "INSERT OR IGNORE INTO city_departure_modes(city_id, mode, timezone, stop_id_prefix) VALUES (?, 'canonical', ?, ?)",
+        (
+            (
+                city_id,
+                str(sources_by_id[source_by_city[city_id]]["timezone"]),
+                str(sources_by_id[source_by_city[city_id]]["identifierPrefix"]),
+            )
+            for city_id in sorted(imported_city_ids)
+        ),
+    )
+    connection.commit()
+    return imported_city_ids
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gtfs-url", required=True)
+    parser.add_argument("--gtfs-url", default="")
     parser.add_argument("--austrian-gtfs", default="")
     parser.add_argument("--stop-data", required=True, help="Read-only current stop dataset")
-    parser.add_argument("--next", required=True)
+    parser.add_argument("--next", default="", help="Fresh database output path (required unless --add-external).")
     parser.add_argument("--days", type=int, default=15)
     parser.add_argument("--cities", default=str(REPOSITORY_ROOT / "config" / "cities.json"))
     parser.add_argument("--swiss-cities", default=str(REPOSITORY_ROOT / "config" / "swiss-cities.json"))
     parser.add_argument("--city-id-aliases", default=str(REPOSITORY_ROOT / "config" / "city-id-aliases.json"))
+    parser.add_argument("--add-external", action="store_true",
+                        help="Augment --db with --external-gtfs-url feeds instead of building a fresh database.")
+    parser.add_argument("--db", default="",
+                        help="Existing database to augment with --add-external.")
+    parser.add_argument("--external-gtfs-url", action="append", default=[],
+                        help="External feed providerID=URL (repeatable, used with --add-external).")
+    parser.add_argument("--timezone", default="",
+                        help="Service-window timezone for active services (default: first external source timezone, else Europe/Berlin).")
+    parser.add_argument("--external-sources", default=str(REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"))
     args = parser.parse_args()
     next_path = Path(args.next)
     next_path.parent.mkdir(parents=True, exist_ok=True)
     next_path.unlink(missing_ok=True)
     dates = service_window(DEFAULT_TIMEZONE, args.days)
+
+    if args.add_external:
+        url_by_provider = parse_external_gtfs_url_args(args.external_gtfs_url)
+        if not url_by_provider:
+            raise ValueError("--add-external requires at least one --external-gtfs-url.")
+        database_path = Path(args.db)
+        if not database_path.is_file():
+            raise ValueError(f"Existing database does not exist: {database_path}")
+        timezone_name = args.timezone.strip() or _external_window_timezone(
+            Path(args.external_sources), url_by_provider
+        )
+        dates = service_window(timezone_name, args.days)
+        connection = sqlite3.connect(database_path)
+        connection.executescript("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;")
+        try:
+            imported = add_external_gtfs(
+                connection,
+                Path(args.stop_data),
+                url_by_provider,
+                repository_root=REPOSITORY_ROOT,
+                sources_path=Path(args.external_sources),
+                dates=dates,
+            )
+            version = str(uuid.uuid4())
+            connection.executemany(
+                "INSERT INTO metadata(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (
+                    ("databaseVersion", version),
+                    ("generatedAt", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")),
+                    ("validFrom", dates[0].isoformat()),
+                    ("validThrough", dates[-1].isoformat()),
+                    ("timezone", timezone_name),
+                ),
+            )
+            validate(connection)
+            connection.commit()
+        finally:
+            connection.close()
+        print(json.dumps({"databaseVersion": version, "externalCityCount": len(imported)}, separators=(",", ":")))
+        return
+
+    if not args.gtfs_url.strip():
+        raise ValueError("--gtfs-url is required unless --add-external is used.")
+    if not args.next.strip():
+        raise ValueError("--next is required unless --add-external is used.")
     with load_gtfs_archive(args.gtfs_url) as archive:
         connection = connect(next_path)
         try:
@@ -188,7 +348,8 @@ def main() -> None:
                 CREATE TABLE city_departure_modes (
                     city_id TEXT PRIMARY KEY,
                     mode TEXT NOT NULL,
-                    timezone TEXT NOT NULL
+                    timezone TEXT NOT NULL,
+                    stop_id_prefix TEXT NOT NULL DEFAULT ''
                 ) WITHOUT ROWID;
             """)
             connection.executemany(

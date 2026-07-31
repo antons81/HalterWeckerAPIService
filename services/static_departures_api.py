@@ -70,20 +70,33 @@ class Database:
             finally:
                 cursor.close()
 
-    def city_departure_mode(self, city_id: str) -> tuple[str, str]:
+    def city_departure_mode(self, city_id: str) -> tuple[str, str, str]:
         with self.lock:
+            try:
+                cursor = self._connection().execute(
+                    "SELECT mode, timezone, stop_id_prefix FROM city_departure_modes WHERE city_id=?",
+                    (city_id,)
+                )
+                try:
+                    row = cursor.fetchone()
+                finally:
+                    cursor.close()
+                if row is not None:
+                    return (str(row[0]), str(row[1]), str(row[2]))
+            except sqlite3.OperationalError:
+                pass
             try:
                 cursor = self._connection().execute(
                     "SELECT mode, timezone FROM city_departure_modes WHERE city_id=?",
                     (city_id,)
                 )
+                try:
+                    row = cursor.fetchone()
+                finally:
+                    cursor.close()
             except sqlite3.OperationalError:
-                return "canonical", DEFAULT_TIMEZONE
-            try:
-                row = cursor.fetchone()
-            finally:
-                cursor.close()
-        return (str(row[0]), str(row[1])) if row else ("canonical", DEFAULT_TIMEZONE)
+                return "canonical", DEFAULT_TIMEZONE, ""
+        return (str(row[0]), str(row[1]), "") if row else ("canonical", DEFAULT_TIMEZONE, "")
 
     def resolve_city(self, city_id: str) -> str:
         with self.lock:
@@ -98,9 +111,9 @@ class Database:
             return str(row[0]) if row else city_id
 
     def _query_stop_id(self, city_id: str, stop_id: str) -> str:
-        mode, _ = self.city_departure_mode(city_id)
+        mode, _, stop_id_prefix = self.city_departure_mode(city_id)
         if mode != "exact-stop-with-parent-fallback":
-            return stop_id
+            return f"{stop_id_prefix}{stop_id}"
         with self.lock:
             cursor = self._connection().execute(
                 "SELECT 1 FROM stop_times WHERE raw_stop_id=? LIMIT 1", (stop_id,)
@@ -120,7 +133,7 @@ class Database:
         return str(row[0]) if row and row[0] else stop_id
 
     def lines(self, city_id: str, stop_id: str) -> list[dict[str, str | None]]:
-        mode, _ = self.city_departure_mode(city_id)
+        mode, _, _ = self.city_departure_mode(city_id)
         query_stop_id = self._query_stop_id(city_id, stop_id)
         stop_predicate = "s.raw_stop_id=?" if mode == "exact-stop-with-parent-fallback" else "rs.canonical_stop_id=?"
         with self.lock:
@@ -154,7 +167,7 @@ class Database:
     ) -> list[dict[str, object]]:
         service_from = (from_date.date() - timedelta(days=1)).strftime("%Y%m%d") if from_date else "00000000"
         service_to = to_date.date().strftime("%Y%m%d") if to_date else "99999999"
-        mode, _ = self.city_departure_mode(city_id)
+        mode, _, _ = self.city_departure_mode(city_id)
         query_stop_id = self._query_stop_id(city_id, stop_id)
         stop_predicate = "s.raw_stop_id=?" if mode == "exact-stop-with-parent-fallback" else "rs.canonical_stop_id=?"
         with self.lock:
@@ -280,7 +293,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(HTTPStatus.OK, payload)
             if parsed.path == "/static-departures/board":
                 limit = bounded_limit(query.get("limit", [None])[0])
-                _, timezone_name = self.database.city_departure_mode(resolved_city)
+                _, timezone_name, _ = self.database.city_departure_mode(resolved_city)
                 from_date = parse_iso_boundary(query.get("from", [None])[0], timezone_name)
                 to_date = parse_iso_boundary(query.get("to", [None])[0], timezone_name)
                 departures = self.database.board(resolved_city, stop, 1000 if from_date or to_date else limit, from_date, to_date)

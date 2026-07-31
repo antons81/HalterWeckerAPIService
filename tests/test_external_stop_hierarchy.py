@@ -372,5 +372,164 @@ class ExternalDepartureDedupTests(unittest.TestCase):
         self.assertEqual(len(departures["stops"]["11706"]), 2)
 
 
+class ExternalDuplicateConsolidationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.out = self.root / "out"
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _build(
+        self, stop_times: str
+    ) -> tuple[list[dict], dict[str, list[dict]]]:
+        archive_path = self.root / "twins.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(
+                "stops.txt",
+                "stop_id,stop_name,stop_lat,stop_lon,parent_station,location_type,platform_code\n"
+                "9838,Blackeberg,59.049,18.050,,1,\n"
+                "9022050009838001,Blackeberg spår 1,59.0491,18.0501,9838,0,1\n"
+                "10079,Blackeberg,59.0492,18.0503,,1,\n"
+                "9022050010079001,Blackeberg spår 1,59.0493,18.0504,10079,0,1\n"
+                "88888,Blackeberg,59.10,17.90,,1,\n"
+                "9022088888001,Blackeberg spår 1,59.1001,17.9001,88888,0,1\n"
+            )
+            archive.writestr(
+                "routes.txt",
+                "route_id,route_short_name,route_long_name,route_type\nR1,112,,0\n",
+            )
+            archive.writestr(
+                "trips.txt",
+                "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+                "R1,S1,T1,Towards Stockholm,0\n"
+                "R1,S1,T2,Towards Stockholm,0\n",
+            )
+            archive.writestr("stop_times.txt", stop_times)
+            archive.writestr(
+                "calendar.txt",
+                "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+                "start_date,end_date\n"
+                "S1,1,1,1,1,1,1,1,20200101,20301231\n",
+            )
+        cities = [{
+            "id": "stockholm",
+            "name": "Stockholm",
+            "aliases": [],
+            "latitude": 59.05,
+            "longitude": 18.05,
+            "radiusMeters": 30000,
+            "packageMode": "external",
+        }]
+        with zipfile.ZipFile(archive_path) as archive:
+            manifest, package_stops = build_external_stop_packages(
+                archive, cities, self.out, stop_id_mode="exact"
+            )
+            build_external_route_index(archive, cities, self.out)
+            build_external_departure_index(
+                archive, cities, self.out, timezone_name="Europe/Stockholm"
+            )
+        departures = json.loads(
+            (self.out / "departures" / "stockholm.json").read_text(encoding="utf-8")
+        )
+        return manifest, departures, package_stops
+
+    def _twin_stop_times(self) -> str:
+        return (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "T1,07:55:00,08:00:00,9022050009838001,1\n"
+        )
+
+    def test_unserved_twin_is_dropped_live_twin_kept(self) -> None:
+        manifest, departures, package_stops = self._build(
+            self._twin_stop_times()
+        )
+        ids = {stop["id"] for stop in package_stops["stockholm"]}
+        self.assertIn("9838", ids)
+        self.assertNotIn("88888", ids)
+        self.assertNotIn("10079", ids)
+        self.assertEqual(manifest[0]["stopCount"], 1)
+        self.assertIn("9838", departures["stops"])
+        self.assertNotIn("10079", departures["stops"])
+        self.assertNotIn("88888", departures["stops"])
+        board = departures["stops"]["9838"]
+        self.assertEqual(board[0]["s"], "9022050009838001")
+        self.assertEqual(board[0]["platform"], "1")
+
+    def test_unserved_parent_not_published_even_if_far_from_twin(self) -> None:
+        manifest, departures, package_stops = self._build(
+            self._twin_stop_times()
+        )
+        ids = {stop["id"] for stop in package_stops["stockholm"]}
+        self.assertNotIn("88888", ids)
+
+    def test_served_twins_are_both_kept(self) -> None:
+        stop_times = (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "T1,07:55:00,08:00:00,9022050009838001,1\n"
+            "T2,08:55:00,09:00:00,9022050010079001,1\n"
+        )
+        manifest, departures, package_stops = self._build(stop_times)
+        ids = {stop["id"] for stop in package_stops["stockholm"]}
+        self.assertIn("9838", ids)
+        self.assertIn("10079", ids)
+        self.assertNotIn("88888", ids)
+        self.assertEqual(manifest[0]["stopCount"], 2)
+        self.assertEqual(len(departures["stops"]["9838"]), 1)
+        self.assertEqual(len(departures["stops"]["10079"]), 1)
+
+    def test_poi_parent_without_service_is_excluded(self) -> None:
+        """Parent stations with no served children must not appear on the map.
+        Regression: Ice Bar (68746), Casino Cosmopol (68745), etc."""
+        archive_path = self.root / "poi.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(
+                "stops.txt",
+                "stop_id,stop_name,stop_lat,stop_lon,parent_station,location_type,platform_code\n"
+                "68746,Ice Bar,59.3328,18.0571,,1,\n"
+                "9022050068746001,Ice Bar,59.3328,18.0571,68746,0,*\n"
+                "1,Stockholm Centralstation,59.3315,18.0549,,1,\n"
+                "9022050000001047,Stockholm C spår 1,59.3315,18.0549,1,0,1\n"
+            )
+            archive.writestr(
+                "routes.txt",
+                "route_id,route_short_name,route_long_name,route_type\nR1,17,,0\n",
+            )
+            archive.writestr(
+                "trips.txt",
+                "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+                "R1,S1,T1,Towards Stockholm,0\n",
+            )
+            archive.writestr(
+                "stop_times.txt",
+                "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+                "T1,08:00:00,08:00:00,9022050000001047,1\n"
+            )
+            archive.writestr(
+                "calendar.txt",
+                "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+                "start_date,end_date\n"
+                "S1,1,1,1,1,1,1,1,20200101,20301231\n",
+            )
+        cities = [{
+            "id": "stockholm",
+            "name": "Stockholm",
+            "aliases": [],
+            "latitude": 59.3293,
+            "longitude": 18.0686,
+            "radiusMeters": 30000,
+            "packageMode": "external",
+        }]
+        with zipfile.ZipFile(archive_path) as archive:
+            _, package_stops = build_external_stop_packages(
+                archive, cities, self.out, stop_id_mode="exact"
+            )
+        ids = {stop["id"] for stop in package_stops["stockholm"]}
+        self.assertIn("1", ids, "served parent (via child platform) must be public")
+        self.assertNotIn("68746", ids, "POI-like unserved parent must NOT be public")
+        self.assertNotIn("9022050068746001", ids, "child of unserved parent must NOT be public")
+
+
 if __name__ == "__main__":
     unittest.main()
