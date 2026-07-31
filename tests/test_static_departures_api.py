@@ -8,10 +8,12 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import static_departures_api
 from import_static_departures_database import populate_german_city_memberships
 from static_departures_api import Database, Handler
 from swap_static_departures_database import activate_database
@@ -314,6 +316,72 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
 
                 self.assertIn("second", results)
                 self.assertEqual(server.get("/static-departures/meta")["databaseVersion"], "second")
+
+
+class StaticDeparturesStaticFileTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._saved_root = static_departures_api.STATIC_DATA_ROOT
+
+    def tearDown(self) -> None:
+        static_departures_api.STATIC_DATA_ROOT = self._saved_root
+
+    def _start(self, root: Path) -> StaticDeparturesHTTPServer:
+        static_departures_api.STATIC_DATA_ROOT = str(root)
+        path = root / "current.sqlite"
+        write_database(path, "static")
+        return StaticDeparturesHTTPServer(path)
+
+    def _status(self, server: StaticDeparturesHTTPServer, url_path: str) -> tuple[int, dict[str, object]]:
+        try:
+            with urlopen(f"{server.base_url}{url_path}", timeout=5) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            return error.code, json.loads(error.read().decode("utf-8"))
+
+    def test_serves_stop_data_files_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "stops").mkdir()
+            (root / "manifest.json").write_text('{"version":"dev"}', encoding="utf-8")
+            (root / "stops" / "stockholm.json").write_text('[{"id":"11706"}]', encoding="utf-8")
+            with self._start(root) as server:
+                status, manifest = self._status(server, "/static-stop-data/manifest.json")
+                self.assertEqual(status, 200)
+                self.assertEqual(manifest, {"version": "dev"})
+                status, stops = self._status(server, "/static-stop-data/stops/stockholm.json")
+                self.assertEqual(status, 200)
+                self.assertEqual(stops, [{"id": "11706"}])
+
+    def test_rejects_path_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with self._start(root) as server:
+                for attempt in (
+                    "/static-stop-data/../manifest.json",
+                    "/static-stop-data/%2e%2e/manifest.json",
+                    "/static-stop-data/a/../../etc/passwd",
+                ):
+                    status, _ = self._status(server, attempt)
+                    self.assertEqual(status, 403, attempt)
+
+    def test_rejects_non_json_and_missing_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "notes.txt").write_text("hello", encoding="utf-8")
+            with self._start(root) as server:
+                status, _ = self._status(server, "/static-stop-data/notes.txt")
+                self.assertEqual(status, 404)
+                status, _ = self._status(server, "/static-stop-data/missing.json")
+                self.assertEqual(status, 404)
+
+    def test_static_serving_disabled_without_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "manifest.json").write_text("{}", encoding="utf-8")
+            with self._start(root) as server:
+                static_departures_api.STATIC_DATA_ROOT = ""
+                status, _ = self._status(server, "/static-stop-data/manifest.json")
+                self.assertEqual(status, 404)
 
 
 if __name__ == "__main__":

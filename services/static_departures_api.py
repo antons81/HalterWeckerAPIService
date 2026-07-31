@@ -5,17 +5,20 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 from zoneinfo import ZoneInfo
 
 
 DEFAULT_TIMEZONE = "Europe/Berlin"
+STATIC_DATA_ROOT = os.environ.get("STATIC_DATA_ROOT", "")
 
 
 class Database:
@@ -224,9 +227,42 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
         self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
 
+    def send_static_file(self, relative: str) -> None:
+        root = Path(STATIC_DATA_ROOT)
+        if not root.is_dir():
+            return self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        segments = [part for part in unquote(relative).split("/") if part not in ("", ".")]
+        if any(part == ".." for part in segments):
+            return self.send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+        candidate = root.joinpath(*segments).resolve()
+        try:
+            candidate.relative_to(root.resolve())
+        except ValueError:
+            return self.send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+        if not candidate.is_file() or candidate.suffix != ".json":
+            return self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        try:
+            size = candidate.stat().st_size
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Cache-Control", "public, max-age=300, stale-while-revalidate=60")
+            self.end_headers()
+            with candidate.open("rb") as source:
+                shutil.copyfileobj(source, self.wfile)
+        except OSError:
+            try:
+                self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+            except OSError:
+                pass
+
     def do_GET(self) -> None:
         parsed, query = urlparse(self.path), parse_qs(urlparse(self.path).query)
         try:
+            if parsed.path.startswith("/static-stop-data/"):
+                return self.send_static_file(parsed.path[len("/static-stop-data/"):])
             if parsed.path == "/static-departures/health":
                 return self.send_json(HTTPStatus.OK, {"ok": True, "database": self.database.meta()})
             if parsed.path == "/static-departures/meta":
