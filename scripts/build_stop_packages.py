@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import io
 import json
 import math
@@ -50,6 +51,7 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "avvHafas",
     "oebb",
     "netherlands",
+    "sweden",
 }
 SUPPORTED_TRANSIT_RADAR_FEATURES = {
     "liveVehicles",
@@ -89,18 +91,30 @@ def distance_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float
     ))
 
 
-def load_gtfs_archive(url: str) -> zipfile.ZipFile:
+def load_gtfs_archive(
+    url: str,
+    headers: dict[str, str] | None = None,
+) -> zipfile.ZipFile:
+    """Load a GTFS ZIP from a local path or HTTP(S) URL.
+
+    Optional request headers support authenticated external feeds. Response
+    bodies that are gzip-compressed (magic 1f 8b) are decompressed before ZIP
+    open. Existing callers that pass only a URL keep working.
+    """
     parsed_url = urlsplit(url)
     if parsed_url.scheme in ("", "file"):
         path = Path(parsed_url.path if parsed_url.scheme == "file" else url)
         return zipfile.ZipFile(path)
 
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "HalteWeckerStopPipeline/1.0"}
-    )
+    request_headers = {"User-Agent": "HalteWeckerStopPipeline/1.0"}
+    if headers:
+        request_headers.update(headers)
+    request = urllib.request.Request(url, headers=request_headers)
     with urllib.request.urlopen(request, timeout=180) as response:
-        return zipfile.ZipFile(io.BytesIO(response.read()))
+        payload = response.read()
+    if payload.startswith(b"\x1f\x8b"):
+        payload = gzip.decompress(payload)
+    return zipfile.ZipFile(io.BytesIO(payload))
 
 
 def paged_url(url: str, start_index: int) -> str:
@@ -539,7 +553,7 @@ def load_cities(path: Path) -> list[dict[str, object]]:
             raise ValueError(f"Invalid longitude for {city_id}")
         if not isinstance(radius, (int, float)) or radius <= 0:
             raise ValueError(f"Invalid radius for {city_id}")
-        if package_mode not in {"german", "swiss", "austrian"}:
+        if package_mode not in {"german", "swiss", "austrian", "external"}:
             raise ValueError(f"Invalid package mode for {city_id}: {package_mode!r}")
         if transit_radar is not None:
             validate_transit_radar(city_id, latitude, longitude, transit_radar)
@@ -654,6 +668,16 @@ def validate_transit_radar_provider(
         return
 
     if adapter == "netherlands":
+        return
+
+    if adapter == "sweden":
+        if region is not None:
+            raise ValueError(f"Sweden does not use a radar region for {city_id}")
+        if configuration.get("radarStops") is not None:
+            raise ValueError(f"Sweden does not use radar stops for {city_id}")
+        operator = configuration.get("operator")
+        if not isinstance(operator, str) or not operator.strip():
+            raise ValueError(f"Sweden requires a non-empty operator for {city_id}")
         return
 
     if adapter == "vagPuls" and city_id != "nurnberg":
@@ -955,6 +979,8 @@ def transit_radar_manifest(
                 provider_id = "oebb"
             elif adapter == "netherlands":
                 provider_id = f"netherlands-{city_id}"
+            elif adapter == "sweden":
+                provider_id = f"sweden-{city_id}"
             elif adapter == "bwTrias":
                 provider_id = "bw-trias"
             else:
@@ -973,7 +999,7 @@ def transit_radar_manifest(
                 supports_departures = bool(
                     provider_configuration.get(
                         "supportsDepartures",
-                        adapter in {"bwTrias", "vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "avvHafas", "oebb", "netherlands"}
+                        adapter in {"bwTrias", "vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "avvHafas", "oebb", "netherlands", "sweden"}
                     )
                 )
                 supports_live_vehicles = bool(
@@ -1019,6 +1045,9 @@ def transit_radar_manifest(
             agency = provider_configuration.get("agency")
             if isinstance(agency, str):
                 provider["agency"] = agency
+            operator = provider_configuration.get("operator")
+            if isinstance(operator, str) and operator.strip():
+                provider["operator"] = operator.strip()
             efa_path = provider_configuration.get("efaPath")
             if isinstance(efa_path, str):
                 provider["efaPath"] = efa_path
@@ -1035,9 +1064,14 @@ def transit_radar_manifest(
                 provider["gatewayURL"] = gateway_url
             providers.append(provider)
 
-        country_suffix = "nl" if any(p.get("adapter") == "netherlands" for p in providers) else (
-            "at" if any(p.get("adapter") == "oebb" for p in providers) else "de"
-        )
+        if any(p.get("adapter") == "netherlands" for p in providers):
+            country_suffix = "nl"
+        elif any(p.get("adapter") == "sweden" for p in providers):
+            country_suffix = "se"
+        elif any(p.get("adapter") == "oebb" for p in providers):
+            country_suffix = "at"
+        else:
+            country_suffix = "de"
         radar_cities.append({
             "cityID": f"{city_id}-{country_suffix}",
             "appCityID": city_id,
@@ -1933,8 +1967,24 @@ def main() -> None:
     parser.add_argument("--swiss-cities", default="config/swiss-cities.json")
     parser.add_argument("--nl-gtfs-url", default="")
     parser.add_argument("--nl-cities", default="config/cities.json")
+    parser.add_argument(
+        "--external-gtfs-sources",
+        default="config/external-gtfs-sources.json",
+    )
+    parser.add_argument(
+        "--external-gtfs-url",
+        action="append",
+        default=[],
+        help="Repeatable providerID=URL mapping for external GTFS sources.",
+    )
     args = parser.parse_args()
 
+    from external_gtfs import (
+        parse_external_gtfs_url_args,
+        process_external_gtfs_sources,
+    )
+
+    repository_root = Path(__file__).resolve().parents[1]
     cities = load_cities(Path(args.cities))
     archive = load_gtfs_archive(args.gtfs_url)
     stop_rows = load_table(archive, "stops.txt")
@@ -1989,6 +2039,36 @@ def main() -> None:
         build_nl_route_index(nl_archive, nl_cities, output)
         build_nl_departure_index(nl_archive, nl_cities, output)
         manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
+
+    external_url_by_provider = parse_external_gtfs_url_args(args.external_gtfs_url)
+    (
+        external_manifest_entries,
+        external_cities,
+        external_package_stops,
+        external_lines,
+    ) = process_external_gtfs_sources(
+        repository_root=repository_root,
+        sources_path=Path(args.external_gtfs_sources),
+        url_by_provider=external_url_by_provider,
+        output=output,
+        load_gtfs_archive=load_gtfs_archive,
+        occupied_city_ids=set(manifest_sources),
+    )
+    if external_manifest_entries:
+        entries_by_source: dict[str, list[dict[str, object]]] = {}
+        for entry in external_manifest_entries:
+            source_label = str(entry.pop("_source", "External GTFS branch"))
+            entries_by_source.setdefault(source_label, []).append(entry)
+        for source_label, entries in entries_by_source.items():
+            merge_manifest_entries(
+                manifest,
+                entries,
+                source=source_label,
+                sources_by_city_id=manifest_sources,
+            )
+        package_stops_by_city_id.update(external_package_stops)
+        manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
+
     rnv_cities, rnv_city_ids = build_rnv_assets(
         archive=load_gtfs_archive(args.rnv_gtfs_url),
         output=output,
@@ -1998,8 +2078,10 @@ def main() -> None:
         gateway_url=args.rnv_gateway_url.strip()
     )
     validate_manifest_city_ids(manifest, manifest_sources)
-    included_city_ids = radar_city_ids(manifest, cities)
+    radar_cities = list(cities) + list(external_cities)
+    included_city_ids = radar_city_ids(manifest, radar_cities)
     included_city_ids.update(rnv_city_ids)
+    included_city_ids.update(str(city["id"]) for city in external_cities)
     included_stop_ids = {
         str(stop["id"])
         for city_id in included_city_ids
@@ -2030,6 +2112,8 @@ def main() -> None:
                 stops = json.loads(stop_path.read_text(encoding="utf-8"))
                 package_stops_by_city_id[city_id] = stops
                 package_stops_by_city_id[f"{city_id}-nl"] = stops
+    if external_lines:
+        lines_by_stop_id.update(external_lines)
     (output / "cities.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     (output / "manifest.json").write_text(
         json.dumps(
@@ -2042,7 +2126,7 @@ def main() -> None:
     (output / "transit-radar-cities.json").write_text(
         json.dumps(
             transit_radar_manifest(
-                cities,
+                radar_cities,
                 additional_cities=rnv_cities,
                 vag_gateway_url=args.vag_gateway_url.strip(),
                 package_stops_by_city_id=package_stops_by_city_id,
@@ -2065,6 +2149,11 @@ def main() -> None:
                     "name": "Rhein-Neckar-Verkehr GmbH (rnv)",
                     "license": "Datenlizenz Deutschland – Namensnennung – Version 2.0",
                     "url": "https://www.rnv-online.de/unternehmen/open-data/"
+                },
+                {
+                    "name": "Samtrafiken / Trafiklab",
+                    "license": "Trafiklab API terms",
+                    "url": "https://www.trafiklab.se/"
                 }
             ],
             ensure_ascii=False,
@@ -2072,13 +2161,14 @@ def main() -> None:
         ),
         encoding="utf-8"
     )
+    external_city_id_set = {str(city["id"]) for city in external_cities}
     build_city_line_catalogs(
         output=output,
         manifest=manifest,
         package_stops_by_city_id=package_stops_by_city_id,
         lines_by_stop_id=lines_by_stop_id,
-        cities=cities,
-        additional_city_ids=rnv_city_ids
+        cities=radar_cities,
+        additional_city_ids=rnv_city_ids | external_city_id_set
     )
     build_vbb_network_indexes(load_gtfs_archive(args.vbb_gtfs_url), output, cities)
     print(

@@ -17,6 +17,7 @@ from build_german_departure_index import (
     update_terminal_stops,
 )
 from build_stop_packages import load_cities, nl_city_ids
+from external_gtfs import external_city_ids, load_external_gtfs_sources
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -28,10 +29,18 @@ def configured_external_city_ids(cities_path: Path, swiss_cities_path: Path) -> 
     excluded.update(
         str(city["id"])
         for city in cities
-        if city.get("packageMode") == "austrian"
+        if city.get("packageMode") in {"austrian", "external"}
     )
     if swiss_cities_path.exists():
         excluded.update(str(city["id"]) for city in load_cities(swiss_cities_path))
+    external_sources_path = REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
+    if external_sources_path.exists():
+        excluded.update(
+            external_city_ids(
+                load_external_gtfs_sources(external_sources_path),
+                REPOSITORY_ROOT,
+            )
+        )
     return excluded
 
 

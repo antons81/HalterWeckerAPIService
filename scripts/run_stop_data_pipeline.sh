@@ -82,14 +82,30 @@ cd "$REPO"
 rm -rf "$STAGING" "$ROLLBACK"
 mkdir -p "$STAGING"
 
+# Map provider env vars to repeatable --external-gtfs-url providerID=URL args.
+# Add future countries here without changing build_stop_packages.py.
+run_build_stop_packages() {
+  local nl_url="${1-}"
+  local -a cmd
+  cmd=(
+    python3 "$REPO/scripts/build_stop_packages.py"
+    --gtfs-url "$GTFS_URL"
+    --swiss-gtfs-url "$SWISS_GTFS_URL"
+    --austrian-gtfs-url "${AUSTRIAN_GTFS_URL:-}"
+  )
+  if [ -n "$nl_url" ]; then
+    cmd+=(--nl-gtfs-url "$nl_url")
+  fi
+  if [ -n "${SWEDEN_GTFS_URL:-}" ]; then
+    cmd+=(--external-gtfs-url "sweden=${SWEDEN_GTFS_URL}")
+  fi
+  cmd+=(--output "$BUILD_DIR")
+  "${cmd[@]}"
+}
+
 if [ "${FORCE_PRESERVE_NL:-0}" = "1" ]; then
   BUILD_WITHOUT_NL=1
-elif ! python3 "$REPO/scripts/build_stop_packages.py" \
-  --gtfs-url "$GTFS_URL" \
-  --swiss-gtfs-url "$SWISS_GTFS_URL" \
-  --austrian-gtfs-url "${AUSTRIAN_GTFS_URL:-}" \
-  --nl-gtfs-url "$NL_GTFS_URL" \
-  --output "$BUILD_DIR"; then
+elif ! run_build_stop_packages "$NL_GTFS_URL"; then
   BUILD_WITHOUT_NL=1
 else
   BUILD_WITHOUT_NL=0
@@ -99,11 +115,7 @@ if [ "$BUILD_WITHOUT_NL" = "1" ]; then
   test -d "$CURRENT"
   echo "Preserving the last published Dutch assets."
   rm -rf "$BUILD_DIR"
-  python3 "$REPO/scripts/build_stop_packages.py" \
-    --gtfs-url "$GTFS_URL" \
-    --swiss-gtfs-url "$SWISS_GTFS_URL" \
-    --austrian-gtfs-url "${AUSTRIAN_GTFS_URL:-}" \
-    --output "$BUILD_DIR"
+  run_build_stop_packages ""
   python3 "$REPO/scripts/preserve_nl_assets.py" \
     --current "$CURRENT" \
     --output "$BUILD_DIR" \
@@ -117,6 +129,29 @@ python3 "$REPO/scripts/build_swiss_departure_index.py" \
 test -f "$BUILD_DIR/manifest.json"
 test -f "$BUILD_DIR/transit-radar-cities.json"
 test -f "$BUILD_DIR/swiss-static/manifest.json"
+
+if [ -n "${SWEDEN_GTFS_URL:-}" ]; then
+  test -f "$BUILD_DIR/stops/stockholm.json"
+  test -f "$BUILD_DIR/departures/stockholm.json"
+  python3 - "$BUILD_DIR/manifest.json" "$BUILD_DIR/transit-radar-cities.json" <<'PY'
+import json
+import sys
+
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+radar = json.load(open(sys.argv[2], encoding="utf-8"))
+manifest_ids = [city.get("id") for city in manifest.get("cities", [])]
+if manifest_ids.count("stockholm") != 1:
+    raise SystemExit(
+        f"manifest must contain stockholm exactly once, found {manifest_ids.count('stockholm')}"
+    )
+radar_ids = [city.get("appCityID") for city in radar.get("cities", [])]
+if radar_ids.count("stockholm") != 1:
+    raise SystemExit(
+        f"transit-radar-cities must contain stockholm exactly once, found {radar_ids.count('stockholm')}"
+    )
+print("[StopData] Sweden external packages validated")
+PY
+fi
 
 # Do not replace or remove the last working published dataset before the complete
 # staged build has passed all builders and manifest validation.

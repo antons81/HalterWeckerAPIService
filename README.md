@@ -42,6 +42,78 @@ Austria uses `packageMode: "austrian"` and an independent radius-package builder
 
 City line catalogs are derived from the GTFS relationship `stop_times → trips → routes`. They contain only routes serving at least one stop inside the selected municipality. The iOS app uses these optional catalogs to scope regional realtime vehicle feeds to the selected city and falls back to the unfiltered live feed when no valid catalog is available.
 
+## External GTFS providers (Sweden-first)
+
+Germany, Switzerland, Austria and the Netherlands keep their existing builders. Additional countries use a **generic external GTFS registry** so new feeds do not need Sweden-specific Python forks.
+
+### Architecture
+
+| Piece | Role |
+|-------|------|
+| `config/external-gtfs-sources.json` | Source registry (id, cities file, timezone, `identifierPrefix`, `stopIDMode`) |
+| `config/sweden-cities.json` | City packages + transit radar for Sweden |
+| `scripts/external_gtfs.py` | Validation, authenticated download, stop/route/departure builders |
+| `scripts/build_stop_packages.py` | `--external-gtfs-sources`, repeatable `--external-gtfs-url providerID=URL` |
+| `scripts/run_stop_data_pipeline.sh` | Maps `SWEDEN_GTFS_URL` → `--external-gtfs-url sweden=...` |
+
+`stopIDMode: "exact"` keeps original GTFS `stop_id` values (including platforms and parents as separate stops). Sweden GTFS-RT uses the same IDs, so they must not be canonicalized to `parent_station`.
+
+Sweden static departures are published as compact city files:
+
+- `stops/stockholm.json`
+- `departures/stockholm.json` (`timezone`, exact stop keys, `t/r/h/d/p` rows)
+- `routes/stockholm.json`
+
+Sweden is **not** imported into the shared German/Austrian static-departures SQLite in this architecture. Stockholm is excluded from German SQLite membership via `configured_external_city_ids`.
+
+Realtime stays on the existing worker (`/sweden/sl/...`). City config carries adapter `sweden` and operator `sl` only — no embedded realtime URLs.
+
+### Required environment (production)
+
+Add to `/etc/haltewecker-stop-data.env` (operator-managed; never commit secrets):
+
+```bash
+SWEDEN_GTFS_URL=<Samtrafiken Sweden 3 static GTFS URL>
+SAMTRAFIKEN_STATIC_API_KEY=<secret>
+```
+
+The pipeline never logs the API key. Remote Sweden downloads send `Accept-Encoding: gzip` and attach the key as the Trafiklab `key` query parameter.
+
+### Staging dry-run (no publication)
+
+```bash
+cd /srv/haltewecker/pipeline/HalterWeckerAPIService
+set -a && source /etc/haltewecker-stop-data.env && set +a
+rm -rf /tmp/haltewecker-external-dryrun
+python3 scripts/build_stop_packages.py \
+  --gtfs-url "$GTFS_URL" \
+  --swiss-gtfs-url "$SWISS_GTFS_URL" \
+  --austrian-gtfs-url "${AUSTRIAN_GTFS_URL:-}" \
+  --nl-gtfs-url "$NL_GTFS_URL" \
+  --external-gtfs-url "sweden=$SWEDEN_GTFS_URL" \
+  --output /tmp/haltewecker-external-dryrun
+test -f /tmp/haltewecker-external-dryrun/stops/stockholm.json
+test -f /tmp/haltewecker-external-dryrun/departures/stockholm.json
+python3 -c 'import json; m=json.load(open("/tmp/haltewecker-external-dryrun/manifest.json")); print(sum(1 for c in m["cities"] if c["id"]=="stockholm"))'
+```
+
+### Production publication
+
+```bash
+# only after dry-run succeeds; publishes via staging swap + static-departures sync
+sudo -u deploy /srv/haltewecker/pipeline/HalterWeckerAPIService/scripts/run_stop_data_pipeline.sh
+```
+
+Do not edit `/srv/haltewecker/data/current` by hand.
+
+### Adding another country (no new Python CLI flags)
+
+1. Append a source object to `config/external-gtfs-sources.json`.
+2. Add `config/<country>-cities.json` with `packageMode: "external"` and `externalGTFSProvider`.
+3. Map `COUNTRY_GTFS_URL` → `--external-gtfs-url "<id>=$COUNTRY_GTFS_URL"` in `run_stop_data_pipeline.sh`.
+4. Register auth in `EXTERNAL_SOURCE_AUTH` inside `scripts/external_gtfs.py` if the feed needs a key.
+5. Add a realtime adapter only when a worker exists.
+
 ## rnv regional Live Radar
 
 The pipeline downloads the official rnv static GTFS feed and automatically adds every municipality containing an rnv stop to the Transit Radar manifest. The provider remains disabled until the repository variable `RNV_GATEWAY_URL` contains the HTTPS base URL of a deployed gateway. Setting that single variable enables all generated rnv municipalities during the next data build.

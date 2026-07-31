@@ -1,0 +1,27 @@
+[
+  {
+    "id": "stockholm",
+    "name": "Stockholm",
+    "aliases": [],
+    "latitude": 59.3293,
+    "longitude": 18.0686,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "sweden",
+    "transitRadar": {
+      "adapter": "sweden",
+      "operator": "sl",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "supportsLiveVehicles": true,
+      "supportsRealtimeDelay": true,
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "realtimeDelay"
+      ],
+      "statusMessage": "Live-Radar und Live-Abfahrten für Stockholm"
+    }
+  }
+]

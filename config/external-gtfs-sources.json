@@ -1,0 +1,12 @@
+[
+  {
+    "id": "sweden",
+    "cities": "config/sweden-cities.json",
+    "timezone": "Europe/Stockholm",
+    "identifierPrefix": "se:",
+    "stopIDMode": "exact",
+    "buildStops": true,
+    "buildRoutes": true,
+    "buildDepartures": true
+  }
+]
