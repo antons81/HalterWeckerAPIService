@@ -1988,9 +1988,21 @@ def build_city_line_catalogs(
         )
 
 
-def main() -> None:
+def parse_build_stop_packages_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gtfs-url", required=True)
+    parser.add_argument(
+        "--gtfs-url",
+        default="",
+        help="German GTFS ZIP URL or path. Required unless --skip-german is set.",
+    )
+    parser.add_argument(
+        "--skip-german",
+        action="store_true",
+        help=(
+            "Skip German GTFS/BKG/rnv/VBB processing. Use with external or other "
+            "non-German provider URLs for independent provider builds."
+        ),
+    )
     parser.add_argument(
         "--vbb-gtfs-url",
         default="https://unternehmen.vbb.de/fileadmin/user_upload/VBB/Dokumente/API-Datensaetze/gtfs-mastscharf/GTFS.zip"
@@ -2019,7 +2031,33 @@ def main() -> None:
         default=[],
         help="Repeatable providerID=URL mapping for external GTFS sources.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    has_german = bool(args.gtfs_url.strip()) and not args.skip_german
+    has_other = bool(
+        args.swiss_gtfs_url.strip()
+        or args.austrian_gtfs_url.strip()
+        or args.nl_gtfs_url.strip()
+        or args.external_gtfs_url
+    )
+    if args.skip_german:
+        if has_german:
+            # Explicit skip wins; ignore accidental --gtfs-url.
+            pass
+        if not has_other:
+            parser.error(
+                "--skip-german requires at least one non-German source "
+                "(--external-gtfs-url, --swiss-gtfs-url, --austrian-gtfs-url, "
+                "or --nl-gtfs-url)."
+            )
+    elif not args.gtfs_url.strip():
+        parser.error("--gtfs-url is required unless --skip-german is set")
+
+    return args
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_build_stop_packages_args(argv)
 
     from external_gtfs import (
         parse_external_gtfs_url_args,
@@ -2027,23 +2065,49 @@ def main() -> None:
     )
 
     repository_root = Path(__file__).resolve().parents[1]
-    cities = load_cities(Path(args.cities))
-    archive = load_gtfs_archive(args.gtfs_url)
-    stop_rows = load_table(archive, "stops.txt")
-    stops = canonicalize(stop_rows)
-    municipalities = load_municipalities(args.municipalities_url)
     output = Path(args.output)
-    german_cities = german_branch_cities(cities)
-    manifest, skipped_stop_count, package_stops_by_city_id = build_stop_packages(
-        stops,
-        german_cities,
-        municipalities,
-        output
-    )
-    manifest_sources = {
-        str(entry["id"]): "German GTFS branch (config/cities.json)"
-        for entry in manifest
-    }
+    output.mkdir(parents=True, exist_ok=True)
+
+    cities: list[dict[str, object]] = []
+    if Path(args.cities).exists() and (
+        not args.skip_german
+        or args.austrian_gtfs_url.strip()
+        or args.nl_gtfs_url.strip()
+    ):
+        cities = load_cities(Path(args.cities))
+
+    manifest: list[dict[str, object]] = []
+    manifest_sources: dict[str, str] = {}
+    package_stops_by_city_id: dict[str, list[dict[str, object]]] = {}
+    lines_by_stop_id: dict[str, dict[str, dict[str, object]]] = {}
+    skipped_stop_count = 0
+    german_stop_count = 0
+    rnv_cities: list[dict[str, object]] = []
+    rnv_city_ids: set[str] = set()
+    nl_archive: zipfile.ZipFile | None = None
+
+    german_archive: zipfile.ZipFile | None = None
+    german_stop_rows: list[dict[str, str]] = []
+    municipalities: list[dict[str, object]] = []
+
+    if not args.skip_german:
+        german_archive = load_gtfs_archive(args.gtfs_url)
+        german_stop_rows = load_table(german_archive, "stops.txt")
+        stops = canonicalize(german_stop_rows)
+        german_stop_count = len(stops)
+        municipalities = load_municipalities(args.municipalities_url)
+        german_cities = german_branch_cities(cities)
+        manifest, skipped_stop_count, package_stops_by_city_id = build_stop_packages(
+            stops,
+            german_cities,
+            municipalities,
+            output
+        )
+        manifest_sources = {
+            str(entry["id"]): "German GTFS branch (config/cities.json)"
+            for entry in manifest
+        }
+
     if args.swiss_gtfs_url.strip():
         swiss_cities = load_cities(Path(args.swiss_cities))
         merge_manifest_entries(
@@ -2056,6 +2120,8 @@ def main() -> None:
         )
         manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
     if args.austrian_gtfs_url.strip():
+        if not cities:
+            cities = load_cities(Path(args.cities))
         merge_manifest_entries(
             manifest,
             build_austrian_stop_packages(
@@ -2065,7 +2131,6 @@ def main() -> None:
             sources_by_city_id=manifest_sources,
         )
         manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
-    nl_archive: zipfile.ZipFile | None = None
     if args.nl_gtfs_url.strip():
         nl_cities = load_cities(Path(args.nl_cities))
         nl_archive = load_gtfs_archive(args.nl_gtfs_url)
@@ -2108,31 +2173,53 @@ def main() -> None:
         package_stops_by_city_id.update(external_package_stops)
         manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
 
-    rnv_cities, rnv_city_ids = build_rnv_assets(
-        archive=load_gtfs_archive(args.rnv_gtfs_url),
-        output=output,
-        manifest=manifest,
-        cities=cities,
-        municipalities=municipalities,
-        gateway_url=args.rnv_gateway_url.strip()
-    )
+    if not args.skip_german:
+        assert german_archive is not None
+        rnv_cities, rnv_city_ids = build_rnv_assets(
+            archive=load_gtfs_archive(args.rnv_gtfs_url),
+            output=output,
+            manifest=manifest,
+            cities=cities,
+            municipalities=municipalities,
+            gateway_url=args.rnv_gateway_url.strip()
+        )
+
+    if not manifest:
+        raise ValueError(
+            "No city packages were produced. Provide a German GTFS source or "
+            "at least one non-German provider URL."
+        )
+
     validate_manifest_city_ids(manifest, manifest_sources)
-    radar_cities = list(cities) + list(external_cities)
-    included_city_ids = radar_city_ids(manifest, radar_cities)
-    included_city_ids.update(rnv_city_ids)
-    included_city_ids.update(str(city["id"]) for city in external_cities)
-    included_stop_ids = {
-        str(stop["id"])
-        for city_id in included_city_ids
-        for stop in package_stops_by_city_id.get(city_id, [])
-    }
-    lines_by_stop_id = build_lines_by_stop_id(
-        stop_rows=stop_rows,
-        stop_times=iter_table(archive, "stop_times.txt"),
-        trips=load_table(archive, "trips.txt"),
-        routes=load_table(archive, "routes.txt"),
-        included_stop_ids=included_stop_ids
-    )
+    if args.skip_german:
+        radar_cities = list(external_cities)
+        if args.swiss_gtfs_url.strip():
+            radar_cities.extend(load_cities(Path(args.swiss_cities)))
+        if args.austrian_gtfs_url.strip() or args.nl_gtfs_url.strip():
+            if not cities:
+                cities = load_cities(Path(args.cities))
+            radar_cities.extend(cities)
+    else:
+        radar_cities = list(cities) + list(external_cities)
+
+    if not args.skip_german:
+        assert german_archive is not None
+        included_city_ids = radar_city_ids(manifest, radar_cities)
+        included_city_ids.update(rnv_city_ids)
+        included_city_ids.update(str(city["id"]) for city in external_cities)
+        included_stop_ids = {
+            str(stop["id"])
+            for city_id in included_city_ids
+            for stop in package_stops_by_city_id.get(city_id, [])
+        }
+        lines_by_stop_id = build_lines_by_stop_id(
+            stop_rows=german_stop_rows,
+            stop_times=iter_table(german_archive, "stop_times.txt"),
+            trips=load_table(german_archive, "trips.txt"),
+            routes=load_table(german_archive, "routes.txt"),
+            included_stop_ids=included_stop_ids
+        )
+
     if nl_archive is not None:
         nl_stop_rows = list(iter_table(nl_archive, "stops.txt"))
         nl_ids = nl_city_ids(load_cities(Path(args.nl_cities)))
@@ -2144,13 +2231,12 @@ def main() -> None:
             included_stop_ids={str(s["id"]) for s in swiss_stops(nl_stop_rows)}
         )
         lines_by_stop_id.update(nl_lines)
-        included_city_ids.update(nl_ids)
         for city_id in nl_ids:
             stop_path = output / "stops" / f"{city_id}.json"
             if stop_path.exists():
-                stops = json.loads(stop_path.read_text(encoding="utf-8"))
-                package_stops_by_city_id[city_id] = stops
-                package_stops_by_city_id[f"{city_id}-nl"] = stops
+                package_stops = json.loads(stop_path.read_text(encoding="utf-8"))
+                package_stops_by_city_id[city_id] = package_stops
+                package_stops_by_city_id[f"{city_id}-nl"] = package_stops
     if external_lines:
         lines_by_stop_id.update(external_lines)
     (output / "cities.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2176,28 +2262,25 @@ def main() -> None:
         ),
         encoding="utf-8"
     )
+    attributions = [
+        {
+            "name": "Bundesamt für Kartographie und Geodäsie (BKG)",
+            "license": "Datenlizenz Deutschland – Namensnennung – Version 2.0",
+            "url": "https://gdz.bkg.bund.de/index.php/default/open-data/wfs-verwaltungsgebiete-1-250-000-stand-01-01-wfs-vg250.html"
+        },
+        {
+            "name": "Rhein-Neckar-Verkehr GmbH (rnv)",
+            "license": "Datenlizenz Deutschland – Namensnennung – Version 2.0",
+            "url": "https://www.rnv-online.de/unternehmen/open-data/"
+        },
+        {
+            "name": "Samtrafiken / Trafiklab",
+            "license": "Trafiklab API terms",
+            "url": "https://www.trafiklab.se/"
+        }
+    ]
     (output / "attributions.json").write_text(
-        json.dumps(
-            [
-                {
-                    "name": "Bundesamt für Kartographie und Geodäsie (BKG)",
-                    "license": "Datenlizenz Deutschland – Namensnennung – Version 2.0",
-                    "url": "https://gdz.bkg.bund.de/index.php/default/open-data/wfs-verwaltungsgebiete-1-250-000-stand-01-01-wfs-vg250.html"
-                },
-                {
-                    "name": "Rhein-Neckar-Verkehr GmbH (rnv)",
-                    "license": "Datenlizenz Deutschland – Namensnennung – Version 2.0",
-                    "url": "https://www.rnv-online.de/unternehmen/open-data/"
-                },
-                {
-                    "name": "Samtrafiken / Trafiklab",
-                    "license": "Trafiklab API terms",
-                    "url": "https://www.trafiklab.se/"
-                }
-            ],
-            ensure_ascii=False,
-            indent=2
-        ),
+        json.dumps(attributions, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
     external_city_id_set = {str(city["id"]) for city in external_cities}
@@ -2209,11 +2292,17 @@ def main() -> None:
         cities=radar_cities,
         additional_city_ids=rnv_city_ids | external_city_id_set
     )
-    build_vbb_network_indexes(load_gtfs_archive(args.vbb_gtfs_url), output, cities)
-    print(
-        f"Built {len(manifest)} city packages from {len(stops)} canonical stops; "
-        f"skipped {skipped_stop_count} stops outside German municipalities."
-    )
+    if not args.skip_german:
+        build_vbb_network_indexes(load_gtfs_archive(args.vbb_gtfs_url), output, cities)
+        print(
+            f"Built {len(manifest)} city packages from {german_stop_count} canonical stops; "
+            f"skipped {skipped_stop_count} stops outside German municipalities."
+        )
+    else:
+        print(
+            f"Built {len(manifest)} city packages in --skip-german mode "
+            f"(no German GTFS branch)."
+        )
 
 
 if __name__ == "__main__":
