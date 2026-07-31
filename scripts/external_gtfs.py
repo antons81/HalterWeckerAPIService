@@ -521,6 +521,26 @@ def _line_label(route: dict[str, str], route_id: str) -> str:
     )
 
 
+def _compact_departure_identity(item: dict[str, str]) -> tuple[tuple[str, str], ...]:
+    """Deterministic identity covering every compact field of a departure row."""
+    return tuple(sorted(item.items()))
+
+
+def _dedupe_exact_departures(
+    items: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Drop exact duplicate compact departure rows, keeping the first occurrence."""
+    deduped: list[dict[str, str]] = []
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    for item in items:
+        identity = _compact_departure_identity(item)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduped.append(item)
+    return deduped
+
+
 def build_external_departure_index(
     archive: zipfile.ZipFile,
     cities: list[dict[str, object]],
@@ -640,7 +660,6 @@ def build_external_departure_index(
         departures_by_stop: dict[str, list[dict[str, str]]] = {}
         for stop_id in sorted(city_stop_ids.get(city_id, set())):
             items: list[dict[str, str]] = []
-            seen: set[tuple[str, str, str, str, str, str, str]] = set()
             for departure_time, trip_id, orig_stop_id, platform_code in sorted(
                 stop_departures.get(stop_id, []),
                 key=lambda value: (value[0], value[1]),
@@ -655,38 +674,21 @@ def build_external_departure_index(
                         route, route_id
                     )
                 direction_id = meta["direction_id"]
-                key = (
-                    trip_id,
-                    route_id,
-                    destination,
-                    direction_id,
-                    departure_time,
-                    orig_stop_id,
-                )
-                if key in seen:
-                    continue
-                # Emit one compact row per active service day that shares this trip.
-                for _service_date in active_by_service.get(meta["service_id"], []):
-                    day_key = key + (_service_date,)
-                    if day_key in seen:
-                        continue
-                    seen.add(day_key)
-                    item: dict[str, str] = {
-                        "t": trip_id,
-                        "r": route_id,
-                        "h": destination,
-                        "d": direction_id,
-                        "p": departure_time,
-                    }
-                    if orig_stop_id != stop_id:
-                        item["s"] = orig_stop_id
-                        if platform_code:
-                            item["platform"] = platform_code
-                    items.append(item)
-                    break  # one compact row per trip/time is enough for the client index
+                item: dict[str, str] = {
+                    "t": trip_id,
+                    "r": route_id,
+                    "h": destination,
+                    "d": direction_id,
+                    "p": departure_time,
+                }
+                if orig_stop_id != stop_id:
+                    item["s"] = orig_stop_id
+                    if platform_code:
+                        item["platform"] = platform_code
+                items.append(item)
             if items:
                 items.sort(key=lambda item: (item["p"], item["t"], item["r"]))
-                departures_by_stop[stop_id] = items
+                departures_by_stop[stop_id] = _dedupe_exact_departures(items)
 
         platforms = {
             parent: sorted(child_ids)
