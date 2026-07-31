@@ -195,7 +195,7 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
 
 
 class ExternalStopAndDepartureTests(unittest.TestCase):
-    def test_exact_stop_ids_preserve_parent_and_platform(self) -> None:
+    def test_child_platform_collapses_into_parent_station(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             archive_path = Path(temp) / "se.zip"
             _gtfs_zip(
@@ -221,10 +221,8 @@ class ExternalStopAndDepartureTests(unittest.TestCase):
                     archive, cities, Path(temp) / "out", stop_id_mode="exact"
                 )
             ids = {stop["id"] for stop in package_stops["stockholm"]}
-            self.assertIn("9022001000001001", ids)
-            self.assertIn("9022001000001001_1", ids)
-            self.assertIn("9022001000002002", ids)
-            self.assertEqual(manifest[0]["stopCount"], 3)
+            self.assertEqual(ids, {"9022001000001001", "9022001000002002"})
+            self.assertEqual(manifest[0]["stopCount"], 2)
             payload = json.loads(
                 (Path(temp) / "out" / "stops" / "stockholm.json").read_text()
             )
