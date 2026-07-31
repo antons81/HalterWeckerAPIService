@@ -1574,18 +1574,60 @@ def validate_manifest_city_ids(
         seen[city_id] = source
 
 
+def city_transit_radar_adapters(city: dict[str, object]) -> set[str]:
+    """Return adapter names declared on a city's transitRadar config."""
+    configuration = city.get("transitRadar")
+    if isinstance(configuration, dict):
+        adapter = configuration.get("adapter")
+        return {str(adapter)} if isinstance(adapter, str) and adapter else set()
+    if isinstance(configuration, list):
+        adapters: set[str] = set()
+        for provider in configuration:
+            if not isinstance(provider, dict):
+                continue
+            adapter = provider.get("adapter")
+            if isinstance(adapter, str) and adapter:
+                adapters.add(adapter)
+        return adapters
+    return set()
+
+
 def nl_city_ids(cities: list[dict[str, object]]) -> set[str]:
-    ids: set[str] = set()
-    for city in cities:
-        tr = city.get("transitRadar")
-        if isinstance(tr, dict) and tr.get("adapter") == "netherlands":
-            ids.add(str(city["id"]))
-        elif isinstance(tr, list):
-            for p in tr:
-                if isinstance(p, dict) and p.get("adapter") == "netherlands":
-                    ids.add(str(city["id"]))
-                    break
-    return ids
+    return {
+        str(city["id"])
+        for city in cities
+        if "netherlands" in city_transit_radar_adapters(city)
+    }
+
+
+# Adapters whose stop packages are built by a non-German feed branch.
+# Cities that only appear in shared config/cities.json for these adapters must
+# not be registered by the German GTFS branch.
+NON_GERMAN_STOP_PACKAGE_ADAPTERS = frozenset({
+    "netherlands",
+    "oebb",
+    "sweden",
+})
+
+
+def is_german_branch_city(city: dict[str, object]) -> bool:
+    """True when the German GTFS branch should emit a stop package for this city.
+
+    Shared config/cities.json also lists Netherlands, ÖBB and other non-German
+    cities. Those IDs must only be claimed by their own feed branches.
+    """
+    package_mode = city.get("packageMode", "german")
+    if package_mode != "german":
+        return False
+    adapters = city_transit_radar_adapters(city)
+    if adapters & NON_GERMAN_STOP_PACKAGE_ADAPTERS:
+        return False
+    return True
+
+
+def german_branch_cities(cities: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Configured cities actually processed by the German GTFS branch."""
+    return [city for city in cities if is_german_branch_city(city)]
 
 
 def build_nl_stop_packages(
@@ -1991,10 +2033,7 @@ def main() -> None:
     stops = canonicalize(stop_rows)
     municipalities = load_municipalities(args.municipalities_url)
     output = Path(args.output)
-    german_cities = [
-        city for city in cities
-        if city.get("packageMode", "german") == "german"
-    ]
+    german_cities = german_branch_cities(cities)
     manifest, skipped_stop_count, package_stops_by_city_id = build_stop_packages(
         stops,
         german_cities,
