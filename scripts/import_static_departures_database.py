@@ -265,8 +265,9 @@ def main() -> None:
     parser.add_argument("--external-sources", default=str(REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"))
     args = parser.parse_args()
     next_path = Path(args.next)
-    next_path.parent.mkdir(parents=True, exist_ok=True)
-    next_path.unlink(missing_ok=True)
+    if not args.add_external:
+        next_path.parent.mkdir(parents=True, exist_ok=True)
+        next_path.unlink(missing_ok=True)
     dates = service_window(DEFAULT_TIMEZONE, args.days)
 
     if args.add_external:

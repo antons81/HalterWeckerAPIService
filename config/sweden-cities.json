@@ -14,11 +14,10 @@
       "isEnabled": true,
       "supportsDepartures": true,
       "features": [
-        "realtimeDepartures",
         "firstDepartures",
         "stopLookup"
       ],
-      "statusMessage": "Static-Departures für Stockholm"
+      "statusMessage": "Static-Departures for Stockholm"
     }
   }
 ]
