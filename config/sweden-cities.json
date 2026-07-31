@@ -13,15 +13,12 @@
       "operator": "sl",
       "isEnabled": true,
       "supportsDepartures": true,
-      "supportsLiveVehicles": true,
-      "supportsRealtimeDelay": true,
       "features": [
-        "liveVehicles",
         "realtimeDepartures",
         "firstDepartures",
-        "realtimeDelay"
+        "stopLookup"
       ],
-      "statusMessage": "Live-Radar und Live-Abfahrten für Stockholm"
+      "statusMessage": "Static-Departures für Stockholm"
     }
   }
 ]
