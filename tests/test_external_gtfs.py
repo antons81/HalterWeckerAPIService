@@ -20,6 +20,7 @@ from external_gtfs import (  # noqa: E402
     build_external_departure_index,
     build_external_lines,
     build_external_stop_packages,
+    build_external_trip_index,
     external_city_ids,
     load_external_cities,
     load_external_gtfs_sources,
@@ -389,6 +390,63 @@ class ExternalStopAndDepartureTests(unittest.TestCase):
                 )
             departures = json.loads((out / "departures" / "stockholm.json").read_text())
             self.assertGreater(len(departures["stops"]["9022001000001001"]), 0)
+
+    def test_trip_index_maps_realtime_ids_to_routes_and_headsigns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            archive_path = root / "se.zip"
+            _gtfs_zip(
+                archive_path,
+                stops=(
+                    "stop_id,stop_name,stop_lat,stop_lon\n"
+                    "9022001000001001,T-Centralen,59.331,18.058\n"
+                    "9022001000002002,Slussen,59.320,18.072\n"
+                ),
+                routes=(
+                    "route_id,route_short_name,route_long_name,route_type\n"
+                    "R1,17,,0\n"
+                ),
+                trips=(
+                    "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+                    "R1,S1,1401000012345678,Real Headsign,0\n"
+                    "R1,S1,1401000099999999,,0\n"
+                    "OTHER,S1,NON_REALTIME_ID,,0\n"
+                ),
+                stop_times=(
+                    "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+                    "1401000012345678,08:00:00,08:00:00,9022001000001001,1\n"
+                    "1401000012345678,08:10:00,08:10:00,9022001000002002,2\n"
+                    "1401000099999999,09:00:00,09:00:00,9022001000001001,1\n"
+                    "1401000099999999,09:12:00,09:12:00,9022001000002002,2\n"
+                    "NON_REALTIME_ID,10:00:00,10:00:00,9022001000001001,1\n"
+                    "NON_REALTIME_ID,10:12:00,10:12:00,9022001000002002,2\n"
+                ),
+            )
+            cities = [{
+                "id": "stockholm",
+                "name": "Stockholm",
+                "aliases": [],
+                "latitude": 59.3293,
+                "longitude": 18.0686,
+                "radiusMeters": 30000,
+                "packageMode": "external",
+            }]
+            out = root / "out"
+            with zipfile.ZipFile(archive_path) as archive:
+                build_external_stop_packages(archive, cities, out, stop_id_mode="exact")
+                build_external_departure_index(
+                    archive, cities, out, timezone_name="Europe/Stockholm"
+                )
+                build_external_trip_index(archive, cities, out)
+
+            trip_index = json.loads((out / "trips" / "stockholm.json").read_text())
+            # realtime-prefix trips resolved to their route
+            self.assertEqual(trip_index["1401000012345678"]["r"], "R1")
+            self.assertEqual(trip_index["1401000099999999"]["r"], "R1")
+            # headsign from trips.txt, not the terminal-stop fallback
+            self.assertEqual(trip_index["1401000012345678"]["h"], "Real Headsign")
+            # non-realtime-format trips are excluded from the index
+            self.assertNotIn("NON_REALTIME_ID", trip_index)
 
     def test_stockholm_appears_once_in_manifests(self) -> None:
         cities = load_cities(REPOSITORY_ROOT / "config" / "sweden-cities.json")

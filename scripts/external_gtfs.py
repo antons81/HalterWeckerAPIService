@@ -555,6 +555,74 @@ def build_external_route_index(
         )
 
 
+def build_external_trip_index(
+    archive: zipfile.ZipFile,
+    cities: list[dict[str, object]],
+    output: Path,
+) -> None:
+    """Write a compact realtime trip index: tripId -> {"r": routeId, "h": headsign}.
+
+    The Samtrafiken GTFS-RT VehiclePositions feed rarely carries routeId
+    (only ~7/486 in a live sample). It does carry tripId in the "1401..."
+    format used by the SL operator. This index lets the iOS radar resolve a
+    realtime tripId to a static route/line and (where known) a headsign.
+
+    Only trips whose id uses the realtime "1401..." prefix are included, and
+    only when their route exists in routes.txt. Headsigns are enriched from
+    the already-written departures index (active-window trips only).
+    """
+    if not cities:
+        return
+
+    routes = {
+        str(row["route_id"]): row
+        for row in load_table(archive, "routes.txt")
+        if row.get("route_id")
+    }
+
+    trip_route: dict[str, str] = {}
+    for trip in iter_table(archive, "trips.txt"):
+        trip_id = str(trip.get("trip_id", "")).strip()
+        route_id = str(trip.get("route_id", "")).strip()
+        if trip_id.startswith("1401") and route_id in routes:
+            trip_route[trip_id] = route_id
+
+    if not trip_route:
+        return
+
+    trips_directory = output / "trips"
+    trips_directory.mkdir(parents=True, exist_ok=True)
+
+    for city in cities:
+        city_id = str(city["id"])
+        headsigns: dict[str, str] = {}
+        departures_path = output / "departures" / f"{city_id}.json"
+        if departures_path.exists():
+            try:
+                departures = json.loads(departures_path.read_text(encoding="utf-8"))
+                for deps in departures.get("stops", {}).values():
+                    for dep in deps:
+                        trip_id = dep.get("t", "")
+                        headsign = dep.get("h", "")
+                        if trip_id in trip_route and headsign:
+                            headsigns.setdefault(trip_id, headsign)
+            except (OSError, ValueError):
+                pass
+
+        index: dict[str, dict[str, str]] = {}
+        for trip_id, route_id in trip_route.items():
+            entry: dict[str, str] = {"r": route_id}
+            if headsign := headsigns.get(trip_id):
+                entry["h"] = headsign
+            index[trip_id] = entry
+
+        (trips_directory / f"{city_id}.json").write_text(
+            json.dumps(index, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        print(f"[ExternalGTFS] trip index {city_id}: {len(index)} trips")
+
+
 def _service_calendar(archive: zipfile.ZipFile) -> dict[str, dict[str, object]]:
     calendar: dict[str, dict[str, object]] = {}
     names = set(archive.namelist())
@@ -947,6 +1015,9 @@ def process_external_gtfs_sources(
                     output,
                     timezone_name=str(source["timezone"]),
                 )
+
+            if source.get("buildTripIndex", True):
+                build_external_trip_index(archive, cities, output)
 
             if package_stops:
                 lines_by_stop_id.update(
