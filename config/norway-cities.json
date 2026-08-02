@@ -1,0 +1,235 @@
+[
+  {
+    "id": "oslo",
+    "name": "Oslo",
+    "aliases": [],
+    "latitude": 59.9139,
+    "longitude": 10.7522,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "norway",
+    "transitRadar": {
+      "adapter": "entur",
+      "radarCodespaces": ["VYG", "FLT", "GOA"],
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"],
+      "allowedVehicleModes": ["RAIL"],
+      "statusMessage": "Railradar für Oslo; Ruter-Fahrzeuge derzeit nicht verfügbar",
+      "region": {
+        "minimumLongitude": 10.25,
+        "minimumLatitude": 59.65,
+        "maximumLongitude": 11.25,
+        "maximumLatitude": 60.15
+      }
+    }
+  },
+  {
+    "id": "bergen",
+    "name": "Bergen",
+    "aliases": [],
+    "latitude": 60.3913,
+    "longitude": 5.3221,
+    "radiusMeters": 25000,
+    "packageMode": "external",
+    "externalGTFSProvider": "norway",
+    "transitRadar": {
+      "adapter": "entur",
+      "radarCodespaces": ["SKY"],
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"],
+      "region": {
+        "minimumLongitude": 5.0,
+        "minimumLatitude": 60.2,
+        "maximumLongitude": 5.6,
+        "maximumLatitude": 60.55
+      }
+    }
+  },
+  {
+    "id": "stavanger",
+    "name": "Stavanger",
+    "aliases": ["Sandnes"],
+    "latitude": 58.97,
+    "longitude": 5.7331,
+    "radiusMeters": 24000,
+    "packageMode": "external",
+    "externalGTFSProvider": "norway",
+    "transitRadar": {
+      "adapter": "entur",
+      "radarCodespaces": ["KOL"],
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"],
+      "region": {
+        "minimumLongitude": 5.45,
+        "minimumLatitude": 58.8,
+        "maximumLongitude": 6.0,
+        "maximumLatitude": 59.1
+      }
+    }
+  },
+  {
+    "id": "trondheim",
+    "name": "Trondheim",
+    "aliases": [],
+    "latitude": 63.4305,
+    "longitude": 10.3951,
+    "radiusMeters": 25000,
+    "packageMode": "external",
+    "externalGTFSProvider": "norway",
+    "transitRadar": {
+      "adapter": "entur",
+      "radarCodespaces": ["ATB"],
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"],
+      "region": {
+        "minimumLongitude": 10.1,
+        "minimumLatitude": 63.25,
+        "maximumLongitude": 10.7,
+        "maximumLatitude": 63.65
+      }
+    }
+  },
+  {
+    "id": "drammen",
+    "name": "Drammen",
+    "aliases": [],
+    "latitude": 59.7439,
+    "longitude": 10.2045,
+    "radiusMeters": 18000,
+    "packageMode": "external",
+    "externalGTFSProvider": "norway",
+    "transitRadar": {
+      "adapter": "entur",
+      "radarCodespaces": ["BRA"],
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"],
+      "region": {
+        "minimumLongitude": 9.9,
+        "minimumLatitude": 59.55,
+        "maximumLongitude": 10.5,
+        "maximumLatitude": 59.9
+      }
+    }
+  },
+  {
+    "id": "fredrikstad",
+    "name": "Fredrikstad",
+    "aliases": ["Sarpsborg"],
+    "latitude": 59.2181,
+    "longitude": 10.9298,
+    "radiusMeters": 22000,
+    "packageMode": "external",
+    "externalGTFSProvider": "norway",
+    "transitRadar": {
+      "adapter": "entur",
+      "radarCodespaces": ["OST"],
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"],
+      "region": {
+        "minimumLongitude": 10.7,
+        "minimumLatitude": 59.0,
+        "maximumLongitude": 11.2,
+        "maximumLatitude": 59.4
+      }
+    }
+  },
+  {
+    "id": "skien",
+    "name": "Skien",
+    "aliases": ["Porsgrunn"],
+    "latitude": 59.2096,
+    "longitude": 9.61,
+    "radiusMeters": 20000,
+    "packageMode": "external",
+    "externalGTFSProvider": "norway",
+    "transitRadar": {
+      "adapter": "entur",
+      "radarCodespaces": ["VOT", "TEL"],
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"],
+      "region": {
+        "minimumLongitude": 9.25,
+        "minimumLatitude": 59.05,
+        "maximumLongitude": 9.9,
+        "maximumLatitude": 59.35
+      }
+    }
+  },
+  {
+    "id": "kristiansand",
+    "name": "Kristiansand",
+    "aliases": [],
+    "latitude": 58.1467,
+    "longitude": 7.9956,
+    "radiusMeters": 20000,
+    "packageMode": "external",
+    "externalGTFSProvider": "norway",
+    "transitRadar": {
+      "adapter": "entur",
+      "radarCodespaces": ["AKT"],
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"],
+      "region": {
+        "minimumLongitude": 7.7,
+        "minimumLatitude": 57.95,
+        "maximumLongitude": 8.3,
+        "maximumLatitude": 58.3
+      }
+    }
+  },
+  {
+    "id": "tonsberg",
+    "name": "Tønsberg",
+    "aliases": ["Tonsberg"],
+    "latitude": 59.2675,
+    "longitude": 10.4076,
+    "radiusMeters": 18000,
+    "packageMode": "external",
+    "externalGTFSProvider": "norway",
+    "transitRadar": {
+      "adapter": "entur",
+      "radarCodespaces": ["VOT"],
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"],
+      "region": {
+        "minimumLongitude": 10.1,
+        "minimumLatitude": 59.1,
+        "maximumLongitude": 10.7,
+        "maximumLatitude": 59.45
+      }
+    }
+  },
+  {
+    "id": "alesund",
+    "name": "Ålesund",
+    "aliases": ["Alesund"],
+    "latitude": 62.4722,
+    "longitude": 6.1495,
+    "radiusMeters": 18000,
+    "packageMode": "external",
+    "externalGTFSProvider": "norway",
+    "transitRadar": {
+      "adapter": "entur",
+      "radarCodespaces": ["MOR"],
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"],
+      "region": {
+        "minimumLongitude": 5.8,
+        "minimumLatitude": 62.3,
+        "maximumLongitude": 6.5,
+        "maximumLatitude": 62.65
+      }
+    }
+  },
+  {
+    "id": "tromso",
+    "name": "Tromsø",
+    "aliases": ["Tromso"],
+    "latitude": 69.6492,
+    "longitude": 18.9553,
+    "radiusMeters": 22000,
+    "packageMode": "external",
+    "externalGTFSProvider": "norway",
+    "transitRadar": {
+      "adapter": "entur",
+      "radarCodespaces": ["TRO"],
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"],
+      "region": {
+        "minimumLongitude": 18.4,
+        "minimumLatitude": 69.45,
+        "maximumLongitude": 19.4,
+        "maximumLatitude": 69.9
+      }
+    }
+  }
+]

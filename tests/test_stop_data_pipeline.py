@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,6 +41,9 @@ case \"${1:-}\" in
     if [ \"${BUILD_FAIL:-0}\" = \"1\" ]; then
       exit 1
     fi
+    if [ -n \"${BUILD_ARGS_LOG:-}\" ]; then
+      printf '%s\\n' \"$*\" > \"$BUILD_ARGS_LOG\"
+    fi
     output=\"\"
     while [ \"$#\" -gt 0 ]; do
       if [ \"$1\" = \"--output\" ]; then
@@ -49,8 +53,10 @@ case \"${1:-}\" in
       shift
     done
     mkdir -p \"$output/swiss-static\"
-    printf '{\"version\":\"2026-07-30\",\"cities\":[]}' > \"$output/manifest.json\"
-    if [ \"${BUILD_INVALID:-0}\" != \"1\" ]; then
+    if [ \"${BUILD_INVALID:-0}\" = \"1\" ]; then
+      printf '{\"version\":\"2026-07-30\",\"cities\":[]}' > \"$output/manifest.json\"
+    else
+      printf '{\"version\":\"2026-07-30\",\"cities\":[]}' > \"$output/manifest.json\"
       : > \"$output/transit-radar-cities.json\"
     fi
     printf 'new' > \"$output/release-marker\"
@@ -68,7 +74,7 @@ case \"${1:-}\" in
     : > \"$output/manifest.json\"
     ;;
   -)
-    printf '2026-07-30\\n'
+    exec "$REAL_PYTHON" "$@"
     ;;
   *)
     echo \"unexpected python3 invocation: $*\" >&2
@@ -122,6 +128,8 @@ exit 64
             "STOP_DATA_LOCK": str(self.root / "stop-data.lock"),
             "STOP_DATA_ENV_FILE": str(self.environment_file),
             "SYSTEMCTL_LOG": str(self.systemctl_log),
+            "BUILD_ARGS_LOG": str(self.root / "build-args.log"),
+            "REAL_PYTHON": sys.executable,
             "GTFS_URL": "https://example.invalid/german.zip",
             "SWISS_GTFS_URL": "https://example.invalid/swiss.zip",
             "NL_GTFS_URL": "https://example.invalid/netherlands.zip",
@@ -158,6 +166,21 @@ exit 64
                 "start-current=new",
                 "show haltewecker-static-departures.service -p Result -p ExecMainStatus"
             ]
+        )
+
+    def test_external_sources_do_not_require_a_norway_cli_override(self) -> None:
+        result = self.run_pipeline()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        build_args = (self.root / "build-args.log").read_text(encoding="utf-8")
+        self.assertIn(
+            f"--external-gtfs-sources {REPOSITORY_ROOT / 'config' / 'external-gtfs-sources.json'}",
+            build_args,
+        )
+        self.assertNotIn("norway=", build_args)
+        self.assertEqual(
+            (self.data_root / "current" / "release-marker").read_text(encoding="utf-8"),
+            "new",
         )
 
     def test_failed_static_departures_result_fails_after_publication(self) -> None:

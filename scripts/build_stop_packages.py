@@ -52,6 +52,7 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "oebb",
     "netherlands",
     "sweden",
+    "entur",
 }
 SUPPORTED_TRANSIT_RADAR_FEATURES = {
     "liveVehicles",
@@ -680,6 +681,25 @@ def validate_transit_radar_provider(
             raise ValueError(f"Sweden requires a non-empty operator for {city_id}")
         return
 
+    if adapter == "entur":
+        codespaces = configuration.get("radarCodespaces")
+        if not isinstance(codespaces, list) or not codespaces:
+            raise ValueError(f"Entur requires radar codespaces for {city_id}")
+        if not all(isinstance(code, str) and code.strip() for code in codespaces):
+            raise ValueError(f"Invalid Entur radar codespaces for {city_id}")
+        if len(codespaces) != len(set(codespaces)):
+            raise ValueError(f"Duplicate Entur radar codespaces for {city_id}")
+        allowed_vehicle_modes = configuration.get("allowedVehicleModes")
+        if allowed_vehicle_modes is not None and (
+            not isinstance(allowed_vehicle_modes, list)
+            or not allowed_vehicle_modes
+            or not all(
+                isinstance(mode, str) and mode.strip()
+                for mode in allowed_vehicle_modes
+            )
+        ):
+            raise ValueError(f"Invalid Entur allowed vehicle modes for {city_id}")
+
     if adapter == "vagPuls" and city_id != "nurnberg":
         raise ValueError(f"Invalid VAG PULS configuration for {city_id}")
 
@@ -981,6 +1001,8 @@ def transit_radar_manifest(
                 provider_id = f"netherlands-{city_id}"
             elif adapter == "sweden":
                 provider_id = f"sweden-{city_id}"
+            elif adapter == "entur":
+                provider_id = f"entur-{city_id}"
             elif adapter == "bwTrias":
                 provider_id = "bw-trias"
             else:
@@ -999,7 +1021,7 @@ def transit_radar_manifest(
                 supports_departures = bool(
                     provider_configuration.get(
                         "supportsDepartures",
-                        adapter in {"bwTrias", "vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "avvHafas", "oebb", "netherlands", "sweden"}
+                        adapter in {"bwTrias", "vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "avvHafas", "oebb", "netherlands", "sweden", "entur"}
                     )
                 )
                 supports_live_vehicles = bool(
@@ -1057,6 +1079,12 @@ def transit_radar_manifest(
             supports_coordinate_catalog = provider_configuration.get("supportsCoordinateCatalog")
             if supports_coordinate_catalog is not None:
                 provider["supportsCoordinateCatalog"] = supports_coordinate_catalog
+            radar_codespaces = provider_configuration.get("radarCodespaces")
+            if isinstance(radar_codespaces, list):
+                provider["radarCodespaces"] = radar_codespaces
+            allowed_vehicle_modes = provider_configuration.get("allowedVehicleModes")
+            if isinstance(allowed_vehicle_modes, list):
+                provider["allowedVehicleModes"] = allowed_vehicle_modes
             gateway_url = provider_configuration.get("gatewayURL")
             if adapter == "vagPuls" and vag_gateway_url:
                 gateway_url = vag_gateway_url
@@ -1070,6 +1098,8 @@ def transit_radar_manifest(
             country_suffix = "se"
         elif any(p.get("adapter") == "oebb" for p in providers):
             country_suffix = "at"
+        elif any(p.get("adapter") == "entur" for p in providers):
+            country_suffix = "no"
         else:
             country_suffix = "de"
         radar_cities.append({

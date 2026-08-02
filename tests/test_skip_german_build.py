@@ -44,6 +44,29 @@ def _write_sweden_fixture(root: Path) -> Path:
     return archive_path
 
 
+def _write_sweden_source_config(root: Path) -> Path:
+    source_config = root / "external-gtfs-sources.json"
+    source_config.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "sweden",
+                    "cities": "config/sweden-cities.json",
+                    "timezone": "Europe/Stockholm",
+                    "identifierPrefix": "se:",
+                    "stopIDMode": "exact",
+                    "buildStops": True,
+                    "buildRoutes": True,
+                    "buildDepartures": True,
+                    "country": "SE",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return source_config
+
+
 class SkipGermanBuildTests(unittest.TestCase):
     def test_gtfs_url_required_without_skip_german(self) -> None:
         with self.assertRaises(SystemExit) as raised:
@@ -62,6 +85,7 @@ class SkipGermanBuildTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             archive_path = _write_sweden_fixture(root)
+            source_config = _write_sweden_source_config(root)
             output = root / "out"
             repo = Path(__file__).resolve().parents[1]
 
@@ -86,7 +110,7 @@ class SkipGermanBuildTests(unittest.TestCase):
                     "--cities",
                     str(repo / "config" / "cities.json"),
                     "--external-gtfs-sources",
-                    str(repo / "config" / "external-gtfs-sources.json"),
+                    str(source_config),
                     "--external-gtfs-url",
                     f"sweden={archive_path}",
                     "--output",
@@ -112,6 +136,7 @@ class SkipGermanBuildTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             archive_path = _write_sweden_fixture(root)
+            source_config = _write_sweden_source_config(root)
             output = root / "out"
             repo = Path(__file__).resolve().parents[1]
 
@@ -154,7 +179,7 @@ class SkipGermanBuildTests(unittest.TestCase):
                     "--cities",
                     str(repo / "config" / "cities.json"),
                     "--external-gtfs-sources",
-                    str(repo / "config" / "external-gtfs-sources.json"),
+                    str(source_config),
                     "--external-gtfs-url",
                     f"sweden={archive_path}",
                     "--output",

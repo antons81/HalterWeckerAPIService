@@ -94,6 +94,7 @@ run_build_stop_packages() {
     --gtfs-url "$GTFS_URL"
     --swiss-gtfs-url "$SWISS_GTFS_URL"
     --austrian-gtfs-url "${AUSTRIAN_GTFS_URL:-}"
+    --external-gtfs-sources "$REPO/config/external-gtfs-sources.json"
   )
   if [ -n "$nl_url" ]; then
     cmd+=(--nl-gtfs-url "$nl_url")

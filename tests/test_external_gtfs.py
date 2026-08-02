@@ -68,12 +68,42 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
         sources = load_external_gtfs_sources(
             REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
         )
-        self.assertEqual(len(sources), 1)
-        validate_external_gtfs_source(sources[0], REPOSITORY_ROOT)
-        cities = load_external_cities(sources[0], REPOSITORY_ROOT)
+        self.assertEqual({source["id"] for source in sources}, {"sweden", "norway"})
+        sweden = next(source for source in sources if source["id"] == "sweden")
+        validate_external_gtfs_source(sweden, REPOSITORY_ROOT)
+        cities = load_external_cities(sweden, REPOSITORY_ROOT)
         self.assertEqual([city["id"] for city in cities], ["stockholm"])
         self.assertEqual(cities[0]["packageMode"], "external")
         self.assertEqual(cities[0]["externalGTFSProvider"], "sweden")
+
+    def test_validate_norway_registry_and_city_coverage(self) -> None:
+        sources = load_external_gtfs_sources(
+            REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
+        )
+        norway = next(source for source in sources if source["id"] == "norway")
+        validate_external_gtfs_source(norway, REPOSITORY_ROOT)
+        self.assertEqual(
+            norway["url"],
+            "https://storage.googleapis.com/marduk-production/outbound/gtfs/rb_norway-aggregated-gtfs.zip",
+        )
+        cities = load_external_cities(norway, REPOSITORY_ROOT)
+        self.assertEqual(len(cities), 11)
+        self.assertEqual({city["id"] for city in cities}, {
+            "oslo", "bergen", "stavanger", "trondheim", "drammen",
+            "fredrikstad", "skien", "kristiansand", "tonsberg",
+            "alesund", "tromso",
+        })
+
+    def test_norway_radar_manifest_preserves_multiple_codespaces(self) -> None:
+        cities = load_cities(REPOSITORY_ROOT / "config" / "norway-cities.json")
+        manifest = transit_radar_manifest(cities)
+        oslo = next(city for city in manifest["cities"] if city["appCityID"] == "oslo")
+        provider = oslo["providers"][0]
+        self.assertEqual(oslo["cityID"], "oslo-no")
+        self.assertEqual(provider["providerID"], "entur-oslo")
+        self.assertEqual(provider["radarCodespaces"], ["VYG", "FLT", "GOA"])
+        self.assertEqual(provider["allowedVehicleModes"], ["RAIL"])
+        self.assertIn("liveVehicles", provider["features"])
 
     def test_duplicate_provider_ids_fail(self) -> None:
         source = {
@@ -543,6 +573,88 @@ class ExternalStopAndDepartureTests(unittest.TestCase):
             )
             self.assertIn("key=unit-test-key", url)
             self.assertEqual(headers.get("Accept-Encoding"), "gzip")
+
+    def test_end_to_end_norway_source_builds_static_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "config").mkdir()
+            archive_path = root / "norway.zip"
+            _gtfs_zip(
+                archive_path,
+                stops=(
+                    "stop_id,stop_name,stop_lat,stop_lon\n"
+                    "NSR:StopPlace:58366,Jernbanetorget,59.9119,10.75038\n"
+                    "NSR:StopPlace:59872,Oslo S,59.9098,10.7528\n"
+                ),
+                stop_times=(
+                    "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+                    "T1,08:00:00,08:00:00,NSR:StopPlace:58366,1\n"
+                    "T1,08:10:00,08:10:00,NSR:StopPlace:59872,2\n"
+                ),
+            )
+            (root / "config" / "norway-cities.json").write_text(json.dumps([{
+                "id": "oslo",
+                "name": "Oslo",
+                "aliases": [],
+                "latitude": 59.9139,
+                "longitude": 10.7522,
+                "radiusMeters": 30_000,
+                "packageMode": "external",
+                "externalGTFSProvider": "norway",
+                "transitRadar": {
+                    "adapter": "entur",
+                    "radarCodespaces": ["VYG", "FLT", "GOA"],
+                    "isEnabled": True,
+                    "features": [
+                        "liveVehicles",
+                        "realtimeDepartures",
+                        "firstDepartures",
+                        "stopLookup",
+                        "realtimeDelay",
+                    ],
+                    "region": {
+                        "minimumLongitude": 10.25,
+                        "minimumLatitude": 59.65,
+                        "maximumLongitude": 11.25,
+                        "maximumLatitude": 60.15,
+                    },
+                },
+            }]))
+            (root / "config" / "external-gtfs-sources.json").write_text(json.dumps([{
+                "id": "norway",
+                "url": str(archive_path),
+                "cities": "config/norway-cities.json",
+                "timezone": "Europe/Oslo",
+                "identifierPrefix": "no:",
+                "stopIDMode": "exact",
+                "country": "NO",
+                "buildStops": True,
+                "buildRoutes": True,
+                "buildDepartures": True,
+                "buildTripIndex": False,
+            }]))
+
+            out = root / "out"
+            entries, external_cities, package_stops, lines = process_external_gtfs_sources(
+                repository_root=root,
+                sources_path=root / "config" / "external-gtfs-sources.json",
+                url_by_provider={},
+                output=out,
+                load_gtfs_archive=load_gtfs_archive,
+            )
+
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["id"], "oslo")
+            self.assertEqual(entries[0]["country"], "NO")
+            self.assertEqual([city["id"] for city in external_cities], ["oslo"])
+            self.assertEqual(
+                {stop["id"] for stop in package_stops["oslo"]},
+                {"NSR:StopPlace:58366", "NSR:StopPlace:59872"},
+            )
+            self.assertTrue((out / "stops" / "oslo.json").exists())
+            self.assertTrue((out / "routes" / "oslo.json").exists())
+            self.assertTrue((out / "departures" / "oslo.json").exists())
+            self.assertIn("NSR:StopPlace:58366", lines)
 
     def test_gzip_payload_is_accepted_by_load_gtfs_archive(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

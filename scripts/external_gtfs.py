@@ -72,6 +72,12 @@ def validate_external_gtfs_source(
             f"External GTFS source {source_id} city file does not exist: {cities_path}"
         )
 
+    configured_url = source.get("url")
+    if configured_url is not None and (
+        not isinstance(configured_url, str) or not configured_url.strip()
+    ):
+        raise ValueError(f"External GTFS source {source_id} has an invalid URL.")
+
     timezone_name = source.get("timezone")
     if not isinstance(timezone_name, str) or not timezone_name.strip():
         raise ValueError(f"External GTFS source {source_id} is missing timezone.")
@@ -962,13 +968,16 @@ def process_external_gtfs_sources(
         known_source_ids.add(source_id)
         known_prefixes.add(str(source["identifierPrefix"]))
 
-        url = url_by_provider.get(source_id, "").strip()
+        configured_url = source.get("url")
+        url = url_by_provider.get(
+            source_id,
+            configured_url if isinstance(configured_url, str) else "",
+        ).strip()
         if not url:
-            # Source is configured but not activated for this run. Production
-            # pipeline must pass --external-gtfs-url for each active provider.
+            # Source is configured but not activated for this run.
             print(
                 f"[ExternalGTFS] skipping source {source_id}: "
-                f"no --external-gtfs-url {source_id}=URL provided"
+                f"no URL configured for {source_id}"
             )
             continue
 

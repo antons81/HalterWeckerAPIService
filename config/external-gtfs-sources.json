@@ -9,5 +9,18 @@
     "buildRoutes": true,
     "buildDepartures": true,
     "country": "SE"
+  },
+  {
+    "id": "norway",
+    "url": "https://storage.googleapis.com/marduk-production/outbound/gtfs/rb_norway-aggregated-gtfs.zip",
+    "cities": "config/norway-cities.json",
+    "timezone": "Europe/Oslo",
+    "identifierPrefix": "no:",
+    "stopIDMode": "exact",
+    "buildStops": true,
+    "buildRoutes": true,
+    "buildDepartures": true,
+    "buildTripIndex": false,
+    "country": "NO"
   }
 ]
