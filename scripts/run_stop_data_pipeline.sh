@@ -11,7 +11,9 @@ ROLLBACK="$DATA_ROOT/temp/current-rollback"
 STOP_DATA_LOCK="${STOP_DATA_LOCK:-/run/lock/haltewecker-stop-data.lock}"
 STOP_DATA_ENV_FILE="${STOP_DATA_ENV_FILE:-/etc/haltewecker-stop-data.env}"
 
+set -a
 source "$STOP_DATA_ENV_FILE"
+set +a
 
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 SUDO_BIN="${SUDO_BIN:-sudo}"
