@@ -7,6 +7,12 @@ GTFS_URL="${GTFS_URL:?GTFS_URL is required}"
 AUSTRIAN_GTFS_PATH="${AUSTRIAN_GTFS_PATH:-}"
 LOG_PREFIX="[StaticDepartures]"
 
+if [[ -z "$AUSTRIAN_GTFS_PATH" && -d "$DATA_ROOT/austria" ]]; then
+  while IFS= read -r candidate; do
+    AUSTRIAN_GTFS_PATH="$candidate"
+  done < <(find "$DATA_ROOT/austria" -maxdepth 1 -type f -name '*.zip' -print | sort)
+fi
+
 echo "$LOG_PREFIX import started at $(date -Is)"
 IMPORT_ARGS=(
   --gtfs-url "$GTFS_URL"
