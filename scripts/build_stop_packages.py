@@ -2085,7 +2085,6 @@ def main(argv: list[str] | None = None) -> None:
     lines_by_stop_id: dict[str, dict[str, dict[str, object]]] = {}
     skipped_stop_count = 0
     german_stop_count = 0
-    internal_german_package_count = 0
     rnv_cities: list[dict[str, object]] = []
     rnv_city_ids: set[str] = set()
     nl_archive: zipfile.ZipFile | None = None
@@ -2107,12 +2106,6 @@ def main(argv: list[str] | None = None) -> None:
             municipalities,
             output
         )
-        internal_german_package_count = len(manifest)
-        configured_city_ids = {str(city["id"]) for city in german_cities}
-        manifest = [
-            entry for entry in manifest
-            if str(entry["id"]) in configured_city_ids
-        ]
         manifest_sources = {
             str(entry["id"]): "German GTFS branch (config/cities.json)"
             for entry in manifest
@@ -2305,8 +2298,7 @@ def main(argv: list[str] | None = None) -> None:
     if not args.skip_german:
         build_vbb_network_indexes(load_gtfs_archive(args.vbb_gtfs_url), output, cities)
         print(
-            f"Built {internal_german_package_count} internal Germany packages and "
-            f"{len(manifest)} runtime city entries from {german_stop_count} canonical stops; "
+            f"Built {len(manifest)} city packages from {german_stop_count} canonical stops; "
             f"skipped {skipped_stop_count} stops outside German municipalities."
         )
     else:
