@@ -2,6 +2,7 @@ import io
 import json
 import tempfile
 import unittest
+import urllib.error
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
@@ -33,10 +34,57 @@ class FakeResponse:
         return None
 
     def read(self, *_args):
-        return self.body
+        if not self.body:
+            return b""
+        size = _args[0] if _args else len(self.body)
+        chunk, self.body = self.body[:size], self.body[size:]
+        return chunk
 
 
 class GTFSArtifactCacheTests(unittest.TestCase):
+    def test_germany_request_preserves_exact_url_and_legacy_user_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "germany.zip"
+            write_gtfs(source)
+            payload = source.read_bytes()
+            cache = GTFSArtifactCache(root / "cache")
+            exact_url = (
+                "https://download.example.invalid/gtfs.zip?"
+                "expires=2099-01-01T00%3A00%3A00Z&signature=abc123"
+            )
+            requests = []
+
+            def fake_urlopen(request, timeout=0):
+                requests.append((request, timeout))
+                if request.get_method() == "HEAD":
+                    raise urllib.error.HTTPError(
+                        request.full_url,
+                        403,
+                        "HEAD is not supported by the feed",
+                        {},
+                        io.BytesIO(),
+                    )
+                return FakeResponse(
+                    body=payload,
+                    headers={"Content-Length": str(len(payload))},
+                )
+
+            with patch(
+                "gtfs_source_cache.urllib.request.urlopen",
+                side_effect=fake_urlopen,
+            ):
+                result = cache.resolve("germany", exact_url)
+
+            self.assertEqual(result.status, "updated")
+            self.assertEqual([request.full_url for request, _ in requests], [exact_url, exact_url])
+            self.assertEqual(
+                [request.get_header("User-agent") for request, _ in requests],
+                ["HalteWeckerStopPipeline/1.0", "HalteWeckerStopPipeline/1.0"],
+            )
+            self.assertEqual(requests[0][0].get_method(), "HEAD")
+            self.assertEqual(requests[1][0].get_method(), "GET")
+
     def test_source_version_reuses_validated_local_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 
 DEFAULT_CACHE_ROOT = Path("/srv/haltewecker/cache/gtfs")
 REQUIRED_GTFS_FILES = {"stops.txt", "routes.txt", "trips.txt", "stop_times.txt"}
+DEFAULT_REQUEST_HEADERS = {"User-Agent": "HalteWeckerStopPipeline/1.0"}
 
 
 @dataclass(frozen=True)
@@ -172,7 +173,10 @@ class GTFSArtifactCache:
     ) -> ArtifactResult:
         artifact, state_path, lock_path = self._paths(source_id)
         artifact.parent.mkdir(parents=True, exist_ok=True)
-        request_headers = {str(key): str(value) for key, value in (headers or {}).items()}
+        request_headers = dict(DEFAULT_REQUEST_HEADERS)
+        request_headers.update(
+            {str(key): str(value) for key, value in (headers or {}).items()}
+        )
         parsed = urlsplit(url)
         started = time.monotonic()
 

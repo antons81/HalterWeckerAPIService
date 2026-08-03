@@ -28,20 +28,37 @@ def resolve_one(
     state_url: str | None = None,
 ) -> ArtifactResult:
     started = time.monotonic()
-    result = cache.resolve(
-        source_id,
-        url,
-        headers=headers,
-        source_version=source_version,
-        allow_stale=allow_stale,
-        state_url=state_url,
-    )
+    try:
+        result = cache.resolve(
+            source_id,
+            url,
+            headers=headers,
+            source_version=source_version,
+            allow_stale=allow_stale,
+            state_url=state_url,
+        )
+    except Exception as error:
+        duration = time.monotonic() - started
+        print(
+            f"[GTFSCache] source={source_id} stage=resolve "
+            f"status=failed duration={duration:.2f}s reason={error}"
+        )
+        print(
+            f"[GTFSCache] source={source_id} stage=download "
+            f"status=failed duration={duration:.2f}s"
+        )
+        raise
+    duration = time.monotonic() - started
     print(
         f"[GTFSCache] source={source_id} stage=resolve "
-        f"status={result.status} duration={time.monotonic() - started:.2f}s"
+        f"status={result.status} duration={duration:.2f}s"
         + (f" reason={result.reason}" if result.reason else "")
     )
-    print(f"[GTFSCache] source={source_id} stage=download status={'skipped' if result.status == 'unchanged' else result.status} duration=0.00s")
+    download_status = "skipped" if result.status == "unchanged" else result.status
+    print(
+        f"[GTFSCache] source={source_id} stage=download "
+        f"status={download_status} duration={duration:.2f}s"
+    )
     return result
 
 
