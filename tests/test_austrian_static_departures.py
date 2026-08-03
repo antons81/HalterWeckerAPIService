@@ -16,10 +16,24 @@ from build_german_departure_index import (
     resolve_canonical_stops,
     update_terminal_stops,
 )
+from austrian_sources import load_austrian_sources
+from import_static_departures_database import configured_austrian_static_city_ids
 from static_departures_api import Database
 
 
 class AustrianStaticDepartureTests(unittest.TestCase):
+    def test_all_registry_cities_are_configured_for_static_departures(self) -> None:
+        repository_root = Path(__file__).resolve().parents[1]
+        registry_city_ids = {
+            str(city_id)
+            for source in load_austrian_sources(repository_root / "config" / "austrian-sources.json")
+            for city_id in source["cities"]
+        }
+        configured_city_ids = configured_austrian_static_city_ids(
+            repository_root / "config" / "cities.json"
+        )
+        self.assertEqual(configured_city_ids, registry_city_ids)
+
     def test_vor_ids_platform_parent_and_calendar_exceptions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
