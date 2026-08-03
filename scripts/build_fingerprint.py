@@ -13,6 +13,7 @@ DEFAULT_INPUTS = (
     "config/swiss-cities.json",
     "config/austrian-sources.json",
     "config/external-gtfs-sources.json",
+    "config/ireland-cities.json",
     "config/city-id-aliases.json",
     "scripts/build_stop_packages.py",
     "scripts/external_gtfs.py",

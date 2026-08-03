@@ -19,6 +19,20 @@ The workflow runs every day and publishes:
 
 Each stop has `id`, `name`, `latitude`, `longitude`, and `searchName` fields. The iOS app validates downloaded JSON and later imports it into its local SQLite FTS index.
 
+## Ireland NTA realtime snapshots
+
+The production stop-data pipeline consumes the atomically published local static feed at
+`/srv/haltewecker/data/ireland/static`; the Ireland systemd updater remains the only owner
+of static-feed refreshes. The API container exposes the separately refreshed, read-only
+snapshots without forwarding NTA credentials:
+
+- `/ireland/realtime/vehicles`
+- `/ireland/realtime/trip-updates`
+
+Both endpoints validate the stored JSON and return its original bytes. Missing or malformed
+snapshots return `503`; the API container mounts the Ireland `realtime` directory for this
+feature and does not mount `/srv/haltewecker/data/ireland/.env`.
+
 ## Static departures synchronization
 
 `scripts/run_stop_data_pipeline.sh` publishes `/srv/haltewecker/data/current` atomically. Only after that replacement succeeds, it starts and waits for `haltewecker-static-departures.service`. The stop-data pipeline succeeds only when systemd reports both `Result=success` and `ExecMainStatus=0`; otherwise the stop release remains published but the pipeline exits non-zero and logs that static departures are not synchronized.

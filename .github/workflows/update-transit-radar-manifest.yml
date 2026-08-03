@@ -6,6 +6,8 @@ on:
       - main
     paths:
       - "config/cities.json"
+      - "config/external-gtfs-sources.json"
+      - "config/ireland-cities.json"
       - ".github/workflows/update-transit-radar-manifest.yml"
 
 permissions:

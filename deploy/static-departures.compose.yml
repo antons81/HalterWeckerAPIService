@@ -7,9 +7,14 @@ services:
     environment:
       DEPARTURES_DATABASE: ${DEPARTURES_DATABASE:-/data/current-release/departures.sqlite}
       STATIC_DATA_ROOT: ${STATIC_DATA_ROOT:-/data/current-release/stop-data}
+      IRELAND_REALTIME_ROOT: ${IRELAND_REALTIME_ROOT:-/data/ireland/realtime}
       PORT: "8080"
     volumes:
-      - /srv/haltewecker/data:/data:ro
+      - /srv/haltewecker/data/releases:/data/releases:ro
+      - /srv/haltewecker/data/current:/data/current:ro
+      - /srv/haltewecker/data/current-release:/data/current-release:ro
+      - /srv/haltewecker/data/departures-current.sqlite:/data/departures-current.sqlite:ro
+      - /srv/haltewecker/data/ireland/realtime:/data/ireland/realtime:ro
     restart: unless-stopped
     read_only: true
     tmpfs:

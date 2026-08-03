@@ -55,6 +55,7 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "oebb",
     "netherlands",
     "sweden",
+    "ireland",
     "entur",
 }
 SUPPORTED_TRANSIT_RADAR_FEATURES = {
@@ -95,10 +96,31 @@ def distance_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float
     ))
 
 
+class DirectoryGTFSArchive:
+    """Small read-only archive facade for an atomically published GTFS directory."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def namelist(self) -> list[str]:
+        return [path.name for path in self.root.iterdir() if path.is_file()]
+
+    def open(self, filename: str):
+        path = (self.root / filename).resolve()
+        try:
+            path.relative_to(self.root.resolve())
+        except ValueError as error:
+            raise FileNotFoundError(filename) from error
+        return path.open("rb")
+
+    def close(self) -> None:
+        return None
+
+
 def load_gtfs_archive(
     url: str,
     headers: dict[str, str] | None = None,
-) -> zipfile.ZipFile:
+) -> zipfile.ZipFile | DirectoryGTFSArchive:
     """Load a GTFS ZIP from a local path or HTTP(S) URL.
 
     Optional request headers support authenticated external feeds. Response
@@ -108,6 +130,8 @@ def load_gtfs_archive(
     parsed_url = urlsplit(url)
     if parsed_url.scheme in ("", "file"):
         path = Path(parsed_url.path if parsed_url.scheme == "file" else url)
+        if path.is_dir():
+            return DirectoryGTFSArchive(path)
         return zipfile.ZipFile(path)
 
     request_headers = {"User-Agent": "HalteWeckerStopPipeline/1.0"}
@@ -691,6 +715,11 @@ def validate_transit_radar_provider(
             raise ValueError(f"Sweden requires a non-empty operator for {city_id}")
         return
 
+    if adapter == "ireland":
+        if not isinstance(region, dict):
+            raise ValueError(f"Ireland requires a radar region for {city_id}")
+        return
+
     if adapter == "entur":
         codespaces = configuration.get("radarCodespaces")
         if not isinstance(codespaces, list) or not codespaces:
@@ -1011,6 +1040,8 @@ def transit_radar_manifest(
                 provider_id = f"netherlands-{city_id}"
             elif adapter == "sweden":
                 provider_id = f"sweden-{city_id}"
+            elif adapter == "ireland":
+                provider_id = f"ireland-{city_id}"
             elif adapter == "entur":
                 provider_id = f"entur-{city_id}"
             elif adapter == "bwTrias":
@@ -1100,6 +1131,10 @@ def transit_radar_manifest(
                 gateway_url = vag_gateway_url
             if isinstance(gateway_url, str):
                 provider["gatewayURL"] = gateway_url
+            for url_key in ("staticBaseURL", "boardURL", "realtimeURL"):
+                configured_url = provider_configuration.get(url_key)
+                if isinstance(configured_url, str) and configured_url.strip():
+                    provider[url_key] = configured_url.strip()
             providers.append(provider)
 
         if any(p.get("adapter") == "netherlands" for p in providers):
@@ -1110,6 +1145,8 @@ def transit_radar_manifest(
             country_suffix = "at"
         elif any(p.get("adapter") == "entur" for p in providers):
             country_suffix = "no"
+        elif any(p.get("adapter") == "ireland" for p in providers):
+            country_suffix = "ie"
         else:
             country_suffix = "de"
         radar_cities.append({

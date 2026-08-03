@@ -1,0 +1,97 @@
+[
+  {
+    "id": "dublin",
+    "name": "Dublin",
+    "aliases": [],
+    "latitude": 53.3498,
+    "longitude": -6.2603,
+    "radiusMeters": 35000,
+    "packageMode": "external",
+    "externalGTFSProvider": "ireland",
+    "transitRadar": {
+      "adapter": "ireland",
+      "isEnabled": true,
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "realtimeURL": "https://api.asoftlabs.app/ireland/realtime/vehicles",
+      "region": {"minimumLongitude": -6.55, "minimumLatitude": 53.15, "maximumLongitude": -6.00, "maximumLatitude": 53.60},
+      "statusMessage": "Ireland Live-Radar und Live-Abfahrten für Dublin"
+    }
+  },
+  {
+    "id": "cork",
+    "name": "Cork",
+    "aliases": [],
+    "latitude": 51.8985,
+    "longitude": -8.4756,
+    "radiusMeters": 20000,
+    "packageMode": "external",
+    "externalGTFSProvider": "ireland",
+    "transitRadar": {
+      "adapter": "ireland",
+      "isEnabled": true,
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "realtimeURL": "https://api.asoftlabs.app/ireland/realtime/vehicles",
+      "region": {"minimumLongitude": -8.75, "minimumLatitude": 51.75, "maximumLongitude": -8.20, "maximumLatitude": 52.05},
+      "statusMessage": "Ireland Live-Radar und Live-Abfahrten für Cork"
+    }
+  },
+  {
+    "id": "galway",
+    "name": "Galway",
+    "aliases": [],
+    "latitude": 53.2707,
+    "longitude": -9.0568,
+    "radiusMeters": 15000,
+    "packageMode": "external",
+    "externalGTFSProvider": "ireland",
+    "transitRadar": {
+      "adapter": "ireland",
+      "isEnabled": true,
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "realtimeURL": "https://api.asoftlabs.app/ireland/realtime/vehicles",
+      "region": {"minimumLongitude": -9.30, "minimumLatitude": 53.15, "maximumLongitude": -8.80, "maximumLatitude": 53.45},
+      "statusMessage": "Ireland Live-Radar und Live-Abfahrten für Galway"
+    }
+  },
+  {
+    "id": "limerick",
+    "name": "Limerick",
+    "aliases": [],
+    "latitude": 52.6638,
+    "longitude": -8.6267,
+    "radiusMeters": 15000,
+    "packageMode": "external",
+    "externalGTFSProvider": "ireland",
+    "transitRadar": {
+      "adapter": "ireland",
+      "isEnabled": true,
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "realtimeURL": "https://api.asoftlabs.app/ireland/realtime/vehicles",
+      "region": {"minimumLongitude": -8.90, "minimumLatitude": 52.55, "maximumLongitude": -8.35, "maximumLatitude": 52.80},
+      "statusMessage": "Ireland Live-Radar und Live-Abfahrten für Limerick"
+    }
+  },
+  {
+    "id": "waterford",
+    "name": "Waterford",
+    "aliases": [],
+    "latitude": 52.2593,
+    "longitude": -7.1101,
+    "radiusMeters": 12000,
+    "packageMode": "external",
+    "externalGTFSProvider": "ireland",
+    "transitRadar": {
+      "adapter": "ireland",
+      "isEnabled": true,
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "realtimeURL": "https://api.asoftlabs.app/ireland/realtime/vehicles",
+      "region": {"minimumLongitude": -7.35, "minimumLatitude": 52.15, "maximumLongitude": -6.85, "maximumLatitude": 52.40},
+      "statusMessage": "Ireland Live-Radar und Live-Abfahrten für Waterford"
+    }
+  }
+]

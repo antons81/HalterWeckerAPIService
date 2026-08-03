@@ -19,6 +19,9 @@ from zoneinfo import ZoneInfo
 
 DEFAULT_TIMEZONE = "Europe/Berlin"
 STATIC_DATA_ROOT = os.environ.get("STATIC_DATA_ROOT", "")
+IRELAND_REALTIME_ROOT = Path(
+    os.environ.get("IRELAND_REALTIME_ROOT", "/data/ireland/realtime")
+)
 
 
 class Database:
@@ -240,6 +243,31 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
         self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
 
+    def send_ireland_realtime(self, filename: str) -> None:
+        """Serve an atomically replaced NTA JSON snapshot without rewriting it."""
+        path = IRELAND_REALTIME_ROOT / filename
+        try:
+            body = path.read_bytes()
+            payload = json.loads(body)
+            if not isinstance(payload, dict) \
+                    or not isinstance(payload.get("header"), dict) \
+                    or not isinstance(payload.get("entity"), list):
+                raise ValueError("invalid GTFS-Realtime JSON shape")
+        except FileNotFoundError:
+            return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "realtime source unavailable"})
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+            return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "realtime source invalid"})
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except OSError:
+            pass
+
     def send_static_file(self, relative: str) -> None:
         root = Path(STATIC_DATA_ROOT)
         if not root.is_dir():
@@ -276,6 +304,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if parsed.path.startswith("/static-stop-data/"):
                 return self.send_static_file(parsed.path[len("/static-stop-data/"):])
+            if parsed.path == "/ireland/realtime/vehicles":
+                return self.send_ireland_realtime("vehicles.json")
+            if parsed.path == "/ireland/realtime/trip-updates":
+                return self.send_ireland_realtime("trip_updates.json")
             if parsed.path == "/static-departures/health":
                 return self.send_json(HTTPStatus.OK, {"ok": True, "database": self.database.meta()})
             if parsed.path == "/static-departures/meta":

@@ -263,6 +263,27 @@ print("[StopData] Sweden external packages validated")
 PY
 fi
 
+if [[ -d "$DATA_ROOT/ireland/static" ]]; then
+  for ireland_city in dublin cork galway limerick waterford; do
+    test -f "$BUILD_DIR/stops/$ireland_city.json"
+    test -f "$BUILD_DIR/routes/$ireland_city.json"
+    test -f "$BUILD_DIR/departures/$ireland_city.json"
+  done
+  python3 - "$BUILD_DIR/manifest.json" "$BUILD_DIR/transit-radar-cities.json" <<'PY'
+import json
+import sys
+
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+radar = json.load(open(sys.argv[2], encoding="utf-8"))
+expected = {"dublin", "cork", "galway", "limerick", "waterford"}
+manifest_ids = {city.get("id") for city in manifest.get("cities", [])}
+radar_ids = {city.get("appCityID") for city in radar.get("cities", [])}
+if not expected.issubset(manifest_ids) or not expected.issubset(radar_ids):
+    raise SystemExit("Ireland stop or radar manifest is incomplete")
+print("[StopData] Ireland external packages validated")
+PY
+fi
+
 OLD_RELEASE_TARGET=""
 if [[ -L "$CURRENT_RELEASE" ]]; then
   OLD_RELEASE_TARGET="$(readlink "$CURRENT_RELEASE")"

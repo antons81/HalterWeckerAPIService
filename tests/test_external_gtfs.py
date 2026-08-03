@@ -19,6 +19,7 @@ from external_gtfs import (  # noqa: E402
     authenticated_external_request,
     build_external_departure_index,
     build_external_lines,
+    build_external_route_index,
     build_external_stop_packages,
     build_external_trip_index,
     external_city_ids,
@@ -68,13 +69,29 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
         sources = load_external_gtfs_sources(
             REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
         )
-        self.assertEqual({source["id"] for source in sources}, {"sweden", "norway"})
+        self.assertEqual(
+            {source["id"] for source in sources},
+            {"sweden", "norway", "ireland"},
+        )
         sweden = next(source for source in sources if source["id"] == "sweden")
         validate_external_gtfs_source(sweden, REPOSITORY_ROOT)
         cities = load_external_cities(sweden, REPOSITORY_ROOT)
         self.assertEqual([city["id"] for city in cities], ["stockholm"])
         self.assertEqual(cities[0]["packageMode"], "external")
         self.assertEqual(cities[0]["externalGTFSProvider"], "sweden")
+
+    def test_validate_ireland_local_registry_and_city_coverage(self) -> None:
+        sources = load_external_gtfs_sources(
+            REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
+        )
+        ireland = next(source for source in sources if source["id"] == "ireland")
+        validate_external_gtfs_source(ireland, REPOSITORY_ROOT)
+        cities = load_external_cities(ireland, REPOSITORY_ROOT)
+        self.assertEqual(
+            [city["id"] for city in cities],
+            ["dublin", "cork", "galway", "limerick", "waterford"],
+        )
+        self.assertEqual(ireland["localPath"], "/srv/haltewecker/data/ireland/static")
 
     def test_validate_norway_registry_and_city_coverage(self) -> None:
         sources = load_external_gtfs_sources(
@@ -231,6 +248,60 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
 
 
 class ExternalStopAndDepartureTests(unittest.TestCase):
+    def test_ireland_verified_trip_route_stop_join_preserves_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            archive_path = root / "ireland.zip"
+            _gtfs_zip(
+                archive_path,
+                stops=(
+                    "stop_id,stop_name,stop_lat,stop_lon\n"
+                    "8460B5550401,Galway Ceannt,53.27395,-9.0474\n"
+                ),
+                routes=(
+                    "route_id,route_short_name,route_long_name,route_type\n"
+                    "2 51 c b,51,Cork - Limerick - Galway,3\n"
+                ),
+                trips=(
+                    "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+                    "2 51 c b,162,5789_34702,Galway,0\n"
+                ),
+                stop_times=(
+                    "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+                    "5789_34702,19:45:00,19:45:00,8460B5550401,24\n"
+                ),
+                calendar=(
+                    "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+                    "start_date,end_date\n"
+                    "162,1,1,1,1,1,1,1,20200101,20301231\n"
+                ),
+            )
+            city = {
+                "id": "galway",
+                "name": "Galway",
+                "aliases": [],
+                "latitude": 53.2707,
+                "longitude": -9.0568,
+                "radiusMeters": 15000,
+                "packageMode": "external",
+            }
+            with zipfile.ZipFile(archive_path) as archive:
+                build_external_stop_packages(archive, [city], root / "out")
+                build_external_route_index(archive, [city], root / "out")
+                build_external_departure_index(
+                    archive, [city], root / "out", "Europe/Dublin"
+                )
+
+            routes = json.loads((root / "out/routes/galway.json").read_text())
+            departures = json.loads((root / "out/departures/galway.json").read_text())
+            self.assertEqual(routes["2 51 c b"]["short_name"], "51")
+            self.assertEqual(routes["2 51 c b"]["headsigns"]["0"], "Galway")
+            departure = departures["stops"]["8460B5550401"][0]
+            self.assertEqual(departure["t"], "5789_34702")
+            self.assertEqual(departure["r"], "2 51 c b")
+            self.assertEqual(departure["h"], "Galway")
+            self.assertEqual(departure["p"], "19:45:00")
+
     def test_child_platform_collapses_into_parent_station(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             archive_path = Path(temp) / "se.zip"

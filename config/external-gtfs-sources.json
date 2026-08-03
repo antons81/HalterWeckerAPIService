@@ -22,5 +22,18 @@
     "buildDepartures": true,
     "buildTripIndex": false,
     "country": "NO"
+  },
+  {
+    "id": "ireland",
+    "localPath": "/srv/haltewecker/data/ireland/static",
+    "cities": "config/ireland-cities.json",
+    "timezone": "Europe/Dublin",
+    "identifierPrefix": "ie:",
+    "stopIDMode": "exact",
+    "buildStops": true,
+    "buildRoutes": true,
+    "buildDepartures": true,
+    "buildTripIndex": false,
+    "country": "IE"
   }
 ]

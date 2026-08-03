@@ -7,6 +7,7 @@ on:
       - main
     paths:
       - "scripts/**"
+      - "config/**"
       - ".github/workflows/update-stop-data.yml"
   schedule:
     - cron: "17 22 * * *"

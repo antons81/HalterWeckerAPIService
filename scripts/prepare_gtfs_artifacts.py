@@ -96,6 +96,22 @@ def main() -> None:
     for source in load_external_gtfs_sources(Path(args.external_sources)):
         source_id = str(source["id"])
         configured = source.get("url")
+        local_path = str(source.get("localPath") or "").strip()
+        if local_path and source_id not in external_urls:
+            path = Path(local_path)
+            if not path.is_dir():
+                raise ValueError(
+                    f"Local external GTFS source {source_id} is missing: {path}"
+                )
+            result["external"][source_id] = {
+                "path": str(path),
+                "status": "local",
+            }
+            print(
+                f"[GTFSCache] source={source_id} stage=resolve "
+                "status=local path=directory"
+            )
+            continue
         url = external_urls.get(source_id, str(configured or "")).strip()
         if not url:
             continue
