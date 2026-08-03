@@ -4,9 +4,29 @@ set -euo pipefail
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 DATA_ROOT="${DATA_ROOT:-/srv/haltewecker/data}"
 GTFS_URL="${GTFS_URL:?GTFS_URL is required}"
+STOP_DATA_PATH="${STOP_DATA_PATH:-$DATA_ROOT/current}"
+NEXT_DATABASE_PATH="${NEXT_DATABASE_PATH:-$DATA_ROOT/staging/departures-next.sqlite}"
+RELEASE_ID="${RELEASE_ID:-}"
 AUSTRIAN_GTFS_PATH="${AUSTRIAN_GTFS_PATH:-}"
 AUSTRIAN_GTFS_DIR="${AUSTRIAN_GTFS_DIR:-$DATA_ROOT/austria}"
 LOG_PREFIX="[StaticDepartures]"
+CONTAINER_NAME="${STATIC_DEPARTURES_CONTAINER_NAME:-static-departures-api}"
+ACTIVE_RELEASE_DIR=""
+if [[ -z "$RELEASE_ID" && -L "$DATA_ROOT/current-release" ]]; then
+  ACTIVE_RELEASE_DIR="$DATA_ROOT/current-release"
+  RELEASE_ID="$(python3 - "$ACTIVE_RELEASE_DIR/release-metadata.json" <<'PY'
+import json
+import sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["releaseID"])
+PY
+)"
+  STOP_DATA_PATH="$ACTIVE_RELEASE_DIR/stop-data"
+  NEXT_DATABASE_PATH="$ACTIVE_RELEASE_DIR/departures-next.sqlite"
+fi
+
+if [[ "${READINESS_ONLY:-0}" == "1" ]]; then
+  echo "$LOG_PREFIX release=${RELEASE_ID:-legacy} stage=readiness started"
+else
 
 if [[ -z "$AUSTRIAN_GTFS_PATH" && -d "$AUSTRIAN_GTFS_DIR" && ! -f "$AUSTRIAN_GTFS_DIR/.env" ]]; then
   while IFS= read -r candidate; do
@@ -14,22 +34,43 @@ if [[ -z "$AUSTRIAN_GTFS_PATH" && -d "$AUSTRIAN_GTFS_DIR" && ! -f "$AUSTRIAN_GTF
   done < <(find "$AUSTRIAN_GTFS_DIR" -maxdepth 1 -type f -name '*.zip' -print | sort)
 fi
 
-echo "$LOG_PREFIX import started at $(date -Is)"
+stage_started=$SECONDS
+echo "$LOG_PREFIX release=${RELEASE_ID:-legacy} stage=import started at $(date -Is)"
 IMPORT_ARGS=(
   --gtfs-url "$GTFS_URL"
-  --stop-data "$DATA_ROOT/current"
-  --next "$DATA_ROOT/staging/departures-next.sqlite"
+  --stop-data "$STOP_DATA_PATH"
+  --next "$NEXT_DATABASE_PATH"
 )
+if [[ -n "$RELEASE_ID" ]]; then
+  IMPORT_ARGS+=(--release-id "$RELEASE_ID")
+fi
 if [[ -n "$AUSTRIAN_GTFS_PATH" ]]; then
   IMPORT_ARGS+=(--austrian-gtfs "$AUSTRIAN_GTFS_PATH")
 elif [[ -d "$AUSTRIAN_GTFS_DIR" && -f "$AUSTRIAN_GTFS_DIR/.env" ]]; then
   IMPORT_ARGS+=(--austrian-gtfs-dir "$AUSTRIAN_GTFS_DIR" --austrian-sources "$REPO/config/austrian-sources.json")
 fi
 python3 "$REPO/scripts/import_static_departures_database.py" "${IMPORT_ARGS[@]}"
+echo "$LOG_PREFIX release=${RELEASE_ID:-legacy} stage=import duration=$((SECONDS - stage_started))s"
+
+if [[ "${SKIP_ACTIVATION:-0}" == "1" ]]; then
+  echo "$LOG_PREFIX release=${RELEASE_ID:-legacy} stage=validation duration=0s (database validation completed by importer)"
+  exit 0
+fi
 
 echo "$LOG_PREFIX atomic activation started at $(date -Is)"
-VERSION="$(python3 "$REPO/scripts/swap_static_departures_database.py" --data-root "$DATA_ROOT")"
+if [[ -n "$ACTIVE_RELEASE_DIR" ]]; then
+  VERSION="$(python3 - "$NEXT_DATABASE_PATH" "$ACTIVE_RELEASE_DIR/departures.sqlite" <<'PY'
+import os
+import sys
+os.replace(sys.argv[1], sys.argv[2])
+print("release-updated")
+PY
+)"
+else
+  VERSION="$(python3 "$REPO/scripts/swap_static_departures_database.py" --data-root "$DATA_ROOT")"
+fi
 echo "$LOG_PREFIX activated databaseVersion=$VERSION"
+fi
 
 echo "$LOG_PREFIX refreshing static-departures-api container"
 docker compose -f "$REPO/deploy/static-departures.compose.yml" up -d --build
@@ -38,13 +79,26 @@ HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-45}"
 HEALTH_INTERVAL_SECONDS="${HEALTH_INTERVAL_SECONDS:-2}"
 deadline=$((SECONDS + HEALTH_TIMEOUT_SECONDS))
 HEALTH=""
-until HEALTH="$(docker exec static-departures-api python3 -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8080/static-departures/health", timeout=5).read().decode())' 2>/dev/null)"; do
+readiness_started=$SECONDS
+until HEALTH="$(docker exec "$CONTAINER_NAME" python3 -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8080/static-departures/health", timeout=5).read().decode())' 2>/dev/null)"; do
   if (( SECONDS >= deadline )); then
     echo "$LOG_PREFIX health check timed out after ${HEALTH_TIMEOUT_SECONDS}s" >&2
-    docker logs --tail 80 static-departures-api >&2 || true
+    docker logs --tail 80 "$CONTAINER_NAME" >&2 || true
     exit 1
   fi
   sleep "$HEALTH_INTERVAL_SECONDS"
 done
 echo "$LOG_PREFIX health=$HEALTH"
+if [[ -n "$RELEASE_ID" ]]; then
+  python3 - "$HEALTH" "$RELEASE_ID" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+actual = payload.get("database", {}).get("releaseID", "")
+if actual != sys.argv[2]:
+    raise SystemExit(f"runtime release mismatch: expected {sys.argv[2]}, got {actual or '<missing>'}")
+PY
+fi
+echo "$LOG_PREFIX release=${RELEASE_ID:-legacy} stage=readiness duration=$((SECONDS - readiness_started))s"
 echo "$LOG_PREFIX completed at $(date -Is)"

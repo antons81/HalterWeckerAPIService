@@ -3,9 +3,10 @@ services:
     build:
       context: ..
       dockerfile: services/static-departures.Dockerfile
-    container_name: static-departures-api
+    container_name: ${STATIC_DEPARTURES_CONTAINER_NAME:-static-departures-api}
     environment:
-      DEPARTURES_DATABASE: /data/departures-current.sqlite
+      DEPARTURES_DATABASE: ${DEPARTURES_DATABASE:-/data/current-release/departures.sqlite}
+      STATIC_DATA_ROOT: ${STATIC_DATA_ROOT:-/data/current-release/stop-data}
       PORT: "8080"
     volumes:
       - /srv/haltewecker/data:/data:ro

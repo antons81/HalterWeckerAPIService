@@ -38,6 +38,7 @@ set -euo pipefail
 
 case \"${1:-}\" in
   *build_stop_packages.py)
+    printf 'build\\n' >> "$BUILD_CALLS_LOG"
     if [ \"${BUILD_FAIL:-0}\" = \"1\" ]; then
       exit 1
     fi
@@ -54,9 +55,9 @@ case \"${1:-}\" in
     done
     mkdir -p \"$output/swiss-static\"
     if [ \"${BUILD_INVALID:-0}\" = \"1\" ]; then
-      printf '{\"version\":\"2026-07-30\",\"cities\":[]}' > \"$output/manifest.json\"
+      printf '{\"version\":\"2026-07-30\",\"cities\":[{\"id\":\"test-city\",\"name\":\"Test City\",\"url\":\"stops/test-city.json\"}]}' > \"$output/manifest.json\"
     else
-      printf '{\"version\":\"2026-07-30\",\"cities\":[]}' > \"$output/manifest.json\"
+      printf '{\"version\":\"2026-07-30\",\"cities\":[{\"id\":\"test-city\",\"name\":\"Test City\",\"url\":\"stops/test-city.json\"}]}' > \"$output/manifest.json\"
       : > \"$output/transit-radar-cities.json\"
     fi
     printf 'new' > \"$output/release-marker\"
@@ -111,6 +112,18 @@ fi
 echo \"unexpected systemctl invocation: $*\" >&2
 exit 64
 """)
+        self.write_mock("static-departures-pipeline", """#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "${READINESS_ONLY:-0}" = "1" ]; then
+  [ "${READINESS_FAIL:-0}" != "1" ] || exit 1
+  exit 0
+fi
+[ "${STATIC_IMPORT_FAIL:-0}" != "1" ] || exit 1
+printf '%s\\n' "${STOP_DATA_PATH}" > "${STAGED_STOP_DATA_LOG}"
+mkdir -p "$(dirname "$NEXT_DATABASE_PATH")"
+printf 'releaseID=%s\\n' "$RELEASE_ID" > "$NEXT_DATABASE_PATH"
+""")
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -129,6 +142,9 @@ exit 64
             "STOP_DATA_ENV_FILE": str(self.environment_file),
             "SYSTEMCTL_LOG": str(self.systemctl_log),
             "BUILD_ARGS_LOG": str(self.root / "build-args.log"),
+            "BUILD_CALLS_LOG": str(self.root / "build-calls.log"),
+            "STAGED_STOP_DATA_LOG": str(self.root / "staged-stop-data.log"),
+            "STATIC_DEPARTURES_PIPELINE": str(self.bin_directory / "static-departures-pipeline"),
             "REAL_PYTHON": sys.executable,
             "GTFS_URL": "https://example.invalid/german.zip",
             "SWISS_GTFS_URL": "https://example.invalid/swiss.zip",
@@ -156,16 +172,20 @@ exit 64
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.data_root / "current" / "release-marker").read_text(encoding="utf-8"), "new")
         self.assertEqual((self.data_root / "previous" / "stop-data" / "release-marker").read_text(encoding="utf-8"), "old")
-        self.assertIn("published stop release version=2026-07-30", result.stdout)
+        self.assertRegex(result.stdout, r"release=.* stage=commit duration=")
         self.assertIn("static departures synchronized", result.stdout)
+        self.assertEqual(self.systemctl_calls(), [])
+        staged_path = (self.root / "staged-stop-data.log").read_text().strip()
+        self.assertIn("/releases/", staged_path)
+        self.assertTrue(staged_path.endswith("/stop-data"))
+        self.assertIn("releaseID=", (self.data_root / "departures-current.sqlite").read_text())
         self.assertEqual(
-            self.systemctl_calls(),
-            [
-                "start --help",
-                "start --wait haltewecker-static-departures.service",
-                "start-current=new",
-                "show haltewecker-static-departures.service -p Result -p ExecMainStatus"
-            ]
+            (self.data_root / "current" / "release-marker").read_text(),
+            "new",
+        )
+        self.assertNotEqual(
+            (self.data_root / "previous" / "stop-data" / "release-marker").read_text(),
+            "new",
         )
 
     def test_external_sources_do_not_require_a_norway_cli_override(self) -> None:
@@ -184,13 +204,11 @@ exit 64
         )
 
     def test_failed_static_departures_result_fails_after_publication(self) -> None:
-        result = self.run_pipeline(SYSTEMCTL_RESULT="failed", SYSTEMCTL_EXEC_MAIN_STATUS="1")
+        result = self.run_pipeline(READINESS_FAIL="1")
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual((self.data_root / "current" / "release-marker").read_text(encoding="utf-8"), "new")
-        self.assertIn("static departures are not synchronized", result.stderr)
-        self.assertIn("Result=failed", result.stdout)
-        self.assertIn("ExecMainStatus=1", result.stdout)
+        self.assertEqual((self.data_root / "current" / "release-marker").read_text(encoding="utf-8"), "old")
+        self.assertIn("runtime readiness failed", result.stderr)
 
     def test_build_failure_does_not_trigger_static_departures(self) -> None:
         result = self.run_pipeline(BUILD_FAIL="1")
@@ -198,6 +216,8 @@ exit 64
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual((self.data_root / "current" / "release-marker").read_text(encoding="utf-8"), "old")
         self.assertEqual(self.systemctl_calls(), [])
+        self.assertEqual((self.root / "build-calls.log").read_text().splitlines(), ["build"])
+        self.assertNotIn("Dutch", result.stdout)
 
     def test_validation_failure_does_not_trigger_static_departures(self) -> None:
         result = self.run_pipeline(BUILD_INVALID="1")
@@ -206,20 +226,25 @@ exit 64
         self.assertEqual((self.data_root / "current" / "release-marker").read_text(encoding="utf-8"), "old")
         self.assertEqual(self.systemctl_calls(), [])
 
-    def test_fallback_without_wait_verifies_oneshot_result(self) -> None:
+    def test_readiness_success_commits_without_systemd_rebuild(self) -> None:
         result = self.run_pipeline(SYSTEMCTL_SUPPORTS_WAIT="0")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("systemctl --wait is unavailable", result.stdout)
-        self.assertEqual(
-            self.systemctl_calls(),
-            [
-                "start --help",
-                "start haltewecker-static-departures.service",
-                "start-current=new",
-                "show haltewecker-static-departures.service -p Result -p ExecMainStatus"
-            ]
-        )
+        self.assertEqual(self.systemctl_calls(), [])
+
+    def test_static_import_failure_keeps_previous_pair(self) -> None:
+        result = self.run_pipeline(STATIC_IMPORT_FAIL="1")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.data_root / "current" / "release-marker").read_text(), "old")
+        self.assertFalse((self.data_root / "current-release").exists())
+
+    def test_readiness_failure_keeps_previous_pair(self) -> None:
+        result = self.run_pipeline(READINESS_FAIL="1")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.data_root / "current" / "release-marker").read_text(), "old")
+        self.assertFalse((self.data_root / "current-release").exists())
 
     def test_overlapping_stop_data_publication_is_rejected_before_rebuild(self) -> None:
         result = self.run_pipeline(FLOCK_FAIL="1")

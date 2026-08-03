@@ -2110,6 +2110,11 @@ def parse_build_stop_packages_args(argv: list[str] | None = None) -> argparse.Na
     )
     parser.add_argument("--swiss-cities", default="config/swiss-cities.json")
     parser.add_argument("--nl-gtfs-url", default="")
+    parser.add_argument(
+        "--allow-nl-failure",
+        action="store_true",
+        help="Keep building other sources and mark NL as unavailable when only the NL branch fails.",
+    )
     parser.add_argument("--nl-cities", default="config/cities.json")
     parser.add_argument(
         "--external-gtfs-sources",
@@ -2239,16 +2244,25 @@ def main(argv: list[str] | None = None) -> None:
         manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
     if args.nl_gtfs_url.strip():
         nl_cities = load_cities(Path(args.nl_cities))
-        nl_archive = load_gtfs_archive(args.nl_gtfs_url)
-        merge_manifest_entries(
-            manifest,
-            build_nl_stop_packages(nl_archive, nl_cities, output),
-            source="Netherlands GTFS branch (config/cities.json)",
-            sources_by_city_id=manifest_sources,
-        )
-        build_nl_route_index(nl_archive, nl_cities, output)
-        build_nl_departure_index(nl_archive, nl_cities, output)
-        manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
+        try:
+            nl_archive = load_gtfs_archive(args.nl_gtfs_url)
+            merge_manifest_entries(
+                manifest,
+                build_nl_stop_packages(nl_archive, nl_cities, output),
+                source="Netherlands GTFS branch (config/cities.json)",
+                sources_by_city_id=manifest_sources,
+            )
+            build_nl_route_index(nl_archive, nl_cities, output)
+            build_nl_departure_index(nl_archive, nl_cities, output)
+            manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
+        except Exception as error:
+            if not args.allow_nl_failure:
+                raise
+            if nl_archive is not None:
+                nl_archive.close()
+            print(f"[NL] source failed; preserving previous validated assets: {error}")
+            (output / ".nl-failure").write_text(str(error), encoding="utf-8")
+            nl_archive = None
 
     external_url_by_provider = parse_external_gtfs_url_args(args.external_gtfs_url)
     (

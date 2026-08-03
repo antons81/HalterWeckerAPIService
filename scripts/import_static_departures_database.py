@@ -288,6 +288,7 @@ def main() -> None:
     parser.add_argument("--austrian-sources", default=str(DEFAULT_REGISTRY))
     parser.add_argument("--stop-data", required=True, help="Read-only current stop dataset")
     parser.add_argument("--next", default="", help="Fresh database output path (required unless --add-external).")
+    parser.add_argument("--release-id", default="", help="Release identity stored in database metadata.")
     parser.add_argument("--days", type=int, default=15)
     parser.add_argument("--cities", default=str(REPOSITORY_ROOT / "config" / "cities.json"))
     parser.add_argument("--swiss-cities", default=str(REPOSITORY_ROOT / "config" / "swiss-cities.json"))
@@ -335,6 +336,7 @@ def main() -> None:
                 "INSERT INTO metadata(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (
                     ("databaseVersion", version),
+                    ("releaseID", args.release_id.strip()),
                     ("generatedAt", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")),
                     ("validFrom", dates[0].isoformat()),
                     ("validThrough", dates[-1].isoformat()),
@@ -410,6 +412,7 @@ def main() -> None:
             version = str(uuid.uuid4())
             connection.executemany("INSERT INTO metadata VALUES (?, ?)", (
                 ("schemaVersion", "1"), ("databaseVersion", version),
+                ("releaseID", args.release_id.strip()),
                 ("generatedAt", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")),
                 ("validFrom", dates[0].isoformat()), ("validThrough", dates[-1].isoformat()),
                 ("timezone", DEFAULT_TIMEZONE),
