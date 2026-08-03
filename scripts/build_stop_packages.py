@@ -18,6 +18,8 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Iterable
 
+from austrian_sources import load_austrian_sources, public_stop_id, sources_for_city
+
 EARTH_RADIUS_METERS = 6_371_000
 AUTO_EFA_RADAR_STOP_LIMIT = 12
 CITY_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -1541,24 +1543,69 @@ def build_swiss_stop_packages(
 def build_austrian_stop_packages(
     archive: zipfile.ZipFile, cities: list[dict[str, object]], output: Path
 ) -> list[dict[str, object]]:
-    """Build configured Austrian radius packages from official GTFS Schedule stops."""
+    """Backward-compatible single-feed Austrian package builder."""
+    source = {"id": "vor", "identifierPrefix": "vor:", "cities": [str(city["id"]) for city in cities], "preserveStopIDs": True}
+    return build_austrian_stop_packages_from_sources({"vor": archive}, cities, output, [source])
+
+
+def build_austrian_stop_packages_from_sources(
+    archives_by_source: dict[str, zipfile.ZipFile],
+    cities: list[dict[str, object]],
+    output: Path,
+    registry: list[dict[str, object]] | None = None,
+) -> list[dict[str, object]]:
+    """Build Austrian radius packages from all configured regional feeds.
+
+    Physical duplicates in Linz are collapsed by normalized name and a 50 m
+    coordinate bucket. The higher-priority feed remains the public stop while
+    all source IDs are retained in ``sourceStopIDs`` for static timetable joins.
+    """
+    registry = registry or load_austrian_sources()
+    source_by_id = {str(source["id"]): source for source in registry}
     austria_cities = [city for city in cities if city.get("packageMode") == "austrian"]
-    stops_by_city_id = {str(city["id"]): [] for city in austria_cities}
-    for stop in swiss_stops(iter_table(archive, "stops.txt")):
-        for city in austria_cities:
-            if distance_meters(
-                float(stop["latitude"]), float(stop["longitude"]),
-                float(city["latitude"]), float(city["longitude"])
-            ) <= float(city["radiusMeters"]):
-                stops_by_city_id[str(city["id"])].append(stop)
+    stops_by_city_id: dict[str, dict[tuple[object, ...], dict[str, object]]] = {
+        str(city["id"]): {} for city in austria_cities
+    }
+    for source_id, archive in archives_by_source.items():
+        source = source_by_id[source_id]
+        priority = int(source.get("linzPriority", 0))
+        for stop in swiss_stops(iter_table(archive, "stops.txt")):
+            stop["id"] = public_stop_id(source, str(stop["id"]))
+            for city in austria_cities:
+                city_id = str(city["id"])
+                if city_id not in source.get("cities", []):
+                    continue
+                if distance_meters(
+                    float(stop["latitude"]), float(stop["longitude"]),
+                    float(city["latitude"]), float(city["longitude"])
+                ) > float(city["radiusMeters"]):
+                    continue
+                key = (
+                    normalized(str(stop["name"])),
+                    round(float(stop["latitude"]) * 20),
+                    round(float(stop["longitude"]) * 20),
+                ) if city_id == "linz" else (str(stop["id"]),)
+                existing = stops_by_city_id[city_id].get(key)
+                if existing is None:
+                    stop["sourceStopIDs"] = [str(stop["id"])]
+                    stop["sourcePriority"] = priority
+                    stops_by_city_id[city_id][key] = stop
+                elif priority < int(existing.get("sourcePriority", 0)):
+                    stop["sourceStopIDs"] = list(existing.get("sourceStopIDs", [])) + [str(stop["id"])]
+                    stop["sourcePriority"] = priority
+                    stops_by_city_id[city_id][key] = stop
+                else:
+                    existing.setdefault("sourceStopIDs", []).append(str(stop["id"]))
 
     packages_directory = output / "stops"
     packages_directory.mkdir(parents=True, exist_ok=True)
     manifest = []
     for city in austria_cities:
-        city_stops = stops_by_city_id[str(city["id"])]
+        city_stops = list(stops_by_city_id[str(city["id"])].values())
         if not city_stops:
             raise ValueError(f'No Austrian GTFS stops found for configured city {city["id"]}.')
+        for stop in city_stops:
+            stop.pop("sourcePriority", None)
         filename = write_stop_package(packages_directory, str(city["id"]), city_stops)
         manifest.append({"id": city["id"], "name": city["name"],
                          "aliases": city.get("aliases", []), "stopCount": len(city_stops),
@@ -2051,6 +2098,16 @@ def parse_build_stop_packages_args(argv: list[str] | None = None) -> argparse.Na
     parser.add_argument("--output", default="docs/data")
     parser.add_argument("--swiss-gtfs-url", default="")
     parser.add_argument("--austrian-gtfs-url", default="")
+    parser.add_argument(
+        "--austrian-gtfs-dir",
+        default="",
+        help="Directory containing <source-id>-<year>.zip files from the MVO downloader.",
+    )
+    parser.add_argument(
+        "--austrian-sources",
+        default="config/austrian-sources.json",
+        help="Declarative Austrian source registry.",
+    )
     parser.add_argument("--swiss-cities", default="config/swiss-cities.json")
     parser.add_argument("--nl-gtfs-url", default="")
     parser.add_argument("--nl-cities", default="config/cities.json")
@@ -2070,6 +2127,7 @@ def parse_build_stop_packages_args(argv: list[str] | None = None) -> argparse.Na
     has_other = bool(
         args.swiss_gtfs_url.strip()
         or args.austrian_gtfs_url.strip()
+        or args.austrian_gtfs_dir.strip()
         or args.nl_gtfs_url.strip()
         or args.external_gtfs_url
     )
@@ -2105,6 +2163,7 @@ def main(argv: list[str] | None = None) -> None:
     if Path(args.cities).exists() and (
         not args.skip_german
         or args.austrian_gtfs_url.strip()
+        or args.austrian_gtfs_dir.strip()
         or args.nl_gtfs_url.strip()
     ):
         cities = load_cities(Path(args.cities))
@@ -2152,14 +2211,28 @@ def main(argv: list[str] | None = None) -> None:
             sources_by_city_id=manifest_sources,
         )
         manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
-    if args.austrian_gtfs_url.strip():
+    if args.austrian_gtfs_url.strip() or args.austrian_gtfs_dir.strip():
         if not cities:
             cities = load_cities(Path(args.cities))
+        from austrian_sources import load_austrian_sources
+        austrian_registry = load_austrian_sources(Path(args.austrian_sources))
+        if args.austrian_gtfs_dir.strip():
+            archives: dict[str, zipfile.ZipFile] = {}
+            for source in austrian_registry:
+                candidates = sorted(Path(args.austrian_gtfs_dir).glob(f"{source['id']}-*.zip"))
+                if not candidates:
+                    raise ValueError(f"Missing downloaded Austrian GTFS for source {source['id']}")
+                archives[str(source["id"])] = load_gtfs_archive(str(candidates[-1]))
+            package_entries = build_austrian_stop_packages_from_sources(
+                archives, cities, output, austrian_registry
+            )
+        else:
+            package_entries = build_austrian_stop_packages(
+                load_gtfs_archive(args.austrian_gtfs_url), cities, output
+            )
         merge_manifest_entries(
             manifest,
-            build_austrian_stop_packages(
-                load_gtfs_archive(args.austrian_gtfs_url), cities, output
-            ),
+            package_entries,
             source="Austrian GTFS branch (config/cities.json)",
             sources_by_city_id=manifest_sources,
         )

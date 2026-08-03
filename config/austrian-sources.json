@@ -1,0 +1,10 @@
+[
+  {"id":"vor","datasetId":52,"identifierPrefix":"vor:","cities":["wien","st-poelten"],"preserveStopIDs":true},
+  {"id":"steiermark","datasetId":53,"identifierPrefix":"steiermark:","cities":["graz"]},
+  {"id":"salzburg","datasetId":54,"identifierPrefix":"salzburg:","cities":["salzburg"]},
+  {"id":"kaernten","datasetId":55,"identifierPrefix":"kaernten:","cities":["klagenfurt"]},
+  {"id":"ooevv","datasetId":56,"identifierPrefix":"ooevv:","cities":["linz"],"linzPriority":0},
+  {"id":"tirol","datasetId":57,"identifierPrefix":"tirol:","cities":["innsbruck"]},
+  {"id":"vorarlberg","datasetId":58,"identifierPrefix":"vorarlberg:","cities":["bregenz"]},
+  {"id":"linz-ag","datasetId":69,"identifierPrefix":"linz-ag:","cities":["linz"],"linzPriority":1}
+]

@@ -17,6 +17,7 @@ from build_german_departure_index import (
     update_terminal_stops,
 )
 from build_stop_packages import load_cities, load_gtfs_archive, nl_city_ids
+from austrian_sources import DEFAULT_REGISTRY, load_austrian_sources, public_stop_id
 from external_gtfs import (
     authenticated_external_request,
     external_city_ids,
@@ -100,13 +101,12 @@ def populate_city_memberships(
         package = json.loads(package_path.read_text(encoding="utf-8"))
         if not isinstance(package, list):
             raise ValueError(f"Invalid stop package for {city_id}")
-        stop_ids = sorted(
-            {
-                str(stop["id"])
-                for stop in package
-                if isinstance(stop, dict) and stop.get("id")
-            }
-        )
+        stop_ids: set[str] = set()
+        for stop in package:
+            if not isinstance(stop, dict) or not stop.get("id"):
+                continue
+            stop_ids.add(str(stop["id"]))
+            stop_ids.update(str(alias) for alias in stop.get("sourceStopIDs", []) if alias)
         connection.executemany(
             "INSERT OR IGNORE INTO city_stops(city_id, stop_id) VALUES (?, ?)",
             ((city_id, stop_id) for stop_id in stop_ids),
@@ -135,6 +135,42 @@ def configured_austrian_static_city_ids(cities_path: Path) -> set[str]:
         if city.get("packageMode") == "austrian"
         and city.get("staticDepartures") is True
     }
+
+
+def import_austrian_gtfs(
+    connection: sqlite3.Connection,
+    stop_data: Path,
+    cities_path: Path,
+    gtfs_dir: Path,
+    registry_path: Path,
+) -> set[str]:
+    registry = load_austrian_sources(registry_path)
+    expected_city_ids = configured_austrian_static_city_ids(cities_path)
+    imported_city_ids: set[str] = set()
+    for source in registry:
+        source_id = str(source["id"])
+        candidates = sorted(gtfs_dir.glob(f"{source_id}-*.zip"))
+        if not candidates:
+            raise ValueError(f"Missing Austrian GTFS archive for source {source_id}")
+        with load_gtfs_archive(str(candidates[-1])) as archive:
+            stop_prefix = "" if source.get("preserveStopIDs", False) else str(source["identifierPrefix"])
+            populate_gtfs(
+                connection,
+                archive,
+                identifier_prefix=str(source["identifierPrefix"]),
+                stop_id_prefix=stop_prefix,
+            )
+        imported_city_ids.update(str(city) for city in source["cities"])
+    if imported_city_ids != expected_city_ids:
+        raise ValueError(
+            "Austrian registry/city configuration mismatch: "
+            f"registry={sorted(imported_city_ids)} configured={sorted(expected_city_ids)}"
+        )
+    return populate_city_memberships(
+        connection,
+        stop_data,
+        included_city_ids=expected_city_ids,
+    )
 
 
 def validate(connection: sqlite3.Connection) -> None:
@@ -248,6 +284,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--gtfs-url", default="")
     parser.add_argument("--austrian-gtfs", default="")
+    parser.add_argument("--austrian-gtfs-dir", default="")
+    parser.add_argument("--austrian-sources", default=str(DEFAULT_REGISTRY))
     parser.add_argument("--stop-data", required=True, help="Read-only current stop dataset")
     parser.add_argument("--next", default="", help="Fresh database output path (required unless --add-external).")
     parser.add_argument("--days", type=int, default=15)
@@ -319,7 +357,15 @@ def main() -> None:
         try:
             populate_gtfs(connection, archive)
             austrian_city_ids = configured_austrian_static_city_ids(Path(args.cities))
-            if args.austrian_gtfs:
+            if args.austrian_gtfs_dir:
+                austrian_city_ids = import_austrian_gtfs(
+                    connection,
+                    Path(args.stop_data),
+                    Path(args.cities),
+                    Path(args.austrian_gtfs_dir),
+                    Path(args.austrian_sources),
+                )
+            elif args.austrian_gtfs:
                 with load_gtfs_archive(args.austrian_gtfs) as austrian_archive:
                     populate_gtfs(connection, austrian_archive, identifier_prefix="vor:")
             resolve_canonical_stops(connection)
@@ -329,13 +375,16 @@ def main() -> None:
                 configured_external_city_ids(Path(args.cities), Path(args.swiss_cities))
             )
             if austrian_city_ids:
-                if not args.austrian_gtfs:
-                    raise ValueError("Austrian static departure cities require --austrian-gtfs.")
-                city_ids.update(populate_city_memberships(
-                    connection,
-                    Path(args.stop_data),
-                    included_city_ids=austrian_city_ids,
-                ))
+                if not args.austrian_gtfs and not args.austrian_gtfs_dir:
+                    raise ValueError("Austrian static departure cities require an Austrian GTFS source.")
+                if not args.austrian_gtfs_dir:
+                    city_ids.update(populate_city_memberships(
+                        connection,
+                        Path(args.stop_data),
+                        included_city_ids=austrian_city_ids,
+                    ))
+                else:
+                    city_ids.update(austrian_city_ids)
             populate_active_services(connection, dates)
             update_terminal_stops(connection)
             connection.executescript("""

@@ -19,6 +19,8 @@ SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 SUDO_BIN="${SUDO_BIN:-sudo}"
 STATIC_DEPARTURES_SERVICE="${STATIC_DEPARTURES_SERVICE:-haltewecker-static-departures.service}"
 FLOCK_BIN="${FLOCK_BIN:-flock}"
+AUSTRIAN_DATA_ROOT="${AUSTRIAN_DATA_ROOT:-$DATA_ROOT/austria}"
+MVO_ENV_FILE="${MVO_ENV_FILE:-$AUSTRIAN_DATA_ROOT/.env}"
 
 mkdir -p "$(dirname "$STOP_DATA_LOCK")"
 exec 9>"$STOP_DATA_LOCK"
@@ -81,6 +83,14 @@ synchronize_static_departures() {
 
 cd "$REPO"
 
+if [[ -f "$MVO_ENV_FILE" ]]; then
+  echo "[StopData] refreshing Austrian MVO GTFS sources"
+  python3 "$REPO/scripts/download_austrian_gtfs.py" \
+    --registry "$REPO/config/austrian-sources.json" \
+    --env-file "$MVO_ENV_FILE" \
+    --output "$AUSTRIAN_DATA_ROOT"
+fi
+
 rm -rf "$STAGING" "$ROLLBACK"
 mkdir -p "$STAGING"
 
@@ -93,9 +103,14 @@ run_build_stop_packages() {
     python3 "$REPO/scripts/build_stop_packages.py"
     --gtfs-url "$GTFS_URL"
     --swiss-gtfs-url "$SWISS_GTFS_URL"
-    --austrian-gtfs-url "${AUSTRIAN_GTFS_URL:-}"
+    --austrian-sources "$REPO/config/austrian-sources.json"
     --external-gtfs-sources "$REPO/config/external-gtfs-sources.json"
   )
+  if [[ -d "$AUSTRIAN_DATA_ROOT" && -f "$AUSTRIAN_DATA_ROOT/.env" ]]; then
+    cmd+=(--austrian-gtfs-dir "$AUSTRIAN_DATA_ROOT")
+  else
+    cmd+=(--austrian-gtfs-url "${AUSTRIAN_GTFS_URL:-}")
+  fi
   if [ -n "$nl_url" ]; then
     cmd+=(--nl-gtfs-url "$nl_url")
   fi
@@ -132,6 +147,11 @@ python3 "$REPO/scripts/build_swiss_departure_index.py" \
 test -f "$BUILD_DIR/manifest.json"
 test -f "$BUILD_DIR/transit-radar-cities.json"
 test -f "$BUILD_DIR/swiss-static/manifest.json"
+if [[ -f "$MVO_ENV_FILE" ]]; then
+  python3 "$REPO/scripts/validate_austrian_stop_packages.py" \
+    --stop-data "$BUILD_DIR" \
+    --registry "$REPO/config/austrian-sources.json"
+fi
 
 if [ -n "${SWEDEN_GTFS_URL:-}" ]; then
   test -f "$BUILD_DIR/stops/stockholm.json"
