@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import sqlite3
+import time
 import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -29,6 +30,13 @@ from external_gtfs import (
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
+
+def timed_stage(source: str, stage: str, callback):
+    started = time.monotonic()
+    result = callback()
+    print(f"[StaticDepartures] source={source} stage={stage} duration={time.monotonic() - started:.2f}s")
+    return result
 
 
 def _external_window_timezone(
@@ -154,11 +162,15 @@ def import_austrian_gtfs(
             raise ValueError(f"Missing Austrian GTFS archive for source {source_id}")
         with load_gtfs_archive(str(candidates[-1])) as archive:
             stop_prefix = "" if source.get("preserveStopIDs", False) else str(source["identifierPrefix"])
-            populate_gtfs(
-                connection,
-                archive,
-                identifier_prefix=str(source["identifierPrefix"]),
-                stop_id_prefix=stop_prefix,
+            timed_stage(
+                f"austria:{source_id}",
+                "populate_gtfs",
+                lambda: populate_gtfs(
+                    connection,
+                    archive,
+                    identifier_prefix=str(source["identifierPrefix"]),
+                    stop_id_prefix=stop_prefix,
+                ),
             )
         imported_city_ids.update(str(city) for city in source["cities"])
     if imported_city_ids != expected_city_ids:
@@ -323,14 +335,14 @@ def main() -> None:
         connection = sqlite3.connect(database_path)
         connection.executescript("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;")
         try:
-            imported = add_external_gtfs(
+            imported = timed_stage("external", "populate_gtfs", lambda: add_external_gtfs(
                 connection,
                 Path(args.stop_data),
                 url_by_provider,
                 repository_root=REPOSITORY_ROOT,
                 sources_path=Path(args.external_sources),
                 dates=dates,
-            )
+            ))
             version = str(uuid.uuid4())
             connection.executemany(
                 "INSERT INTO metadata(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -357,7 +369,7 @@ def main() -> None:
     with load_gtfs_archive(args.gtfs_url) as archive:
         connection = connect(next_path)
         try:
-            populate_gtfs(connection, archive)
+            timed_stage("germany", "populate_gtfs", lambda: populate_gtfs(connection, archive))
             austrian_city_ids = configured_austrian_static_city_ids(Path(args.cities))
             if args.austrian_gtfs_dir:
                 austrian_city_ids = import_austrian_gtfs(
@@ -369,13 +381,11 @@ def main() -> None:
                 )
             elif args.austrian_gtfs:
                 with load_gtfs_archive(args.austrian_gtfs) as austrian_archive:
-                    populate_gtfs(connection, austrian_archive, identifier_prefix="vor:")
-            resolve_canonical_stops(connection)
-            city_ids = populate_german_city_memberships(
-                connection,
-                Path(args.stop_data),
-                configured_external_city_ids(Path(args.cities), Path(args.swiss_cities))
-            )
+                    timed_stage("austria:vor", "populate_gtfs", lambda: populate_gtfs(connection, austrian_archive, identifier_prefix="vor:"))
+            timed_stage("all", "canonical-stops", lambda: resolve_canonical_stops(connection))
+            city_ids = timed_stage("all", "city-memberships", lambda: populate_german_city_memberships(
+                connection, Path(args.stop_data), configured_external_city_ids(Path(args.cities), Path(args.swiss_cities))
+            ))
             if austrian_city_ids:
                 if not args.austrian_gtfs and not args.austrian_gtfs_dir:
                     raise ValueError("Austrian static departure cities require an Austrian GTFS source.")
@@ -387,8 +397,8 @@ def main() -> None:
                     ))
                 else:
                     city_ids.update(austrian_city_ids)
-            populate_active_services(connection, dates)
-            update_terminal_stops(connection)
+            timed_stage("all", "active-services", lambda: populate_active_services(connection, dates))
+            timed_stage("all", "terminal-stops", lambda: update_terminal_stops(connection))
             connection.executescript("""
                 CREATE TABLE city_aliases (
                     alias_city_id TEXT PRIMARY KEY,
@@ -417,7 +427,7 @@ def main() -> None:
                 ("validFrom", dates[0].isoformat()), ("validThrough", dates[-1].isoformat()),
                 ("timezone", DEFAULT_TIMEZONE),
             ))
-            validate(connection)
+            timed_stage("all", "validation", lambda: validate(connection))
             connection.commit()
         finally:
             connection.close()

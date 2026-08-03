@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -994,6 +995,7 @@ def process_external_gtfs_sources(
         request_url, headers = authenticated_external_request(
             source_id, url, environ=environ
         )
+        source_started = time.monotonic()
         archive = load_gtfs_archive(request_url, headers=headers)
         try:
             package_stops: dict[str, list[dict[str, object]]] = {}
@@ -1034,6 +1036,11 @@ def process_external_gtfs_sources(
                 )
         finally:
             archive.close()
+
+        print(
+            f"[StopData] source={source_id} stage=build "
+            f"duration={time.monotonic() - source_started:.2f}s"
+        )
 
         external_cities.extend(cities)
 

@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import shutil
+import time
 import tempfile
 import urllib.error
 import urllib.parse
@@ -15,6 +16,7 @@ import zipfile
 from pathlib import Path
 
 from austrian_sources import DEFAULT_REGISTRY, load_austrian_sources
+from gtfs_source_cache import DEFAULT_CACHE_ROOT, GTFSArtifactCache
 
 
 DEFAULT_ENV_FILE = Path("/srv/haltewecker/data/austria/.env")
@@ -78,7 +80,14 @@ def active_version(dataset: dict[str, object]) -> tuple[int, dict[str, object] |
     return year, version_by_year.get(year)
 
 
-def download_source(source: dict[str, object], catalog: list[dict[str, object]], token_value: str, target_dir: Path, env: dict[str, str]) -> dict[str, object]:
+def download_source(
+    source: dict[str, object],
+    catalog: list[dict[str, object]],
+    token_value: str,
+    target_dir: Path,
+    env: dict[str, str],
+    cache: GTFSArtifactCache,
+) -> dict[str, object]:
     dataset = next((item for item in catalog if int(item.get("id", -1)) == int(source["datasetId"])), None)
     if dataset is None:
         raise RuntimeError(f"MVO dataset {source['datasetId']} is absent from catalog")
@@ -89,37 +98,35 @@ def download_source(source: dict[str, object], catalog: list[dict[str, object]],
     url = f"{env['MVO_API_BASE'].rstrip('/')}/data-sets/{source['datasetId']}/{year}/file"
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"{source['id']}-{year}.zip"
-    fd, temporary_name = tempfile.mkstemp(prefix=f".{source['id']}-", suffix=".zip", dir=target_dir)
-    os.close(fd)
-    temporary = Path(temporary_name)
-    try:
-        request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token_value}", "Accept": "application/zip"})
-        with urllib.request.urlopen(request, timeout=180) as response, temporary.open("wb") as output:
-            if not 200 <= response.status < 300:
-                raise RuntimeError(f"MVO file request failed with HTTP {response.status}")
-            shutil.copyfileobj(response, output)
-        actual_size = temporary.stat().st_size
-        if actual_size < 1024:
-            raise RuntimeError(f"MVO archive for {source['id']} is unexpectedly small")
-        try:
-            if expected_size is not None and actual_size < max(1024, int(expected_size) // 2):
-                raise RuntimeError(f"MVO archive for {source['id']} is smaller than catalog size expectation")
-        except (TypeError, ValueError):
-            pass
-        with zipfile.ZipFile(temporary) as archive:
-            bad = archive.testzip()
-            if bad is not None:
-                raise RuntimeError(f"MVO archive for {source['id']} failed ZIP validation at {bad}")
-            required = {"stops.txt", "routes.txt", "trips.txt", "stop_times.txt"}
-            if not required.issubset(set(archive.namelist())):
-                raise RuntimeError(f"MVO archive for {source['id']} misses GTFS files")
-        os.replace(temporary, target)
-        return {"source": source["id"], "datasetId": source["datasetId"], "year": year, "originalName": original_name, "size": actual_size, "path": str(target), "status": "updated"}
-    except Exception:
-        temporary.unlink(missing_ok=True)
-        if not target.exists():
-            raise
-        return {"source": source["id"], "datasetId": source["datasetId"], "year": year, "originalName": original_name, "path": str(target), "status": "preserved-existing"}
+    result = cache.resolve(
+        str(source["id"]),
+        url,
+        headers={"Authorization": f"Bearer {token_value}", "Accept": "application/zip"},
+        source_version={
+            "datasetId": int(source["datasetId"]),
+            "year": year,
+            "originalName": original_name,
+            "size": expected_size,
+        },
+        allow_stale=True,
+        seed_path=target,
+        minimum_size=int(expected_size) if expected_size is not None else None,
+    )
+    target_dir.mkdir(parents=True, exist_ok=True)
+    temporary_link = target.with_name(f".{target.name}.next")
+    temporary_link.unlink(missing_ok=True)
+    temporary_link.symlink_to(result.path)
+    os.replace(temporary_link, target)
+    return {
+        "source": source["id"],
+        "datasetId": source["datasetId"],
+        "year": year,
+        "originalName": original_name,
+        "size": result.state.get("size") if result.state else expected_size,
+        "path": str(target),
+        "status": result.status,
+        "reason": result.reason,
+    }
 
 
 def main() -> None:
@@ -127,6 +134,7 @@ def main() -> None:
     parser.add_argument("--registry", type=Path, default=DEFAULT_REGISTRY)
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
     parser.add_argument("--output", type=Path, default=Path("/srv/haltewecker/data/austria"))
+    parser.add_argument("--cache-root", type=Path, default=Path(os.environ.get("GTFS_CACHE_ROOT", str(DEFAULT_CACHE_ROOT))))
     args = parser.parse_args()
     env = read_env(args.env_file)
     required = ("MVO_USERNAME", "MVO_PASSWORD", "MVO_TOKEN_URL", "MVO_API_BASE")
@@ -139,8 +147,12 @@ def main() -> None:
         raise RuntimeError("MVO catalog has no dataset list")
     results = []
     access_token = token(env)
+    cache = GTFSArtifactCache(args.cache_root / "austria")
     for source in load_austrian_sources(args.registry):
-        results.append(download_source(source, [item for item in catalog if isinstance(item, dict)], access_token, args.output, env))
+        started = time.monotonic()
+        result = download_source(source, [item for item in catalog if isinstance(item, dict)], access_token, args.output, env, cache)
+        results.append(result)
+        print(f"[GTFSCache] source=austria:{source['id']} stage=artifact status={result['status']} duration={time.monotonic() - started:.2f}s")
     print(json.dumps({"sources": results}, ensure_ascii=False, separators=(",", ":")))
 
 

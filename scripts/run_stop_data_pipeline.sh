@@ -7,6 +7,7 @@ RELEASES="$DATA_ROOT/releases"
 RELEASE_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 RELEASE_DIR="$RELEASES/$RELEASE_ID"
 BUILD_DIR="$RELEASE_DIR/stop-data"
+ARTIFACTS_JSON="$RELEASE_DIR/gtfs-artifacts.json"
 CURRENT="$DATA_ROOT/current"
 PREVIOUS="$DATA_ROOT/previous/stop-data"
 ROLLBACK="$DATA_ROOT/temp/current-rollback/$RELEASE_ID"
@@ -107,6 +108,51 @@ if [[ -f "$MVO_ENV_FILE" ]]; then
     --output "$AUSTRIAN_DATA_ROOT"
 fi
 
+EXTERNAL_URL_OVERRIDES=()
+if [[ -n "${SWEDEN_GTFS_URL:-}" ]]; then
+  EXTERNAL_URL_OVERRIDES+=(--external-gtfs-url "sweden=$SWEDEN_GTFS_URL")
+fi
+PREPARE_ARGS=(
+  --cache-root "${GTFS_CACHE_ROOT:-/srv/haltewecker/cache/gtfs}"
+  --gtfs-url "$GTFS_URL"
+  --swiss-gtfs-url "$SWISS_GTFS_URL"
+  --nl-gtfs-url "${NL_GTFS_URL:-}"
+  --external-sources "$REPO/config/external-gtfs-sources.json"
+)
+if [[ ${#EXTERNAL_URL_OVERRIDES[@]} -gt 0 ]]; then
+  PREPARE_ARGS+=("${EXTERNAL_URL_OVERRIDES[@]}")
+fi
+PREPARE_ARGS+=(--output "$ARTIFACTS_JSON")
+python3 "$REPO/scripts/prepare_gtfs_artifacts.py" "${PREPARE_ARGS[@]}"
+BUILD_FINGERPRINT="$(python3 "$REPO/scripts/build_fingerprint.py" --repository "$REPO")"
+echo "[StopData] release=$RELEASE_ID buildFingerprint=$BUILD_FINGERPRINT"
+
+ARTIFACT_VALUES=()
+while IFS= read -r artifact_value; do
+  ARTIFACT_VALUES+=("$artifact_value")
+done < <(python3 - "$ARTIFACTS_JSON" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+sources = payload["sources"]
+print(sources["germany"]["path"])
+print(sources["swiss"]["path"])
+print(sources.get("netherlands", {}).get("path", ""))
+print(payload.get("nlFailure") or "")
+for source_id, entry in sorted(payload.get("external", {}).items()):
+    print(f"external:{source_id}={entry['path']}")
+PY
+)
+GTFS_URL="${ARTIFACT_VALUES[0]}"
+SWISS_GTFS_URL="${ARTIFACT_VALUES[1]}"
+NL_GTFS_URL="${ARTIFACT_VALUES[2]}"
+NL_SOURCE_FAILED="${ARTIFACT_VALUES[3]}"
+EXTERNAL_GTFS_ARGS=()
+for value in "${ARTIFACT_VALUES[@]:4}"; do
+  EXTERNAL_GTFS_ARGS+=(--external-gtfs-url "${value#external:}")
+done
+
 mkdir -p "$BUILD_DIR" "$RELEASES"
 
 # Map provider env vars to repeatable --external-gtfs-url providerID=URL args.
@@ -129,8 +175,8 @@ run_build_stop_packages() {
   if [ -n "$nl_url" ]; then
     cmd+=(--nl-gtfs-url "$nl_url")
   fi
-  if [ -n "${SWEDEN_GTFS_URL:-}" ]; then
-    cmd+=(--external-gtfs-url "sweden=${SWEDEN_GTFS_URL}")
+  if [[ ${#EXTERNAL_GTFS_ARGS[@]} -gt 0 ]]; then
+    cmd+=("${EXTERNAL_GTFS_ARGS[@]}")
   fi
   cmd+=(--output "$BUILD_DIR")
   if [[ -n "${NL_GTFS_URL:-}" ]]; then
@@ -141,7 +187,7 @@ run_build_stop_packages() {
 
 run_build_stop_packages "${NL_GTFS_URL:-}"
 
-if [[ "${FORCE_PRESERVE_NL:-0}" = "1" || -f "$BUILD_DIR/.nl-failure" ]]; then
+if [[ "${FORCE_PRESERVE_NL:-0}" = "1" || -n "$NL_SOURCE_FAILED" || -f "$BUILD_DIR/.nl-failure" ]]; then
   test -d "$CURRENT"
   echo "[StopData] release=$RELEASE_ID preserving last validated Dutch assets"
   python3 "$REPO/scripts/preserve_nl_assets.py" \
@@ -151,9 +197,11 @@ if [[ "${FORCE_PRESERVE_NL:-0}" = "1" || -f "$BUILD_DIR/.nl-failure" ]]; then
   rm -f "$BUILD_DIR/.nl-failure"
 fi
 
+SWISS_INDEX_STARTED=$SECONDS
 python3 "$REPO/scripts/build_swiss_departure_index.py" \
   --gtfs-url "$SWISS_GTFS_URL" \
   --output "$BUILD_DIR/swiss-static"
+echo "[StopData] source=swiss stage=departure-index duration=$(elapsed_seconds "$SWISS_INDEX_STARTED")"
 
 test -f "$BUILD_DIR/manifest.json"
 test -f "$BUILD_DIR/transit-radar-cities.json"
@@ -166,7 +214,7 @@ fi
 
 echo "[StopData] release=$RELEASE_ID stage=build duration=$(elapsed_seconds "$TOTAL_STARTED")"
 VALIDATION_STARTED=$SECONDS
-python3 - "$BUILD_DIR/manifest.json" "$RELEASE_ID" "$RELEASE_DIR/release-metadata.json" <<'PY'
+python3 - "$BUILD_DIR/manifest.json" "$RELEASE_ID" "$RELEASE_DIR/release-metadata.json" "$BUILD_FINGERPRINT" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -174,12 +222,13 @@ from pathlib import Path
 manifest_path = Path(sys.argv[1])
 release_id = sys.argv[2]
 metadata_path = Path(sys.argv[3])
+build_fingerprint = sys.argv[4]
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 if not isinstance(manifest.get("cities"), list) or not manifest["cities"]:
     raise SystemExit("staged stop manifest has no cities")
 manifest["releaseID"] = release_id
 manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-metadata_path.write_text(json.dumps({"releaseID": release_id, "stopManifestVersion": manifest.get("version")}, indent=2), encoding="utf-8")
+metadata_path.write_text(json.dumps({"releaseID": release_id, "buildFingerprint": build_fingerprint, "stopManifestVersion": manifest.get("version")}, indent=2), encoding="utf-8")
 PY
 echo "[StopData] release=$RELEASE_ID stage=validation duration=$(elapsed_seconds "$VALIDATION_STARTED")"
 

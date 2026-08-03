@@ -37,6 +37,21 @@ exit 0
 set -euo pipefail
 
 case \"${1:-}\" in
+  *build_fingerprint.py)
+    printf 'test-build-fingerprint\\n'
+    ;;
+  *prepare_gtfs_artifacts.py)
+    output=\"\"
+    while [ \"$#\" -gt 0 ]; do
+      if [ \"$1\" = \"--output\" ]; then
+        output=\"$2\"
+        break
+      fi
+      shift
+    done
+    mkdir -p \"$(dirname \"$output\")\"
+    printf '{\"sources\":{\"germany\":{\"path\":\"/tmp/germany.zip\"},\"swiss\":{\"path\":\"/tmp/swiss.zip\"}},\"external\":{},\"nlFailure\":null}' > \"$output\"
+    ;;
   *build_stop_packages.py)
     printf 'build\\n' >> "$BUILD_CALLS_LOG"
     if [ \"${BUILD_FAIL:-0}\" = \"1\" ]; then

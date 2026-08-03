@@ -10,6 +10,7 @@ import io
 import json
 import math
 import re
+import time as monotonic_clock
 import unicodedata
 import urllib.request
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -118,6 +119,13 @@ def load_gtfs_archive(
     if payload.startswith(b"\x1f\x8b"):
         payload = gzip.decompress(payload)
     return zipfile.ZipFile(io.BytesIO(payload))
+
+
+def timed_stage(source: str, stage: str, callback):
+    started = monotonic_clock.monotonic()
+    result = callback()
+    print(f"[StopData] source={source} stage={stage} duration={monotonic_clock.monotonic() - started:.2f}s")
+    return result
 
 
 def paged_url(url: str, start_index: int) -> str:
@@ -2192,13 +2200,12 @@ def main(argv: list[str] | None = None) -> None:
         german_stop_rows = load_table(german_archive, "stops.txt")
         stops = canonicalize(german_stop_rows)
         german_stop_count = len(stops)
-        municipalities = load_municipalities(args.municipalities_url)
+        municipalities = timed_stage("bkg", "fetch", lambda: load_municipalities(args.municipalities_url))
         german_cities = german_branch_cities(cities)
-        manifest, skipped_stop_count, package_stops_by_city_id = build_stop_packages(
-            stops,
-            german_cities,
-            municipalities,
-            output
+        manifest, skipped_stop_count, package_stops_by_city_id = timed_stage(
+            "germany", "packages", lambda: build_stop_packages(
+                stops, german_cities, municipalities, output
+            )
         )
         manifest_sources = {
             str(entry["id"]): "German GTFS branch (config/cities.json)"
@@ -2209,8 +2216,11 @@ def main(argv: list[str] | None = None) -> None:
         swiss_cities = load_cities(Path(args.swiss_cities))
         merge_manifest_entries(
             manifest,
-            build_swiss_stop_packages(
-                load_gtfs_archive(args.swiss_gtfs_url), swiss_cities, output
+            timed_stage(
+                "swiss", "packages",
+                lambda: build_swiss_stop_packages(
+                    load_gtfs_archive(args.swiss_gtfs_url), swiss_cities, output
+                ),
             ),
             source="Swiss GTFS branch (config/swiss-cities.json)",
             sources_by_city_id=manifest_sources,
@@ -2228,12 +2238,18 @@ def main(argv: list[str] | None = None) -> None:
                 if not candidates:
                     raise ValueError(f"Missing downloaded Austrian GTFS for source {source['id']}")
                 archives[str(source["id"])] = load_gtfs_archive(str(candidates[-1]))
-            package_entries = build_austrian_stop_packages_from_sources(
-                archives, cities, output, austrian_registry
+            package_entries = timed_stage(
+                "austria", "packages",
+                lambda: build_austrian_stop_packages_from_sources(
+                    archives, cities, output, austrian_registry
+                ),
             )
         else:
-            package_entries = build_austrian_stop_packages(
-                load_gtfs_archive(args.austrian_gtfs_url), cities, output
+            package_entries = timed_stage(
+                "austria", "packages",
+                lambda: build_austrian_stop_packages(
+                    load_gtfs_archive(args.austrian_gtfs_url), cities, output
+                ),
             )
         merge_manifest_entries(
             manifest,
@@ -2252,8 +2268,8 @@ def main(argv: list[str] | None = None) -> None:
                 source="Netherlands GTFS branch (config/cities.json)",
                 sources_by_city_id=manifest_sources,
             )
-            build_nl_route_index(nl_archive, nl_cities, output)
-            build_nl_departure_index(nl_archive, nl_cities, output)
+            timed_stage("netherlands", "routes", lambda: build_nl_route_index(nl_archive, nl_cities, output))
+            timed_stage("netherlands", "departures", lambda: build_nl_departure_index(nl_archive, nl_cities, output))
             manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
         except Exception as error:
             if not args.allow_nl_failure:
@@ -2270,13 +2286,16 @@ def main(argv: list[str] | None = None) -> None:
         external_cities,
         external_package_stops,
         external_lines,
-    ) = process_external_gtfs_sources(
-        repository_root=repository_root,
-        sources_path=Path(args.external_gtfs_sources),
-        url_by_provider=external_url_by_provider,
-        output=output,
-        load_gtfs_archive=load_gtfs_archive,
-        occupied_city_ids=set(manifest_sources),
+    ) = timed_stage(
+        "external", "sources",
+        lambda: process_external_gtfs_sources(
+            repository_root=repository_root,
+            sources_path=Path(args.external_gtfs_sources),
+            url_by_provider=external_url_by_provider,
+            output=output,
+            load_gtfs_archive=load_gtfs_archive,
+            occupied_city_ids=set(manifest_sources),
+        ),
     )
     if external_manifest_entries:
         entries_by_source: dict[str, list[dict[str, object]]] = {}
@@ -2295,13 +2314,15 @@ def main(argv: list[str] | None = None) -> None:
 
     if not args.skip_german:
         assert german_archive is not None
-        rnv_cities, rnv_city_ids = build_rnv_assets(
-            archive=load_gtfs_archive(args.rnv_gtfs_url),
-            output=output,
-            manifest=manifest,
-            cities=cities,
-            municipalities=municipalities,
-            gateway_url=args.rnv_gateway_url.strip()
+        rnv_cities, rnv_city_ids = timed_stage(
+            "rnv", "assets", lambda: build_rnv_assets(
+                archive=load_gtfs_archive(args.rnv_gtfs_url),
+                output=output,
+                manifest=manifest,
+                cities=cities,
+                municipalities=municipalities,
+                gateway_url=args.rnv_gateway_url.strip()
+            )
         )
 
     if not manifest:
@@ -2413,7 +2434,7 @@ def main(argv: list[str] | None = None) -> None:
         additional_city_ids=rnv_city_ids | external_city_id_set
     )
     if not args.skip_german:
-        build_vbb_network_indexes(load_gtfs_archive(args.vbb_gtfs_url), output, cities)
+        timed_stage("vbb", "indexes", lambda: build_vbb_network_indexes(load_gtfs_archive(args.vbb_gtfs_url), output, cities))
         print(
             f"Built {len(manifest)} city packages from {german_stop_count} canonical stops; "
             f"skipped {skipped_stop_count} stops outside German municipalities."
