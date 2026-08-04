@@ -76,7 +76,13 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
         sweden = next(source for source in sources if source["id"] == "sweden")
         validate_external_gtfs_source(sweden, REPOSITORY_ROOT)
         cities = load_external_cities(sweden, REPOSITORY_ROOT)
-        self.assertEqual([city["id"] for city in cities], ["stockholm"])
+        self.assertEqual(
+            [city["id"] for city in cities],
+            [
+                "stockholm", "malmo", "goteborg", "uppsala", "vaxjo",
+                "helsingborg", "linkoping", "jonkoping", "orebro", "vasteras",
+            ],
+        )
         self.assertEqual(cities[0]["packageMode"], "external")
         self.assertEqual(cities[0]["externalGTFSProvider"], "sweden")
 
@@ -549,19 +555,29 @@ class ExternalStopAndDepartureTests(unittest.TestCase):
             # non-realtime-format trips are excluded from the index
             self.assertNotIn("NON_REALTIME_ID", trip_index)
 
-    def test_stockholm_appears_once_in_manifests(self) -> None:
+    def test_sweden_appears_once_with_production_static_urls_in_manifests(self) -> None:
         cities = load_cities(REPOSITORY_ROOT / "config" / "sweden-cities.json")
         radar = transit_radar_manifest(cities, skip_auto_radar_stops=True)
         app_ids = [city["appCityID"] for city in radar["cities"]]
-        self.assertEqual(app_ids.count("stockholm"), 1)
+        expected_ids = {
+            "stockholm", "malmo", "goteborg", "uppsala", "vaxjo",
+            "helsingborg", "linkoping", "jonkoping", "orebro", "vasteras",
+        }
+        self.assertEqual(set(app_ids), expected_ids)
+        self.assertEqual(len(app_ids), len(expected_ids))
         stockholm = next(city for city in radar["cities"] if city["appCityID"] == "stockholm")
         self.assertEqual(stockholm["cityID"], "stockholm-se")
-        provider = stockholm["providers"][0]
-        self.assertEqual(provider["adapter"], "sweden")
-        self.assertEqual(provider["operator"], "sl")
-        self.assertEqual(provider["providerID"], "sweden-stockholm")
-        self.assertNotIn("gatewayURL", provider)
-        self.assertNotIn("region", provider)
+        for city in radar["cities"]:
+            provider = city["providers"][0]
+            self.assertEqual(provider["adapter"], "sweden")
+            self.assertEqual(provider["providerID"], f"sweden-{city['appCityID']}")
+            self.assertEqual(provider["staticBaseURL"], "https://api.asoftlabs.app")
+            self.assertEqual(
+                provider["boardURL"],
+                "https://api.asoftlabs.app/static-departures",
+            )
+            self.assertIn("region", provider)
+            self.assertNotIn("gatewayURL", provider)
 
         manifest: list[dict[str, object]] = []
         sources: dict[str, str] = {}
@@ -572,6 +588,81 @@ class ExternalStopAndDepartureTests(unittest.TestCase):
             sources_by_city_id=sources,
         )
         self.assertEqual([entry["id"] for entry in manifest].count("stockholm"), 1)
+
+    def test_sweden_registry_builds_stops_routes_and_departures_for_every_city(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "config").mkdir()
+            city_config = json.loads(
+                (REPOSITORY_ROOT / "config" / "sweden-cities.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            (root / "config" / "sweden-cities.json").write_text(
+                json.dumps(city_config),
+                encoding="utf-8",
+            )
+            archive_path = root / "sweden.zip"
+            stop_rows = ["stop_id,stop_name,stop_lat,stop_lon,parent_station"]
+            stop_time_rows = [
+                "trip_id,arrival_time,departure_time,stop_id,stop_sequence"
+            ]
+            for sequence, city in enumerate(city_config, start=1):
+                stop_id = f"SE-{city['id']}"
+                stop_rows.append(
+                    f"{stop_id},{city['name']},{city['latitude']},{city['longitude']},"
+                )
+                departure = f"08:{sequence:02d}:00"
+                stop_time_rows.append(
+                    f"1401000000000001,{departure},{departure},{stop_id},{sequence}"
+                )
+            _gtfs_zip(
+                archive_path,
+                stops="\n".join(stop_rows) + "\n",
+                trips=(
+                    "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+                    "R1,S1,1401000000000001,Sweden,0\n"
+                ),
+                stop_times="\n".join(stop_time_rows) + "\n",
+            )
+            (root / "config" / "external-gtfs-sources.json").write_text(
+                json.dumps([{
+                    "id": "sweden",
+                    "cities": "config/sweden-cities.json",
+                    "timezone": "Europe/Stockholm",
+                    "identifierPrefix": "se:",
+                    "stopIDMode": "exact",
+                    "country": "SE",
+                    "buildStops": True,
+                    "buildRoutes": True,
+                    "buildDepartures": True,
+                    "buildTripIndex": True,
+                }]),
+                encoding="utf-8",
+            )
+
+            output = root / "out"
+            entries, external_cities, package_stops, _ = process_external_gtfs_sources(
+                repository_root=root,
+                sources_path=root / "config" / "external-gtfs-sources.json",
+                url_by_provider={"sweden": str(archive_path)},
+                output=output,
+                load_gtfs_archive=load_gtfs_archive,
+            )
+
+            expected_ids = [city["id"] for city in city_config]
+            self.assertEqual([entry["id"] for entry in entries], expected_ids)
+            self.assertEqual(
+                [city["id"] for city in external_cities],
+                expected_ids,
+            )
+            for city_id in expected_ids:
+                self.assertTrue((output / "stops" / f"{city_id}.json").is_file())
+                self.assertTrue((output / "routes" / f"{city_id}.json").is_file())
+                self.assertTrue(
+                    (output / "departures" / f"{city_id}.json").is_file()
+                )
+                self.assertTrue(package_stops[city_id])
 
     def test_end_to_end_process_with_local_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

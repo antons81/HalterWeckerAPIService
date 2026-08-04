@@ -19,6 +19,10 @@ from zoneinfo import ZoneInfo
 
 DEFAULT_TIMEZONE = "Europe/Berlin"
 STATIC_DATA_ROOT = os.environ.get("STATIC_DATA_ROOT", "")
+STATIC_DATA_PATH_PREFIXES = (
+    "/static-stop-data/",
+    "/static-stop-data-dev/",
+)
 IRELAND_REALTIME_ROOT = Path(
     os.environ.get("IRELAND_REALTIME_ROOT", "/data/ireland/realtime")
 )
@@ -302,8 +306,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed, query = urlparse(self.path), parse_qs(urlparse(self.path).query)
         try:
-            if parsed.path.startswith("/static-stop-data/"):
-                return self.send_static_file(parsed.path[len("/static-stop-data/"):])
+            for prefix in STATIC_DATA_PATH_PREFIXES:
+                if parsed.path.startswith(prefix):
+                    return self.send_static_file(parsed.path[len(prefix):])
             if parsed.path == "/ireland/realtime/vehicles":
                 return self.send_ireland_realtime("vehicles.json")
             if parsed.path == "/ireland/realtime/trip-updates":

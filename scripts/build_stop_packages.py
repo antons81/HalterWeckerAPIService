@@ -709,8 +709,6 @@ def validate_transit_radar_provider(
         return
 
     if adapter == "sweden":
-        if region is not None:
-            raise ValueError(f"Sweden does not use a radar region for {city_id}")
         if configuration.get("radarStops") is not None:
             raise ValueError(f"Sweden does not use radar stops for {city_id}")
         operator = configuration.get("operator")

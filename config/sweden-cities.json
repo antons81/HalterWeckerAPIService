@@ -13,11 +13,259 @@
       "operator": "sl",
       "isEnabled": true,
       "supportsDepartures": true,
-      "features": [
-        "firstDepartures",
-        "stopLookup"
-      ],
-      "statusMessage": "Static-Departures for Stockholm"
+      "features": ["liveVehicles", "firstDepartures", "stopLookup"],
+      "statusMessage": "Live-Radar + Abfahrten für Stockholm",
+      "region": {
+        "minimumLongitude": 17.0,
+        "minimumLatitude": 58.9,
+        "maximumLongitude": 19.0,
+        "maximumLatitude": 60.0
+      },
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/sweden/sl/vehicle-positions"
+    }
+  },
+  {
+    "id": "malmo",
+    "name": "Malmö",
+    "aliases": [],
+    "latitude": 55.605,
+    "longitude": 13.0038,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "sweden",
+    "transitRadar": {
+      "adapter": "sweden",
+      "operator": "skane",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "features": ["liveVehicles", "firstDepartures", "stopLookup"],
+      "statusMessage": "Live-Radar + Abfahrten für Malmö",
+      "region": {
+        "minimumLongitude": 12.7812,
+        "minimumLatitude": 55.4792,
+        "maximumLongitude": 13.2264,
+        "maximumLatitude": 55.7308
+      },
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/sweden/skane/vehicle-positions"
+    }
+  },
+  {
+    "id": "goteborg",
+    "name": "Göteborg",
+    "aliases": [],
+    "latitude": 57.7089,
+    "longitude": 11.9746,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "sweden",
+    "transitRadar": {
+      "adapter": "sweden",
+      "operator": "vt",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "features": ["firstDepartures", "stopLookup"],
+      "statusMessage": "Static-Departures für Göteborg",
+      "region": {
+        "minimumLongitude": 11.6719,
+        "minimumLatitude": 57.5472,
+        "maximumLongitude": 12.2773,
+        "maximumLatitude": 57.8706
+      },
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures"
+    }
+  },
+  {
+    "id": "uppsala",
+    "name": "Uppsala",
+    "aliases": [],
+    "latitude": 59.8586,
+    "longitude": 17.6389,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "sweden",
+    "transitRadar": {
+      "adapter": "sweden",
+      "operator": "ul",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "features": ["liveVehicles", "firstDepartures", "stopLookup"],
+      "statusMessage": "Live-Radar + Abfahrten für Uppsala",
+      "region": {
+        "minimumLongitude": 17.3527,
+        "minimumLatitude": 59.7149,
+        "maximumLongitude": 17.9251,
+        "maximumLatitude": 60.0023
+      },
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/sweden/ul/vehicle-positions"
+    }
+  },
+  {
+    "id": "vaxjo",
+    "name": "Växjö",
+    "aliases": [],
+    "latitude": 56.8772,
+    "longitude": 14.8091,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "sweden",
+    "transitRadar": {
+      "adapter": "sweden",
+      "operator": "krono",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "features": ["liveVehicles", "firstDepartures", "stopLookup"],
+      "statusMessage": "Live-Radar + Abfahrten für Växjö",
+      "region": {
+        "minimumLongitude": 14.5625,
+        "minimumLatitude": 56.7425,
+        "maximumLongitude": 15.0557,
+        "maximumLatitude": 57.0119
+      },
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/sweden/krono/vehicle-positions"
+    }
+  },
+  {
+    "id": "helsingborg",
+    "name": "Helsingborg",
+    "aliases": [],
+    "latitude": 56.046,
+    "longitude": 12.694,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "sweden",
+    "transitRadar": {
+      "adapter": "sweden",
+      "operator": "skane",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "features": ["liveVehicles", "firstDepartures", "stopLookup"],
+      "statusMessage": "Live-Radar + Abfahrten für Helsingborg",
+      "region": {
+        "minimumLongitude": 12.544,
+        "minimumLatitude": 55.896,
+        "maximumLongitude": 12.844,
+        "maximumLatitude": 56.196
+      },
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/sweden/skane/vehicle-positions"
+    }
+  },
+  {
+    "id": "linkoping",
+    "name": "Linköping",
+    "aliases": [],
+    "latitude": 58.411,
+    "longitude": 15.625,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "sweden",
+    "transitRadar": {
+      "adapter": "sweden",
+      "operator": "otraf",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "features": ["liveVehicles", "firstDepartures", "stopLookup"],
+      "statusMessage": "Live-Radar + Abfahrten für Linköping",
+      "region": {
+        "minimumLongitude": 15.475,
+        "minimumLatitude": 58.261,
+        "maximumLongitude": 15.775,
+        "maximumLatitude": 58.561
+      },
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/sweden/otraf/vehicle-positions"
+    }
+  },
+  {
+    "id": "jonkoping",
+    "name": "Jönköping",
+    "aliases": [],
+    "latitude": 57.783,
+    "longitude": 14.162,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "sweden",
+    "transitRadar": {
+      "adapter": "sweden",
+      "operator": "jlt",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "features": ["liveVehicles", "firstDepartures", "stopLookup"],
+      "statusMessage": "Live-Radar + Abfahrten für Jönköping",
+      "region": {
+        "minimumLongitude": 14.012,
+        "minimumLatitude": 57.633,
+        "maximumLongitude": 14.312,
+        "maximumLatitude": 57.933
+      },
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/sweden/jlt/vehicle-positions"
+    }
+  },
+  {
+    "id": "orebro",
+    "name": "Örebro",
+    "aliases": [],
+    "latitude": 59.275,
+    "longitude": 15.213,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "sweden",
+    "transitRadar": {
+      "adapter": "sweden",
+      "operator": "orebro",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "features": ["liveVehicles", "firstDepartures", "stopLookup"],
+      "statusMessage": "Live-Radar + Abfahrten für Örebro",
+      "region": {
+        "minimumLongitude": 15.063,
+        "minimumLatitude": 59.125,
+        "maximumLongitude": 15.363,
+        "maximumLatitude": 59.425
+      },
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/sweden/orebro/vehicle-positions"
+    }
+  },
+  {
+    "id": "vasteras",
+    "name": "Västerås",
+    "aliases": [],
+    "latitude": 59.617,
+    "longitude": 16.54,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "sweden",
+    "transitRadar": {
+      "adapter": "sweden",
+      "operator": "vastmanland",
+      "isEnabled": true,
+      "supportsDepartures": true,
+      "features": ["liveVehicles", "firstDepartures", "stopLookup"],
+      "statusMessage": "Live-Radar + Abfahrten für Västerås",
+      "region": {
+        "minimumLongitude": 16.39,
+        "minimumLatitude": 59.467,
+        "maximumLongitude": 16.69,
+        "maximumLatitude": 59.767
+      },
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/sweden/vastmanland/vehicle-positions"
     }
   }
 ]

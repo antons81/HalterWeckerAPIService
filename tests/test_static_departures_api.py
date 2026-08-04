@@ -345,12 +345,13 @@ class StaticDeparturesStaticFileTests(unittest.TestCase):
             (root / "manifest.json").write_text('{"version":"dev"}', encoding="utf-8")
             (root / "stops" / "stockholm.json").write_text('[{"id":"11706"}]', encoding="utf-8")
             with self._start(root) as server:
-                status, manifest = self._status(server, "/static-stop-data/manifest.json")
-                self.assertEqual(status, 200)
-                self.assertEqual(manifest, {"version": "dev"})
-                status, stops = self._status(server, "/static-stop-data/stops/stockholm.json")
-                self.assertEqual(status, 200)
-                self.assertEqual(stops, [{"id": "11706"}])
+                for prefix in ("/static-stop-data/", "/static-stop-data-dev/"):
+                    status, manifest = self._status(server, f"{prefix}manifest.json")
+                    self.assertEqual(status, 200)
+                    self.assertEqual(manifest, {"version": "dev"})
+                    status, stops = self._status(server, f"{prefix}stops/stockholm.json")
+                    self.assertEqual(status, 200)
+                    self.assertEqual(stops, [{"id": "11706"}])
 
     def test_rejects_path_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -360,6 +361,9 @@ class StaticDeparturesStaticFileTests(unittest.TestCase):
                     "/static-stop-data/../manifest.json",
                     "/static-stop-data/%2e%2e/manifest.json",
                     "/static-stop-data/a/../../etc/passwd",
+                    "/static-stop-data-dev/../manifest.json",
+                    "/static-stop-data-dev/%2e%2e/manifest.json",
+                    "/static-stop-data-dev/a/../../etc/passwd",
                 ):
                     status, _ = self._status(server, attempt)
                     self.assertEqual(status, 403, attempt)
@@ -369,10 +373,11 @@ class StaticDeparturesStaticFileTests(unittest.TestCase):
             root = Path(temp)
             (root / "notes.txt").write_text("hello", encoding="utf-8")
             with self._start(root) as server:
-                status, _ = self._status(server, "/static-stop-data/notes.txt")
-                self.assertEqual(status, 404)
-                status, _ = self._status(server, "/static-stop-data/missing.json")
-                self.assertEqual(status, 404)
+                for prefix in ("/static-stop-data/", "/static-stop-data-dev/"):
+                    status, _ = self._status(server, f"{prefix}notes.txt")
+                    self.assertEqual(status, 404)
+                    status, _ = self._status(server, f"{prefix}missing.json")
+                    self.assertEqual(status, 404)
 
     def test_static_serving_disabled_without_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -380,8 +385,9 @@ class StaticDeparturesStaticFileTests(unittest.TestCase):
             (root / "manifest.json").write_text("{}", encoding="utf-8")
             with self._start(root) as server:
                 static_departures_api.STATIC_DATA_ROOT = ""
-                status, _ = self._status(server, "/static-stop-data/manifest.json")
-                self.assertEqual(status, 404)
+                for prefix in ("/static-stop-data/", "/static-stop-data-dev/"):
+                    status, _ = self._status(server, f"{prefix}manifest.json")
+                    self.assertEqual(status, 404)
 
 
 if __name__ == "__main__":

@@ -241,24 +241,31 @@ SKIP_ACTIVATION=1 \
 echo "[StaticDepartures] release=$RELEASE_ID stage=import duration=$(elapsed_seconds "$STATIC_STARTED")"
 
 if [ -n "${SWEDEN_GTFS_URL:-}" ]; then
-  test -f "$BUILD_DIR/stops/stockholm.json"
-  test -f "$BUILD_DIR/departures/stockholm.json"
+  for sweden_city in stockholm malmo goteborg uppsala vaxjo helsingborg linkoping jonkoping orebro vasteras; do
+    test -f "$BUILD_DIR/stops/$sweden_city.json"
+    test -f "$BUILD_DIR/routes/$sweden_city.json"
+    test -f "$BUILD_DIR/departures/$sweden_city.json"
+  done
   python3 - "$BUILD_DIR/manifest.json" "$BUILD_DIR/transit-radar-cities.json" <<'PY'
 import json
 import sys
 
 manifest = json.load(open(sys.argv[1], encoding="utf-8"))
 radar = json.load(open(sys.argv[2], encoding="utf-8"))
+expected = {
+    "stockholm", "malmo", "goteborg", "uppsala", "vaxjo",
+    "helsingborg", "linkoping", "jonkoping", "orebro", "vasteras",
+}
 manifest_ids = [city.get("id") for city in manifest.get("cities", [])]
-if manifest_ids.count("stockholm") != 1:
-    raise SystemExit(
-        f"manifest must contain stockholm exactly once, found {manifest_ids.count('stockholm')}"
-    )
 radar_ids = [city.get("appCityID") for city in radar.get("cities", [])]
-if radar_ids.count("stockholm") != 1:
-    raise SystemExit(
-        f"transit-radar-cities must contain stockholm exactly once, found {radar_ids.count('stockholm')}"
-    )
+if any(manifest_ids.count(city_id) != 1 for city_id in expected):
+    raise SystemExit("manifest must contain every Swedish city exactly once")
+if not expected.issubset(manifest_ids):
+    raise SystemExit("manifest is missing a Swedish city")
+if any(radar_ids.count(city_id) != 1 for city_id in expected):
+    raise SystemExit("transit-radar-cities must contain every Swedish city exactly once")
+if not expected.issubset(radar_ids):
+    raise SystemExit("transit-radar-cities is missing a Swedish city")
 print("[StopData] Sweden external packages validated")
 PY
 fi
