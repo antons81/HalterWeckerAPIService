@@ -19,7 +19,10 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Iterable
 
-from austrian_sources import load_austrian_sources, public_stop_id, sources_for_city
+try:
+    from .austrian_sources import load_austrian_sources, public_stop_id, sources_for_city
+except ImportError:
+    from austrian_sources import load_austrian_sources, public_stop_id, sources_for_city
 
 EARTH_RADIUS_METERS = 6_371_000
 AUTO_EFA_RADAR_STOP_LIMIT = 12
@@ -2200,10 +2203,16 @@ def parse_build_stop_packages_args(argv: list[str] | None = None) -> argparse.Na
 def main(argv: list[str] | None = None) -> None:
     args = parse_build_stop_packages_args(argv)
 
-    from external_gtfs import (
-        parse_external_gtfs_url_args,
-        process_external_gtfs_sources,
-    )
+    try:
+        from .external_gtfs import (
+            parse_external_gtfs_url_args,
+            process_external_gtfs_sources,
+        )
+    except ImportError:
+        from external_gtfs import (
+            parse_external_gtfs_url_args,
+            process_external_gtfs_sources,
+        )
 
     repository_root = Path(__file__).resolve().parents[1]
     output = Path(args.output)
@@ -2266,7 +2275,6 @@ def main(argv: list[str] | None = None) -> None:
     if args.austrian_gtfs_url.strip() or args.austrian_gtfs_dir.strip():
         if not cities:
             cities = load_cities(Path(args.cities))
-        from austrian_sources import load_austrian_sources
         austrian_registry = load_austrian_sources(Path(args.austrian_sources))
         if args.austrian_gtfs_dir.strip():
             archives: dict[str, zipfile.ZipFile] = {}

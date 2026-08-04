@@ -12,15 +12,26 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
-from build_stop_packages import (
-    build_lines_by_stop_id_noncanonical,
-    distance_meters,
-    iter_table,
-    load_cities,
-    load_table,
-    normalized,
-    write_stop_package,
-)
+try:
+    from .build_stop_packages import (
+        build_lines_by_stop_id_noncanonical,
+        distance_meters,
+        iter_table,
+        load_cities,
+        load_table,
+        normalized,
+        write_stop_package,
+    )
+except ImportError:
+    from build_stop_packages import (
+        build_lines_by_stop_id_noncanonical,
+        distance_meters,
+        iter_table,
+        load_cities,
+        load_table,
+        normalized,
+        write_stop_package,
+    )
 
 
 # Auth is resolved at runtime from environment variables. Secrets never appear
