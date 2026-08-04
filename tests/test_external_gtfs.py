@@ -498,7 +498,7 @@ class ExternalStopAndDepartureTests(unittest.TestCase):
             departures = json.loads((out / "departures" / "stockholm.json").read_text())
             self.assertGreater(len(departures["stops"]["9022001000001001"]), 0)
 
-    def test_trip_index_maps_realtime_ids_to_routes_and_headsigns(self) -> None:
+    def test_trip_index_maps_operator_namespaces_to_routes_and_headsigns(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             archive_path = root / "se.zip"
@@ -517,6 +517,9 @@ class ExternalStopAndDepartureTests(unittest.TestCase):
                     "route_id,service_id,trip_id,trip_headsign,direction_id\n"
                     "R1,S1,1401000012345678,Real Headsign,0\n"
                     "R1,S1,1401000099999999,,0\n"
+                    "R1,S1,7611000012345678,Kronoberg Headsign,0\n"
+                    "R1,S1,1211000012345678,Skane Headsign,1\n"
+                    "R1,S1,1410000012345678,Vasttrafik Headsign,1\n"
                     "OTHER,S1,NON_REALTIME_ID,,0\n"
                 ),
                 stop_times=(
@@ -525,6 +528,12 @@ class ExternalStopAndDepartureTests(unittest.TestCase):
                     "1401000012345678,08:10:00,08:10:00,9022001000002002,2\n"
                     "1401000099999999,09:00:00,09:00:00,9022001000001001,1\n"
                     "1401000099999999,09:12:00,09:12:00,9022001000002002,2\n"
+                    "7611000012345678,10:00:00,10:00:00,9022001000001001,1\n"
+                    "7611000012345678,10:12:00,10:12:00,9022001000002002,2\n"
+                    "1211000012345678,11:00:00,11:00:00,9022001000001001,1\n"
+                    "1211000012345678,11:12:00,11:12:00,9022001000002002,2\n"
+                    "1410000012345678,12:00:00,12:00:00,9022001000001001,1\n"
+                    "1410000012345678,12:12:00,12:12:00,9022001000002002,2\n"
                     "NON_REALTIME_ID,10:00:00,10:00:00,9022001000001001,1\n"
                     "NON_REALTIME_ID,10:12:00,10:12:00,9022001000002002,2\n"
                 ),
@@ -544,15 +553,22 @@ class ExternalStopAndDepartureTests(unittest.TestCase):
                 build_external_departure_index(
                     archive, cities, out, timezone_name="Europe/Stockholm"
                 )
+                build_external_route_index(archive, cities, out)
                 build_external_trip_index(archive, cities, out)
 
             trip_index = json.loads((out / "trips" / "stockholm.json").read_text())
-            # realtime-prefix trips resolved to their route
+            # Operator namespaces resolve to their route without a prefix allowlist.
             self.assertEqual(trip_index["1401000012345678"]["r"], "R1")
             self.assertEqual(trip_index["1401000099999999"]["r"], "R1")
+            self.assertEqual(trip_index["7611000012345678"]["r"], "R1")
+            self.assertEqual(trip_index["1211000012345678"]["r"], "R1")
+            self.assertEqual(trip_index["1410000012345678"]["r"], "R1")
             # headsign from trips.txt, not the terminal-stop fallback
             self.assertEqual(trip_index["1401000012345678"]["h"], "Real Headsign")
-            # non-realtime-format trips are excluded from the index
+            self.assertEqual(trip_index["7611000012345678"]["h"], "Kronoberg Headsign")
+            self.assertEqual(trip_index["1211000012345678"]["h"], "Skane Headsign")
+            self.assertEqual(trip_index["1410000012345678"]["h"], "Vasttrafik Headsign")
+            # Trips whose route is not present in routes.txt are excluded.
             self.assertNotIn("NON_REALTIME_ID", trip_index)
 
     def test_sweden_appears_once_with_production_static_urls_in_manifests(self) -> None:
