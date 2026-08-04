@@ -45,6 +45,28 @@ def service_active(service: dict | None, date: str) -> bool:
     return bool(service["weekdays"][datetime.strptime(date, "%Y%m%d").weekday()])
 
 
+def stop_time_targets(all_stops: dict[str, dict[str, str]], selected: dict[str, dict[str, str]]):
+    """Map each source stop_id to the selected Swiss output stops that consume it."""
+    members_by_parent: dict[str, list[str]] = defaultdict(list)
+    for stop_id, stop in all_stops.items():
+        parent_station = (stop.get("parent_station") or "").strip()
+        if parent_station:
+            members_by_parent[parent_station].append(stop_id)
+
+    targets: dict[str, list[str]] = defaultdict(list)
+    for output_stop_id, stop in selected.items():
+        parent_station = (stop.get("parent_station") or "").strip()
+        platform_code = (stop.get("platform_code") or "").strip()
+        source_stop_ids = (
+            members_by_parent.get(parent_station, [output_stop_id])
+            if parent_station and not platform_code
+            else [output_stop_id]
+        )
+        for source_stop_id in source_stop_ids:
+            targets[source_stop_id].append(output_stop_id)
+    return targets
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--gtfs-url", required=True)
@@ -77,10 +99,11 @@ def main():
                 for offset in (-1, 0, 1)
             ]
             departures = defaultdict(list)
+            targets = stop_time_targets(all_stops, selected)
             relevant_trips = set()
             for row in rows(archive, "stop_times.txt"):
                 stop_id = row.get("stop_id")
-                if stop_id not in selected or not row.get("departure_time"):
+                if stop_id not in targets or not row.get("departure_time"):
                     continue
                 trip = trips.get(row["trip_id"])
                 if not trip:
@@ -90,7 +113,9 @@ def main():
                 service = calendar.get(trip.get("service_id"))
                 for service_date in departure_dates:
                     if service_active(service, service_date):
-                        departures[stop_id].append({"tripId": row["trip_id"], "routeId": trip.get("route_id", ""), "line": route.get("route_short_name") or route.get("route_long_name") or trip.get("route_id", ""), "destination": trip.get("trip_headsign") or "", "departureTime": row["departure_time"], "serviceDate": service_date, "transportType": transport_type(route.get("route_type"))})
+                        item = {"tripId": row["trip_id"], "routeId": trip.get("route_id", ""), "line": route.get("route_short_name") or route.get("route_long_name") or trip.get("route_id", ""), "destination": trip.get("trip_headsign") or "", "departureTime": row["departure_time"], "serviceDate": service_date, "transportType": transport_type(route.get("route_type"))}
+                        for output_stop_id in targets[stop_id]:
+                            departures[output_stop_id].append(item.copy())
             terminals = {}
             for row in rows(archive, "stop_times.txt"):
                 if row.get("trip_id") in relevant_trips:
