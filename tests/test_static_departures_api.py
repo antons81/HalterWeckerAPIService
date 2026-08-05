@@ -291,12 +291,14 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                 database.executemany(
                     "INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?)",
                     [("trip-b", "future-only", "route-1", "Destination B", "0", "terminal-b"),
-                     ("trip-c", "future-only", "route-1", "Destination C", "0", "terminal-c")],
+                     ("trip-c", "future-only", "route-1", "Destination C", "0", "terminal-c"),
+                     ("trip-same-name", "future-only", "route-1", "Weixdorf", "0", "terminal-b")],
                 )
                 database.executemany(
                     "INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)",
-                    [("trip-b", "stop-platform", "02:00:00", 7200, 1),
-                     ("trip-c", "stop-platform", "03:00:00", 10800, 1)],
+                     [("trip-b", "stop-platform", "02:00:00", 7200, 1),
+                     ("trip-c", "stop-platform", "03:00:00", 10800, 1),
+                     ("trip-same-name", "stop-platform", "04:00:00", 14400, 1)],
                 )
                 database.commit()
                 lines = Database(str(path)).lines("dresden", "stop-parent")
@@ -305,6 +307,25 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
 
             destinations = {entry["destination"] for entry in lines}
             self.assertEqual(destinations, {"Weixdorf", "Destination B", "Destination C"})
+            weixdorf_keys = {
+                entry["directionKey"] for entry in lines if entry["destination"] == "Weixdorf"
+            }
+            self.assertEqual(len(weixdorf_keys), 2)
+
+    def test_lines_use_terminal_stop_name_when_trip_headsign_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "current.sqlite"
+            write_database(path, "empty-headsign")
+            database = sqlite3.connect(path)
+            try:
+                database.execute("UPDATE trips SET headsign='' WHERE trip_id='trip-1'")
+                database.commit()
+                lines = Database(str(path)).lines("dresden", "stop-parent")
+            finally:
+                database.close()
+
+            self.assertEqual(lines[0]["destination"], "Terminal")
+            self.assertEqual(lines[0]["destinationStopID"], "terminal")
 
     def test_known_stop_without_scheduled_departures_returns_empty_success(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

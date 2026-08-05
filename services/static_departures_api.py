@@ -162,12 +162,13 @@ class Database:
                 SELECT DISTINCT t.route_id,
                        COALESCE(NULLIF(r.short_name,''),NULLIF(r.long_name,''),t.route_id),
                        t.direction_id,
-                       t.headsign,
+                       COALESCE(NULLIF(t.headsign,''),NULLIF(destination_stops.stop_name,''),'Unbekanntes Ziel'),
                        t.terminal_stop_id
                 FROM stop_times s
                 JOIN raw_stops rs ON rs.stop_id=s.raw_stop_id
                 JOIN trips t ON t.trip_id=s.trip_id
                 LEFT JOIN routes r ON r.route_id=t.route_id
+                LEFT JOIN raw_stops AS destination_stops ON destination_stops.stop_id=t.terminal_stop_id
                 WHERE {stop_predicate}
                 ORDER BY 2,1
                 """,
