@@ -248,7 +248,15 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                 self.assertEqual(health["database"]["databaseVersion"], "endpoint")
                 self.assertEqual(server.get("/static-departures/meta")["databaseVersion"], "endpoint")
                 lines = server.get("/static-departures/lines?cityID=dresden&stopID=stop-parent")["lines"]
-                self.assertEqual(lines, [{"routeID": "route-1", "line": "7", "direction": "0"}])
+                self.assertEqual(lines, [{
+                    "routeID": "route-1",
+                    "line": "7",
+                    "directionID": "0",
+                    "direction": "Weixdorf",
+                    "destination": "Weixdorf",
+                    "destinationStopID": "terminal",
+                    "directionKey": "route-1|direction:0|destination-stop:terminal",
+                }])
                 board = server.get(
                     "/static-departures/board?cityID=dresden&stopID=stop-parent"
                     "&from=2026-07-28T23:50:00%2B02:00&to=2026-07-29T00:10:00%2B02:00&limit=1"
@@ -268,6 +276,35 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                 self.assertEqual(aliased["cityID"], "koln")
                 self.assertEqual(aliased["requestedCityID"], "koeln")
                 self.assertEqual(aliased["lines"][0]["line"], "7")
+
+    def test_lines_are_topology_and_keep_multiple_destinations_without_active_services(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "current.sqlite"
+            write_database(path, "topology")
+            database = sqlite3.connect(path)
+            try:
+                database.executemany(
+                    "INSERT INTO raw_stops VALUES (?, ?, ?, ?, ?, ?)",
+                    [("terminal-b", "", "Destination B", "", 4, "terminal-b"),
+                     ("terminal-c", "", "Destination C", "", 5, "terminal-c")],
+                )
+                database.executemany(
+                    "INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?)",
+                    [("trip-b", "future-only", "route-1", "Destination B", "0", "terminal-b"),
+                     ("trip-c", "future-only", "route-1", "Destination C", "0", "terminal-c")],
+                )
+                database.executemany(
+                    "INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)",
+                    [("trip-b", "stop-platform", "02:00:00", 7200, 1),
+                     ("trip-c", "stop-platform", "03:00:00", 10800, 1)],
+                )
+                database.commit()
+                lines = Database(str(path)).lines("dresden", "stop-parent")
+            finally:
+                database.close()
+
+            destinations = {entry["destination"] for entry in lines}
+            self.assertEqual(destinations, {"Weixdorf", "Destination B", "Destination C"})
 
     def test_known_stop_without_scheduled_departures_returns_empty_success(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

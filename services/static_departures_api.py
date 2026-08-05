@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import threading
 import time
+import unicodedata
 from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +30,18 @@ IRELAND_REALTIME_ROOT = Path(
 
 
 class Database:
+    @staticmethod
+    def _direction_key(route_id: str, direction_id: str | None, destination_stop_id: str | None, destination: str) -> str:
+        direction = (direction_id or "").strip()
+        terminal = (destination_stop_id or "").strip()
+        if terminal:
+            return f"{route_id}|direction:{direction}|destination-stop:{terminal}"
+        normalized = "".join(
+            character for character in unicodedata.normalize("NFKD", destination).casefold()
+            if not unicodedata.combining(character)
+        )
+        return f"{route_id}|direction:{direction}|destination:{' '.join(normalized.split())}"
+
     def __init__(self, path: str, ttl: float = 2.0) -> None:
         self.path, self.ttl, self.connection, self.identity, self.checked_at = path, ttl, None, None, 0.0
         self.lock = threading.Lock()
@@ -148,7 +161,9 @@ class Database:
                 f"""
                 SELECT DISTINCT t.route_id,
                        COALESCE(NULLIF(r.short_name,''),NULLIF(r.long_name,''),t.route_id),
-                       t.direction_id
+                       t.direction_id,
+                       t.headsign,
+                       t.terminal_stop_id
                 FROM stop_times s
                 JOIN raw_stops rs ON rs.stop_id=s.raw_stop_id
                 JOIN trips t ON t.trip_id=s.trip_id
@@ -162,7 +177,18 @@ class Database:
                 rows = cursor.fetchall()
             finally:
                 cursor.close()
-        return [{"routeID": route_id, "line": line, "direction": direction or None} for route_id, line, direction in rows]
+        return [
+            {
+                "routeID": route_id,
+                "line": line,
+                "directionID": direction or None,
+                "direction": destination or None,
+                "destination": destination or None,
+                "destinationStopID": destination_stop_id or None,
+                "directionKey": self._direction_key(route_id, direction, destination_stop_id, destination),
+            }
+            for route_id, line, direction, destination, destination_stop_id in rows
+        ]
 
     def board(
         self,
@@ -183,7 +209,7 @@ class Database:
                 SELECT a.service_date,s.departure_time,s.departure_seconds,t.trip_id,t.route_id,
                        COALESCE(NULLIF(r.short_name,''),NULLIF(r.long_name,''),t.route_id),
                        COALESCE(NULLIF(t.headsign,''),NULLIF(destination_stops.stop_name,''),'Unbekanntes Ziel'),
-                       t.direction_id,rs.platform_code
+                       t.direction_id, t.terminal_stop_id, rs.platform_code
                 FROM stop_times s
                 JOIN raw_stops rs ON rs.stop_id=s.raw_stop_id
                 JOIN trips t ON t.trip_id=s.trip_id
@@ -208,11 +234,14 @@ class Database:
                 "routeID": route_id,
                 "line": line,
                 "destination": destination,
+                "directionID": direction or None,
                 "direction": direction or None,
+                "directionKey": self._direction_key(route_id, direction, destination_stop_id, destination),
+                "destinationStopID": destination_stop_id or None,
                 "platform": platform or None,
                 "isRealtime": False
             }
-            for service_date, departure_time, _seconds, trip_id, route_id, line, destination, direction, platform in rows
+            for service_date, departure_time, _seconds, trip_id, route_id, line, destination, direction, destination_stop_id, platform in rows
         ]
 
 
