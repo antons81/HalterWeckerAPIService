@@ -1,0 +1,21 @@
+[
+  {
+    "id": "toronto",
+    "name": "Toronto",
+    "aliases": ["Toronto, ON"],
+    "latitude": 43.6532,
+    "longitude": -79.3832,
+    "radiusMeters": 55000,
+    "packageMode": "external",
+    "externalGTFSProviders": ["ttc-surface", "ttc-subway"],
+    "transitRadar": {
+      "adapter": "ttc",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": ["realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay", "tripUpdates"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "realtimeURL": "https://api.asoftlabs.app/ttc/realtime/trip-updates",
+      "statusMessage": "Live-Abfahrten und statische Fahrpläne für Toronto"
+    }
+  }
+]

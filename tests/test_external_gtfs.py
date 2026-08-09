@@ -71,7 +71,14 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
         )
         self.assertEqual(
             {source["id"] for source in sources},
-            {"sweden", "norway", "ireland", "translink"},
+            {
+                "sweden",
+                "norway",
+                "ireland",
+                "translink",
+                "ttc-surface",
+                "ttc-subway",
+            },
         )
         sweden = next(source for source in sources if source["id"] == "sweden")
         validate_external_gtfs_source(sweden, REPOSITORY_ROOT)
@@ -136,6 +143,143 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
             "https://api.asoftlabs.app/translink/realtime/trip-updates",
         )
         self.assertNotIn("liveVehicles", provider["features"])
+
+    def test_validate_ttc_registry_and_static_manifest(self) -> None:
+        sources = load_external_gtfs_sources(
+            REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
+        )
+        ttc_sources = [
+            source for source in sources if str(source["id"]).startswith("ttc-")
+        ]
+        self.assertEqual(
+            {source["id"] for source in ttc_sources},
+            {"ttc-surface", "ttc-subway"},
+        )
+        for source in ttc_sources:
+            validate_external_gtfs_source(source, REPOSITORY_ROOT)
+            self.assertEqual(source["timezone"], "America/Toronto")
+            self.assertEqual(source["mergeGroup"], "toronto")
+            self.assertTrue(str(source["namespace"]).startswith("ttc-"))
+            self.assertNotIn("apiKey", source)
+
+        cities = load_external_cities(ttc_sources[0], REPOSITORY_ROOT)
+        manifest = transit_radar_manifest(cities)
+        city = manifest["cities"][0]
+        provider = city["providers"][0]
+        self.assertEqual(city["cityID"], "toronto-ca")
+        self.assertEqual(provider["providerID"], "ttc-toronto")
+        self.assertEqual(
+            provider["realtimeURL"],
+            "https://api.asoftlabs.app/ttc/realtime/trip-updates",
+        )
+        self.assertIn("tripUpdates", provider["features"])
+        self.assertNotIn("liveVehicles", provider["features"])
+        self.assertNotIn("vehiclePositions", provider["features"])
+
+    def test_canadian_timers_use_local_night_and_shared_service(self) -> None:
+        vancouver_timer = (
+            REPOSITORY_ROOT / "deploy" / "systemd" / "haltewecker-static-departures.timer"
+        ).read_text(encoding="utf-8")
+        toronto_timer = (
+            REPOSITORY_ROOT / "deploy" / "systemd" / "haltewecker-toronto-static-departures.timer"
+        ).read_text(encoding="utf-8")
+        self.assertIn("OnCalendar=*-*-* 03:30:00 America/Vancouver", vancouver_timer)
+        self.assertIn("OnCalendar=*-*-* 03:30:00 America/Toronto", toronto_timer)
+        self.assertIn("Unit=haltewecker-static-departures.service", vancouver_timer)
+        self.assertIn("Unit=haltewecker-static-departures.service", toronto_timer)
+        self.assertIn("Persistent=true", vancouver_timer)
+        self.assertIn("Persistent=true", toronto_timer)
+
+    def test_toronto_namespaced_sources_merge_without_cross_join(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "config").mkdir()
+            (root / "config" / "ttc-cities.json").write_text(
+                json.dumps([
+                    {
+                        "id": "toronto",
+                        "name": "Toronto",
+                        "aliases": [],
+                        "latitude": 43.6532,
+                        "longitude": -79.3832,
+                        "radiusMeters": 50_000,
+                        "packageMode": "external",
+                        "externalGTFSProviders": ["ttc-surface", "ttc-subway"],
+                    }
+                ])
+            )
+            surface_zip = _gtfs_zip(
+                root / "surface.zip",
+                stops="stop_id,stop_name,stop_lat,stop_lon\n100,Surface stop,43.6532,-79.3832\n",
+                routes="route_id,route_short_name,route_long_name,route_type\n600,506,Surface route,0\n",
+                trips="route_id,service_id,trip_id,trip_headsign,direction_id\n600,S1,trip-600,Surface destination,0\n",
+                stop_times="trip_id,arrival_time,departure_time,stop_id,stop_sequence\ntrip-600,08:00:00,08:00:00,100,1\n",
+            )
+            subway_zip = _gtfs_zip(
+                root / "subway.zip",
+                stops="stop_id,stop_name,stop_lat,stop_lon\n100,Subway stop,43.6532,-79.3832\n",
+                routes="route_id,route_short_name,route_long_name,route_type\n600,1,Yonge-University,1\n",
+                trips="route_id,service_id,trip_id,trip_headsign,direction_id\n600,S1,trip-600,Subway destination,0\n",
+                stop_times="trip_id,arrival_time,departure_time,stop_id,stop_sequence\ntrip-600,08:05:00,08:05:00,100,1\n",
+            )
+            sources = [
+                {
+                    "id": "ttc-surface",
+                    "url": str(surface_zip),
+                    "cities": "config/ttc-cities.json",
+                    "timezone": "America/Toronto",
+                    "identifierPrefix": "ttc-surface:",
+                    "namespace": "ttc-surface:",
+                    "mergeGroup": "toronto",
+                    "stopIDMode": "exact",
+                    "country": "CA",
+                },
+                {
+                    "id": "ttc-subway",
+                    "url": str(subway_zip),
+                    "cities": "config/ttc-cities.json",
+                    "timezone": "America/Toronto",
+                    "identifierPrefix": "ttc-subway:",
+                    "namespace": "ttc-subway:",
+                    "mergeGroup": "toronto",
+                    "stopIDMode": "exact",
+                    "country": "CA",
+                },
+            ]
+            sources_path = root / "sources.json"
+            sources_path.write_text(json.dumps(sources))
+            output = root / "out"
+
+            manifest, cities, packages, lines = process_external_gtfs_sources(
+                repository_root=root,
+                sources_path=sources_path,
+                url_by_provider={},
+                output=output,
+                load_gtfs_archive=load_gtfs_archive,
+            )
+
+            self.assertEqual([entry["id"] for entry in manifest], ["toronto"])
+            self.assertEqual([city["id"] for city in cities], ["toronto"])
+            stop_ids = {stop["id"] for stop in packages["toronto"]}
+            self.assertEqual(stop_ids, {"ttc-surface:100", "ttc-subway:100"})
+            routes = json.loads((output / "routes" / "toronto.json").read_text())
+            self.assertEqual(set(routes), {"ttc-surface:600", "ttc-subway:600"})
+            departures = json.loads(
+                (output / "departures" / "toronto.json").read_text()
+            )
+            self.assertEqual(
+                set(departures["stops"]),
+                {"ttc-surface:100", "ttc-subway:100"},
+            )
+            self.assertEqual(
+                {item["r"] for items in departures["stops"].values() for item in items},
+                {"ttc-surface:600", "ttc-subway:600"},
+            )
+            trips = json.loads((output / "trips" / "toronto.json").read_text())
+            self.assertEqual(
+                set(trips), {"ttc-surface:trip-600", "ttc-subway:trip-600"}
+            )
+            self.assertEqual(set(lines), {"ttc-surface:100", "ttc-subway:100"})
 
     def test_norway_radar_manifest_preserves_multiple_codespaces(self) -> None:
         cities = load_cities(REPOSITORY_ROOT / "config" / "norway-cities.json")

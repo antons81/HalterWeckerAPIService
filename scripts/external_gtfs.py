@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -68,6 +69,7 @@ def validate_external_gtfs_source(
     *,
     known_source_ids: set[str] | None = None,
     known_prefixes: set[str] | None = None,
+    known_namespaces: set[str] | None = None,
 ) -> None:
     source_id = source.get("id")
     if not isinstance(source_id, str) or not source_id.strip():
@@ -108,6 +110,27 @@ def validate_external_gtfs_source(
     if known_prefixes is not None and prefix in known_prefixes:
         raise ValueError(f"Duplicate external GTFS identifierPrefix: {prefix}")
 
+    namespace = source.get("namespace", "")
+    if not isinstance(namespace, str):
+        raise ValueError(f"External GTFS source {source_id} has an invalid namespace.")
+    if namespace and (
+        namespace.strip() != namespace
+        or any(character.isspace() for character in namespace)
+        or not namespace.endswith(":")
+    ):
+        raise ValueError(
+            f"External GTFS source {source_id} namespace must be a whitespace-free "
+            "prefix ending with ':'."
+        )
+    if namespace and known_namespaces is not None and namespace in known_namespaces:
+        raise ValueError(f"Duplicate external GTFS namespace: {namespace}")
+
+    merge_group = source.get("mergeGroup")
+    if merge_group is not None and (
+        not isinstance(merge_group, str) or not merge_group.strip()
+    ):
+        raise ValueError(f"External GTFS source {source_id} has an invalid mergeGroup.")
+
     country = source.get("country")
     if not isinstance(country, str) or not country.strip():
         raise ValueError(f"External GTFS source {source_id} is missing country.")
@@ -142,7 +165,18 @@ def load_external_cities(
                 f"External city {city_id} must set packageMode to 'external'."
             )
         provider = city.get("externalGTFSProvider")
-        if provider is not None and provider != source_id:
+        providers = city.get("externalGTFSProviders")
+        if providers is not None and (
+            not isinstance(providers, list)
+            or not providers
+            or not all(isinstance(item, str) and item.strip() for item in providers)
+            or source_id not in providers
+        ):
+            raise ValueError(
+                f"External city {city_id} externalGTFSProviders does not include "
+                f"source {source_id!r}."
+            )
+        if providers is None and provider is not None and provider != source_id:
             raise ValueError(
                 f"External city {city_id} externalGTFSProvider {provider!r} "
                 f"does not match source {source_id!r}."
@@ -238,6 +272,16 @@ def _feed_stop_rows(
         for row in iter_table(archive, "stops.txt")
         if row.get("stop_id")
     }
+
+
+def _published_id(raw_id: str, namespace: str) -> str:
+    return f"{namespace}{raw_id}" if namespace else raw_id
+
+
+def _raw_id(published_id: str, namespace: str) -> str:
+    if namespace:
+        return published_id[len(namespace):] if published_id.startswith(namespace) else ""
+    return published_id
 
 
 def _stop_resolution_map(
@@ -363,6 +407,7 @@ def build_external_stop_packages(
     cities: list[dict[str, object]],
     output: Path,
     stop_id_mode: str = "exact",
+    namespace: str = "",
 ) -> tuple[list[dict[str, object]], dict[str, list[dict[str, object]]]]:
     if stop_id_mode != "exact":
         raise ValueError(f"Unsupported stopIDMode: {stop_id_mode!r}")
@@ -468,7 +513,7 @@ def build_external_stop_packages(
         city_id = str(city["id"])
         public_entries = [
             {
-                "id": stop["id"],
+                "id": _published_id(str(stop["id"]), namespace),
                 "name": stop["name"],
                 "latitude": stop["latitude"],
                 "longitude": stop["longitude"],
@@ -493,6 +538,7 @@ def build_external_route_index(
     archive: zipfile.ZipFile,
     cities: list[dict[str, object]],
     output: Path,
+    namespace: str = "",
 ) -> None:
     if not cities:
         return
@@ -531,7 +577,10 @@ def build_external_route_index(
         if not stop_path.exists():
             city_stop_ids[city_id] = set()
             continue
-        ids = {str(stop["id"]) for stop in json.loads(stop_path.read_text(encoding="utf-8"))}
+        ids = {
+            _raw_id(str(stop["id"]), namespace)
+            for stop in json.loads(stop_path.read_text(encoding="utf-8"))
+        }
         city_stop_ids[city_id] = ids
         public_stop_ids.update(ids)
 
@@ -550,9 +599,10 @@ def build_external_route_index(
         city_routes: dict[str, dict[str, object]] = {}
         for stop_id in city_stop_ids[city_id]:
             for route_id in stop_route_ids.get(stop_id, set()):
-                if route_id not in city_routes:
+                published_route_id = _published_id(route_id, namespace)
+                if published_route_id not in city_routes:
                     route = routes[route_id]
-                    city_routes[route_id] = {
+                    city_routes[published_route_id] = {
                         "short_name": str(route.get("route_short_name", "")),
                         "long_name": str(route.get("route_long_name", "")),
                         "type": str(route.get("route_type", "3")),
@@ -561,8 +611,9 @@ def build_external_route_index(
                     }
         for trip_id, (direction_id, headsign) in trip_headsigns.items():
             route_id = trip_routes.get(trip_id)
-            if route_id and route_id in city_routes:
-                headsigns = city_routes[route_id].setdefault("headsigns", {})
+            published_route_id = _published_id(route_id, namespace) if route_id else ""
+            if published_route_id and published_route_id in city_routes:
+                headsigns = city_routes[published_route_id].setdefault("headsigns", {})
                 if isinstance(headsigns, dict) and direction_id not in headsigns:
                     headsigns[direction_id] = headsign
         ordered = {
@@ -579,6 +630,7 @@ def build_external_trip_index(
     archive: zipfile.ZipFile,
     cities: list[dict[str, object]],
     output: Path,
+    namespace: str = "",
 ) -> None:
     """Write a compact realtime trip index: tripId -> {"r": routeId, "h": headsign}.
 
@@ -638,7 +690,7 @@ def build_external_trip_index(
         city_trip_route = {
             trip_id: route_id
             for trip_id, route_id in trip_route.items()
-            if route_id in city_route_ids
+            if _published_id(route_id, namespace) in city_route_ids
         }
         headsigns: dict[str, str] = {}
         departures_path = output / "departures" / f"{city_id}.json"
@@ -656,10 +708,10 @@ def build_external_trip_index(
 
         index: dict[str, dict[str, str]] = {}
         for trip_id, route_id in city_trip_route.items():
-            entry: dict[str, str] = {"r": route_id}
+            entry: dict[str, str] = {"r": _published_id(route_id, namespace)}
             if headsign := headsigns.get(trip_id):
                 entry["h"] = headsign
-            index[trip_id] = entry
+            index[_published_id(trip_id, namespace)] = entry
 
         (trips_directory / f"{city_id}.json").write_text(
             json.dumps(index, ensure_ascii=False, separators=(",", ":")),
@@ -768,6 +820,7 @@ def build_external_departure_index(
     cities: list[dict[str, object]],
     output: Path,
     timezone_name: str,
+    namespace: str = "",
 ) -> None:
     if not cities:
         return
@@ -826,7 +879,10 @@ def build_external_departure_index(
         stops = json.loads(stop_path.read_text(encoding="utf-8"))
         ids = {str(stop["id"]) for stop in stops}
         city_stop_ids[city_id] = ids
-        public_stop_ids.update(ids)
+        public_stop_ids.update(
+            raw_id for raw_id in (_raw_id(stop_id, namespace) for stop_id in ids)
+            if raw_id
+        )
 
     feed_stops = _feed_stop_rows(archive)
     resolve = _stop_resolution_map(feed_stops, public_stop_ids)
@@ -880,7 +936,10 @@ def build_external_departure_index(
     for city in cities:
         city_id = str(city["id"])
         departures_by_stop: dict[str, list[dict[str, str]]] = {}
-        for stop_id in sorted(city_stop_ids.get(city_id, set())):
+        for published_stop_id in sorted(city_stop_ids.get(city_id, set())):
+            stop_id = _raw_id(published_stop_id, namespace)
+            if not stop_id:
+                continue
             items: list[dict[str, str]] = []
             for departure_time, trip_id, orig_stop_id, platform_code, sequence in sorted(
                 stop_departures.get(stop_id, []),
@@ -897,26 +956,28 @@ def build_external_departure_index(
                     )
                 direction_id = meta["direction_id"]
                 item: dict[str, str] = {
-                    "t": trip_id,
-                    "r": route_id,
+                    "t": _published_id(trip_id, namespace),
+                    "r": _published_id(route_id, namespace),
                     "h": destination,
                     "d": direction_id,
                     "p": departure_time,
                     "q": str(sequence),
                 }
                 if orig_stop_id != stop_id:
-                    item["s"] = orig_stop_id
+                    item["s"] = _published_id(orig_stop_id, namespace)
                     if platform_code:
                         item["platform"] = platform_code
                 items.append(item)
             if items:
                 items.sort(key=lambda item: (item["p"], item["t"], item["r"]))
-                departures_by_stop[stop_id] = _dedupe_exact_departures(items)
+                departures_by_stop[published_stop_id] = _dedupe_exact_departures(items)
 
         platforms = {
-            parent: sorted(child_ids)
+            _published_id(parent, namespace): sorted(
+                _published_id(child_id, namespace) for child_id in child_ids
+            )
             for parent, child_ids in platforms_by_parent.items()
-            if parent in city_stop_ids.get(city_id, set())
+            if _published_id(parent, namespace) in city_stop_ids.get(city_id, set())
         }
         payload = {
             "generatedAt": generated_at,
@@ -936,11 +997,14 @@ def build_external_departure_index(
 def build_external_lines(
     archive: zipfile.ZipFile,
     package_stops_by_city_id: dict[str, list[dict[str, object]]],
+    namespace: str = "",
 ) -> dict[str, dict[str, dict[str, object]]]:
     included_stop_ids = {
-        str(stop["id"])
+        raw_id
         for stops in package_stops_by_city_id.values()
         for stop in stops
+        for raw_id in [_raw_id(str(stop["id"]), namespace)]
+        if raw_id
     }
     if not included_stop_ids:
         return {}
@@ -955,13 +1019,26 @@ def build_external_lines(
                 continue
             yield {**stop_time, "stop_id": public_stop_id}
 
-    return build_lines_by_stop_id_noncanonical(
+    lines = build_lines_by_stop_id_noncanonical(
         stop_rows=stop_rows,
         stop_times=resolved_stop_times(),
         trips=load_table(archive, "trips.txt"),
         routes=load_table(archive, "routes.txt"),
         included_stop_ids=included_stop_ids,
     )
+    if not namespace:
+        return lines
+
+    return {
+        _published_id(stop_id, namespace): {
+            _published_id(route_id, namespace): {
+                **line,
+                "routeID": _published_id(str(line["routeID"]), namespace),
+            }
+            for route_id, line in route_lines.items()
+        }
+        for stop_id, route_lines in lines.items()
+    }
 
 
 def process_external_gtfs_sources(
@@ -991,11 +1068,15 @@ def process_external_gtfs_sources(
 
     known_source_ids: set[str] = set()
     known_prefixes: set[str] = set()
+    known_namespaces: set[str] = set()
     occupied = set(occupied_city_ids or ())
     manifest_entries: list[dict[str, object]] = []
-    external_cities: list[dict[str, object]] = []
+    external_cities_by_id: dict[str, dict[str, object]] = {}
     package_stops_by_city_id: dict[str, list[dict[str, object]]] = {}
     lines_by_stop_id: dict[str, dict[str, dict[str, object]]] = {}
+    external_city_sources: dict[str, dict[str, object]] = {}
+    namespaced_records: dict[str, list[dict[str, object]]] = {}
+    namespace_root = output / ".external-namespaces"
 
     for source in sources:
         validate_external_gtfs_source(
@@ -1003,10 +1084,14 @@ def process_external_gtfs_sources(
             repository_root,
             known_source_ids=known_source_ids,
             known_prefixes=known_prefixes,
+            known_namespaces=known_namespaces,
         )
         source_id = str(source["id"])
         known_source_ids.add(source_id)
         known_prefixes.add(str(source["identifierPrefix"]))
+        namespace = str(source.get("namespace", ""))
+        if namespace:
+            known_namespaces.add(namespace)
 
         configured_url = source.get("url")
         url = url_by_provider.get(
@@ -1025,53 +1110,101 @@ def process_external_gtfs_sources(
         for city in cities:
             city_id = str(city["id"])
             if city_id in occupied:
-                raise ValueError(
-                    f"Duplicate city id across feeds: {city_id} "
-                    f"(external source {source_id})."
+                previous = external_city_sources.get(city_id)
+                same_merge_group = bool(
+                    namespace
+                    and previous
+                    and str(source.get("mergeGroup", "")).strip()
+                    and str(source.get("mergeGroup"))
+                    == str(previous.get("mergeGroup"))
+                    and str(previous.get("namespace", ""))
                 )
-            occupied.add(city_id)
+                if not same_merge_group:
+                    raise ValueError(
+                        f"Duplicate city id across feeds: {city_id} "
+                        f"(external source {source_id})."
+                    )
+            else:
+                occupied.add(city_id)
+                external_city_sources[city_id] = {
+                    "mergeGroup": source.get("mergeGroup"),
+                    "namespace": namespace,
+                }
+                external_cities_by_id[city_id] = city
 
         request_url, headers = authenticated_external_request(
             source_id, url, environ=environ
         )
         source_started = time.monotonic()
         archive = load_gtfs_archive(request_url, headers=headers)
+        source_output = output
+        if namespace:
+            source_output = namespace_root / source_id
+            shutil.rmtree(source_output, ignore_errors=True)
+            source_output.mkdir(parents=True, exist_ok=True)
         try:
             package_stops: dict[str, list[dict[str, object]]] = {}
             if source.get("buildStops", True):
                 entries, package_stops = build_external_stop_packages(
                     archive,
                     cities,
-                    output,
+                    source_output,
                     stop_id_mode=str(source.get("stopIDMode", "exact")),
+                    namespace=namespace,
                 )
-                for entry in entries:
-                    entry_with_source = dict(entry)
-                    entry_with_source["_source"] = (
-                        f"External GTFS source {source_id} "
-                        f"({source.get('cities')})"
-                    )
-                    entry_with_source["country"] = str(source["country"])
-                    manifest_entries.append(entry_with_source)
-                package_stops_by_city_id.update(package_stops)
+                if namespace:
+                    for city in cities:
+                        city_id = str(city["id"])
+                        namespaced_records.setdefault(city_id, []).append({
+                            "sourceID": source_id,
+                            "source": source,
+                            "city": city,
+                            "output": source_output,
+                            "packageStops": package_stops.get(city_id, []),
+                        })
+                else:
+                    for entry in entries:
+                        entry_with_source = dict(entry)
+                        entry_with_source["_source"] = (
+                            f"External GTFS source {source_id} "
+                            f"({source.get('cities')})"
+                        )
+                        entry_with_source["country"] = str(source["country"])
+                        manifest_entries.append(entry_with_source)
+                    package_stops_by_city_id.update(package_stops)
 
             if source.get("buildRoutes", True):
-                build_external_route_index(archive, cities, output)
+                build_external_route_index(
+                    archive,
+                    cities,
+                    source_output,
+                    namespace=namespace,
+                )
 
             if source.get("buildDepartures", True):
                 build_external_departure_index(
                     archive,
                     cities,
-                    output,
+                    source_output,
                     timezone_name=str(source["timezone"]),
+                    namespace=namespace,
                 )
 
             if source.get("buildTripIndex", True):
-                build_external_trip_index(archive, cities, output)
+                build_external_trip_index(
+                    archive,
+                    cities,
+                    source_output,
+                    namespace=namespace,
+                )
 
             if package_stops:
                 lines_by_stop_id.update(
-                    build_external_lines(archive, package_stops)
+                    build_external_lines(
+                        archive,
+                        package_stops,
+                        namespace=namespace,
+                    )
                 )
         finally:
             archive.close()
@@ -1081,6 +1214,127 @@ def process_external_gtfs_sources(
             f"duration={time.monotonic() - source_started:.2f}s"
         )
 
-        external_cities.extend(cities)
+    for city_id, records in namespaced_records.items():
+        city = records[0]["city"]
+        merged_stops: list[dict[str, object]] = []
+        merged_routes: dict[str, object] = {}
+        merged_departures: dict[str, list[dict[str, object]]] = {}
+        merged_platforms: dict[str, set[str]] = {}
+        merged_trip_index: dict[str, object] = {}
+        timezones: set[str] = set()
+        generated_at: str | None = None
 
-    return manifest_entries, external_cities, package_stops_by_city_id, lines_by_stop_id
+        for record in records:
+            source_output = Path(record["output"])
+            source_id = str(record["sourceID"])
+            stop_path = source_output / "stops" / f"{city_id}.json"
+            if stop_path.exists():
+                merged_stops.extend(json.loads(stop_path.read_text(encoding="utf-8")))
+
+            route_path = source_output / "routes" / f"{city_id}.json"
+            if route_path.exists():
+                payload = json.loads(route_path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    overlap = set(merged_routes).intersection(payload)
+                    if overlap:
+                        raise ValueError(
+                            f"External GTFS namespace collision in routes for {city_id}: "
+                            f"{sorted(overlap)[:3]}"
+                        )
+                    merged_routes.update(payload)
+
+            departure_path = source_output / "departures" / f"{city_id}.json"
+            if departure_path.exists():
+                payload = json.loads(departure_path.read_text(encoding="utf-8"))
+                timezones.add(str(payload.get("timezone", "")))
+                generated_value = payload.get("generatedAt")
+                if isinstance(generated_value, str):
+                    generated_at = max(generated_at or generated_value, generated_value)
+                for stop_id, items in dict(payload.get("stops") or {}).items():
+                    merged_departures.setdefault(str(stop_id), []).extend(items)
+                for parent_id, child_ids in dict(payload.get("platforms") or {}).items():
+                    merged_platforms.setdefault(str(parent_id), set()).update(
+                        str(child_id) for child_id in child_ids
+                    )
+
+            trip_path = source_output / "trips" / f"{city_id}.json"
+            if trip_path.exists():
+                payload = json.loads(trip_path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    overlap = set(merged_trip_index).intersection(payload)
+                    if overlap:
+                        raise ValueError(
+                            f"External GTFS namespace collision in trips for {city_id}: "
+                            f"{sorted(overlap)[:3]}"
+                        )
+                    merged_trip_index.update(payload)
+
+        if len(timezones - {""}) > 1:
+            raise ValueError(
+                f"Merged external city {city_id} has conflicting timezones: "
+                f"{sorted(timezones)}"
+            )
+        if not merged_stops or not merged_departures:
+            raise ValueError(f"Merged external city {city_id} has incomplete assets.")
+
+        merged_stops.sort(key=lambda stop: (str(stop.get("searchName", "")), str(stop["id"])))
+        stops_directory = output / "stops"
+        stops_directory.mkdir(parents=True, exist_ok=True)
+        (stops_directory / f"{city_id}.json").write_text(
+            json.dumps(merged_stops, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+
+        routes_directory = output / "routes"
+        routes_directory.mkdir(parents=True, exist_ok=True)
+        (routes_directory / f"{city_id}.json").write_text(
+            json.dumps(dict(sorted(merged_routes.items())), ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+
+        for stop_id, items in merged_departures.items():
+            items.sort(key=lambda item: (str(item.get("p", "")), str(item.get("t", "")), str(item.get("r", ""))))
+            merged_departures[stop_id] = _dedupe_exact_departures(items)
+        departures_directory = output / "departures"
+        departures_directory.mkdir(parents=True, exist_ok=True)
+        departure_payload = {
+            "generatedAt": generated_at,
+            "timezone": next(iter(timezones - {""}), "America/Toronto"),
+            "stops": dict(sorted(merged_departures.items())),
+            "platforms": {
+                parent: sorted(children)
+                for parent, children in sorted(merged_platforms.items())
+            },
+        }
+        (departures_directory / f"{city_id}.json").write_text(
+            json.dumps(departure_payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+
+        if merged_trip_index:
+            trips_directory = output / "trips"
+            trips_directory.mkdir(parents=True, exist_ok=True)
+            (trips_directory / f"{city_id}.json").write_text(
+                json.dumps(dict(sorted(merged_trip_index.items())), ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+
+        source_ids = ", ".join(str(record["sourceID"]) for record in records)
+        manifest_entries.append({
+            "id": city_id,
+            "name": city["name"],
+            "aliases": city.get("aliases", []),
+            "stopCount": len(merged_stops),
+            "url": f"stops/{city_id}.json",
+            "country": str(records[0]["source"]["country"]),
+            "_source": f"External GTFS namespaces: {source_ids}",
+        })
+        package_stops_by_city_id[city_id] = merged_stops
+
+    shutil.rmtree(namespace_root, ignore_errors=True)
+    return (
+        manifest_entries,
+        list(external_cities_by_id.values()),
+        package_stops_by_city_id,
+        lines_by_stop_id,
+    )

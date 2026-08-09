@@ -37,7 +37,7 @@ feature and does not mount `/srv/haltewecker/data/ireland/.env`.
 
 `scripts/run_stop_data_pipeline.sh` publishes `/srv/haltewecker/data/current` atomically. Only after that replacement succeeds, it starts and waits for `haltewecker-static-departures.service`. The stop-data pipeline succeeds only when systemd reports both `Result=success` and `ExecMainStatus=0`; otherwise the stop release remains published but the pipeline exits non-zero and logs that static departures are not synchronized.
 
-The static-departures service remains the only SQLite rebuild path and keeps its `flock` serialization. The nightly `haltewecker-static-departures.timer` at 01:30 remains enabled as a fallback/recovery run. The stop-data pipeline also takes `/run/lock/haltewecker-stop-data.lock`, so overlapping publications cannot request competing rebuilds.
+The static-departures service remains the only SQLite rebuild path and keeps its `flock` serialization. The timezone-aware nightly timers run the same service at 03:30 local time in Vancouver and Toronto as fallback/recovery runs. The stop-data pipeline also takes `/run/lock/haltewecker-stop-data.lock`, so overlapping publications cannot request competing rebuilds.
 
 The `deploy` user needs non-interactive permission for `systemctl start` and `systemctl show` on `haltewecker-static-departures.service`. Verify a completed synchronization with:
 
@@ -81,6 +81,8 @@ Sweden static departures are published as compact city files:
 Sweden is **not** imported into the shared German/Austrian static-departures SQLite in this architecture. Stockholm is excluded from German SQLite membership via `configured_external_city_ids`.
 
 Realtime stays on the existing worker (`/sweden/sl/...`). City config carries adapter `sweden` and operator `sl` only — no embedded realtime URLs.
+
+TTC uses two isolated external GTFS namespaces (`ttc-surface:` and `ttc-subway:`) merged into one Toronto package. The surface namespace is eligible for the public TripUpdates gateway; subway departures remain static. The TTC source and gateway do not use an API key or an environment secret, and Toronto does not advertise live vehicle positions.
 
 ### Required environment (production)
 

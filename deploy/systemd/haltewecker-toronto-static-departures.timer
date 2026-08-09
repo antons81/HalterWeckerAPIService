@@ -1,0 +1,10 @@
+[Unit]
+Description=Run HalteWecker Toronto static departures build nightly
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 America/Toronto
+Persistent=true
+Unit=haltewecker-static-departures.service
+
+[Install]
+WantedBy=timers.target

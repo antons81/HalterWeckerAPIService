@@ -48,5 +48,35 @@
     "buildDepartures": true,
     "buildTripIndex": true,
     "country": "CA"
+  },
+  {
+    "id": "ttc-surface",
+    "url": "https://ckan0.cf.opendata.inter.prod-toronto.ca/dataset/bd4809dd-e289-4de8-bbde-c5c00dafbf4f/resource/28514055-d011-4ed7-8bb0-97961dfe2b66/download/surfacegtfs.zip",
+    "cities": "config/ttc-cities.json",
+    "timezone": "America/Toronto",
+    "identifierPrefix": "ttc-surface:",
+    "namespace": "ttc-surface:",
+    "mergeGroup": "toronto",
+    "stopIDMode": "exact",
+    "buildStops": true,
+    "buildRoutes": true,
+    "buildDepartures": true,
+    "buildTripIndex": true,
+    "country": "CA"
+  },
+  {
+    "id": "ttc-subway",
+    "url": "https://ckan0.cf.opendata.inter.prod-toronto.ca/dataset/7795b45e-e65a-4465-81fc-c36b9dfff169/resource/cfb6b2b8-6191-41e3-bda1-b175c51148cb/download/opendata_ttc_schedules.zip",
+    "cities": "config/ttc-cities.json",
+    "timezone": "America/Toronto",
+    "identifierPrefix": "ttc-subway:",
+    "namespace": "ttc-subway:",
+    "mergeGroup": "toronto",
+    "stopIDMode": "exact",
+    "buildStops": true,
+    "buildRoutes": true,
+    "buildDepartures": true,
+    "buildTripIndex": true,
+    "country": "CA"
   }
 ]

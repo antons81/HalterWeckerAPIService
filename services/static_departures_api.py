@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from zoneinfo import ZoneInfo
 
 from translink_gateway import TransLinkProxy
+from ttc_gateway import TTCProxy
 from tfl_gateway import TfLProxy
 
 
@@ -277,6 +278,7 @@ class Handler(BaseHTTPRequestHandler):
     database: Database
     tfl_gateway: TfLProxy | None = None
     translink_gateway: TransLinkProxy | None = None
+    ttc_gateway: TTCProxy | None = None
 
     def send_json(
         self,
@@ -362,6 +364,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "TransLink provider unavailable"})
                 response = self.translink_gateway.handle(parsed.path, query)
                 return self.send_json(response.status, response.payload, response.cache_control)
+            if parsed.path == "/ttc/realtime/trip-updates":
+                if self.ttc_gateway is None:
+                    return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "TTC provider unavailable"})
+                response = self.ttc_gateway.handle(parsed.path, query)
+                return self.send_json(response.status, response.payload, response.cache_control)
             for prefix in STATIC_DATA_PATH_PREFIXES:
                 if parsed.path.startswith(prefix):
                     return self.send_static_file(parsed.path[len(prefix):])
@@ -410,4 +417,5 @@ if __name__ == "__main__":
     Handler.database = database
     Handler.tfl_gateway = TfLProxy.from_environment()
     Handler.translink_gateway = TransLinkProxy.from_environment()
+    Handler.ttc_gateway = TTCProxy.from_environment()
     ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Handler).serve_forever()
