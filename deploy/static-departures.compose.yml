@@ -1,5 +1,7 @@
 services:
   static-departures-api:
+    env_file:
+      - /srv/haltewecker/secrets/uk/.env
     build:
       context: ..
       dockerfile: services/static-departures.Dockerfile
@@ -8,7 +10,6 @@ services:
       DEPARTURES_DATABASE: ${DEPARTURES_DATABASE:-/data/current-release/departures.sqlite}
       STATIC_DATA_ROOT: ${STATIC_DATA_ROOT:-/data/current-release/stop-data}
       IRELAND_REALTIME_ROOT: ${IRELAND_REALTIME_ROOT:-/data/ireland/realtime}
-      TFL_API_KEY: ${TFL_API_KEY:-}
       PORT: "8080"
     volumes:
       - /srv/haltewecker/data/releases:/data/releases:ro
