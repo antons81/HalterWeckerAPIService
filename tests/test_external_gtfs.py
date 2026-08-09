@@ -71,7 +71,7 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
         )
         self.assertEqual(
             {source["id"] for source in sources},
-            {"sweden", "norway", "ireland"},
+            {"sweden", "norway", "ireland", "translink"},
         )
         sweden = next(source for source in sources if source["id"] == "sweden")
         validate_external_gtfs_source(sweden, REPOSITORY_ROOT)
@@ -116,6 +116,26 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
             "fredrikstad", "skien", "kristiansand", "tonsberg",
             "alesund", "tromso",
         })
+
+    def test_validate_translink_registry_and_static_manifest(self) -> None:
+        sources = load_external_gtfs_sources(
+            REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
+        )
+        translink = next(source for source in sources if source["id"] == "translink")
+        validate_external_gtfs_source(translink, REPOSITORY_ROOT)
+        cities = load_external_cities(translink, REPOSITORY_ROOT)
+        self.assertEqual([city["id"] for city in cities], ["vancouver"])
+        manifest = transit_radar_manifest(cities)
+        city = manifest["cities"][0]
+        provider = city["providers"][0]
+        self.assertEqual(city["cityID"], "vancouver-ca")
+        self.assertEqual(provider["providerID"], "translink-vancouver")
+        self.assertEqual(provider["staticBaseURL"], "https://api.asoftlabs.app")
+        self.assertEqual(
+            provider["realtimeURL"],
+            "https://api.asoftlabs.app/translink/realtime/trip-updates",
+        )
+        self.assertNotIn("liveVehicles", provider["features"])
 
     def test_norway_radar_manifest_preserves_multiple_codespaces(self) -> None:
         cities = load_cities(REPOSITORY_ROOT / "config" / "norway-cities.json")
@@ -254,6 +274,65 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
 
 
 class ExternalStopAndDepartureTests(unittest.TestCase):
+    def test_translink_native_stop_codes_and_departure_sequence_are_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            archive_path = root / "translink.zip"
+            _gtfs_zip(
+                archive_path,
+                stops=(
+                    "stop_id,stop_code,stop_name,stop_lat,stop_lon\n"
+                    "75,50075,Northbound Burrard St @ Davie St,49.2827,-123.1207\n"
+                    "11535,61519,Northbound Seymour St @ Dunsmuir St,49.2828,-123.1208\n"
+                ),
+                routes=(
+                    "route_id,route_short_name,route_long_name,route_type\n"
+                    "6612,002,Macdonald,3\n"
+                ),
+                trips=(
+                    "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+                    "6612,S1,15210220,2 Macdonald/To Burrard Station,0\n"
+                ),
+                stop_times=(
+                    "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+                    "15210220,08:00:00,08:00:00,75,15\n"
+                ),
+            )
+            city = {
+                "id": "vancouver",
+                "name": "Vancouver",
+                "aliases": ["Metro Vancouver"],
+                "latitude": 49.2827,
+                "longitude": -123.1207,
+                "radiusMeters": 55000,
+                "packageMode": "external",
+            }
+            with zipfile.ZipFile(archive_path) as archive:
+                _, package_stops = build_external_stop_packages(
+                    archive, [city], root / "out", stop_id_mode="exact"
+                )
+                build_external_route_index(archive, [city], root / "out")
+                build_external_departure_index(
+                    archive, [city], root / "out", "America/Vancouver"
+                )
+
+            stops = {item["id"]: item for item in package_stops["vancouver"]}
+            self.assertEqual(stops["75"]["stopCode"], "50075")
+            self.assertEqual(stops["11535"]["stopCode"], "61519")
+            routes = json.loads((root / "out/routes/vancouver.json").read_text())
+            self.assertEqual(routes["6612"]["short_name"], "002")
+            self.assertEqual(
+                routes["6612"]["headsigns"]["0"],
+                "2 Macdonald/To Burrard Station",
+            )
+            departures = json.loads(
+                (root / "out/departures/vancouver.json").read_text()
+            )
+            departure = departures["stops"]["75"][0]
+            self.assertEqual(departure["t"], "15210220")
+            self.assertEqual(departure["r"], "6612")
+            self.assertEqual(departure["q"], "15")
+
     def test_ireland_verified_trip_route_stop_join_preserves_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

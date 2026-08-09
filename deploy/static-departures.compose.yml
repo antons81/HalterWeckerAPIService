@@ -2,6 +2,7 @@ services:
   static-departures-api:
     env_file:
       - /srv/haltewecker/secrets/uk/.env
+      - /srv/haltewecker/secrets/canada-metrolink/.env
     build:
       context: ..
       dockerfile: services/static-departures.Dockerfile

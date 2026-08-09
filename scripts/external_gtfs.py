@@ -390,6 +390,7 @@ def build_external_stop_packages(
             "latitude": latitude,
             "longitude": longitude,
             "searchName": normalized(name),
+            "stopCode": str(row.get("stop_code", "") or "").strip(),
             "location_type": _parse_location_type(row.get("location_type")),
             "parent_station": str(row.get("parent_station", "") or "").strip(),
             "platform_code": str(row.get("platform_code", "") or "").strip(),
@@ -472,6 +473,7 @@ def build_external_stop_packages(
                 "latitude": stop["latitude"],
                 "longitude": stop["longitude"],
                 "searchName": stop["searchName"],
+                "stopCode": stop["stopCode"] or None,
             }
             for stop in city_public[city_id]
         ]
@@ -830,7 +832,7 @@ def build_external_departure_index(
     resolve = _stop_resolution_map(feed_stops, public_stop_ids)
 
     # Stream stop_times once: collect departures for package stops and terminal stops.
-    stop_departures: dict[str, list[tuple[str, str, str, str]]] = {}
+    stop_departures: dict[str, list[tuple[str, str, str, str, int]]] = {}
     terminal_by_trip: dict[str, tuple[int, str]] = {}
     for stop_time in iter_table(archive, "stop_times.txt"):
         trip_id = str(stop_time.get("trip_id", "")).strip()
@@ -838,6 +840,10 @@ def build_external_departure_index(
             continue
         stop_id = str(stop_time.get("stop_id", "")).strip()
         departure_time = stop_time.get("departure_time", "").strip()
+        try:
+            sequence = int(stop_time.get("stop_sequence", "0") or "0")
+        except ValueError:
+            sequence = 0
         if stop_id and departure_time:
             public_stop_id = resolve(stop_id)
             if public_stop_id is not None:
@@ -847,12 +853,8 @@ def build_external_departure_index(
                         feed_stops.get(stop_id, {}).get("platform_code", "") or ""
                     ).strip()
                 stop_departures.setdefault(public_stop_id, []).append(
-                    (departure_time, trip_id, stop_id, platform_code)
+                    (departure_time, trip_id, stop_id, platform_code, sequence)
                 )
-        try:
-            sequence = int(stop_time.get("stop_sequence", "0") or "0")
-        except ValueError:
-            sequence = 0
         if stop_id:
             previous = terminal_by_trip.get(trip_id)
             if previous is None or sequence >= previous[0]:
@@ -880,9 +882,9 @@ def build_external_departure_index(
         departures_by_stop: dict[str, list[dict[str, str]]] = {}
         for stop_id in sorted(city_stop_ids.get(city_id, set())):
             items: list[dict[str, str]] = []
-            for departure_time, trip_id, orig_stop_id, platform_code in sorted(
+            for departure_time, trip_id, orig_stop_id, platform_code, sequence in sorted(
                 stop_departures.get(stop_id, []),
-                key=lambda value: (value[0], value[1]),
+                key=lambda value: (value[0], value[1], value[4]),
             ):
                 meta = trip_meta[trip_id]
                 route_id = meta["route_id"]
@@ -900,6 +902,7 @@ def build_external_departure_index(
                     "h": destination,
                     "d": direction_id,
                     "p": departure_time,
+                    "q": str(sequence),
                 }
                 if orig_stop_id != stop_id:
                     item["s"] = orig_stop_id

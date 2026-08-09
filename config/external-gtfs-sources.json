@@ -35,5 +35,18 @@
     "buildDepartures": true,
     "buildTripIndex": false,
     "country": "IE"
+  },
+  {
+    "id": "translink",
+    "url": "https://gtfs-static.translink.ca/gtfs/google_transit.zip",
+    "cities": "config/translink-cities.json",
+    "timezone": "America/Vancouver",
+    "identifierPrefix": "ca:",
+    "stopIDMode": "exact",
+    "buildStops": true,
+    "buildRoutes": true,
+    "buildDepartures": true,
+    "buildTripIndex": true,
+    "country": "CA"
   }
 ]

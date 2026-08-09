@@ -60,6 +60,7 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "sweden",
     "ireland",
     "entur",
+    "translink",
 }
 SUPPORTED_TRANSIT_RADAR_FEATURES = {
     "liveVehicles",
@@ -721,6 +722,26 @@ def validate_transit_radar_provider(
             raise ValueError(f"Ireland requires a radar region for {city_id}")
         return
 
+    if adapter == "translink":
+        if city_id != "vancouver":
+            raise ValueError(f"Invalid TransLink configuration for {city_id}")
+        if configuration.get("region") is not None:
+            raise ValueError(f"TransLink does not use a radar region for {city_id}")
+        if configuration.get("radarStops") is not None:
+            raise ValueError(f"TransLink does not use radar stops for {city_id}")
+        if configuration.get("gatewayURL") is not None:
+            raise ValueError(f"TransLink does not use a gateway URL in the manifest for {city_id}")
+        for key in ("staticBaseURL", "realtimeURL"):
+            value = configuration.get(key)
+            if not isinstance(value, str) or not value.startswith("https://"):
+                raise ValueError(f"TransLink requires an HTTPS {key} for {city_id}")
+        features = configuration.get("features")
+        if isinstance(features, list) and any(
+            feature in {"liveVehicles", "vehiclePositions"} for feature in features
+        ):
+            raise ValueError(f"TransLink Radar is disabled for {city_id}")
+        return
+
     if adapter == "entur":
         codespaces = configuration.get("radarCodespaces")
         if not isinstance(codespaces, list) or not codespaces:
@@ -1045,6 +1066,8 @@ def transit_radar_manifest(
                 provider_id = f"ireland-{city_id}"
             elif adapter == "entur":
                 provider_id = f"entur-{city_id}"
+            elif adapter == "translink":
+                provider_id = f"translink-{city_id}"
             elif adapter == "bwTrias":
                 provider_id = "bw-trias"
             else:
@@ -1063,7 +1086,7 @@ def transit_radar_manifest(
                 supports_departures = bool(
                     provider_configuration.get(
                         "supportsDepartures",
-                        adapter in {"bwTrias", "vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "avvHafas", "oebb", "netherlands", "sweden", "entur"}
+                        adapter in {"bwTrias", "vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "avvHafas", "oebb", "netherlands", "sweden", "ireland", "entur", "translink"}
                     )
                 )
                 supports_live_vehicles = bool(
@@ -1148,6 +1171,8 @@ def transit_radar_manifest(
             country_suffix = "no"
         elif any(p.get("adapter") == "ireland" for p in providers):
             country_suffix = "ie"
+        elif any(p.get("adapter") == "translink" for p in providers):
+            country_suffix = "ca"
         else:
             country_suffix = "de"
         radar_cities.append({

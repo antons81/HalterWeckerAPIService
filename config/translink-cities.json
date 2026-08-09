@@ -1,0 +1,21 @@
+[
+  {
+    "id": "vancouver",
+    "name": "Vancouver",
+    "aliases": ["Metro Vancouver", "Vancouver, BC"],
+    "latitude": 49.2827,
+    "longitude": -123.1207,
+    "radiusMeters": 55000,
+    "packageMode": "external",
+    "externalGTFSProvider": "translink",
+    "transitRadar": {
+      "adapter": "translink",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": ["realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "realtimeURL": "https://api.asoftlabs.app/translink/realtime/trip-updates",
+      "statusMessage": "Live-Abfahrten und statische Fahrpläne für Vancouver"
+    }
+  }
+]
