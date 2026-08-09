@@ -17,6 +17,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 from zoneinfo import ZoneInfo
 
+from tfl_gateway import TfLProxy
+
 
 DEFAULT_TIMEZONE = "Europe/Berlin"
 STATIC_DATA_ROOT = os.environ.get("STATIC_DATA_ROOT", "")
@@ -272,10 +274,22 @@ def bounded_limit(raw: str | None) -> int:
 
 class Handler(BaseHTTPRequestHandler):
     database: Database
+    tfl_gateway: TfLProxy | None = None
 
-    def send_json(self, status: int, payload: object) -> None:
+    def send_json(
+        self,
+        status: int,
+        payload: object,
+        cache_control: str | None = None,
+    ) -> None:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
-        self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        if cache_control:
+            self.send_header("Cache-Control", cache_control)
+        self.end_headers()
+        self.wfile.write(body)
 
     def send_ireland_realtime(self, filename: str) -> None:
         """Serve an atomically replaced NTA JSON snapshot without rewriting it."""
@@ -336,6 +350,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed, query = urlparse(self.path), parse_qs(urlparse(self.path).query)
         try:
+            if parsed.path.startswith("/tfl/"):
+                if self.tfl_gateway is None:
+                    return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "TfL provider unavailable"})
+                response = self.tfl_gateway.handle(parsed.path, query)
+                return self.send_json(response.status, response.payload, response.cache_control)
             for prefix in STATIC_DATA_PATH_PREFIXES:
                 if parsed.path.startswith(prefix):
                     return self.send_static_file(parsed.path[len(prefix):])
@@ -382,4 +401,5 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     database = Database(os.environ.get("DEPARTURES_DATABASE", "/data/departures-current.sqlite"))
     Handler.database = database
+    Handler.tfl_gateway = TfLProxy.from_environment()
     ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Handler).serve_forever()
