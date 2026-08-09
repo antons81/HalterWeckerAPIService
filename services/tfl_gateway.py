@@ -35,7 +35,14 @@ Transport = Callable[[str, float], tuple[int, bytes]]
 
 
 def _default_transport(url: str, timeout: float) -> tuple[int, bytes]:
-    request = Request(url, headers={"Accept": "application/json"}, method="GET")
+    request = Request(
+    url,
+    headers={
+        "Accept": "application/json",
+        "User-Agent": "HalteWecker/1.0 (+https://asoftlabs.app)",
+    },
+    method="GET",
+    )
     try:
         with urlopen(request, timeout=timeout) as response:
             return int(response.status), response.read()
