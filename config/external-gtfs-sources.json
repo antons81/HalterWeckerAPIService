@@ -99,7 +99,7 @@
     "buildTripIndex": true,
     "importIntoStaticDepartures": true,
     "staticIdentifierPrefix": "",
-    "staticStopIDPrefix": "",
+    "staticStopIDPrefix": "511-bay-area:",
     "country": "US"
   }
 ]

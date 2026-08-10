@@ -21,6 +21,7 @@ from gtfsrt_gateway import (
 
 
 BAY_AREA_PROVIDER_ID = "511-bay-area"
+BAY_AREA_STOP_ID_PREFIX = f"{BAY_AREA_PROVIDER_ID}:"
 BAY_AREA_CITY_IDS = frozenset({"san-francisco", "oakland", "berkeley", "san-jose"})
 BAY_AREA_TRIP_UPDATES_PATH = "/511/realtime/trip-updates"
 BAY_AREA_VEHICLE_POSITIONS_PATH = "/511/realtime/vehicle-positions"
@@ -33,11 +34,20 @@ def _upstream_url(api_key: str, endpoint: str) -> str:
     return f"https://api.511.org/Transit/{endpoint}?{query}"
 
 
+def internal_stop_id(native_stop_id: str) -> str:
+    """Map a native 511 stop ID to the private static-departures identity."""
+    value = native_stop_id.strip()
+    if not value or value.startswith(BAY_AREA_STOP_ID_PREFIX):
+        return value
+    return f"{BAY_AREA_STOP_ID_PREFIX}{value}"
+
+
 class BayAreaTripUpdatesProxy(GTFSRealtimeGateway):
     @classmethod
     def from_environment(
         cls,
         valid_trip_registry: Callable[[], tuple[set[str], dict[str, str]]] | None = None,
+        valid_stop_registry: Callable[[], set[str]] | None = None,
     ) -> "BayAreaTripUpdatesProxy | None":
         import os
 
@@ -53,6 +63,8 @@ class BayAreaTripUpdatesProxy(GTFSRealtimeGateway):
             cache_ttl=BAY_AREA_CACHE_TTL_SECONDS,
             max_stale=BAY_AREA_MAX_STALE_SECONDS,
             valid_trip_registry=valid_trip_registry,
+            valid_stop_registry=valid_stop_registry,
+            stop_id_mapper=internal_stop_id,
         )
 
 

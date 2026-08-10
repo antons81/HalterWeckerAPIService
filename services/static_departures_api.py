@@ -147,6 +147,21 @@ class Database:
         routes = {str(row[0]) for row in route_rows}
         return trips, routes, route_by_trip
 
+    def provider_stop_registry(self, provider_id: str) -> set[str]:
+        """Return internal stop identities for realtime ownership checks."""
+        with self.lock:
+            try:
+                rows = self._connection().execute(
+                    """
+                    SELECT key_1 FROM provider_entities
+                    WHERE entity_type='raw_stops' AND provider_id=?
+                    """,
+                    (provider_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return set()
+        return {str(row[0]) for row in rows}
+
     def city_departure_mode(self, city_id: str) -> tuple[str, str, str, str]:
         with self.lock:
             try:
@@ -507,7 +522,8 @@ if __name__ == "__main__":
     Handler.translink_gateway = TransLinkProxy.from_environment()
     Handler.ttc_gateway = TTCProxy.from_environment()
     Handler.bay_area_trip_updates_gateway = BayAreaTripUpdatesProxy.from_environment(
-        valid_trip_registry=lambda: database.provider_trip_registry("511-bay-area")
+        valid_trip_registry=lambda: database.provider_trip_registry("511-bay-area"),
+        valid_stop_registry=lambda: database.provider_stop_registry("511-bay-area"),
     )
     Handler.bay_area_vehicle_positions_gateway = BayAreaVehiclePositionsProxy.from_environment(
         valid_registry=lambda: database.provider_realtime_registry("511-bay-area")

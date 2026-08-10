@@ -24,6 +24,14 @@ DEFAULT_TIMEZONE = "Europe/Berlin"
 DEFAULT_PROVIDER_ID = "germany"
 
 
+def internal_stop_id(native_stop_id: str, prefix: str = "") -> str:
+    """Return the deterministic internal ID for a native GTFS stop ID."""
+    value = native_stop_id.strip()
+    if not value:
+        return ""
+    return value if not prefix or value.startswith(prefix) else f"{prefix}{value}"
+
+
 def gtfs_rows(archive: zipfile.ZipFile, name: str) -> Iterable[dict[str, str]]:
     if name not in archive.namelist():
         return []
@@ -185,6 +193,32 @@ def populate_gtfs(
     if missing:
         raise ValueError(f"GTFS archive is missing required files: {', '.join(sorted(missing))}")
 
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS transfers (
+            from_stop_id TEXT NOT NULL,
+            to_stop_id TEXT NOT NULL,
+            transfer_type INTEGER NOT NULL,
+            min_transfer_time INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (from_stop_id, to_stop_id, transfer_type)
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS pathways (
+            pathway_id TEXT PRIMARY KEY,
+            from_stop_id TEXT NOT NULL,
+            to_stop_id TEXT NOT NULL,
+            pathway_mode TEXT NOT NULL,
+            is_bidirectional INTEGER NOT NULL,
+            length TEXT NOT NULL,
+            traversal_time INTEGER NOT NULL,
+            stair_count INTEGER NOT NULL,
+            max_slope TEXT NOT NULL,
+            min_width TEXT NOT NULL,
+            signposted_as TEXT NOT NULL,
+            reversed_signposted_as TEXT NOT NULL
+        ) WITHOUT ROWID;
+        """
+    )
+
     route_columns = {
         str(row[1]) for row in connection.execute("PRAGMA table_info(routes)")
     }
@@ -198,8 +232,8 @@ def populate_gtfs(
         "INSERT INTO raw_stops(stop_id, parent_station, stop_name, platform_code, source_order) VALUES (?, ?, ?, ?, ?)",
         (
             (
-                stop_id_prefix + row["stop_id"].strip(),
-                stop_id_prefix + row.get("parent_station", "").strip() if row.get("parent_station", "").strip() else "",
+                internal_stop_id(row["stop_id"], stop_id_prefix),
+                internal_stop_id(row.get("parent_station", ""), stop_id_prefix),
                 row.get("stop_name", "").strip(),
                 row.get("platform_code", "").strip(),
                 index,
@@ -209,7 +243,7 @@ def populate_gtfs(
         ),
     )
     stop_ids.extend(
-        stop_id_prefix + row["stop_id"].strip()
+        internal_stop_id(row["stop_id"], stop_id_prefix)
         for row in gtfs_rows(archive, "stops.txt")
         if row.get("stop_id", "").strip()
     )
@@ -318,12 +352,88 @@ def populate_gtfs(
             sequence = int(row.get("stop_sequence", "0") or 0)
         except ValueError:
             sequence = 0
-        batch.append((identifier_prefix + trip_id, stop_id_prefix + raw_stop_id, departure_time, departure_seconds, sequence))
+        batch.append((identifier_prefix + trip_id, internal_stop_id(raw_stop_id, stop_id_prefix), departure_time, departure_seconds, sequence))
         if len(batch) == 20_000:
             connection.executemany("INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)", batch)
             batch.clear()
     if batch:
         connection.executemany("INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)", batch)
+
+    if "transfers.txt" in archive.namelist():
+        transfer_keys: list[tuple[str, str, str]] = []
+        connection.executemany(
+            "INSERT INTO transfers(from_stop_id, to_stop_id, transfer_type, min_transfer_time) VALUES (?, ?, ?, ?)",
+            (
+                (
+                    internal_stop_id(row.get("from_stop_id", ""), stop_id_prefix),
+                    internal_stop_id(row.get("to_stop_id", ""), stop_id_prefix),
+                    int(row.get("transfer_type", "0") or 0),
+                    int(row.get("min_transfer_time", "0") or 0),
+                )
+                for row in gtfs_rows(archive, "transfers.txt")
+                if row.get("from_stop_id", "").strip() and row.get("to_stop_id", "").strip()
+            ),
+        )
+        transfer_keys.extend(
+            (
+                internal_stop_id(row.get("from_stop_id", ""), stop_id_prefix),
+                internal_stop_id(row.get("to_stop_id", ""), stop_id_prefix),
+                row.get("transfer_type", "0").strip() or "0",
+            )
+            for row in gtfs_rows(archive, "transfers.txt")
+            if row.get("from_stop_id", "").strip() and row.get("to_stop_id", "").strip()
+        )
+        register_entities(connection, provider_id, "transfers", transfer_keys)
+
+    if "pathways.txt" in archive.namelist():
+        pathway_keys: list[tuple[str, str, str]] = []
+        connection.executemany(
+            """
+            INSERT INTO pathways(
+                pathway_id, from_stop_id, to_stop_id, pathway_mode,
+                is_bidirectional, length, traversal_time, stair_count,
+                max_slope, min_width, signposted_as, reversed_signposted_as
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    internal_stop_id(
+                        row.get("pathway_id", ""),
+                        identifier_prefix or stop_id_prefix,
+                    ),
+                    internal_stop_id(row.get("from_stop_id", ""), stop_id_prefix),
+                    internal_stop_id(row.get("to_stop_id", ""), stop_id_prefix),
+                    row.get("pathway_mode", "").strip(),
+                    int(row.get("is_bidirectional", "0") or 0),
+                    row.get("length", "").strip(),
+                    int(row.get("traversal_time", "0") or 0),
+                    int(row.get("stair_count", "0") or 0),
+                    row.get("max_slope", "").strip(),
+                    row.get("min_width", "").strip(),
+                    row.get("signposted_as", "").strip(),
+                    row.get("reversed_signposted_as", "").strip(),
+                )
+                for row in gtfs_rows(archive, "pathways.txt")
+                if row.get("pathway_id", "").strip()
+                and row.get("from_stop_id", "").strip()
+                and row.get("to_stop_id", "").strip()
+            ),
+        )
+        pathway_keys.extend(
+            (
+                internal_stop_id(
+                    row.get("pathway_id", ""),
+                    identifier_prefix or stop_id_prefix,
+                ),
+                internal_stop_id(row.get("from_stop_id", ""), stop_id_prefix),
+                internal_stop_id(row.get("to_stop_id", ""), stop_id_prefix),
+            )
+            for row in gtfs_rows(archive, "pathways.txt")
+            if row.get("pathway_id", "").strip()
+            and row.get("from_stop_id", "").strip()
+            and row.get("to_stop_id", "").strip()
+        )
+        register_entities(connection, provider_id, "pathways", pathway_keys)
     connection.commit()
 
 

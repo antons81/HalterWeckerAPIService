@@ -197,6 +197,7 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
         validate_external_gtfs_source(source, REPOSITORY_ROOT)
         self.assertEqual(source["identifierPrefix"], "")
         self.assertTrue(source["preserveNativeIDs"])
+        self.assertEqual(source["staticStopIDPrefix"], "511-bay-area:")
         self.assertNotIn("url", source)
         cities = load_external_cities(source, REPOSITORY_ROOT)
         manifest = transit_radar_manifest(cities)

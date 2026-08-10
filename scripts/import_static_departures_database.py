@@ -154,6 +154,7 @@ def populate_provider_city_memberships(
     connection: sqlite3.Connection,
     stop_data: Path,
     included_city_ids: set[str],
+    stop_id_prefix_by_provider: dict[str, str] | None = None,
 ) -> set[str]:
     """Map package memberships to the providers that own their GTFS stop IDs."""
     manifest = json.loads((stop_data / "manifest.json").read_text(encoding="utf-8"))
@@ -178,6 +179,12 @@ def populate_provider_city_memberships(
         package = json.loads(package_path.read_text(encoding="utf-8"))
         if not isinstance(package, list):
             raise ValueError(f"Invalid stop package for {city_id}")
+        prefix_by_provider = dict(stop_id_prefix_by_provider or {})
+        for provider_id, prefix in connection.execute(
+            "SELECT provider_id, stop_id_prefix FROM provider_city_modes WHERE city_id=?",
+            (city_id,),
+        ):
+            prefix_by_provider.setdefault(str(provider_id), str(prefix))
         package_stop_ids: set[str] = set()
         owned_ids: dict[str, set[str]] = {}
         for stop in package:
@@ -186,7 +193,11 @@ def populate_provider_city_memberships(
             stop_ids = {str(stop["id"])}
             stop_ids.update(str(alias) for alias in stop.get("sourceStopIDs", []) if alias)
             package_stop_ids.update(stop_ids)
-            placeholders = ",".join("?" for _ in stop_ids)
+            candidate_stop_ids = set(stop_ids)
+            for prefix in prefix_by_provider.values():
+                if prefix:
+                    candidate_stop_ids.update(f"{prefix}{stop_id}" for stop_id in stop_ids)
+            placeholders = ",".join("?" for _ in candidate_stop_ids)
             rows = connection.execute(
                 """
                 SELECT provider_id, key_1
@@ -194,9 +205,20 @@ def populate_provider_city_memberships(
                 WHERE entity_type = 'raw_stops'
                   AND key_1 IN (%s)
                 """ % placeholders,
-                tuple(sorted(stop_ids)),
+                tuple(sorted(candidate_stop_ids)),
             )
             owners = [(str(provider), str(stop_id)) for provider, stop_id in rows]
+            preferred_owners = [
+                (provider, stop_id)
+                for provider, stop_id in owners
+                if prefix_by_provider.get(provider)
+                and stop_id in {
+                    f"{prefix_by_provider[provider]}{public_stop_id}"
+                    for public_stop_id in stop_ids
+                }
+            ]
+            if preferred_owners:
+                owners = preferred_owners
             if not owners:
                 raise ValueError(
                     f"Could not resolve provider ownership for package stop "
@@ -340,6 +362,14 @@ def add_external_gtfs(
         raise ValueError(f"Unknown external GTFS sources: {', '.join(unknown)}")
 
     imported_city_ids: set[str] = set()
+    source_stop_id_prefixes = {
+        source_id: str(source.get("staticStopIDPrefix", (
+            str(source.get("namespace", "")).strip()
+            or str(source["identifierPrefix"])
+        )))
+        for source_id, source in sources_by_id.items()
+        if source_id in url_by_provider
+    }
     for source_id in sorted(url_by_provider):
         source = sources_by_id[source_id]
         validate_external_gtfs_source(source, repository_root)
@@ -373,6 +403,7 @@ def add_external_gtfs(
             connection,
             stop_data,
             included_city_ids=imported_city_ids,
+            stop_id_prefix_by_provider=source_stop_id_prefixes,
         )
     populate_active_services(connection, dates)
     update_terminal_stops(connection)

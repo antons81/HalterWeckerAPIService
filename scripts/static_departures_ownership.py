@@ -194,6 +194,13 @@ def _provider_placeholders(provider_ids: list[str]) -> str:
     return ",".join("?" for _ in provider_ids)
 
 
+def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
+    return connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    ).fetchone() is not None
+
+
 def delete_provider_data(
     connection: sqlite3.Connection,
     provider_ids: Iterable[str],
@@ -272,6 +279,52 @@ def delete_provider_data(
         """ % (placeholders, placeholders),
         params + params,
     )
+    if _table_exists(connection, "transfers"):
+        connection.execute(
+            """
+            DELETE FROM transfers AS target
+            WHERE EXISTS (
+                SELECT 1 FROM provider_entities owned
+                WHERE owned.entity_type = 'transfers'
+                  AND owned.provider_id IN (%s)
+                  AND owned.key_1 = target.from_stop_id
+                  AND owned.key_2 = target.to_stop_id
+                  AND owned.key_3 = CAST(target.transfer_type AS TEXT)
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM provider_entities other
+                WHERE other.entity_type = 'transfers'
+                  AND other.provider_id NOT IN (%s)
+                  AND other.key_1 = target.from_stop_id
+                  AND other.key_2 = target.to_stop_id
+                  AND other.key_3 = CAST(target.transfer_type AS TEXT)
+            )
+            """ % (placeholders, placeholders),
+            params + params,
+        )
+    if _table_exists(connection, "pathways"):
+        connection.execute(
+            """
+            DELETE FROM pathways AS target
+            WHERE EXISTS (
+                SELECT 1 FROM provider_entities owned
+                WHERE owned.entity_type = 'pathways'
+                  AND owned.provider_id IN (%s)
+                  AND owned.key_1 = target.pathway_id
+                  AND owned.key_2 = target.from_stop_id
+                  AND owned.key_3 = target.to_stop_id
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM provider_entities other
+                WHERE other.entity_type = 'pathways'
+                  AND other.provider_id NOT IN (%s)
+                  AND other.key_1 = target.pathway_id
+                  AND other.key_2 = target.from_stop_id
+                  AND other.key_3 = target.to_stop_id
+            )
+            """ % (placeholders, placeholders),
+            params + params,
+        )
     for table, entity_type, column in (
         ("trips", "trips", "trip_id"),
         ("routes", "routes", "route_id"),

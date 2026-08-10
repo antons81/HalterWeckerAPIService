@@ -243,6 +243,8 @@ class GTFSRealtimeGateway:
         cache_ttl: float = DEFAULT_CACHE_TTL_SECONDS,
         max_stale: float = DEFAULT_MAX_STALE_SECONDS,
         valid_trip_registry: Callable[[], tuple[set[str], dict[str, str]]] | None = None,
+        valid_stop_registry: Callable[[], set[str]] | None = None,
+        stop_id_mapper: Callable[[str], str] | None = None,
         user_agent: str = "HalteWecker-GTFSRT/1.0",
     ) -> None:
         self._provider_id = provider_id
@@ -256,6 +258,8 @@ class GTFSRealtimeGateway:
         self._cache_ttl = cache_ttl
         self._max_stale = max_stale
         self._valid_trip_registry = valid_trip_registry
+        self._valid_stop_registry = valid_stop_registry
+        self._stop_id_mapper = stop_id_mapper or (lambda stop_id: stop_id)
         self._snapshot: _Snapshot | None = None
         self._lock = threading.Lock()
         self._refresh_lock = threading.Lock()
@@ -325,8 +329,11 @@ class GTFSRealtimeGateway:
     ) -> list[dict[str, object]]:
         valid_trip_ids: set[str] | None = None
         route_by_trip_id: dict[str, str] = {}
+        valid_stop_ids: set[str] | None = None
         if self._valid_trip_registry is not None:
             valid_trip_ids, route_by_trip_id = self._valid_trip_registry()
+        if self._valid_stop_registry is not None:
+            valid_stop_ids = self._valid_stop_registry()
 
         result: list[dict[str, object]] = []
         for update in updates:
@@ -334,6 +341,8 @@ class GTFSRealtimeGateway:
             route_id = self._published_id(update.route_id) if update.route_id else ""
             stop_id = self._published_id(update.stop_id)
             if stop_id not in requested_stop_ids:
+                continue
+            if valid_stop_ids is not None and self._stop_id_mapper(update.stop_id) not in valid_stop_ids:
                 continue
             if valid_trip_ids is not None:
                 if trip_id not in valid_trip_ids:
