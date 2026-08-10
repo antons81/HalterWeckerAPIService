@@ -67,7 +67,14 @@ def _trip_update_feed() -> bytes:
     return _field(1, header) + _field(2, entity)
 
 
-def _feed(path: Path) -> None:
+def _feed(
+    path: Path,
+    transfer_rows: str = (
+        "13114,13115,route,route-a,,,2,60\n"
+        "13114,13115,route,route-b,,,2,60\n"
+        "13114,13115,route,route-b,,,2,60\n"
+    ),
+) -> None:
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr(
             "stops.txt",
@@ -99,8 +106,8 @@ def _feed(path: Path) -> None:
         )
         archive.writestr(
             "transfers.txt",
-            "from_stop_id,to_stop_id,transfer_type,min_transfer_time\n"
-            "13114,13115,2,60\n",
+            "from_stop_id,to_stop_id,from_route_id,to_route_id,from_trip_id,to_trip_id,transfer_type,min_transfer_time\n"
+            + transfer_rows,
         )
         archive.writestr(
             "pathways.txt",
@@ -168,10 +175,48 @@ class ProviderStopIdentityTests(unittest.TestCase):
             )
             self.assertEqual(
                 connection.execute(
-                    "SELECT from_stop_id, to_stop_id FROM transfers WHERE from_stop_id=?",
-                    ("511-bay-area:13114",),
+                    """
+                    SELECT from_trip_id, to_trip_id
+                    FROM transfers
+                    WHERE from_stop_id=?
+                    """,
+                    ("13114",),
                 ).fetchone(),
-                ("511-bay-area:13114", "511-bay-area:13115"),
+                ("", ""),
+            )
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT from_stop_id, to_stop_id, from_trip_id, to_trip_id,
+                           from_route_id, to_route_id, transfer_type, min_transfer_time
+                    FROM transfers
+                    WHERE from_stop_id=?
+                    ORDER BY to_route_id
+                    """,
+                    ("511-bay-area:13114",),
+                ).fetchall(),
+                [
+                    (
+                        "511-bay-area:13114",
+                        "511-bay-area:13115",
+                        "",
+                        "",
+                        "route",
+                        "route-a",
+                        2,
+                        60,
+                    ),
+                    (
+                        "511-bay-area:13114",
+                        "511-bay-area:13115",
+                        "",
+                        "",
+                        "route",
+                        "route-b",
+                        2,
+                        60,
+                    ),
+                ],
             )
             self.assertEqual(
                 connection.execute(
@@ -237,6 +282,36 @@ class ProviderStopIdentityTests(unittest.TestCase):
                 ).fetchone()[0],
                 0,
             )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM transfers WHERE from_stop_id='13114'"
+                ).fetchone()[0],
+                2,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM transfers WHERE from_stop_id='511-bay-area:13114'"
+                ).fetchone()[0],
+                0,
+            )
+            connection.close()
+
+    def test_conflicting_duplicate_transfer_semantics_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "feed.zip"
+            _feed(
+                feed,
+                "13114,13115,route,route-a,,,2,60\n"
+                "13114,13115,route,route-a,,,2,120\n",
+            )
+            connection = connect(root / "departures.sqlite")
+            with zipfile.ZipFile(feed) as archive:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Conflicting duplicate GTFS transfer rows",
+                ):
+                    populate_gtfs(connection, archive, provider_id="provider-a")
             connection.close()
 
     def test_package_membership_maps_public_511_id_to_internal_owner(self) -> None:

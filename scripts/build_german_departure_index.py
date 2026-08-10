@@ -22,6 +22,7 @@ from static_departures_ownership import ensure_ownership_schema, register_entiti
 SCHEMA_VERSION = 1
 DEFAULT_TIMEZONE = "Europe/Berlin"
 DEFAULT_PROVIDER_ID = "germany"
+TRANSFER_KEY_SEPARATOR = "\x1f"
 
 
 def internal_stop_id(native_stop_id: str, prefix: str = "") -> str:
@@ -30,6 +31,32 @@ def internal_stop_id(native_stop_id: str, prefix: str = "") -> str:
     if not value:
         return ""
     return value if not prefix or value.startswith(prefix) else f"{prefix}{value}"
+
+
+def prefixed_optional_identifier(native_identifier: str, prefix: str) -> str:
+    value = native_identifier.strip()
+    return f"{prefix}{value}" if value else ""
+
+
+def transfer_ownership_key(
+    from_stop_id: str,
+    to_stop_id: str,
+    from_trip_id: str,
+    to_trip_id: str,
+    from_route_id: str,
+    to_route_id: str,
+) -> str:
+    """Encode the GTFS transfer primary key for internal ownership metadata."""
+    return TRANSFER_KEY_SEPARATOR.join(
+        (
+            from_stop_id,
+            to_stop_id,
+            from_trip_id,
+            to_trip_id,
+            from_route_id,
+            to_route_id,
+        )
+    )
 
 
 def gtfs_rows(archive: zipfile.ZipFile, name: str) -> Iterable[dict[str, str]]:
@@ -198,10 +225,20 @@ def populate_gtfs(
         CREATE TABLE IF NOT EXISTS transfers (
             from_stop_id TEXT NOT NULL,
             to_stop_id TEXT NOT NULL,
+            from_trip_id TEXT NOT NULL DEFAULT '',
+            to_trip_id TEXT NOT NULL DEFAULT '',
+            from_route_id TEXT NOT NULL DEFAULT '',
+            to_route_id TEXT NOT NULL DEFAULT '',
             transfer_type INTEGER NOT NULL,
             min_transfer_time INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (from_stop_id, to_stop_id, transfer_type)
+            PRIMARY KEY (
+                from_stop_id, to_stop_id,
+                from_trip_id, to_trip_id,
+                from_route_id, to_route_id
+            )
         ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS transfers_by_stop
+            ON transfers(from_stop_id, to_stop_id);
         CREATE TABLE IF NOT EXISTS pathways (
             pathway_id TEXT PRIMARY KEY,
             from_stop_id TEXT NOT NULL,
@@ -218,6 +255,24 @@ def populate_gtfs(
         ) WITHOUT ROWID;
         """
     )
+    transfer_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(transfers)")
+    }
+    required_transfer_columns = {
+        "from_stop_id",
+        "to_stop_id",
+        "from_trip_id",
+        "to_trip_id",
+        "from_route_id",
+        "to_route_id",
+        "transfer_type",
+        "min_transfer_time",
+    }
+    if not required_transfer_columns.issubset(transfer_columns):
+        raise ValueError(
+            "The existing transfers table has a legacy schema; "
+            "a separate migration is required before importing transfers."
+        )
 
     route_columns = {
         str(row[1]) for row in connection.execute("PRAGMA table_info(routes)")
@@ -360,30 +415,75 @@ def populate_gtfs(
         connection.executemany("INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)", batch)
 
     if "transfers.txt" in archive.namelist():
-        transfer_keys: list[tuple[str, str, str]] = []
+        transfer_rows: list[tuple[str, str, str, str, str, str, int, int]] = []
+        seen_transfers: dict[tuple[str, str, str, str, str, str], tuple[int, int]] = {}
+        for row in gtfs_rows(archive, "transfers.txt"):
+            native_from_stop_id = row.get("from_stop_id", "").strip()
+            native_to_stop_id = row.get("to_stop_id", "").strip()
+            if not native_from_stop_id or not native_to_stop_id:
+                continue
+            try:
+                transfer_type = int(row.get("transfer_type", "0") or 0)
+                min_transfer_time = int(row.get("min_transfer_time", "0") or 0)
+            except ValueError as error:
+                raise ValueError(
+                    f"Invalid transfer numeric field for provider {provider_id}."
+                ) from error
+            transfer_key = (
+                internal_stop_id(native_from_stop_id, stop_id_prefix),
+                internal_stop_id(native_to_stop_id, stop_id_prefix),
+                prefixed_optional_identifier(row.get("from_trip_id", ""), identifier_prefix),
+                prefixed_optional_identifier(row.get("to_trip_id", ""), identifier_prefix),
+                prefixed_optional_identifier(row.get("from_route_id", ""), identifier_prefix),
+                prefixed_optional_identifier(row.get("to_route_id", ""), identifier_prefix),
+            )
+            semantic_values = (transfer_type, min_transfer_time)
+            previous_values = seen_transfers.get(transfer_key)
+            if previous_values is not None:
+                if previous_values != semantic_values:
+                    raise ValueError(
+                        "Conflicting duplicate GTFS transfer rows for provider "
+                        f"{provider_id} and transfer key {transfer_key!r}."
+                    )
+                continue
+            seen_transfers[transfer_key] = semantic_values
+            transfer_rows.append((*transfer_key, transfer_type, min_transfer_time))
         connection.executemany(
-            "INSERT INTO transfers(from_stop_id, to_stop_id, transfer_type, min_transfer_time) VALUES (?, ?, ?, ?)",
+            """
+            INSERT INTO transfers(
+                from_stop_id, to_stop_id, from_trip_id, to_trip_id,
+                from_route_id, to_route_id, transfer_type, min_transfer_time
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            transfer_rows,
+        )
+        register_entities(
+            connection,
+            provider_id,
+            "transfers",
             (
                 (
-                    internal_stop_id(row.get("from_stop_id", ""), stop_id_prefix),
-                    internal_stop_id(row.get("to_stop_id", ""), stop_id_prefix),
-                    int(row.get("transfer_type", "0") or 0),
-                    int(row.get("min_transfer_time", "0") or 0),
+                    transfer_ownership_key(
+                        from_stop_id,
+                        to_stop_id,
+                        from_trip_id,
+                        to_trip_id,
+                        from_route_id,
+                        to_route_id,
+                    ),
                 )
-                for row in gtfs_rows(archive, "transfers.txt")
-                if row.get("from_stop_id", "").strip() and row.get("to_stop_id", "").strip()
+                for (
+                    from_stop_id,
+                    to_stop_id,
+                    from_trip_id,
+                    to_trip_id,
+                    from_route_id,
+                    to_route_id,
+                    _transfer_type,
+                    _min_transfer_time,
+                ) in transfer_rows
             ),
         )
-        transfer_keys.extend(
-            (
-                internal_stop_id(row.get("from_stop_id", ""), stop_id_prefix),
-                internal_stop_id(row.get("to_stop_id", ""), stop_id_prefix),
-                row.get("transfer_type", "0").strip() or "0",
-            )
-            for row in gtfs_rows(archive, "transfers.txt")
-            if row.get("from_stop_id", "").strip() and row.get("to_stop_id", "").strip()
-        )
-        register_entities(connection, provider_id, "transfers", transfer_keys)
 
     if "pathways.txt" in archive.namelist():
         pathway_keys: list[tuple[str, str, str]] = []

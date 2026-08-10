@@ -201,6 +201,13 @@ def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
     ).fetchone() is not None
 
 
+def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
+    return {
+        str(row[1])
+        for row in connection.execute(f"PRAGMA table_info({table_name})")
+    }
+
+
 def delete_provider_data(
     connection: sqlite3.Connection,
     provider_ids: Iterable[str],
@@ -280,28 +287,63 @@ def delete_provider_data(
         params + params,
     )
     if _table_exists(connection, "transfers"):
-        connection.execute(
-            """
-            DELETE FROM transfers AS target
-            WHERE EXISTS (
-                SELECT 1 FROM provider_entities owned
-                WHERE owned.entity_type = 'transfers'
-                  AND owned.provider_id IN (%s)
-                  AND owned.key_1 = target.from_stop_id
-                  AND owned.key_2 = target.to_stop_id
-                  AND owned.key_3 = CAST(target.transfer_type AS TEXT)
+        transfer_columns = _table_columns(connection, "transfers")
+        if {
+            "from_stop_id",
+            "to_stop_id",
+            "from_trip_id",
+            "to_trip_id",
+            "from_route_id",
+            "to_route_id",
+        }.issubset(transfer_columns):
+            transfer_identity = (
+                "target.from_stop_id || char(31) || target.to_stop_id || char(31) || "
+                "target.from_trip_id || char(31) || target.to_trip_id || char(31) || "
+                "target.from_route_id || char(31) || target.to_route_id"
             )
-            AND NOT EXISTS (
-                SELECT 1 FROM provider_entities other
-                WHERE other.entity_type = 'transfers'
-                  AND other.provider_id NOT IN (%s)
-                  AND other.key_1 = target.from_stop_id
-                  AND other.key_2 = target.to_stop_id
-                  AND other.key_3 = CAST(target.transfer_type AS TEXT)
+            connection.execute(
+                """
+                DELETE FROM transfers AS target
+                WHERE EXISTS (
+                    SELECT 1 FROM provider_entities owned
+                    WHERE owned.entity_type = 'transfers'
+                      AND owned.provider_id IN (%s)
+                      AND owned.key_1 = %s
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM provider_entities other
+                    WHERE other.entity_type = 'transfers'
+                      AND other.provider_id NOT IN (%s)
+                      AND other.key_1 = %s
+                )
+                """ % (placeholders, transfer_identity, placeholders, transfer_identity),
+                params + params,
             )
-            """ % (placeholders, placeholders),
-            params + params,
-        )
+        elif {"from_stop_id", "to_stop_id", "transfer_type"}.issubset(transfer_columns):
+            connection.execute(
+                """
+                DELETE FROM transfers AS target
+                WHERE EXISTS (
+                    SELECT 1 FROM provider_entities owned
+                    WHERE owned.entity_type = 'transfers'
+                      AND owned.provider_id IN (%s)
+                      AND owned.key_1 = target.from_stop_id
+                      AND owned.key_2 = target.to_stop_id
+                      AND owned.key_3 = CAST(target.transfer_type AS TEXT)
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM provider_entities other
+                    WHERE other.entity_type = 'transfers'
+                      AND other.provider_id NOT IN (%s)
+                      AND other.key_1 = target.from_stop_id
+                      AND other.key_2 = target.to_stop_id
+                      AND other.key_3 = CAST(target.transfer_type AS TEXT)
+                )
+                """ % (placeholders, placeholders),
+                params + params,
+            )
+        else:
+            raise ValueError("Unsupported transfers table schema.")
     if _table_exists(connection, "pathways"):
         connection.execute(
             """

@@ -497,6 +497,48 @@ def validate_scoped_database(
             raise ValueError(
                 f"Provider ownership contains {orphan_count} orphaned {entity_type} rows."
             )
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    if "transfers" in tables:
+        transfer_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(transfers)")
+        }
+        required_transfer_columns = {
+            "from_stop_id",
+            "to_stop_id",
+            "from_trip_id",
+            "to_trip_id",
+            "from_route_id",
+            "to_route_id",
+        }
+        if required_transfer_columns.issubset(transfer_columns):
+            transfer_identity = (
+                "actual.from_stop_id || char(31) || actual.to_stop_id || char(31) || "
+                "actual.from_trip_id || char(31) || actual.to_trip_id || char(31) || "
+                "actual.from_route_id || char(31) || actual.to_route_id"
+            )
+            orphan_count = connection.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM provider_entities owned
+                WHERE owned.entity_type = 'transfers'
+                  AND owned.provider_id IN ({placeholders})
+                  AND NOT EXISTS (
+                      SELECT 1 FROM transfers actual
+                      WHERE owned.key_1 = {transfer_identity}
+                  )
+                """,
+                tuple(provider_ids),
+            ).fetchone()[0]
+            if orphan_count:
+                raise ValueError(
+                    f"Provider ownership contains {orphan_count} orphaned transfers rows."
+                )
 
 
 def prepare_staging_release(
