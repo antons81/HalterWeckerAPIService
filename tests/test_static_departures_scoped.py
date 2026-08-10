@@ -76,6 +76,37 @@ def write_feed(path: Path, provider_prefix: str, version: str) -> None:
         )
 
 
+def write_511_fixture_feed(path: Path) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "stops.txt",
+            "stop_id,stop_name,stop_lat,stop_lon,parent_station\n"
+            "17874,Union Square/Market St Station Southbound,37.78713,-122.40652,\n"
+            "terminal-17874,San Francisco Terminal,37.78,-122.40,\n",
+        )
+        archive.writestr(
+            "routes.txt",
+            "route_id,route_short_name,route_long_name\n"
+            "route-17874,38R,Geary Rapid\n",
+        )
+        archive.writestr(
+            "trips.txt",
+            "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+            "route-17874,service-17874,trip-17874,Terminal,0\n",
+        )
+        archive.writestr(
+            "calendar.txt",
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
+            "service-17874,1,1,1,1,1,1,1,20200101,20301231\n",
+        )
+        archive.writestr(
+            "stop_times.txt",
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "trip-17874,08:00:00,08:00:00,17874,1\n"
+            "trip-17874,08:10:00,08:10:00,terminal-17874,2\n",
+        )
+
+
 def create_database(path: Path, feed_specs: list[tuple[str, str, Path]]) -> None:
     connection = connect(path)
     connection.executescript(
@@ -227,6 +258,144 @@ class StaticDepartureScopeTests(unittest.TestCase):
                     ("fixture-city",),
                 ).fetchone(),
                 ("native:stop-current",),
+            )
+            connection.close()
+
+    def test_511_scoped_import_preserves_public_membership_after_namespaced_gtfs_import(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "511-bay-area.zip"
+            write_511_fixture_feed(feed)
+
+            config = root / "config"
+            config.mkdir(parents=True)
+            (config / "511-bay-area-cities.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "san-francisco",
+                            "name": "San Francisco",
+                            "country": "US",
+                            "latitude": 37.7749,
+                            "longitude": -122.4194,
+                            "radiusMeters": 42000,
+                            "packageMode": "external",
+                            "externalGTFSProvider": "511-bay-area",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            source = {
+                "id": "511-bay-area",
+                "scopedURL": "https://api.511.org/transit/datafeeds?operator_id=RG",
+                "cities": "config/511-bay-area-cities.json",
+                "timezone": "America/Los_Angeles",
+                "identifierPrefix": "",
+                "namespace": "",
+                "preserveNativeIDs": True,
+                "stopIDMode": "exact",
+                "buildStops": True,
+                "buildRoutes": True,
+                "buildDepartures": True,
+                "buildTripIndex": True,
+                "importIntoStaticDepartures": True,
+                "staticIdentifierPrefix": "",
+                "staticStopIDPrefix": "511-bay-area:",
+                "country": "US",
+            }
+            (config / "external-gtfs-sources.json").write_text(
+                json.dumps([source]),
+                encoding="utf-8",
+            )
+
+            stop_data = root / "stop-data"
+            (stop_data / "stops").mkdir(parents=True)
+            (stop_data / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "cities": [
+                            {
+                                "id": "san-francisco",
+                                "url": "stops/san-francisco.json",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (stop_data / "stops" / "san-francisco.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "17874",
+                            "name": "Union Square/Market St Station Southbound",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            connection = connect(root / "departures.sqlite")
+            connection.executescript(
+                """
+                CREATE TABLE city_departure_modes (
+                    city_id TEXT PRIMARY KEY,
+                    mode TEXT NOT NULL,
+                    timezone TEXT NOT NULL,
+                    stop_id_prefix TEXT NOT NULL DEFAULT '',
+                    identifier_prefix TEXT NOT NULL DEFAULT ''
+                ) WITHOUT ROWID;
+                """
+            )
+            provider = scoped.StaticProvider(
+                "511-bay-area",
+                "US",
+                "external",
+                source,
+            )
+
+            scoped.import_external(
+                connection,
+                [provider],
+                stop_data,
+                root,
+                {},
+                15,
+                artifacts={"511-bay-area": feed},
+            )
+            resolve_canonical_stops(connection)
+            update_terminal_stops(connection)
+            rebuild_city_stops(connection)
+            rebuild_city_departure_modes(connection)
+
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM raw_stops WHERE stop_id=?",
+                    ("511-bay-area:17874",),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT stop_id_prefix FROM provider_city_modes WHERE provider_id=? AND city_id=?",
+                    ("511-bay-area", "san-francisco"),
+                ).fetchone(),
+                ("511-bay-area:",),
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM provider_city_stops WHERE provider_id=? AND city_id=? AND stop_id=?",
+                    ("511-bay-area", "san-francisco", "511-bay-area:17874"),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM city_stops WHERE city_id=? AND stop_id=?",
+                    ("san-francisco", "17874"),
+                ).fetchone()[0],
+                1,
             )
             connection.close()
 
