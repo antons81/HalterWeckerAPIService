@@ -251,8 +251,10 @@ def add_external_gtfs(
                 archive,
                 identifier_prefix=str(source["identifierPrefix"]),
                 stop_id_prefix=(
-                    str(source.get("namespace", "")).strip()
-                    or str(source["identifierPrefix"])
+                    str(source.get("staticStopIDPrefix", (
+                        str(source.get("namespace", "")).strip()
+                        or str(source["identifierPrefix"])
+                    )))
                 ),
             )
         imported_city_ids.update(str(city["id"]) for city in cities)
@@ -275,19 +277,34 @@ def add_external_gtfs(
         connection.execute(
             "ALTER TABLE city_departure_modes ADD COLUMN stop_id_prefix TEXT NOT NULL DEFAULT ''"
         )
+    if "identifier_prefix" not in {
+        row[1] for row in connection.execute("PRAGMA table_info(city_departure_modes)")
+    }:
+        connection.execute(
+            "ALTER TABLE city_departure_modes ADD COLUMN identifier_prefix TEXT NOT NULL DEFAULT ''"
+        )
     source_ids_by_city: dict[str, list[str]] = {}
     for source_id in url_by_provider:
         source = sources_by_id[source_id]
         for city in load_external_cities(source, repository_root):
             source_ids_by_city.setdefault(str(city["id"]), []).append(source_id)
     connection.executemany(
-        "INSERT OR IGNORE INTO city_departure_modes(city_id, mode, timezone, stop_id_prefix) VALUES (?, 'canonical', ?, ?)",
+        "INSERT OR IGNORE INTO city_departure_modes(city_id, mode, timezone, stop_id_prefix, identifier_prefix) VALUES (?, 'canonical', ?, ?, ?)",
         (
             (
                 city_id,
                 str(sources_by_id[source_ids_by_city[city_id][0]]["timezone"]),
                 (
-                    str(sources_by_id[source_ids_by_city[city_id][0]]["identifierPrefix"])
+                    str(sources_by_id[source_ids_by_city[city_id][0]].get("staticStopIDPrefix", (
+                        str(sources_by_id[source_ids_by_city[city_id][0]].get("namespace", "")).strip()
+                        or str(sources_by_id[source_ids_by_city[city_id][0]]["identifierPrefix"])
+                    )))
+                    if len(source_ids_by_city[city_id]) == 1
+                    and not str(sources_by_id[source_ids_by_city[city_id][0]].get("namespace", "")).strip()
+                    else ""
+                ),
+                (
+                    str(sources_by_id[source_ids_by_city[city_id][0]].get("staticIdentifierPrefix", ""))
                     if len(source_ids_by_city[city_id]) == 1
                     and not str(sources_by_id[source_ids_by_city[city_id][0]].get("namespace", "")).strip()
                     else ""
@@ -420,7 +437,8 @@ def main() -> None:
                     city_id TEXT PRIMARY KEY,
                     mode TEXT NOT NULL,
                     timezone TEXT NOT NULL,
-                    stop_id_prefix TEXT NOT NULL DEFAULT ''
+                    stop_id_prefix TEXT NOT NULL DEFAULT '',
+                    identifier_prefix TEXT NOT NULL DEFAULT ''
                 ) WITHOUT ROWID;
             """)
             connection.executemany(

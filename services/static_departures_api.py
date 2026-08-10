@@ -94,11 +94,11 @@ class Database:
             finally:
                 cursor.close()
 
-    def city_departure_mode(self, city_id: str) -> tuple[str, str, str]:
+    def city_departure_mode(self, city_id: str) -> tuple[str, str, str, str]:
         with self.lock:
             try:
                 cursor = self._connection().execute(
-                    "SELECT mode, timezone, stop_id_prefix FROM city_departure_modes WHERE city_id=?",
+                    "SELECT mode, timezone, stop_id_prefix, identifier_prefix FROM city_departure_modes WHERE city_id=?",
                     (city_id,)
                 )
                 try:
@@ -106,7 +106,7 @@ class Database:
                 finally:
                     cursor.close()
                 if row is not None:
-                    return (str(row[0]), str(row[1]), str(row[2]))
+                    return (str(row[0]), str(row[1]), str(row[2]), str(row[3]))
             except sqlite3.OperationalError:
                 pass
             try:
@@ -119,8 +119,11 @@ class Database:
                 finally:
                     cursor.close()
             except sqlite3.OperationalError:
-                return "canonical", DEFAULT_TIMEZONE, ""
-        return (str(row[0]), str(row[1]), "") if row else ("canonical", DEFAULT_TIMEZONE, "")
+                    return "canonical", DEFAULT_TIMEZONE, "", ""
+        return (str(row[0]), str(row[1]), "", "") if row else ("canonical", DEFAULT_TIMEZONE, "", "")
+
+    def _public_identifier(self, identifier: str, prefix: str) -> str:
+        return identifier[len(prefix):] if prefix and identifier.startswith(prefix) else identifier
 
     def resolve_city(self, city_id: str) -> str:
         with self.lock:
@@ -135,7 +138,7 @@ class Database:
             return str(row[0]) if row else city_id
 
     def _query_stop_id(self, city_id: str, stop_id: str) -> str:
-        mode, _, stop_id_prefix = self.city_departure_mode(city_id)
+        mode, _, stop_id_prefix, _ = self.city_departure_mode(city_id)
         if mode != "exact-stop-with-parent-fallback":
             return f"{stop_id_prefix}{stop_id}"
         with self.lock:
@@ -157,7 +160,7 @@ class Database:
         return str(row[0]) if row and row[0] else stop_id
 
     def lines(self, city_id: str, stop_id: str) -> list[dict[str, str | None]]:
-        mode, _, _ = self.city_departure_mode(city_id)
+        mode, _, _, identifier_prefix = self.city_departure_mode(city_id)
         query_stop_id = self._query_stop_id(city_id, stop_id)
         stop_predicate = "s.raw_stop_id=?" if mode == "exact-stop-with-parent-fallback" else "rs.canonical_stop_id=?"
         with self.lock:
@@ -184,15 +187,16 @@ class Database:
                 cursor.close()
         return [
             {
-                "routeID": route_id,
+                "routeID": public_route_id,
                 "line": line,
                 "directionID": direction or None,
                 "direction": destination or None,
                 "destination": destination or None,
                 "destinationStopID": destination_stop_id or None,
-                "directionKey": self._direction_key(route_id, direction, destination_stop_id, destination),
+                "directionKey": self._direction_key(public_route_id, direction, destination_stop_id, destination),
             }
             for route_id, line, direction, destination, destination_stop_id in rows
+            for public_route_id in [self._public_identifier(route_id, identifier_prefix)]
         ]
 
     def board(
@@ -205,7 +209,7 @@ class Database:
     ) -> list[dict[str, object]]:
         service_from = (from_date.date() - timedelta(days=1)).strftime("%Y%m%d") if from_date else "00000000"
         service_to = to_date.date().strftime("%Y%m%d") if to_date else "99999999"
-        mode, _, _ = self.city_departure_mode(city_id)
+        mode, _, _, identifier_prefix = self.city_departure_mode(city_id)
         query_stop_id = self._query_stop_id(city_id, stop_id)
         stop_predicate = "s.raw_stop_id=?" if mode == "exact-stop-with-parent-fallback" else "rs.canonical_stop_id=?"
         with self.lock:
@@ -236,13 +240,13 @@ class Database:
             {
                 "serviceDate": f"{service_date[:4]}-{service_date[4:6]}-{service_date[6:]}",
                 "scheduledTime": departure_time,
-                "tripID": trip_id,
-                "routeID": route_id,
+                "tripID": self._public_identifier(trip_id, identifier_prefix),
+                "routeID": public_route_id,
                 "line": line,
                 "destination": destination,
                 "directionID": direction or None,
                 "direction": direction or None,
-                "directionKey": self._direction_key(route_id, direction, destination_stop_id, destination),
+                "directionKey": self._direction_key(public_route_id, direction, destination_stop_id, destination),
                 "destinationStopID": destination_stop_id or None,
                 "platform": platform or None,
                 "stopID": raw_stop_id,
@@ -250,6 +254,7 @@ class Database:
                 "isRealtime": False
             }
             for service_date, departure_time, _seconds, stop_sequence, raw_stop_id, trip_id, route_id, line, destination, direction, destination_stop_id, platform in rows
+            for public_route_id in [self._public_identifier(route_id, identifier_prefix)]
         ]
 
 
@@ -396,7 +401,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(HTTPStatus.OK, payload)
             if parsed.path == "/static-departures/board":
                 limit = bounded_limit(query.get("limit", [None])[0])
-                _, timezone_name, _ = self.database.city_departure_mode(resolved_city)
+                _, timezone_name, _, _ = self.database.city_departure_mode(resolved_city)
                 from_date = parse_iso_boundary(query.get("from", [None])[0], timezone_name)
                 to_date = parse_iso_boundary(query.get("to", [None])[0], timezone_name)
                 departures = self.database.board(resolved_city, stop, 1000 if from_date or to_date else limit, from_date, to_date)

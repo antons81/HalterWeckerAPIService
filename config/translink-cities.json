@@ -14,6 +14,7 @@
       "isExperimental": false,
       "features": ["realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay"],
       "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
       "realtimeURL": "https://api.asoftlabs.app/translink/realtime/trip-updates",
       "statusMessage": "Live-Abfahrten und statische Fahrpläne für Vancouver"
     }

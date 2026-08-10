@@ -139,10 +139,17 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
         self.assertEqual(provider["providerID"], "translink-vancouver")
         self.assertEqual(provider["staticBaseURL"], "https://api.asoftlabs.app")
         self.assertEqual(
+            provider["boardURL"],
+            "https://api.asoftlabs.app/static-departures",
+        )
+        self.assertEqual(
             provider["realtimeURL"],
             "https://api.asoftlabs.app/translink/realtime/trip-updates",
         )
         self.assertNotIn("liveVehicles", provider["features"])
+        self.assertTrue(translink["importIntoStaticDepartures"])
+        self.assertEqual(translink["staticIdentifierPrefix"], "ca:")
+        self.assertEqual(translink["staticStopIDPrefix"], "")
 
     def test_validate_ttc_registry_and_static_manifest(self) -> None:
         sources = load_external_gtfs_sources(

@@ -47,6 +47,9 @@
     "buildRoutes": true,
     "buildDepartures": true,
     "buildTripIndex": true,
+    "importIntoStaticDepartures": true,
+    "staticIdentifierPrefix": "ca:",
+    "staticStopIDPrefix": "",
     "country": "CA"
   },
   {
