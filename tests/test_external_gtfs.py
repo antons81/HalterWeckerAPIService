@@ -149,7 +149,7 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
         self.assertNotIn("liveVehicles", provider["features"])
         self.assertTrue(translink["importIntoStaticDepartures"])
         self.assertEqual(translink["staticIdentifierPrefix"], "ca:")
-        self.assertEqual(translink["staticStopIDPrefix"], "")
+        self.assertEqual(translink["staticStopIDPrefix"], "ca:")
 
     def test_validate_ttc_registry_and_static_manifest(self) -> None:
         sources = load_external_gtfs_sources(

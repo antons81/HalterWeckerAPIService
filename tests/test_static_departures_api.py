@@ -338,11 +338,11 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                     "CREATE TABLE city_departure_modes (city_id TEXT PRIMARY KEY, mode TEXT NOT NULL, timezone TEXT NOT NULL, stop_id_prefix TEXT NOT NULL DEFAULT '', identifier_prefix TEXT NOT NULL DEFAULT '')"
                 )
                 database.execute(
-                    "INSERT INTO city_departure_modes VALUES ('vancouver', 'canonical', 'America/Vancouver', '', 'ca:')"
+                    "INSERT INTO city_departure_modes VALUES ('vancouver', 'canonical', 'America/Vancouver', 'ca:', 'ca:')"
                 )
                 database.execute(
                     "INSERT INTO raw_stops VALUES (?, ?, ?, ?, ?, ?)",
-                    ("11535", "", "Seymour", "", 10, "11535"),
+                    ("ca:11535", "", "Seymour", "", 10, "ca:11535"),
                 )
                 database.execute("INSERT INTO city_stops VALUES ('vancouver', '11535')")
                 database.execute("INSERT INTO routes VALUES ('ca:6612', '002', 'Macdonald')")
@@ -351,7 +351,7 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                 )
                 database.execute("INSERT INTO active_services VALUES ('ca:service-1', '20260728')")
                 database.execute(
-                    "INSERT INTO stop_times VALUES ('ca:trip-1', '11535', '08:00:00', 28800, 15)"
+                    "INSERT INTO stop_times VALUES ('ca:trip-1', 'ca:11535', '08:00:00', 28800, 15)"
                 )
                 database.commit()
             finally:
@@ -367,6 +367,7 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
 
             self.assertEqual(board["departures"][0]["tripID"], "trip-1")
             self.assertEqual(board["departures"][0]["routeID"], "6612")
+            self.assertEqual(board["departures"][0]["stopID"], "11535")
             self.assertEqual(lines["lines"][0]["routeID"], "6612")
 
     def test_lines_are_topology_and_keep_multiple_destinations_without_active_services(self) -> None:

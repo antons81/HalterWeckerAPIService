@@ -111,7 +111,7 @@ class Database:
                 pass
             try:
                 cursor = self._connection().execute(
-                    "SELECT mode, timezone FROM city_departure_modes WHERE city_id=?",
+                    "SELECT mode, timezone, stop_id_prefix FROM city_departure_modes WHERE city_id=?",
                     (city_id,)
                 )
                 try:
@@ -119,8 +119,21 @@ class Database:
                 finally:
                     cursor.close()
             except sqlite3.OperationalError:
+                try:
+                    cursor = self._connection().execute(
+                        "SELECT mode, timezone FROM city_departure_modes WHERE city_id=?",
+                        (city_id,)
+                    )
+                    try:
+                        row = cursor.fetchone()
+                    finally:
+                        cursor.close()
+                except sqlite3.OperationalError:
                     return "canonical", DEFAULT_TIMEZONE, "", ""
-        return (str(row[0]), str(row[1]), "", "") if row else ("canonical", DEFAULT_TIMEZONE, "", "")
+        if not row:
+            return "canonical", DEFAULT_TIMEZONE, "", ""
+        stop_id_prefix = str(row[2]) if len(row) > 2 else ""
+        return str(row[0]), str(row[1]), stop_id_prefix, ""
 
     def _public_identifier(self, identifier: str, prefix: str) -> str:
         return identifier[len(prefix):] if prefix and identifier.startswith(prefix) else identifier
@@ -160,7 +173,7 @@ class Database:
         return str(row[0]) if row and row[0] else stop_id
 
     def lines(self, city_id: str, stop_id: str) -> list[dict[str, str | None]]:
-        mode, _, _, identifier_prefix = self.city_departure_mode(city_id)
+        mode, _, stop_id_prefix, identifier_prefix = self.city_departure_mode(city_id)
         query_stop_id = self._query_stop_id(city_id, stop_id)
         stop_predicate = "s.raw_stop_id=?" if mode == "exact-stop-with-parent-fallback" else "rs.canonical_stop_id=?"
         with self.lock:
@@ -192,11 +205,12 @@ class Database:
                 "directionID": direction or None,
                 "direction": destination or None,
                 "destination": destination or None,
-                "destinationStopID": destination_stop_id or None,
-                "directionKey": self._direction_key(public_route_id, direction, destination_stop_id, destination),
+                "destinationStopID": public_destination_stop_id or None,
+                "directionKey": self._direction_key(public_route_id, direction, public_destination_stop_id, destination),
             }
             for route_id, line, direction, destination, destination_stop_id in rows
             for public_route_id in [self._public_identifier(route_id, identifier_prefix)]
+            for public_destination_stop_id in [self._public_identifier(destination_stop_id, stop_id_prefix)]
         ]
 
     def board(
@@ -209,7 +223,7 @@ class Database:
     ) -> list[dict[str, object]]:
         service_from = (from_date.date() - timedelta(days=1)).strftime("%Y%m%d") if from_date else "00000000"
         service_to = to_date.date().strftime("%Y%m%d") if to_date else "99999999"
-        mode, _, _, identifier_prefix = self.city_departure_mode(city_id)
+        mode, _, stop_id_prefix, identifier_prefix = self.city_departure_mode(city_id)
         query_stop_id = self._query_stop_id(city_id, stop_id)
         stop_predicate = "s.raw_stop_id=?" if mode == "exact-stop-with-parent-fallback" else "rs.canonical_stop_id=?"
         with self.lock:
@@ -246,15 +260,16 @@ class Database:
                 "destination": destination,
                 "directionID": direction or None,
                 "direction": direction or None,
-                "directionKey": self._direction_key(public_route_id, direction, destination_stop_id, destination),
-                "destinationStopID": destination_stop_id or None,
+                "directionKey": self._direction_key(public_route_id, direction, public_destination_stop_id, destination),
+                "destinationStopID": public_destination_stop_id or None,
                 "platform": platform or None,
-                "stopID": raw_stop_id,
+                "stopID": self._public_identifier(raw_stop_id, stop_id_prefix),
                 "stopSequence": stop_sequence,
                 "isRealtime": False
             }
             for service_date, departure_time, _seconds, stop_sequence, raw_stop_id, trip_id, route_id, line, destination, direction, destination_stop_id, platform in rows
             for public_route_id in [self._public_identifier(route_id, identifier_prefix)]
+            for public_destination_stop_id in [self._public_identifier(destination_stop_id, stop_id_prefix)]
         ]
 
 
