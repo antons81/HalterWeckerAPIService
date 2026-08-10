@@ -324,6 +324,7 @@ def add_external_gtfs(
     sources_path: Path,
     dates: list[date],
     populate_memberships: bool = True,
+    environ: dict[str, str] | None = None,
 ) -> set[str]:
     """Augment an existing static departures database with external GTFS feeds.
 
@@ -346,7 +347,7 @@ def add_external_gtfs(
         request_url, headers = authenticated_external_request(
             source_id,
             url_by_provider[source_id],
-            environ=os.environ,
+            environ=environ if environ is not None else os.environ,
         )
         with load_gtfs_archive(request_url, headers=headers) as archive:
             populate_gtfs(

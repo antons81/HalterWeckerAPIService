@@ -46,6 +46,14 @@ EXTERNAL_SOURCE_AUTH: dict[str, dict[str, object]] = {
             "User-Agent": "HalteWeckerStopPipeline/1.0",
         },
     },
+    "511-bay-area": {
+        "api_key_env": "API_511_KEY",
+        "query_parameter": "api_key",
+        "headers": {
+            "Accept-Encoding": "gzip",
+            "User-Agent": "HalteWeckerStopPipeline/1.0",
+        },
+    },
 }
 
 
@@ -102,12 +110,17 @@ def validate_external_gtfs_source(
             f"External GTFS source {source_id} has invalid timezone {timezone_name!r}."
         ) from error
 
+    preserve_native_ids = source.get("preserveNativeIDs", False)
+    if not isinstance(preserve_native_ids, bool):
+        raise ValueError(
+            f"External GTFS source {source_id} has invalid preserveNativeIDs."
+        )
     prefix = source.get("identifierPrefix")
-    if not isinstance(prefix, str) or not prefix.strip():
+    if not isinstance(prefix, str) or (not prefix.strip() and not preserve_native_ids):
         raise ValueError(
             f"External GTFS source {source_id} requires a non-empty identifierPrefix."
         )
-    if known_prefixes is not None and prefix in known_prefixes:
+    if prefix.strip() and known_prefixes is not None and prefix in known_prefixes:
         raise ValueError(f"Duplicate external GTFS identifierPrefix: {prefix}")
 
     namespace = source.get("namespace", "")
@@ -1088,7 +1101,9 @@ def process_external_gtfs_sources(
         )
         source_id = str(source["id"])
         known_source_ids.add(source_id)
-        known_prefixes.add(str(source["identifierPrefix"]))
+        identifier_prefix = str(source.get("identifierPrefix", ""))
+        if identifier_prefix:
+            known_prefixes.add(identifier_prefix)
         namespace = str(source.get("namespace", ""))
         if namespace:
             known_namespaces.add(namespace)

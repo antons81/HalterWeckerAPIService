@@ -78,6 +78,7 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
                 "translink",
                 "ttc-surface",
                 "ttc-subway",
+                "511-bay-area",
             },
         )
         sweden = next(source for source in sources if source["id"] == "sweden")
@@ -187,6 +188,36 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
         self.assertIn("tripUpdates", provider["features"])
         self.assertNotIn("liveVehicles", provider["features"])
         self.assertNotIn("vehiclePositions", provider["features"])
+
+    def test_validate_511_registry_preserves_native_ids_and_radar_urls(self) -> None:
+        sources = load_external_gtfs_sources(
+            REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
+        )
+        source = next(source for source in sources if source["id"] == "511-bay-area")
+        validate_external_gtfs_source(source, REPOSITORY_ROOT)
+        self.assertEqual(source["identifierPrefix"], "")
+        self.assertTrue(source["preserveNativeIDs"])
+        self.assertNotIn("url", source)
+        cities = load_external_cities(source, REPOSITORY_ROOT)
+        manifest = transit_radar_manifest(cities)
+        self.assertEqual(
+            [city["cityID"] for city in manifest["cities"]],
+            ["berkeley-us", "oakland-us", "san-francisco-us", "san-jose-us"],
+        )
+        provider = manifest["cities"][0]["providers"][0]
+        self.assertEqual(provider["providerID"], "511-bay-area-berkeley")
+        self.assertEqual(provider["adapter"], "bayArea511")
+        self.assertEqual(provider["tripUpdatesURL"], "https://api.asoftlabs.app/511/realtime/trip-updates")
+        self.assertIn("vehiclePositions", provider["features"])
+
+    def test_511_auth_requires_only_the_backend_environment_name(self) -> None:
+        with self.assertRaisesRegex(ValueError, "API_511_KEY") as raised:
+            authenticated_external_request(
+                "511-bay-area",
+                "https://api.511.org/transit/datafeeds?operator_id=RG",
+                environ={},
+            )
+        self.assertNotIn("api_key=", str(raised.exception))
 
     def test_canadian_timers_use_local_night_and_shared_service(self) -> None:
         vancouver_timer = (

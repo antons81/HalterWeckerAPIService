@@ -234,6 +234,7 @@ class GTFSRealtimeGateway:
         *,
         provider_id: str,
         city_id: str,
+        city_ids: set[str] | None = None,
         path: str,
         upstream_url: str | Callable[[], str],
         namespace: str = "",
@@ -246,6 +247,7 @@ class GTFSRealtimeGateway:
     ) -> None:
         self._provider_id = provider_id
         self._city_id = city_id
+        self._city_ids = frozenset(city_ids or {city_id})
         self._path = path
         self._upstream_url = upstream_url
         self._namespace = namespace
@@ -361,7 +363,8 @@ class GTFSRealtimeGateway:
     def handle(self, path: str, query: dict[str, list[str]]) -> GatewayResponse:
         if path != self._path:
             return GatewayResponse(HTTPStatus.NOT_FOUND, {"error": "not found"})
-        if query.get("cityID", [None])[0] != self._city_id:
+        requested_city_id = query.get("cityID", [None])[0]
+        if requested_city_id not in self._city_ids:
             return GatewayResponse(HTTPStatus.BAD_REQUEST, {"error": "unsupported cityID"})
         try:
             requested_stop_ids = self._requested_stop_ids(query)
@@ -382,7 +385,7 @@ class GTFSRealtimeGateway:
         payload = {
             "schemaVersion": 1,
             "providerID": self._provider_id,
-            "cityID": self._city_id,
+            "cityID": requested_city_id,
             "stopIDs": requested_stop_ids,
             "feedTimestamp": self._iso_time(snapshot.feed_timestamp),
             "retrievedAt": self._iso_time(int(snapshot.retrieved_at)),

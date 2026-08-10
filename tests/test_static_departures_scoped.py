@@ -151,11 +151,133 @@ class StaticDepartureScopeTests(unittest.TestCase):
 
     def test_unknown_provider_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "Unknown static-departures provider"):
-            scoped.resolve_scope(REPOSITORY_ROOT, provider_id="511-bay-area")
+            scoped.resolve_scope(REPOSITORY_ROOT, provider_id="not-a-real-provider")
 
-    def test_unknown_country_is_rejected_until_a_static_source_exists(self) -> None:
-        with self.assertRaisesRegex(ValueError, "Unknown static-departures country"):
-            scoped.resolve_scope(REPOSITORY_ROOT, country="US")
+    def test_us_scope_resolves_the_511_static_source(self) -> None:
+        _label, providers = scoped.resolve_scope(REPOSITORY_ROOT, country="US")
+        self.assertEqual([provider.provider_id for provider in providers], ["511-bay-area"])
+
+    def test_511_static_assets_replace_only_selected_cities_in_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            config = repository / "config"
+            config.mkdir(parents=True)
+            cities_path = config / "cities.json"
+            cities_path.write_text(
+                json.dumps([
+                    {
+                        "id": "san-francisco",
+                        "name": "San Francisco",
+                        "country": "US",
+                        "packageMode": "external",
+                        "latitude": 37.7749,
+                        "longitude": -122.4194,
+                        "radiusMeters": 42_000,
+                        "transitRadar": {
+                            "adapter": "bayArea511",
+                            "features": ["liveVehicles", "tripUpdates"],
+                            "staticBaseURL": "https://api.asoftlabs.app",
+                            "boardURL": "https://api.asoftlabs.app/static-departures",
+                            "realtimeURL": "https://api.asoftlabs.app/511/realtime/vehicle-positions",
+                            "tripUpdatesURL": "https://api.asoftlabs.app/511/realtime/trip-updates",
+                            "region": {
+                                "minimumLatitude": 37.2,
+                                "maximumLatitude": 38.2,
+                                "minimumLongitude": -122.8,
+                                "maximumLongitude": -121.8,
+                            },
+                        },
+                    }
+                ]),
+                encoding="utf-8",
+            )
+            (config / "external-gtfs-sources.json").write_text(
+                json.dumps([
+                    {
+                        "id": "511-bay-area",
+                        "scopedURL": "https://api.511.org/transit/datafeeds?operator_id=RG",
+                        "cities": "config/cities.json",
+                        "timezone": "America/Los_Angeles",
+                        "identifierPrefix": "",
+                        "namespace": "",
+                        "preserveNativeIDs": True,
+                        "stopIDMode": "exact",
+                        "country": "US",
+                    }
+                ]),
+                encoding="utf-8",
+            )
+            archive_path = root / "511.zip"
+            rewritten = {
+                "stops.txt": (
+                    "stop_id,stop_name,stop_lat,stop_lon\n"
+                    "stop-511,Market Street,37.7749,-122.4194\n"
+                ),
+                "routes.txt": (
+                    "route_id,route_short_name,route_long_name,route_type\n"
+                    "route-511,F,Market Cable Car,5\n"
+                ),
+                "trips.txt": (
+                    "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+                    "route-511,service-511,trip-511,Van Ness,0\n"
+                ),
+                "calendar.txt": (
+                    "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
+                    "service-511,1,1,1,1,1,1,1,20200101,20301231\n"
+                ),
+                "stop_times.txt": (
+                    "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+                    "trip-511,08:00:00,08:00:00,stop-511,1\n"
+                ),
+            }
+            with zipfile.ZipFile(archive_path, "w") as target:
+                for name, content in rewritten.items():
+                    target.writestr(name, content)
+
+            release = root / "release-511"
+            stop_data = release / "stop-data"
+            stop_data.mkdir(parents=True)
+            (stop_data / "manifest.json").write_text(
+                json.dumps({
+                    "version": "old",
+                    "cities": [{"id": "existing", "url": "stops/existing.json"}],
+                }),
+                encoding="utf-8",
+            )
+            (stop_data / "transit-radar-cities.json").write_text(
+                json.dumps({"cities": [{"appCityID": "existing"}]}),
+                encoding="utf-8",
+            )
+            (stop_data / "attributions.json").write_text("[]", encoding="utf-8")
+
+            provider = scoped.StaticProvider(
+                "511-bay-area",
+                "US",
+                "external",
+                json.loads((config / "external-gtfs-sources.json").read_text())[0],
+            )
+            scoped.build_external_static_assets(
+                release,
+                [provider],
+                repository,
+                {"511-bay-area": archive_path},
+            )
+
+            manifest = json.loads((stop_data / "manifest.json").read_text())
+            self.assertEqual(
+                {entry["id"] for entry in manifest["cities"]},
+                {"existing", "san-francisco"},
+            )
+            routes = json.loads((stop_data / "routes" / "san-francisco.json").read_text())
+            self.assertEqual(routes["route-511"]["type"], "5")
+            radar = json.loads((stop_data / "transit-radar-cities.json").read_text())
+            self.assertEqual(
+                {city["appCityID"] for city in radar["cities"]},
+                {"existing", "san-francisco"},
+            )
+            attributions = json.loads((stop_data / "attributions.json").read_text())
+            self.assertEqual(attributions[0]["url"], "https://511.org/open-data")
 
     def test_dry_run_does_not_create_or_modify_data_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -404,7 +526,12 @@ class StaticDepartureScopeTests(unittest.TestCase):
                 "provider-a",
                 "CA",
                 "external",
-                {"id": "provider-a", "cities": "unused", "timezone": "Europe/Berlin"},
+                {
+                    "id": "provider-a",
+                    "cities": "unused",
+                    "timezone": "Europe/Berlin",
+                    "localPath": str(old_a),
+                },
             )
             with mock.patch.object(
                 scoped,

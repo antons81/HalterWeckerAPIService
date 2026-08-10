@@ -62,6 +62,7 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "entur",
     "translink",
     "ttc",
+    "bayArea511",
 }
 SUPPORTED_TRANSIT_RADAR_FEATURES = {
     "liveVehicles",
@@ -70,6 +71,9 @@ SUPPORTED_TRANSIT_RADAR_FEATURES = {
     "stopLookup",
     "realtimeDelay",
     "tripUpdates",
+    "vehiclePositions",
+    "vehicleBearing",
+    "stopSequence",
 }
 STATIC_TRANSIT_RADAR_PROVIDERS = {
     "rheinbahn-duesseldorf": {
@@ -764,6 +768,19 @@ def validate_transit_radar_provider(
             raise ValueError(f"TTC Radar is disabled for {city_id}")
         return
 
+    if adapter == "bayArea511":
+        if city_id not in {"san-francisco", "oakland", "berkeley", "san-jose"}:
+            raise ValueError(f"Invalid 511 Bay Area configuration for {city_id}")
+        if configuration.get("radarStops") is not None:
+            raise ValueError(f"511 Bay Area does not use radar stops for {city_id}")
+        if configuration.get("gatewayURL") is not None:
+            raise ValueError(f"511 Bay Area does not use a gateway URL for {city_id}")
+        for key in ("staticBaseURL", "boardURL", "realtimeURL", "tripUpdatesURL"):
+            value = configuration.get(key)
+            if not isinstance(value, str) or not value.startswith("https://"):
+                raise ValueError(f"511 Bay Area requires an HTTPS {key} for {city_id}")
+        return
+
     if adapter == "entur":
         codespaces = configuration.get("radarCodespaces")
         if not isinstance(codespaces, list) or not codespaces:
@@ -1092,6 +1109,8 @@ def transit_radar_manifest(
                 provider_id = f"translink-{city_id}"
             elif adapter == "ttc":
                 provider_id = f"ttc-{city_id}"
+            elif adapter == "bayArea511":
+                provider_id = f"511-bay-area-{city_id}"
             elif adapter == "bwTrias":
                 provider_id = "bw-trias"
             else:
@@ -1179,7 +1198,7 @@ def transit_radar_manifest(
                 gateway_url = vag_gateway_url
             if isinstance(gateway_url, str):
                 provider["gatewayURL"] = gateway_url
-            for url_key in ("staticBaseURL", "boardURL", "realtimeURL"):
+            for url_key in ("staticBaseURL", "boardURL", "realtimeURL", "tripUpdatesURL"):
                 configured_url = provider_configuration.get(url_key)
                 if isinstance(configured_url, str) and configured_url.strip():
                     provider[url_key] = configured_url.strip()
@@ -1199,6 +1218,8 @@ def transit_radar_manifest(
             country_suffix = "ca"
         elif any(p.get("adapter") == "ttc" for p in providers):
             country_suffix = "ca"
+        elif any(p.get("adapter") == "bayArea511" for p in providers):
+            country_suffix = "us"
         else:
             country_suffix = "de"
         radar_cities.append({

@@ -83,5 +83,23 @@
     "buildTripIndex": true,
     "importIntoStaticDepartures": true,
     "country": "CA"
+  },
+  {
+    "id": "511-bay-area",
+    "scopedURL": "https://api.511.org/transit/datafeeds?operator_id=RG",
+    "cities": "config/511-bay-area-cities.json",
+    "timezone": "America/Los_Angeles",
+    "identifierPrefix": "",
+    "namespace": "",
+    "preserveNativeIDs": true,
+    "stopIDMode": "exact",
+    "buildStops": true,
+    "buildRoutes": true,
+    "buildDepartures": true,
+    "buildTripIndex": true,
+    "importIntoStaticDepartures": true,
+    "staticIdentifierPrefix": "",
+    "staticStopIDPrefix": "",
+    "country": "US"
   }
 ]

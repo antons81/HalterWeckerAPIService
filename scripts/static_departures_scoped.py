@@ -23,7 +23,7 @@ from build_german_departure_index import (
     service_window,
     update_terminal_stops,
 )
-from build_stop_packages import load_gtfs_archive
+from build_stop_packages import load_gtfs_archive, transit_radar_manifest
 from external_gtfs import (
     authenticated_external_request,
     load_external_gtfs_sources,
@@ -206,7 +206,11 @@ def resolve_external_artifact(
     environment: dict[str, str],
 ) -> Path:
     assert provider.source is not None
-    configured_url = str(provider.source.get("url") or "").strip()
+    configured_url = str(
+        provider.source.get("url")
+        or provider.source.get("scopedURL")
+        or ""
+    ).strip()
     local_path = str(provider.source.get("localPath") or "").strip()
     if local_path:
         path = Path(local_path)
@@ -332,11 +336,14 @@ def import_external(
     repository_root: Path,
     environment: dict[str, str],
     days: int,
+    artifacts: dict[str, Path] | None = None,
 ) -> None:
     sources_path = repository_root / "config" / "external-gtfs-sources.json"
     imported_city_ids: set[str] = set()
     for provider in providers:
-        archive_path = resolve_external_artifact(provider, environment)
+        archive_path = (artifacts or {}).get(provider.provider_id)
+        if archive_path is None:
+            archive_path = resolve_external_artifact(provider, environment)
         source = provider.source or {}
         timezone_name = str(source.get("timezone") or DEFAULT_TIMEZONE)
         imported_city_ids.update(add_external_gtfs(
@@ -347,6 +354,7 @@ def import_external(
             sources_path=sources_path,
             dates=service_window(timezone_name, days),
             populate_memberships=False,
+            environ=environment,
         ))
     if imported_city_ids:
         populate_provider_city_memberships(
@@ -354,6 +362,110 @@ def import_external(
             stop_data,
             included_city_ids=imported_city_ids,
         )
+
+
+def build_external_static_assets(
+    release_dir: Path,
+    providers: list[StaticProvider],
+    repository_root: Path,
+    artifacts: dict[str, Path],
+) -> None:
+    """Build selected external JSON assets inside the staged release."""
+    if not providers:
+        return
+    from external_gtfs import process_external_gtfs_sources
+
+    stop_data = release_dir / "stop-data"
+    selected_urls = {
+        provider.provider_id: str(artifacts[provider.provider_id])
+        for provider in providers
+    }
+    manifest_entries, external_cities, _package_stops, _lines = process_external_gtfs_sources(
+        repository_root=repository_root,
+        sources_path=repository_root / "config" / "external-gtfs-sources.json",
+        url_by_provider=selected_urls,
+        output=stop_data,
+        load_gtfs_archive=load_gtfs_archive,
+        occupied_city_ids=set(),
+    )
+
+    manifest_path = stop_data / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError("Staged stop-data is missing manifest.json for external assets.")
+    manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = manifest_payload.get("cities")
+    if not isinstance(manifest, list):
+        raise ValueError("Staged stop-data manifest has no cities array.")
+    indexes = {
+        str(entry.get("id")): index
+        for index, entry in enumerate(manifest)
+        if isinstance(entry, dict) and entry.get("id")
+    }
+    for raw_entry in manifest_entries:
+        entry = dict(raw_entry)
+        entry.pop("_source", None)
+        city_id = str(entry.get("id", ""))
+        if city_id in indexes:
+            manifest[indexes[city_id]] = entry
+        else:
+            indexes[city_id] = len(manifest)
+            manifest.append(entry)
+    manifest.sort(key=lambda entry: str(entry.get("id", "")))
+    manifest_payload["cities"] = manifest
+    manifest_payload["version"] = datetime.now(timezone.utc).date().isoformat()
+    manifest_payload["releaseID"] = release_dir.name
+    manifest_path.write_text(
+        json.dumps(manifest_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (stop_data / "cities.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    radar_path = stop_data / "transit-radar-cities.json"
+    if radar_path.is_file():
+        radar_payload = json.loads(radar_path.read_text(encoding="utf-8"))
+        radar_cities = radar_payload.get("cities")
+        if not isinstance(radar_cities, list):
+            raise ValueError("Staged transit radar manifest has no cities array.")
+        radar_indexes = {
+            str(city.get("appCityID")): index
+            for index, city in enumerate(radar_cities)
+            if isinstance(city, dict) and city.get("appCityID")
+        }
+        for city in transit_radar_manifest(external_cities)["cities"]:
+            app_city_id = str(city["appCityID"])
+            if app_city_id in radar_indexes:
+                radar_cities[radar_indexes[app_city_id]] = city
+            else:
+                radar_indexes[app_city_id] = len(radar_cities)
+                radar_cities.append(city)
+        radar_payload["cities"] = sorted(
+            radar_cities,
+            key=lambda city: str(city.get("appCityID", "")),
+        )
+        radar_path.write_text(
+            json.dumps(radar_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    attributions_path = stop_data / "attributions.json"
+    if attributions_path.is_file():
+        attributions = json.loads(attributions_path.read_text(encoding="utf-8"))
+        if isinstance(attributions, list) and not any(
+            isinstance(item, dict) and item.get("name") == "511 SF Bay"
+            for item in attributions
+        ):
+            attributions.append({
+                "name": "511 SF Bay",
+                "license": "511 Open Data terms",
+                "url": "https://511.org/open-data",
+            })
+            attributions_path.write_text(
+                json.dumps(attributions, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
 
 def validate_scoped_database(
@@ -396,8 +508,7 @@ def prepare_staging_release(
     release_dir = data_root / "releases" / release_id
     release_dir.mkdir(parents=True, exist_ok=False)
     clone_database(source_database, release_dir / "departures.sqlite")
-    stop_data_target = os.path.relpath(source_stop_data, release_dir)
-    (release_dir / "stop-data").symlink_to(stop_data_target)
+    shutil.copytree(source_stop_data, release_dir / "stop-data", symlinks=True)
     source_metadata = source_database.parent / "release-metadata.json"
     if source_metadata.is_file():
         metadata = json.loads(source_metadata.read_text(encoding="utf-8"))
@@ -569,6 +680,10 @@ def scoped_rebuild(
                 )
             external = [provider for provider in providers if provider.kind == "external"]
             if external:
+                external_artifacts = {
+                    provider.provider_id: resolve_external_artifact(provider, environment)
+                    for provider in external
+                }
                 import_external(
                     connection,
                     external,
@@ -576,6 +691,13 @@ def scoped_rebuild(
                     repository_root,
                     environment,
                     int(environment.get("STATIC_DEPARTURES_DAYS", "15")),
+                    artifacts=external_artifacts,
+                )
+                build_external_static_assets(
+                    release_dir,
+                    external,
+                    repository_root,
+                    external_artifacts,
                 )
             resolve_canonical_stops(connection)
             update_terminal_stops(connection)

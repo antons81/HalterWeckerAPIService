@@ -1,0 +1,138 @@
+[
+  {
+    "id": "san-francisco",
+    "name": "San Francisco",
+    "country": "US",
+    "packageMode": "external",
+    "externalGTFSProvider": "511-bay-area",
+    "latitude": 37.7749,
+    "longitude": -122.4194,
+    "radiusMeters": 42000,
+    "transitRadar": {
+      "adapter": "bayArea511",
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "vehiclePositions",
+        "vehicleBearing",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/511/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/511/realtime/trip-updates",
+      "region": {
+        "minimumLatitude": 37.20,
+        "maximumLatitude": 38.20,
+        "minimumLongitude": -122.80,
+        "maximumLongitude": -121.80
+      }
+    }
+  },
+  {
+    "id": "oakland",
+    "name": "Oakland",
+    "country": "US",
+    "packageMode": "external",
+    "externalGTFSProvider": "511-bay-area",
+    "latitude": 37.8044,
+    "longitude": -122.2712,
+    "radiusMeters": 36000,
+    "transitRadar": {
+      "adapter": "bayArea511",
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "vehiclePositions",
+        "vehicleBearing",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/511/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/511/realtime/trip-updates",
+      "region": {
+        "minimumLatitude": 37.20,
+        "maximumLatitude": 38.20,
+        "minimumLongitude": -122.80,
+        "maximumLongitude": -121.80
+      }
+    }
+  },
+  {
+    "id": "berkeley",
+    "name": "Berkeley",
+    "country": "US",
+    "packageMode": "external",
+    "externalGTFSProvider": "511-bay-area",
+    "latitude": 37.8715,
+    "longitude": -122.2730,
+    "radiusMeters": 30000,
+    "transitRadar": {
+      "adapter": "bayArea511",
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "vehiclePositions",
+        "vehicleBearing",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/511/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/511/realtime/trip-updates",
+      "region": {
+        "minimumLatitude": 37.20,
+        "maximumLatitude": 38.20,
+        "minimumLongitude": -122.80,
+        "maximumLongitude": -121.80
+      }
+    }
+  },
+  {
+    "id": "san-jose",
+    "name": "San Jose",
+    "country": "US",
+    "packageMode": "external",
+    "externalGTFSProvider": "511-bay-area",
+    "latitude": 37.3382,
+    "longitude": -121.8863,
+    "radiusMeters": 38000,
+    "transitRadar": {
+      "adapter": "bayArea511",
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "vehiclePositions",
+        "vehicleBearing",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/511/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/511/realtime/trip-updates",
+      "region": {
+        "minimumLatitude": 37.00,
+        "maximumLatitude": 38.00,
+        "minimumLongitude": -122.40,
+        "maximumLongitude": -121.40
+      }
+    }
+  }
+]

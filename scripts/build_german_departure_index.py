@@ -94,7 +94,8 @@ def connect(database_path: Path) -> sqlite3.Connection:
         CREATE TABLE routes (
             route_id TEXT PRIMARY KEY,
             short_name TEXT NOT NULL,
-            long_name TEXT NOT NULL
+            long_name TEXT NOT NULL,
+            route_type TEXT NOT NULL DEFAULT ''
         ) WITHOUT ROWID;
         CREATE TABLE trips (
             trip_id TEXT PRIMARY KEY,
@@ -184,6 +185,14 @@ def populate_gtfs(
     if missing:
         raise ValueError(f"GTFS archive is missing required files: {', '.join(sorted(missing))}")
 
+    route_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(routes)")
+    }
+    if "route_type" not in route_columns:
+        connection.execute(
+            "ALTER TABLE routes ADD COLUMN route_type TEXT NOT NULL DEFAULT ''"
+        )
+
     stop_ids: list[str] = []
     connection.executemany(
         "INSERT INTO raw_stops(stop_id, parent_station, stop_name, platform_code, source_order) VALUES (?, ?, ?, ?, ?)",
@@ -213,9 +222,14 @@ def populate_gtfs(
 
     route_ids: list[str] = []
     connection.executemany(
-        "INSERT INTO routes(route_id, short_name, long_name) VALUES (?, ?, ?)",
+        "INSERT INTO routes(route_id, short_name, long_name, route_type) VALUES (?, ?, ?, ?)",
         (
-            (identifier_prefix + row["route_id"].strip(), row.get("route_short_name", "").strip(), row.get("route_long_name", "").strip())
+            (
+                identifier_prefix + row["route_id"].strip(),
+                row.get("route_short_name", "").strip(),
+                row.get("route_long_name", "").strip(),
+                row.get("route_type", "").strip(),
+            )
             for row in gtfs_rows(archive, "routes.txt") if row.get("route_id", "").strip()
         ),
     )

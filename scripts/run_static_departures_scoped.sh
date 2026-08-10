@@ -26,6 +26,13 @@ if [[ "$DRY_RUN" == "1" ]]; then
   exec python3 "$REPO/scripts/static_departures_scoped.py" "$@"
 fi
 
+STATIC_511_SECRET_FILE="${STATIC_511_SECRET_FILE:-/srv/haltewecker/secrets/usa_511/.env}"
+if [[ -f "$STATIC_511_SECRET_FILE" ]]; then
+  set -a
+  source "$STATIC_511_SECRET_FILE"
+  set +a
+fi
+
 mkdir -p "$(dirname "$LOCK_PATH")"
 exec 9>"$LOCK_PATH"
 if ! "$FLOCK_BIN" -n 9; then

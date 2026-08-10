@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 from translink_gateway import TransLinkProxy
 from ttc_gateway import TTCProxy
 from tfl_gateway import TfLProxy
+from bay_area_gateway import BayAreaTripUpdatesProxy, BayAreaVehiclePositionsProxy
 
 
 DEFAULT_TIMEZONE = "Europe/Berlin"
@@ -93,6 +94,58 @@ class Database:
                 return cursor.fetchone() is not None
             finally:
                 cursor.close()
+
+    def provider_trip_registry(
+        self,
+        provider_id: str,
+    ) -> tuple[set[str], dict[str, str]]:
+        """Return internal trip ownership for realtime validation only."""
+        with self.lock:
+            try:
+                rows = self._connection().execute(
+                    """
+                    SELECT owned.key_1, trips.route_id
+                    FROM provider_entities AS owned
+                    JOIN trips ON trips.trip_id = owned.key_1
+                    WHERE owned.entity_type='trips' AND owned.provider_id=?
+                    """,
+                    (provider_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return set(), {}
+        return {str(row[0]) for row in rows}, {
+            str(row[0]): str(row[1]) for row in rows if row[1]
+        }
+
+    def provider_realtime_registry(
+        self,
+        provider_id: str,
+    ) -> tuple[set[str], set[str], dict[str, str]]:
+        """Return internal trip/route ownership without exposing it publicly."""
+        with self.lock:
+            try:
+                rows = self._connection().execute(
+                    """
+                    SELECT owned.key_1, trips.route_id
+                    FROM provider_entities AS owned
+                    JOIN trips ON trips.trip_id = owned.key_1
+                    WHERE owned.entity_type='trips' AND owned.provider_id=?
+                    """,
+                    (provider_id,),
+                ).fetchall()
+                route_rows = self._connection().execute(
+                    """
+                    SELECT key_1 FROM provider_entities
+                    WHERE entity_type='routes' AND provider_id=?
+                    """,
+                    (provider_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return set(), set(), {}
+        trips = {str(row[0]) for row in rows}
+        route_by_trip = {str(row[0]): str(row[1]) for row in rows if row[1]}
+        routes = {str(row[0]) for row in route_rows}
+        return trips, routes, route_by_trip
 
     def city_departure_mode(self, city_id: str) -> tuple[str, str, str, str]:
         with self.lock:
@@ -302,6 +355,8 @@ class Handler(BaseHTTPRequestHandler):
     tfl_gateway: TfLProxy | None = None
     translink_gateway: TransLinkProxy | None = None
     ttc_gateway: TTCProxy | None = None
+    bay_area_trip_updates_gateway: BayAreaTripUpdatesProxy | None = None
+    bay_area_vehicle_positions_gateway: BayAreaVehiclePositionsProxy | None = None
 
     def send_json(
         self,
@@ -392,6 +447,16 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "TTC provider unavailable"})
                 response = self.ttc_gateway.handle(parsed.path, query)
                 return self.send_json(response.status, response.payload, response.cache_control)
+            if parsed.path == "/511/realtime/trip-updates":
+                if self.bay_area_trip_updates_gateway is None:
+                    return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "511 Bay Area provider unavailable"})
+                response = self.bay_area_trip_updates_gateway.handle(parsed.path, query)
+                return self.send_json(response.status, response.payload, response.cache_control)
+            if parsed.path == "/511/realtime/vehicle-positions":
+                if self.bay_area_vehicle_positions_gateway is None:
+                    return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "511 Bay Area provider unavailable"})
+                response = self.bay_area_vehicle_positions_gateway.handle(parsed.path, query)
+                return self.send_json(response.status, response.payload, response.cache_control)
             for prefix in STATIC_DATA_PATH_PREFIXES:
                 if parsed.path.startswith(prefix):
                     return self.send_static_file(parsed.path[len(prefix):])
@@ -441,4 +506,10 @@ if __name__ == "__main__":
     Handler.tfl_gateway = TfLProxy.from_environment()
     Handler.translink_gateway = TransLinkProxy.from_environment()
     Handler.ttc_gateway = TTCProxy.from_environment()
+    Handler.bay_area_trip_updates_gateway = BayAreaTripUpdatesProxy.from_environment(
+        valid_trip_registry=lambda: database.provider_trip_registry("511-bay-area")
+    )
+    Handler.bay_area_vehicle_positions_gateway = BayAreaVehiclePositionsProxy.from_environment(
+        valid_registry=lambda: database.provider_realtime_registry("511-bay-area")
+    )
     ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Handler).serve_forever()
