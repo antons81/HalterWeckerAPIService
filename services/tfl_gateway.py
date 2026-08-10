@@ -15,7 +15,8 @@ from urllib.request import Request, urlopen
 
 
 TFL_API_BASE_URL = "https://api.tfl.gov.uk"
-TFL_MODES = "bus,tube"
+TFL_MODES = "bus,tube,overground,elizabeth-line,dlr,tram,national-rail"
+TFL_STOP_TYPES = "NaptanPublicBusCoachTram,NaptanMetroStation,NaptanRailStation,TransportInterchange"
 
 
 @dataclass(frozen=True)
@@ -167,12 +168,18 @@ class TfLProxy:
                     ("lon", str(longitude)),
                     ("radius", str(radius)),
                     ("modes", TFL_MODES),
-                    ("stopTypes", "NaptanPublicBusCoachTram,NaptanMetroStation"),
+                    ("stopTypes", TFL_STOP_TYPES),
                 ],
                 60.0,
             )
 
         parts = [part for part in path.split("/") if part]
+        if len(parts) == 3 and parts[:2] == ["tfl", "stops"]:
+            stop_id = self._path_id(parts[2])
+            if stop_id is None:
+                return None
+            return f"/StopPoint/{quote(stop_id, safe='')}", [], 60.0
+
         if len(parts) == 4 and parts[:2] == ["tfl", "stops"] and parts[3] == "arrivals":
             stop_id = self._path_id(parts[2])
             if stop_id is None:

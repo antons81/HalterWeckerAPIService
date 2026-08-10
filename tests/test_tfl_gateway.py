@@ -41,7 +41,10 @@ class TfLProxyTests(unittest.TestCase):
         self.assertEqual(second.payload, first.payload)
         self.assertEqual(len(calls), 1)
         self.assertIn("/StopPoint/Search/Oxford%20Circus", calls[0])
-        self.assertIn("modes=bus%2Ctube", calls[0])
+        self.assertIn(
+            "modes=bus%2Ctube%2Coverground%2Celizabeth-line%2Cdlr%2Ctram%2Cnational-rail",
+            calls[0],
+        )
         self.assertIn("app_key=test-key", calls[0])
 
     def test_routes_nearby_arrivals_vehicle_and_topology(self) -> None:
@@ -66,6 +69,21 @@ class TfLProxyTests(unittest.TestCase):
         self.assertIn("/StopPoint/940GZZLUOXC/Arrivals?", calls[1])
         self.assertIn("/Vehicle/LTZ1030/Arrivals?", calls[2])
         self.assertIn("/Line/159/Route/Sequence/inbound?", calls[3])
+
+    def test_multimodal_stop_detail_uses_full_tfl_stop_point_payload(self) -> None:
+        calls: list[str] = []
+
+        def transport(url: str, _timeout: float) -> tuple[int, bytes]:
+            calls.append(url)
+            return 200, b'{"id":"HUBKGX","modes":["tube","national-rail"],"children":[]}'
+
+        proxy = TfLProxy(api_key="test-key", transport=transport)
+
+        response = proxy.handle("/tfl/stops/HUBKGX", {})
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.payload["id"], "HUBKGX")
+        self.assertIn("/StopPoint/HUBKGX?", calls[0])
 
     def test_upstream_errors_are_sanitized(self) -> None:
         def transport(_url: str, _timeout: float) -> tuple[int, bytes]:
