@@ -160,6 +160,7 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
             self.assertEqual(source["timezone"], "America/Toronto")
             self.assertEqual(source["mergeGroup"], "toronto")
             self.assertTrue(str(source["namespace"]).startswith("ttc-"))
+            self.assertTrue(source["importIntoStaticDepartures"])
             self.assertNotIn("apiKey", source)
 
         cities = load_external_cities(ttc_sources[0], REPOSITORY_ROOT)
@@ -168,6 +169,10 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
         provider = city["providers"][0]
         self.assertEqual(city["cityID"], "toronto-ca")
         self.assertEqual(provider["providerID"], "ttc-toronto")
+        self.assertEqual(
+            provider["boardURL"],
+            "https://api.asoftlabs.app/static-departures",
+        )
         self.assertEqual(
             provider["realtimeURL"],
             "https://api.asoftlabs.app/ttc/realtime/trip-updates",

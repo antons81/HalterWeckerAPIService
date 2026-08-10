@@ -40,6 +40,7 @@ IMPORT_ARGS=(
   --gtfs-url "$GTFS_URL"
   --stop-data "$STOP_DATA_PATH"
   --next "$NEXT_DATABASE_PATH"
+  --external-sources "$REPO/config/external-gtfs-sources.json"
 )
 if [[ -n "$RELEASE_ID" ]]; then
   IMPORT_ARGS+=(--release-id "$RELEASE_ID")
@@ -49,6 +50,40 @@ if [[ -n "$AUSTRIAN_GTFS_PATH" ]]; then
 elif [[ -d "$AUSTRIAN_GTFS_DIR" && -f "$AUSTRIAN_GTFS_DIR/.env" ]]; then
   IMPORT_ARGS+=(--austrian-gtfs-dir "$AUSTRIAN_GTFS_DIR" --austrian-sources "$REPO/config/austrian-sources.json")
 fi
+EXTERNAL_GTFS_IMPORT_ARGS=()
+while IFS= read -r external_mapping; do
+  [[ -n "$external_mapping" ]] || continue
+  EXTERNAL_GTFS_IMPORT_ARGS+=(--external-gtfs-url "$external_mapping")
+done < <(python3 - "${EXTERNAL_GTFS_ARTIFACTS_JSON:-}" "$REPO/config/external-gtfs-sources.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+artifact_path = sys.argv[1].strip()
+sources_path = Path(sys.argv[2])
+sources = json.loads(sources_path.read_text(encoding="utf-8"))
+enabled = {
+    str(source["id"])
+    for source in sources
+    if source.get("importIntoStaticDepartures") is True
+}
+
+if artifact_path:
+    payload = json.loads(Path(artifact_path).read_text(encoding="utf-8"))
+    for source_id, entry in sorted(payload.get("external", {}).items()):
+        if source_id in enabled and isinstance(entry, dict) and entry.get("path"):
+            print(f"{source_id}={entry['path']}")
+else:
+    for source in sources:
+        source_id = str(source.get("id", ""))
+        if source_id not in enabled:
+            continue
+        value = str(source.get("localPath") or source.get("url") or "").strip()
+        if value:
+            print(f"{source_id}={value}")
+PY
+)
+IMPORT_ARGS+=("${EXTERNAL_GTFS_IMPORT_ARGS[@]}")
 python3 "$REPO/scripts/import_static_departures_database.py" "${IMPORT_ARGS[@]}"
 echo "$LOG_PREFIX release=${RELEASE_ID:-legacy} stage=import duration=$((SECONDS - stage_started))s"
 

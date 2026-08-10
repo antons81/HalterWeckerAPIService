@@ -62,6 +62,7 @@
     "buildRoutes": true,
     "buildDepartures": true,
     "buildTripIndex": true,
+    "importIntoStaticDepartures": true,
     "country": "CA"
   },
   {
@@ -77,6 +78,7 @@
     "buildRoutes": true,
     "buildDepartures": true,
     "buildTripIndex": true,
+    "importIntoStaticDepartures": true,
     "country": "CA"
   }
 ]

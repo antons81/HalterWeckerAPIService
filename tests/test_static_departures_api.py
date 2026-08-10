@@ -277,6 +277,57 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                 self.assertEqual(aliased["requestedCityID"], "koeln")
                 self.assertEqual(aliased["lines"][0]["line"], "7")
 
+    def test_toronto_namespaced_board_is_stop_scoped_and_isolated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "current.sqlite"
+            write_database(path, "toronto")
+            database = sqlite3.connect(path)
+            try:
+                database.execute(
+                    "CREATE TABLE city_departure_modes (city_id TEXT PRIMARY KEY, mode TEXT NOT NULL, timezone TEXT NOT NULL, stop_id_prefix TEXT NOT NULL DEFAULT '')"
+                )
+                database.execute(
+                    "INSERT INTO city_departure_modes VALUES ('toronto', 'canonical', 'America/Toronto', '')"
+                )
+                database.execute(
+                    "INSERT INTO raw_stops VALUES (?, ?, ?, ?, ?, ?)",
+                    ("ttc-surface:100", "", "TTC Surface", "", 10, "ttc-surface:100"),
+                )
+                database.execute(
+                    "INSERT INTO city_stops VALUES (?, ?)",
+                    ("toronto", "ttc-surface:100"),
+                )
+                database.execute(
+                    "INSERT INTO routes VALUES (?, ?, ?)",
+                    ("ttc-surface:506", "506", "Carlaw"),
+                )
+                database.execute(
+                    "INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?)",
+                    ("ttc-surface:trip-1", "ttc-surface:service-1", "ttc-surface:506", "Carlaw", "0", "terminal"),
+                )
+                database.execute(
+                    "INSERT INTO active_services VALUES (?, ?)",
+                    ("ttc-surface:service-1", "20260728"),
+                )
+                database.execute(
+                    "INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)",
+                    ("ttc-surface:trip-1", "ttc-surface:100", "08:00:00", 28_800, 1),
+                )
+                database.commit()
+            finally:
+                database.close()
+
+            with StaticDeparturesHTTPServer(path) as server:
+                board = server.get(
+                    "/static-departures/board?cityID=toronto&stopID=ttc-surface:100&limit=1"
+                )
+
+            self.assertEqual(board["cityID"], "toronto")
+            self.assertEqual(board["stopID"], "ttc-surface:100")
+            self.assertEqual(len(board["departures"]), 1)
+            self.assertEqual(board["departures"][0]["tripID"], "ttc-surface:trip-1")
+            self.assertEqual(board["departures"][0]["stopID"], "ttc-surface:100")
+
     def test_lines_are_topology_and_keep_multiple_destinations_without_active_services(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "current.sqlite"

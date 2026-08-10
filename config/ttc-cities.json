@@ -14,6 +14,7 @@
       "isExperimental": false,
       "features": ["realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay", "tripUpdates"],
       "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
       "realtimeURL": "https://api.asoftlabs.app/ttc/realtime/trip-updates",
       "statusMessage": "Live-Abfahrten und statische Fahrpläne für Toronto"
     }

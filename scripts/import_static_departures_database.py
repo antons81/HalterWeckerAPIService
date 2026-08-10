@@ -250,7 +250,10 @@ def add_external_gtfs(
                 connection,
                 archive,
                 identifier_prefix=str(source["identifierPrefix"]),
-                stop_id_prefix=str(source["identifierPrefix"]),
+                stop_id_prefix=(
+                    str(source.get("namespace", "")).strip()
+                    or str(source["identifierPrefix"])
+                ),
             )
         imported_city_ids.update(str(city["id"]) for city in cities)
 
@@ -272,18 +275,23 @@ def add_external_gtfs(
         connection.execute(
             "ALTER TABLE city_departure_modes ADD COLUMN stop_id_prefix TEXT NOT NULL DEFAULT ''"
         )
-    source_by_city: dict[str, str] = {}
+    source_ids_by_city: dict[str, list[str]] = {}
     for source_id in url_by_provider:
         source = sources_by_id[source_id]
         for city in load_external_cities(source, repository_root):
-            source_by_city[str(city["id"])] = source_id
+            source_ids_by_city.setdefault(str(city["id"]), []).append(source_id)
     connection.executemany(
         "INSERT OR IGNORE INTO city_departure_modes(city_id, mode, timezone, stop_id_prefix) VALUES (?, 'canonical', ?, ?)",
         (
             (
                 city_id,
-                str(sources_by_id[source_by_city[city_id]]["timezone"]),
-                str(sources_by_id[source_by_city[city_id]]["identifierPrefix"]),
+                str(sources_by_id[source_ids_by_city[city_id][0]]["timezone"]),
+                (
+                    str(sources_by_id[source_ids_by_city[city_id][0]]["identifierPrefix"])
+                    if len(source_ids_by_city[city_id]) == 1
+                    and not str(sources_by_id[source_ids_by_city[city_id][0]].get("namespace", "")).strip()
+                    else ""
+                ),
             )
             for city_id in sorted(imported_city_ids)
         ),
@@ -310,11 +318,12 @@ def main() -> None:
     parser.add_argument("--db", default="",
                         help="Existing database to augment with --add-external.")
     parser.add_argument("--external-gtfs-url", action="append", default=[],
-                        help="External feed providerID=URL (repeatable, used with --add-external).")
+                        help="External feed providerID=URL (repeatable).")
     parser.add_argument("--timezone", default="",
                         help="Service-window timezone for active services (default: first external source timezone, else Europe/Berlin).")
     parser.add_argument("--external-sources", default=str(REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"))
     args = parser.parse_args()
+    url_by_provider = parse_external_gtfs_url_args(args.external_gtfs_url)
     next_path = Path(args.next)
     if not args.add_external:
         next_path.parent.mkdir(parents=True, exist_ok=True)
@@ -322,7 +331,6 @@ def main() -> None:
     dates = service_window(DEFAULT_TIMEZONE, args.days)
 
     if args.add_external:
-        url_by_provider = parse_external_gtfs_url_args(args.external_gtfs_url)
         if not url_by_provider:
             raise ValueError("--add-external requires at least one --external-gtfs-url.")
         database_path = Path(args.db)
@@ -369,6 +377,7 @@ def main() -> None:
     with load_gtfs_archive(args.gtfs_url) as archive:
         connection = connect(next_path)
         try:
+            imported_external_city_ids: set[str] = set()
             timed_stage("germany", "populate_gtfs", lambda: populate_gtfs(connection, archive))
             austrian_city_ids = configured_austrian_static_city_ids(Path(args.cities))
             if args.austrian_gtfs_dir:
@@ -427,6 +436,20 @@ def main() -> None:
                 ("validFrom", dates[0].isoformat()), ("validThrough", dates[-1].isoformat()),
                 ("timezone", DEFAULT_TIMEZONE),
             ))
+            if url_by_provider:
+                external_timezone = _external_window_timezone(
+                    Path(args.external_sources), url_by_provider
+                )
+                external_dates = service_window(external_timezone, args.days)
+                imported_external_city_ids = timed_stage("external", "populate_gtfs", lambda: add_external_gtfs(
+                    connection,
+                    Path(args.stop_data),
+                    url_by_provider,
+                    repository_root=REPOSITORY_ROOT,
+                    sources_path=Path(args.external_sources),
+                    dates=external_dates,
+                ))
+                city_ids.update(imported_external_city_ids)
             timed_stage("all", "validation", lambda: validate(connection))
             connection.commit()
         finally:

@@ -233,6 +233,7 @@ PY
 echo "[StopData] release=$RELEASE_ID stage=validation duration=$(elapsed_seconds "$VALIDATION_STARTED")"
 
 STATIC_STARTED=$SECONDS
+EXTERNAL_GTFS_ARTIFACTS_JSON="$ARTIFACTS_JSON" \
 STOP_DATA_PATH="$BUILD_DIR" \
 NEXT_DATABASE_PATH="$RELEASE_DIR/departures.sqlite" \
 RELEASE_ID="$RELEASE_ID" \

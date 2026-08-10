@@ -211,7 +211,8 @@ class Database:
         with self.lock:
             cursor = self._connection().execute(
                 f"""
-                SELECT a.service_date,s.departure_time,s.departure_seconds,t.trip_id,t.route_id,
+                SELECT a.service_date,s.departure_time,s.departure_seconds,s.stop_sequence,s.raw_stop_id,
+                       t.trip_id,t.route_id,
                        COALESCE(NULLIF(r.short_name,''),NULLIF(r.long_name,''),t.route_id),
                        COALESCE(NULLIF(t.headsign,''),NULLIF(destination_stops.stop_name,''),'Unbekanntes Ziel'),
                        t.direction_id, t.terminal_stop_id, rs.platform_code
@@ -244,9 +245,11 @@ class Database:
                 "directionKey": self._direction_key(route_id, direction, destination_stop_id, destination),
                 "destinationStopID": destination_stop_id or None,
                 "platform": platform or None,
+                "stopID": raw_stop_id,
+                "stopSequence": stop_sequence,
                 "isRealtime": False
             }
-            for service_date, departure_time, _seconds, trip_id, route_id, line, destination, direction, destination_stop_id, platform in rows
+            for service_date, departure_time, _seconds, stop_sequence, raw_stop_id, trip_id, route_id, line, destination, direction, destination_stop_id, platform in rows
         ]
 
 
