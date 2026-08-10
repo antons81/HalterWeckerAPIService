@@ -27,6 +27,13 @@ from external_gtfs import (
     parse_external_gtfs_url_args,
     validate_external_gtfs_source,
 )
+from static_departures_ownership import (
+    has_ownership_schema,
+    rebuild_city_departure_modes,
+    rebuild_city_stops,
+    register_city_mode,
+    register_city_stops,
+)
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -85,6 +92,7 @@ def populate_city_memberships(
     stop_data: Path,
     included_city_ids: set[str] | None = None,
     excluded_city_ids: set[str] | None = None,
+    provider_id: str | None = None,
 ) -> set[str]:
     manifest_path = stop_data / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -109,16 +117,20 @@ def populate_city_memberships(
         package = json.loads(package_path.read_text(encoding="utf-8"))
         if not isinstance(package, list):
             raise ValueError(f"Invalid stop package for {city_id}")
+        memberships: list[tuple[str, str]] = []
         stop_ids: set[str] = set()
         for stop in package:
             if not isinstance(stop, dict) or not stop.get("id"):
                 continue
             stop_ids.add(str(stop["id"]))
             stop_ids.update(str(alias) for alias in stop.get("sourceStopIDs", []) if alias)
+        memberships.extend((city_id, stop_id) for stop_id in sorted(stop_ids))
         connection.executemany(
             "INSERT OR IGNORE INTO city_stops(city_id, stop_id) VALUES (?, ?)",
-            ((city_id, stop_id) for stop_id in stop_ids),
+            memberships,
         )
+        if provider_id is not None:
+            register_city_stops(connection, provider_id, memberships)
         city_ids.add(city_id)
     connection.commit()
     return city_ids
@@ -127,13 +139,90 @@ def populate_city_memberships(
 def populate_german_city_memberships(
     connection: sqlite3.Connection,
     stop_data: Path,
-    excluded_city_ids: set[str]
+    excluded_city_ids: set[str],
+    provider_id: str = "germany",
 ) -> set[str]:
     return populate_city_memberships(
         connection,
         stop_data,
         excluded_city_ids=excluded_city_ids,
+        provider_id=provider_id,
     )
+
+
+def populate_provider_city_memberships(
+    connection: sqlite3.Connection,
+    stop_data: Path,
+    included_city_ids: set[str],
+) -> set[str]:
+    """Map package memberships to the providers that own their GTFS stop IDs."""
+    manifest = json.loads((stop_data / "manifest.json").read_text(encoding="utf-8"))
+    cities = manifest.get("cities")
+    if not isinstance(cities, list):
+        raise ValueError("Stop manifest must contain a cities array.")
+    if not has_ownership_schema(connection):
+        return populate_city_memberships(
+            connection,
+            stop_data,
+            included_city_ids=included_city_ids,
+        )
+
+    city_ids: set[str] = set()
+    for city in cities:
+        if not isinstance(city, dict) or not isinstance(city.get("id"), str):
+            raise ValueError("Stop manifest contains an invalid city entry.")
+        city_id = str(city["id"])
+        if city_id not in included_city_ids:
+            continue
+        package_path = stop_data / str(city.get("url", ""))
+        package = json.loads(package_path.read_text(encoding="utf-8"))
+        if not isinstance(package, list):
+            raise ValueError(f"Invalid stop package for {city_id}")
+        package_stop_ids: set[str] = set()
+        owned_ids: dict[str, set[str]] = {}
+        for stop in package:
+            if not isinstance(stop, dict) or not stop.get("id"):
+                continue
+            stop_ids = {str(stop["id"])}
+            stop_ids.update(str(alias) for alias in stop.get("sourceStopIDs", []) if alias)
+            package_stop_ids.update(stop_ids)
+            placeholders = ",".join("?" for _ in stop_ids)
+            rows = connection.execute(
+                """
+                SELECT provider_id, key_1
+                FROM provider_entities
+                WHERE entity_type = 'raw_stops'
+                  AND key_1 IN (%s)
+                """ % placeholders,
+                tuple(sorted(stop_ids)),
+            )
+            owners = [(str(provider), str(stop_id)) for provider, stop_id in rows]
+            if not owners:
+                raise ValueError(
+                    f"Could not resolve provider ownership for package stop "
+                    f"{city_id}/{stop.get('id')}"
+                )
+            for provider, stop_id in owners:
+                owned_ids.setdefault(provider, set()).add(stop_id)
+            unresolved_public_id = str(stop["id"]) not in {stop_id for _, stop_id in owners}
+            if unresolved_public_id:
+                for provider, _ in owners:
+                    owned_ids.setdefault(provider, set()).add(str(stop["id"]))
+
+        memberships = [(city_id, stop_id) for stop_id in sorted(package_stop_ids)]
+        connection.executemany(
+            "INSERT OR IGNORE INTO city_stops(city_id, stop_id) VALUES (?, ?)",
+            memberships,
+        )
+        for provider, stop_ids in owned_ids.items():
+            register_city_stops(
+                connection,
+                provider,
+                ((city_id, stop_id) for stop_id in sorted(stop_ids)),
+            )
+        city_ids.add(city_id)
+    connection.commit()
+    return city_ids
 
 
 def configured_austrian_static_city_ids(cities_path: Path) -> set[str]:
@@ -170,6 +259,7 @@ def import_austrian_gtfs(
                     archive,
                     identifier_prefix=str(source["identifierPrefix"]),
                     stop_id_prefix=stop_prefix,
+                    provider_id=source_id,
                 ),
             )
         imported_city_ids.update(str(city) for city in source["cities"])
@@ -178,11 +268,23 @@ def import_austrian_gtfs(
             "Austrian registry/city configuration mismatch: "
             f"registry={sorted(imported_city_ids)} configured={sorted(expected_city_ids)}"
         )
-    return populate_city_memberships(
+    imported_city_ids = populate_provider_city_memberships(
         connection,
         stop_data,
         included_city_ids=expected_city_ids,
     )
+    for source in registry:
+        source_id = str(source["id"])
+        for city_id in source["cities"]:
+            if city_id in expected_city_ids:
+                register_city_mode(
+                    connection,
+                    source_id,
+                    str(city_id),
+                    "exact-stop-with-parent-fallback",
+                    "Europe/Vienna",
+                )
+    return imported_city_ids
 
 
 def validate(connection: sqlite3.Connection) -> None:
@@ -221,6 +323,7 @@ def add_external_gtfs(
     repository_root: Path,
     sources_path: Path,
     dates: list[date],
+    populate_memberships: bool = True,
 ) -> set[str]:
     """Augment an existing static departures database with external GTFS feeds.
 
@@ -256,6 +359,7 @@ def add_external_gtfs(
                         or str(source["identifierPrefix"])
                     )))
                 ),
+                provider_id=source_id,
             )
         imported_city_ids.update(str(city["id"]) for city in cities)
 
@@ -263,11 +367,12 @@ def add_external_gtfs(
         return imported_city_ids
 
     resolve_canonical_stops(connection)
-    populate_city_memberships(
-        connection,
-        stop_data,
-        included_city_ids=imported_city_ids,
-    )
+    if populate_memberships:
+        populate_provider_city_memberships(
+            connection,
+            stop_data,
+            included_city_ids=imported_city_ids,
+        )
     populate_active_services(connection, dates)
     update_terminal_stops(connection)
 
@@ -313,6 +418,31 @@ def add_external_gtfs(
             for city_id in sorted(imported_city_ids)
         ),
     )
+    for city_id in sorted(imported_city_ids):
+        for source_id in source_ids_by_city[city_id]:
+            source = sources_by_id[source_id]
+            register_city_mode(
+                connection,
+                source_id,
+                city_id,
+                "canonical",
+                str(source["timezone"]),
+                (
+                    str(source.get("staticStopIDPrefix", (
+                        str(source.get("namespace", "")).strip()
+                        or str(source["identifierPrefix"])
+                    )))
+                    if len(source_ids_by_city[city_id]) == 1
+                    and not str(source.get("namespace", "")).strip()
+                    else ""
+                ),
+                (
+                    str(source.get("staticIdentifierPrefix", ""))
+                    if len(source_ids_by_city[city_id]) == 1
+                    and not str(source.get("namespace", "")).strip()
+                    else ""
+                ),
+            )
     connection.commit()
     return imported_city_ids
 
@@ -407,7 +537,16 @@ def main() -> None:
                 )
             elif args.austrian_gtfs:
                 with load_gtfs_archive(args.austrian_gtfs) as austrian_archive:
-                    timed_stage("austria:vor", "populate_gtfs", lambda: populate_gtfs(connection, austrian_archive, identifier_prefix="vor:"))
+                    timed_stage(
+                        "austria:vor",
+                        "populate_gtfs",
+                        lambda: populate_gtfs(
+                            connection,
+                            austrian_archive,
+                            identifier_prefix="vor:",
+                            provider_id="vor",
+                        ),
+                    )
             timed_stage("all", "canonical-stops", lambda: resolve_canonical_stops(connection))
             city_ids = timed_stage("all", "city-memberships", lambda: populate_german_city_memberships(
                 connection, Path(args.stop_data), configured_external_city_ids(Path(args.cities), Path(args.swiss_cities))
@@ -420,6 +559,7 @@ def main() -> None:
                         connection,
                         Path(args.stop_data),
                         included_city_ids=austrian_city_ids,
+                        provider_id="vor",
                     ))
                 else:
                     city_ids.update(austrian_city_ids)
@@ -445,6 +585,14 @@ def main() -> None:
                 "INSERT INTO city_departure_modes(city_id, mode, timezone) VALUES (?, 'exact-stop-with-parent-fallback', 'Europe/Vienna')",
                 ((city_id,) for city_id in sorted(austrian_city_ids)),
             )
+            for city_id in sorted(austrian_city_ids):
+                register_city_mode(
+                    connection,
+                    "vor",
+                    city_id,
+                    "exact-stop-with-parent-fallback",
+                    "Europe/Vienna",
+                )
             populate_city_aliases(connection, load_city_aliases(Path(args.city_id_aliases)), city_ids)
             version = str(uuid.uuid4())
             connection.executemany("INSERT INTO metadata VALUES (?, ?)", (
@@ -468,6 +616,8 @@ def main() -> None:
                     dates=external_dates,
                 ))
                 city_ids.update(imported_external_city_ids)
+            rebuild_city_stops(connection)
+            rebuild_city_departure_modes(connection)
             timed_stage("all", "validation", lambda: validate(connection))
             connection.commit()
         finally:

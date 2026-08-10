@@ -16,10 +16,12 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from build_stop_packages import load_gtfs_archive, normalized
+from static_departures_ownership import ensure_ownership_schema, register_entities
 
 
 SCHEMA_VERSION = 1
 DEFAULT_TIMEZONE = "Europe/Berlin"
+DEFAULT_PROVIDER_ID = "germany"
 
 
 def gtfs_rows(archive: zipfile.ZipFile, name: str) -> Iterable[dict[str, str]]:
@@ -136,6 +138,7 @@ def connect(database_path: Path) -> sqlite3.Connection:
         CREATE INDEX stop_times_by_trip ON stop_times(trip_id, stop_sequence);
         """
     )
+    ensure_ownership_schema(connection)
     return connection
 
 
@@ -174,12 +177,14 @@ def populate_gtfs(
     *,
     identifier_prefix: str = "",
     stop_id_prefix: str = "",
+    provider_id: str = DEFAULT_PROVIDER_ID,
 ) -> None:
     required = {"stops.txt", "routes.txt", "trips.txt", "stop_times.txt"}
     missing = required - set(archive.namelist())
     if missing:
         raise ValueError(f"GTFS archive is missing required files: {', '.join(sorted(missing))}")
 
+    stop_ids: list[str] = []
     connection.executemany(
         "INSERT INTO raw_stops(stop_id, parent_station, stop_name, platform_code, source_order) VALUES (?, ?, ?, ?, ?)",
         (
@@ -194,6 +199,19 @@ def populate_gtfs(
             if row.get("stop_id", "").strip()
         ),
     )
+    stop_ids.extend(
+        stop_id_prefix + row["stop_id"].strip()
+        for row in gtfs_rows(archive, "stops.txt")
+        if row.get("stop_id", "").strip()
+    )
+    register_entities(
+        connection,
+        provider_id,
+        "raw_stops",
+        ((stop_id,) for stop_id in stop_ids),
+    )
+
+    route_ids: list[str] = []
     connection.executemany(
         "INSERT INTO routes(route_id, short_name, long_name) VALUES (?, ?, ?)",
         (
@@ -201,6 +219,19 @@ def populate_gtfs(
             for row in gtfs_rows(archive, "routes.txt") if row.get("route_id", "").strip()
         ),
     )
+    route_ids.extend(
+        identifier_prefix + row["route_id"].strip()
+        for row in gtfs_rows(archive, "routes.txt")
+        if row.get("route_id", "").strip()
+    )
+    register_entities(
+        connection,
+        provider_id,
+        "routes",
+        ((route_id,) for route_id in route_ids),
+    )
+
+    trip_ids: list[str] = []
     connection.executemany(
         "INSERT INTO trips(trip_id, service_id, route_id, headsign, direction_id) VALUES (?, ?, ?, ?, ?)",
         (
@@ -209,17 +240,56 @@ def populate_gtfs(
             if row.get("trip_id", "").strip() and row.get("service_id", "").strip()
         ),
     )
+    trip_ids.extend(
+        identifier_prefix + row["trip_id"].strip()
+        for row in gtfs_rows(archive, "trips.txt")
+        if row.get("trip_id", "").strip() and row.get("service_id", "").strip()
+    )
+    register_entities(
+        connection,
+        provider_id,
+        "trips",
+        ((trip_id,) for trip_id in trip_ids),
+    )
+    calendar_ids: list[str] = []
     if "calendar.txt" in archive.namelist():
         connection.executemany(
             "INSERT INTO calendar VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             ((identifier_prefix + row["service_id"].strip(), row.get("start_date", "").strip(), row.get("end_date", "").strip(), int(row.get("monday", "0") or 0), int(row.get("tuesday", "0") or 0), int(row.get("wednesday", "0") or 0), int(row.get("thursday", "0") or 0), int(row.get("friday", "0") or 0), int(row.get("saturday", "0") or 0), int(row.get("sunday", "0") or 0))
              for row in gtfs_rows(archive, "calendar.txt") if row.get("service_id", "").strip()),
         )
+        calendar_ids.extend(
+            identifier_prefix + row["service_id"].strip()
+            for row in gtfs_rows(archive, "calendar.txt")
+            if row.get("service_id", "").strip()
+        )
+        register_entities(
+            connection,
+            provider_id,
+            "calendar",
+            ((service_id,) for service_id in calendar_ids),
+        )
+    calendar_date_keys: list[tuple[str, str, str]] = []
     if "calendar_dates.txt" in archive.namelist():
         connection.executemany(
             "INSERT INTO calendar_dates VALUES (?, ?, ?)",
             ((identifier_prefix + row["service_id"].strip(), row.get("date", "").strip(), int(row.get("exception_type", "0") or 0))
              for row in gtfs_rows(archive, "calendar_dates.txt") if row.get("service_id", "").strip() and row.get("date", "").strip()),
+        )
+        calendar_date_keys.extend(
+            (
+                identifier_prefix + row["service_id"].strip(),
+                row.get("date", "").strip(),
+                row.get("exception_type", "0").strip(),
+            )
+            for row in gtfs_rows(archive, "calendar_dates.txt")
+            if row.get("service_id", "").strip() and row.get("date", "").strip()
+        )
+        register_entities(
+            connection,
+            provider_id,
+            "calendar_dates",
+            calendar_date_keys,
         )
 
     batch: list[tuple[str, str, str, int, int]] = []

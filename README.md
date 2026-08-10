@@ -48,6 +48,28 @@ curl -sS https://api.asoftlabs.app/static-departures/health
 
 The expected service state is `Result=success` and `ExecMainStatus=0`; the health response exposes the active database version and generation time.
 
+### Manual scoped static-departures rebuild
+
+The canonical nightly/full pipeline remains unchanged. For manual development work,
+`scripts/run_static_departures_scoped.sh` can replace one existing provider/source or
+all static providers in one configured country:
+
+```bash
+cd /srv/haltewecker/pipeline/HalterWeckerAPIService
+./scripts/run_static_departures_scoped.sh --provider translink --dry-run
+./scripts/run_static_departures_scoped.sh --provider translink
+./scripts/run_static_departures_scoped.sh --country CA --dry-run
+```
+
+The command uses provider/source namespaces as the replacement unit, clones the active
+immutable release, validates the complete staged SQLite database, and switches the
+release pointers only after validation. It shares
+`/run/lock/haltewecker-static-departures.lock` with the systemd full pipeline and does
+not change timers or scheduling. A database created before internal ownership metadata
+was introduced must first be refreshed by the canonical full pipeline. `US` is rejected
+until a 511 static-departures source is registered; this command does not load or expose
+the 511 API secret.
+
 The pipeline downloads the official BKG VG250 municipality boundaries and assigns every German stop to its municipality. Only municipalities containing at least one stop are published. Stable automatic city IDs contain the municipality's official AGS code. Cities in `config/cities.json` keep their existing IDs, aliases, larger configured radii, and Transit Radar configuration.
 
 ## Austria / ÖBB static stops

@@ -1,0 +1,648 @@
+#!/usr/bin/env python3
+"""Manual provider-scoped static departures rebuild implementation."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+from build_german_departure_index import (
+    DEFAULT_TIMEZONE,
+    populate_gtfs,
+    resolve_canonical_stops,
+    service_window,
+    update_terminal_stops,
+)
+from build_stop_packages import load_gtfs_archive
+from external_gtfs import (
+    authenticated_external_request,
+    load_external_gtfs_sources,
+)
+from gtfs_source_cache import DEFAULT_CACHE_ROOT, GTFSArtifactCache
+from import_static_departures_database import (
+    add_external_gtfs,
+    configured_austrian_static_city_ids,
+    configured_external_city_ids,
+    populate_german_city_memberships,
+    populate_provider_city_memberships,
+    validate,
+)
+from static_departures_ownership import (
+    delete_provider_data,
+    has_ownership_schema,
+    rebuild_city_departure_modes,
+    rebuild_city_stops,
+    register_city_mode,
+)
+from austrian_sources import load_austrian_sources
+
+
+STATIC_CONTAINER_DEFAULT = "static-departures-api"
+
+
+@dataclass(frozen=True)
+class StaticProvider:
+    provider_id: str
+    country: str
+    kind: str
+    source: dict[str, object] | None = None
+
+
+def load_static_providers(repository_root: Path) -> list[StaticProvider]:
+    """Build the registry from the existing source registries."""
+    providers = [StaticProvider("germany", "DE", "germany")]
+    providers.extend(
+        StaticProvider(str(source["id"]), "AT", "austrian", source)
+        for source in load_austrian_sources(
+            repository_root / "config" / "austrian-sources.json"
+        )
+    )
+    for source in load_external_gtfs_sources(
+        repository_root / "config" / "external-gtfs-sources.json"
+    ):
+        if source.get("importIntoStaticDepartures") is True:
+            country = str(source.get("country", "")).strip().upper()
+            if len(country) != 2:
+                raise ValueError(
+                    f"Static external source {source.get('id', '<unknown>')} "
+                    "has no valid country code."
+                )
+            providers.append(
+                StaticProvider(str(source["id"]), country, "external", source)
+            )
+    return providers
+
+
+def resolve_scope(
+    repository_root: Path,
+    *,
+    provider_id: str = "",
+    country: str = "",
+) -> tuple[str, list[StaticProvider]]:
+    if bool(provider_id.strip()) == bool(country.strip()):
+        raise ValueError("Specify exactly one of --provider or --country.")
+
+    providers = load_static_providers(repository_root)
+    by_id = {provider.provider_id: provider for provider in providers}
+    if provider_id.strip():
+        requested = provider_id.strip()
+        provider = by_id.get(requested)
+        if provider is None:
+            raise ValueError(
+                f"Unknown static-departures provider {requested!r}. "
+                f"Known providers: {', '.join(by_id)}"
+            )
+        return f"provider {requested}", [provider]
+
+    requested_country = country.strip().upper()
+    selected = [
+        provider for provider in providers if provider.country == requested_country
+    ]
+    if not selected:
+        raise ValueError(
+            f"Unknown static-departures country {requested_country!r}; "
+            "no provider is registered for this country."
+        )
+    return f"country {requested_country}", selected
+
+
+def current_release_path(data_root: Path) -> Path | None:
+    pointer = data_root / "current-release"
+    if pointer.exists() or pointer.is_symlink():
+        return pointer.resolve()
+    return None
+
+
+def current_database_path(data_root: Path) -> Path:
+    release = current_release_path(data_root)
+    if release is not None:
+        candidate = release / "departures.sqlite"
+        if candidate.is_file():
+            return candidate
+    compatibility = data_root / "departures-current.sqlite"
+    if compatibility.is_file():
+        return compatibility.resolve()
+    raise ValueError(
+        f"No active static departures database found below {data_root}."
+    )
+
+
+def current_stop_data_path(data_root: Path) -> Path:
+    release = current_release_path(data_root)
+    candidates = []
+    if release is not None:
+        candidates.append(release / "stop-data")
+    candidates.append(data_root / "current")
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    raise ValueError(f"No active stop-data directory found below {data_root}.")
+
+
+def clone_database(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    source_connection = sqlite3.connect(source)
+    destination_connection = sqlite3.connect(destination)
+    try:
+        source_connection.backup(destination_connection)
+        destination_connection.commit()
+    finally:
+        destination_connection.close()
+        source_connection.close()
+
+
+def update_release_metadata(
+    connection: sqlite3.Connection,
+    release_id: str,
+    database_version: str,
+) -> None:
+    generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    connection.executemany(
+        """
+        INSERT INTO metadata(key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (
+            ("databaseVersion", database_version),
+            ("releaseID", release_id),
+            ("generatedAt", generated_at),
+        ),
+    )
+
+
+def resolve_gtfs_artifact(
+    provider_id: str,
+    url: str,
+    environment: dict[str, str],
+) -> Path:
+    request_url, headers = authenticated_external_request(
+        provider_id,
+        url,
+        environ=environment,
+    )
+    cache_root = environment.get("GTFS_CACHE_ROOT", str(DEFAULT_CACHE_ROOT))
+    artifact = GTFSArtifactCache(cache_root).resolve(
+        provider_id,
+        request_url,
+        headers=headers,
+        allow_stale=True,
+        state_url=url,
+    )
+    return artifact.path
+
+
+def resolve_external_artifact(
+    provider: StaticProvider,
+    environment: dict[str, str],
+) -> Path:
+    assert provider.source is not None
+    configured_url = str(provider.source.get("url") or "").strip()
+    local_path = str(provider.source.get("localPath") or "").strip()
+    if local_path:
+        path = Path(local_path)
+        if path.is_dir():
+            return path
+        if not path.is_file():
+            raise ValueError(
+                f"Local external source {provider.provider_id} is missing: {path}"
+            )
+        return path
+    if not configured_url:
+        raise ValueError(
+            f"Static provider {provider.provider_id} has no configured GTFS URL."
+        )
+    return resolve_gtfs_artifact(provider.provider_id, configured_url, environment)
+
+
+def resolve_austrian_archive(
+    provider: StaticProvider,
+    data_root: Path,
+    environment: dict[str, str],
+) -> Path:
+    source_id = provider.provider_id
+    explicit = environment.get("AUSTRIAN_GTFS_PATH", "").strip()
+    if explicit and source_id == "vor":
+        path = Path(explicit)
+        if path.is_file():
+            return path
+    directory = Path(
+        environment.get("AUSTRIAN_GTFS_DIR", str(data_root / "austria"))
+    )
+    candidates = sorted(directory.glob(f"{source_id}-*.zip"))
+    if not candidates:
+        raise ValueError(
+            f"No Austrian GTFS archive found for provider {source_id} in {directory}."
+        )
+    return candidates[-1]
+
+
+def import_germany(
+    connection: sqlite3.Connection,
+    provider: StaticProvider,
+    stop_data: Path,
+    repository_root: Path,
+    environment: dict[str, str],
+    days: int,
+) -> None:
+    url = environment.get("GTFS_URL", "").strip()
+    if not url:
+        raise ValueError("GTFS_URL is required for the germany provider.")
+    archive_path = resolve_gtfs_artifact("germany", url, environment)
+    with load_gtfs_archive(str(archive_path)) as archive:
+        populate_gtfs(connection, archive, provider_id=provider.provider_id)
+    excluded = configured_external_city_ids(
+        repository_root / "config" / "cities.json",
+        repository_root / "config" / "swiss-cities.json",
+    )
+    populate_german_city_memberships(
+        connection,
+        stop_data,
+        excluded,
+        provider_id=provider.provider_id,
+    )
+    from build_german_departure_index import populate_active_services
+
+    populate_active_services(connection, service_window(DEFAULT_TIMEZONE, days))
+
+
+def import_austrian(
+    connection: sqlite3.Connection,
+    providers: list[StaticProvider],
+    stop_data: Path,
+    repository_root: Path,
+    data_root: Path,
+    environment: dict[str, str],
+    days: int,
+) -> None:
+    registry_by_id = {
+        str(source["id"]): source
+        for source in load_austrian_sources(
+            repository_root / "config" / "austrian-sources.json"
+        )
+    }
+    for provider in providers:
+        source = registry_by_id[provider.provider_id]
+        archive_path = resolve_austrian_archive(provider, data_root, environment)
+        with load_gtfs_archive(str(archive_path)) as archive:
+            stop_prefix = (
+                "" if source.get("preserveStopIDs", False)
+                else str(source["identifierPrefix"])
+            )
+            populate_gtfs(
+                connection,
+                archive,
+                identifier_prefix=str(source["identifierPrefix"]),
+                stop_id_prefix=stop_prefix,
+                provider_id=provider.provider_id,
+            )
+        for city_id in source["cities"]:
+            register_city_mode(
+                connection,
+                provider.provider_id,
+                str(city_id),
+                "exact-stop-with-parent-fallback",
+                "Europe/Vienna",
+            )
+    populate_provider_city_memberships(
+        connection,
+        stop_data,
+        configured_austrian_static_city_ids(
+            repository_root / "config" / "cities.json"
+        ),
+    )
+    from build_german_departure_index import populate_active_services
+
+    populate_active_services(connection, service_window("Europe/Vienna", days))
+
+
+def import_external(
+    connection: sqlite3.Connection,
+    providers: list[StaticProvider],
+    stop_data: Path,
+    repository_root: Path,
+    environment: dict[str, str],
+    days: int,
+) -> None:
+    sources_path = repository_root / "config" / "external-gtfs-sources.json"
+    imported_city_ids: set[str] = set()
+    for provider in providers:
+        archive_path = resolve_external_artifact(provider, environment)
+        source = provider.source or {}
+        timezone_name = str(source.get("timezone") or DEFAULT_TIMEZONE)
+        imported_city_ids.update(add_external_gtfs(
+            connection,
+            stop_data,
+            {provider.provider_id: str(archive_path)},
+            repository_root=repository_root,
+            sources_path=sources_path,
+            dates=service_window(timezone_name, days),
+            populate_memberships=False,
+        ))
+    if imported_city_ids:
+        populate_provider_city_memberships(
+            connection,
+            stop_data,
+            included_city_ids=imported_city_ids,
+        )
+
+
+def validate_scoped_database(
+    connection: sqlite3.Connection,
+    provider_ids: list[str],
+) -> None:
+    if not has_ownership_schema(connection):
+        raise ValueError("Staged database is missing provider ownership metadata.")
+    validate(connection)
+    placeholders = ",".join("?" for _ in provider_ids)
+    for entity_type, table, column in (
+        ("raw_stops", "raw_stops", "stop_id"),
+        ("routes", "routes", "route_id"),
+        ("trips", "trips", "trip_id"),
+        ("calendar", "calendar", "service_id"),
+    ):
+        orphan_count = connection.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM provider_entities owned
+            LEFT JOIN {table} actual ON actual.{column} = owned.key_1
+            WHERE owned.entity_type = ?
+              AND owned.provider_id IN ({placeholders})
+              AND actual.{column} IS NULL
+            """,
+            (entity_type, *provider_ids),
+        ).fetchone()[0]
+        if orphan_count:
+            raise ValueError(
+                f"Provider ownership contains {orphan_count} orphaned {entity_type} rows."
+            )
+
+
+def prepare_staging_release(
+    data_root: Path,
+    source_database: Path,
+    source_stop_data: Path,
+    release_id: str,
+) -> Path:
+    release_dir = data_root / "releases" / release_id
+    release_dir.mkdir(parents=True, exist_ok=False)
+    clone_database(source_database, release_dir / "departures.sqlite")
+    stop_data_target = os.path.relpath(source_stop_data, release_dir)
+    (release_dir / "stop-data").symlink_to(stop_data_target)
+    source_metadata = source_database.parent / "release-metadata.json"
+    if source_metadata.is_file():
+        metadata = json.loads(source_metadata.read_text(encoding="utf-8"))
+    else:
+        metadata = {}
+    metadata["releaseID"] = release_id
+    (release_dir / "release-metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return release_dir
+
+
+def replace_link(link: Path, target: str) -> None:
+    temporary = link.with_name(f".{link.name}.scoped-next-{os.getpid()}")
+    temporary.unlink(missing_ok=True)
+    temporary.symlink_to(target)
+    os.replace(temporary, link)
+
+
+def link_target(path: Path) -> str | None:
+    return os.readlink(path) if path.is_symlink() else None
+
+
+def activate_release(data_root: Path, release_dir: Path) -> dict[Path, str | None]:
+    links = {
+        data_root / "current-release": link_target(data_root / "current-release"),
+        data_root / "current": link_target(data_root / "current"),
+        data_root / "departures-current.sqlite": link_target(
+            data_root / "departures-current.sqlite"
+        ),
+    }
+    target = os.path.relpath(release_dir, data_root)
+    try:
+        replace_link(data_root / "current-release", target)
+        replace_link(data_root / "current", f"{target}/stop-data")
+        replace_link(
+            data_root / "departures-current.sqlite",
+            f"{target}/departures.sqlite",
+        )
+    except Exception:
+        restore_links(data_root, links)
+        raise
+    return links
+
+
+def restore_links(data_root: Path, links: dict[Path, str | None]) -> None:
+    for path, target in links.items():
+        if target is None:
+            path.unlink(missing_ok=True)
+        else:
+            replace_link(path, target)
+
+
+def run_readiness(
+    repository_root: Path,
+    environment: dict[str, str],
+    expected_release_id: str,
+) -> None:
+    compose_file = repository_root / "deploy" / "static-departures.compose.yml"
+    subprocess.run(
+        ["docker", "compose", "-f", str(compose_file), "up", "-d", "--build"],
+        cwd=repository_root,
+        env=environment,
+        check=True,
+    )
+    container = environment.get(
+        "STATIC_DEPARTURES_CONTAINER_NAME", STATIC_CONTAINER_DEFAULT
+    )
+    timeout = int(environment.get("HEALTH_TIMEOUT_SECONDS", "45"))
+    interval = float(environment.get("HEALTH_INTERVAL_SECONDS", "2"))
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            result = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    container,
+                    "python3",
+                    "-c",
+                    "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8080/static-departures/health', timeout=5).read().decode())",
+                ],
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(result.stdout)
+            if payload.get("status") not in (None, "ok"):
+                raise ValueError("static departures health returned a non-ok status")
+            actual_release_id = str(
+                payload.get("database", {}).get("releaseID", "")
+            )
+            if actual_release_id != expected_release_id:
+                raise ValueError(
+                    f"runtime release mismatch: expected {expected_release_id}, "
+                    f"got {actual_release_id or '<missing>'}"
+                )
+            return
+        except (subprocess.CalledProcessError, OSError, ValueError, json.JSONDecodeError) as error:
+            last_error = error
+            time.sleep(interval)
+    raise RuntimeError(f"Static departures readiness timed out: {last_error}")
+
+
+def print_dry_run(
+    scope_label: str,
+    providers: list[StaticProvider],
+    data_root: Path,
+) -> None:
+    release = current_release_path(data_root)
+    print("Mode: scoped dry-run")
+    print(f"Requested scope: {scope_label}")
+    print("\nResolved providers:")
+    for provider in providers:
+        print(f"  - {provider.provider_id}")
+    print(f"\nCurrent release: {release or '<missing>'}")
+    print("\nProduction switch:")
+    print("  NO")
+
+
+def scoped_rebuild(
+    repository_root: Path,
+    data_root: Path,
+    providers: list[StaticProvider],
+    environment: dict[str, str],
+) -> Path:
+    source_database = current_database_path(data_root)
+    source_stop_data = current_stop_data_path(data_root)
+    release_id = f"scoped-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+    release_dir = prepare_staging_release(
+        data_root,
+        source_database,
+        source_stop_data,
+        release_id,
+    )
+    staged_database = release_dir / "departures.sqlite"
+    provider_ids = [provider.provider_id for provider in providers]
+    try:
+        connection = sqlite3.connect(staged_database)
+        try:
+            if not has_ownership_schema(connection):
+                raise ValueError(
+                    "Active static departures database has no provider ownership metadata; "
+                    "run the canonical full pipeline once before using scoped rebuild."
+                )
+            delete_provider_data(connection, provider_ids)
+            austrian = [provider for provider in providers if provider.kind == "austrian"]
+            if austrian:
+                import_austrian(
+                    connection,
+                    austrian,
+                    source_stop_data,
+                    repository_root,
+                    data_root,
+                    environment,
+                    int(environment.get("STATIC_DEPARTURES_DAYS", "15")),
+                )
+            if any(provider.kind == "germany" for provider in providers):
+                import_germany(
+                    connection,
+                    next(provider for provider in providers if provider.kind == "germany"),
+                    source_stop_data,
+                    repository_root,
+                    environment,
+                    int(environment.get("STATIC_DEPARTURES_DAYS", "15")),
+                )
+            external = [provider for provider in providers if provider.kind == "external"]
+            if external:
+                import_external(
+                    connection,
+                    external,
+                    source_stop_data,
+                    repository_root,
+                    environment,
+                    int(environment.get("STATIC_DEPARTURES_DAYS", "15")),
+                )
+            resolve_canonical_stops(connection)
+            update_terminal_stops(connection)
+            rebuild_city_stops(connection)
+            rebuild_city_departure_modes(connection)
+            version = str(uuid.uuid4())
+            update_release_metadata(connection, release_id, version)
+            validate_scoped_database(connection, provider_ids)
+            connection.commit()
+        finally:
+            connection.close()
+
+        links = activate_release(data_root, release_dir)
+        try:
+            run_readiness(repository_root, environment, release_id)
+        except Exception:
+            restore_links(data_root, links)
+            raise
+        return release_dir
+    except Exception:
+        shutil.rmtree(release_dir, ignore_errors=True)
+        raise
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Manually rebuild selected static-departures providers."
+    )
+    scope = parser.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--provider", default="", help="Canonical provider/source ID")
+    scope.add_argument("--country", default="", help="ISO country code")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Resolve and print the scope without downloading, importing, or publishing",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    repository_root = Path(
+        os.environ.get("REPO", str(Path(__file__).resolve().parents[1]))
+    ).resolve()
+    data_root = Path(
+        os.environ.get("DATA_ROOT", "/srv/haltewecker/data")
+    ).resolve()
+    scope_label, providers = resolve_scope(
+        repository_root,
+        provider_id=args.provider,
+        country=args.country,
+    )
+    if args.dry_run:
+        print_dry_run(scope_label, providers, data_root)
+        return 0
+
+    print("Mode: SCOPED PIPELINE")
+    print(f"Requested scope: {scope_label}")
+    print("Selected providers: " + ", ".join(provider.provider_id for provider in providers))
+    release = scoped_rebuild(repository_root, data_root, providers, dict(os.environ))
+    print(f"Published scoped release: {release}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (ValueError, RuntimeError, OSError, sqlite3.Error) as error:
+        print(f"[SCOPED PIPELINE] ERROR: {error}", file=sys.stderr)
+        raise SystemExit(1)

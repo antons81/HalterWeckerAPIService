@@ -18,7 +18,9 @@ DEFAULT_INPUTS = (
     "scripts/build_stop_packages.py",
     "scripts/external_gtfs.py",
     "scripts/build_swiss_departure_index.py",
+    "scripts/build_german_departure_index.py",
     "scripts/import_static_departures_database.py",
+    "scripts/static_departures_ownership.py",
 )
 
 
