@@ -157,6 +157,79 @@ class StaticDepartureScopeTests(unittest.TestCase):
         _label, providers = scoped.resolve_scope(REPOSITORY_ROOT, country="US")
         self.assertEqual([provider.provider_id for provider in providers], ["511-bay-area"])
 
+    def test_external_scoped_memberships_use_provider_stop_namespace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "feed.zip"
+            write_feed(feed, "native", "current")
+            connection = connect(root / "departures.sqlite")
+            with zipfile.ZipFile(feed) as archive:
+                populate_gtfs(
+                    connection,
+                    archive,
+                    stop_id_prefix="511-bay-area:",
+                    provider_id="511-bay-area",
+                )
+            stop_data = root / "stop-data"
+            (stop_data / "stops").mkdir(parents=True)
+            (stop_data / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "cities": [
+                            {"id": "fixture-city", "url": "stops/fixture-city.json"}
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (stop_data / "stops" / "fixture-city.json").write_text(
+                json.dumps([{"id": "native:stop-current"}]),
+                encoding="utf-8",
+            )
+            provider = scoped.StaticProvider(
+                "511-bay-area",
+                "US",
+                "external",
+                {
+                    "identifierPrefix": "",
+                    "staticStopIDPrefix": "511-bay-area:",
+                },
+            )
+            with mock.patch.object(
+                scoped,
+                "add_external_gtfs",
+                return_value={"fixture-city"},
+            ):
+                scoped.import_external(
+                    connection,
+                    [provider],
+                    stop_data,
+                    root,
+                    {},
+                    15,
+                    artifacts={"511-bay-area": feed},
+                )
+
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT stop_id
+                    FROM provider_city_stops
+                    WHERE provider_id=? AND city_id=?
+                    """,
+                    ("511-bay-area", "fixture-city"),
+                ).fetchone(),
+                ("511-bay-area:native:stop-current",),
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT stop_id FROM city_stops WHERE city_id=?",
+                    ("fixture-city",),
+                ).fetchone(),
+                ("native:stop-current",),
+            )
+            connection.close()
+
     def test_511_static_assets_replace_only_selected_cities_in_staging(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

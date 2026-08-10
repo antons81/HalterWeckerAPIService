@@ -357,10 +357,21 @@ def import_external(
             environ=environment,
         ))
     if imported_city_ids:
+        stop_id_prefix_by_provider = {
+            provider.provider_id: str(
+                (provider.source or {}).get(
+                    "staticStopIDPrefix",
+                    str((provider.source or {}).get("namespace", "")).strip()
+                    or str((provider.source or {}).get("identifierPrefix", "")),
+                )
+            )
+            for provider in providers
+        }
         populate_provider_city_memberships(
             connection,
             stop_data,
             included_city_ids=imported_city_ids,
+            stop_id_prefix_by_provider=stop_id_prefix_by_provider,
         )
 
 
