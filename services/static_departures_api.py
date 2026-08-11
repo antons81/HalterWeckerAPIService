@@ -22,6 +22,7 @@ from ttc_gateway import TTCProxy
 from tfl_gateway import TfLProxy
 from bay_area_gateway import BayAreaTripUpdatesProxy, BayAreaVehiclePositionsProxy
 from king_county_gateway import KingCountyTripUpdatesProxy, KingCountyVehiclePositionsProxy
+from mta_ny_gateway import MtaNYTripUpdatesGateway, MtaNYBusVehiclePositionsGateway, registry_from_database, api_key_from_environment
 
 
 DEFAULT_TIMEZONE = "Europe/Berlin"
@@ -204,8 +205,45 @@ class Database:
         stop_id_prefix = str(row[2]) if len(row) > 2 else ""
         return str(row[0]), str(row[1]), stop_id_prefix, ""
 
+    def city_departure_prefixes(self, city_id: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Return all provider prefixes contributing to a city's merged static board."""
+        with self.lock:
+            try:
+                rows = self._connection().execute(
+                    """
+                    SELECT stop_id_prefix, identifier_prefix
+                    FROM provider_city_modes
+                    WHERE city_id=?
+                    ORDER BY provider_id
+                    """,
+                    (city_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+        if not rows:
+            _, _, stop_id_prefix, identifier_prefix = self.city_departure_mode(city_id)
+            rows = [(stop_id_prefix, identifier_prefix)]
+        stop_prefixes = tuple(dict.fromkeys(str(row[0] or "") for row in rows))
+        identifier_prefixes = tuple(dict.fromkeys(str(row[1] or "") for row in rows))
+        return stop_prefixes, identifier_prefixes
+
+    @staticmethod
+    def _public_identifier_multi(identifier: str | None, prefixes: tuple[str, ...]) -> str:
+        value = str(identifier or "")
+        for prefix in sorted((prefix for prefix in prefixes if prefix), key=len, reverse=True):
+            if value.startswith(prefix):
+                return value[len(prefix):]
+        return value
+
     def _public_identifier(self, identifier: str, prefix: str) -> str:
-        return identifier[len(prefix):] if prefix and identifier.startswith(prefix) else identifier
+        return self._public_identifier_multi(identifier, (prefix,))
+
+    def _canonical_stop_candidates(self, city_id: str, stop_id: str) -> tuple[str, ...]:
+        stop_prefixes, _ = self.city_departure_prefixes(city_id)
+        return tuple(dict.fromkeys(
+            f"{prefix}{stop_id}" if prefix else stop_id
+            for prefix in stop_prefixes
+        ))
 
     def resolve_city(self, city_id: str) -> str:
         with self.lock:
@@ -243,8 +281,15 @@ class Database:
 
     def lines(self, city_id: str, stop_id: str) -> list[dict[str, str | None]]:
         mode, _, stop_id_prefix, identifier_prefix = self.city_departure_mode(city_id)
+        stop_prefixes, identifier_prefixes = self.city_departure_prefixes(city_id)
         query_stop_id = self._query_stop_id(city_id, stop_id)
-        stop_predicate = "s.raw_stop_id=?" if mode == "exact-stop-with-parent-fallback" else "rs.canonical_stop_id=?"
+        if mode == "exact-stop-with-parent-fallback":
+            stop_predicate = "s.raw_stop_id=?"
+            stop_parameters = (query_stop_id,)
+        else:
+            canonical_ids = self._canonical_stop_candidates(city_id, stop_id)
+            stop_predicate = f"rs.canonical_stop_id IN ({','.join('?' for _ in canonical_ids)})"
+            stop_parameters = canonical_ids
         with self.lock:
             cursor = self._connection().execute(
                 f"""
@@ -261,7 +306,7 @@ class Database:
                 WHERE {stop_predicate}
                 ORDER BY 2,1
                 """,
-                (query_stop_id,)
+                stop_parameters
             )
             try:
                 rows = cursor.fetchall()
@@ -278,8 +323,8 @@ class Database:
                 "directionKey": self._direction_key(public_route_id, direction, public_destination_stop_id, destination),
             }
             for route_id, line, direction, destination, destination_stop_id in rows
-            for public_route_id in [self._public_identifier(route_id, identifier_prefix)]
-            for public_destination_stop_id in [self._public_identifier(destination_stop_id, stop_id_prefix)]
+            for public_route_id in [self._public_identifier_multi(route_id, identifier_prefixes)]
+            for public_destination_stop_id in [self._public_identifier_multi(destination_stop_id, stop_prefixes)]
         ]
 
     def board(
@@ -293,8 +338,15 @@ class Database:
         service_from = (from_date.date() - timedelta(days=1)).strftime("%Y%m%d") if from_date else "00000000"
         service_to = to_date.date().strftime("%Y%m%d") if to_date else "99999999"
         mode, _, stop_id_prefix, identifier_prefix = self.city_departure_mode(city_id)
+        stop_prefixes, identifier_prefixes = self.city_departure_prefixes(city_id)
         query_stop_id = self._query_stop_id(city_id, stop_id)
-        stop_predicate = "s.raw_stop_id=?" if mode == "exact-stop-with-parent-fallback" else "rs.canonical_stop_id=?"
+        if mode == "exact-stop-with-parent-fallback":
+            stop_predicate = "s.raw_stop_id=?"
+            stop_parameters = (query_stop_id,)
+        else:
+            canonical_ids = self._canonical_stop_candidates(city_id, stop_id)
+            stop_predicate = f"rs.canonical_stop_id IN ({','.join('?' for _ in canonical_ids)})"
+            stop_parameters = canonical_ids
         with self.lock:
             cursor = self._connection().execute(
                 f"""
@@ -313,7 +365,7 @@ class Database:
                 ORDER BY a.service_date,s.departure_seconds,t.trip_id,s.stop_sequence
                 LIMIT ?
                 """,
-                (query_stop_id, service_from, service_to, limit)
+                (*stop_parameters, service_from, service_to, limit)
             )
             try:
                 rows = cursor.fetchall()
@@ -323,7 +375,7 @@ class Database:
             {
                 "serviceDate": f"{service_date[:4]}-{service_date[4:6]}-{service_date[6:]}",
                 "scheduledTime": departure_time,
-                "tripID": self._public_identifier(trip_id, identifier_prefix),
+                "tripID": self._public_identifier_multi(trip_id, identifier_prefixes),
                 "routeID": public_route_id,
                 "line": line,
                 "destination": destination,
@@ -332,13 +384,13 @@ class Database:
                 "directionKey": self._direction_key(public_route_id, direction, public_destination_stop_id, destination),
                 "destinationStopID": public_destination_stop_id or None,
                 "platform": platform or None,
-                "stopID": self._public_identifier(raw_stop_id, stop_id_prefix),
+                "stopID": self._public_identifier_multi(raw_stop_id, stop_prefixes),
                 "stopSequence": stop_sequence,
                 "isRealtime": False
             }
             for service_date, departure_time, _seconds, stop_sequence, raw_stop_id, trip_id, route_id, line, destination, direction, destination_stop_id, platform in rows
-            for public_route_id in [self._public_identifier(route_id, identifier_prefix)]
-            for public_destination_stop_id in [self._public_identifier(destination_stop_id, stop_id_prefix)]
+            for public_route_id in [self._public_identifier_multi(route_id, identifier_prefixes)]
+            for public_destination_stop_id in [self._public_identifier_multi(destination_stop_id, stop_prefixes)]
         ]
 
 
@@ -375,6 +427,8 @@ class Handler(BaseHTTPRequestHandler):
     bay_area_vehicle_positions_gateway: BayAreaVehiclePositionsProxy | None = None
     king_county_trip_updates_gateway: KingCountyTripUpdatesProxy | None = None
     king_county_vehicle_positions_gateway: KingCountyVehiclePositionsProxy | None = None
+    mta_ny_trip_updates_gateway: MtaNYTripUpdatesGateway | None = None
+    mta_ny_bus_vehicle_positions_gateway: MtaNYBusVehiclePositionsGateway | None = None
 
     def send_json(
         self,
@@ -485,6 +539,16 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "King County provider unavailable"})
                 response = self.king_county_vehicle_positions_gateway.handle(parsed.path, query)
                 return self.send_json(response.status, response.payload, response.cache_control)
+            if parsed.path == "/mta-ny/realtime/trip-updates":
+                if self.mta_ny_trip_updates_gateway is None:
+                    return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "MTA New York provider unavailable"})
+                response = self.mta_ny_trip_updates_gateway.handle(parsed.path, query)
+                return self.send_json(response.status, response.payload, response.cache_control)
+            if parsed.path == "/mta-ny/realtime/bus-vehicle-positions":
+                if self.mta_ny_bus_vehicle_positions_gateway is None:
+                    return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "MTA New York provider unavailable"})
+                response = self.mta_ny_bus_vehicle_positions_gateway.handle(parsed.path, query)
+                return self.send_json(response.status, response.payload, response.cache_control)
             for prefix in STATIC_DATA_PATH_PREFIXES:
                 if parsed.path.startswith(prefix):
                     return self.send_static_file(parsed.path[len(prefix):])
@@ -547,5 +611,13 @@ if __name__ == "__main__":
     )
     Handler.king_county_vehicle_positions_gateway = KingCountyVehiclePositionsProxy.from_database(
         valid_registry=lambda: database.provider_realtime_registry("king-county-metro")
+    )
+    Handler.mta_ny_trip_updates_gateway = MtaNYTripUpdatesGateway(
+        registry=lambda: registry_from_database(database),
+        api_key=api_key_from_environment,
+    )
+    Handler.mta_ny_bus_vehicle_positions_gateway = MtaNYBusVehiclePositionsGateway(
+        registry=lambda: registry_from_database(database),
+        api_key=api_key_from_environment,
     )
     ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Handler).serve_forever()

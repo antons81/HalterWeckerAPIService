@@ -222,7 +222,14 @@ class StaticDepartureScopeTests(unittest.TestCase):
         _label, providers = scoped.resolve_scope(REPOSITORY_ROOT, country="US")
         self.assertEqual(
             [provider.provider_id for provider in providers],
-            ["511-bay-area", "cta-chicago"],
+            [
+                "511-bay-area",
+                "cta-chicago",
+                "king-county-metro",
+                "mta-ny-subway",
+                "mta-ny-nyct-bus",
+                "mta-ny-mta-bus",
+            ],
         )
 
     def test_scoped_cta_rebuild_publishes_native_membership_and_board(self) -> None:

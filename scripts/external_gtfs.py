@@ -1152,12 +1152,10 @@ def process_external_gtfs_sources(
             if city_id in occupied:
                 previous = external_city_sources.get(city_id)
                 same_merge_group = bool(
-                    namespace
-                    and previous
+                    previous
                     and str(source.get("mergeGroup", "")).strip()
                     and str(source.get("mergeGroup"))
                     == str(previous.get("mergeGroup"))
-                    and str(previous.get("namespace", ""))
                 )
                 if not same_merge_group:
                     raise ValueError(
@@ -1178,7 +1176,7 @@ def process_external_gtfs_sources(
         source_started = time.monotonic()
         archive = load_gtfs_archive(request_url, headers=headers)
         source_output = output
-        if namespace:
+        if namespace or str(source.get("mergeGroup", "")).strip():
             source_output = namespace_root / source_id
             shutil.rmtree(source_output, ignore_errors=True)
             source_output.mkdir(parents=True, exist_ok=True)
@@ -1195,7 +1193,7 @@ def process_external_gtfs_sources(
                         source.get("publishPassengerStopIDs", False)
                     ),
                 )
-                if namespace:
+                if namespace or str(source.get("mergeGroup", "")).strip():
                     for city in cities:
                         city_id = str(city["id"])
                         namespaced_records.setdefault(city_id, []).append({

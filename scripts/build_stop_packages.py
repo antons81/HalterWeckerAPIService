@@ -64,6 +64,7 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "ttc",
     "bayArea511",
     "kingCounty",
+    "mtaNY",
     "ctaChicago",
 }
 SUPPORTED_TRANSIT_RADAR_FEATURES = {
@@ -1153,6 +1154,8 @@ def transit_radar_manifest(
                 provider_id = f"511-bay-area-{city_id}"
             elif adapter == "kingCounty":
                 provider_id = "king-county-metro"
+            elif adapter == "mtaNY":
+                provider_id = "mta-ny"
             elif adapter == "ctaChicago":
                 provider_id = "cta-chicago"
             elif adapter == "bwTrias":
@@ -1173,7 +1176,7 @@ def transit_radar_manifest(
                 supports_departures = bool(
                     provider_configuration.get(
                         "supportsDepartures",
-                        adapter in {"bwTrias", "vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "avvHafas", "oebb", "netherlands", "sweden", "ireland", "entur", "translink", "ttc", "kingCounty"}
+                        adapter in {"bwTrias", "vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "avvHafas", "oebb", "netherlands", "sweden", "ireland", "entur", "translink", "ttc", "kingCounty", "mtaNY"}
                     )
                 )
                 supports_live_vehicles = bool(
@@ -1262,7 +1265,7 @@ def transit_radar_manifest(
             country_suffix = "ca"
         elif any(p.get("adapter") == "ttc" for p in providers):
             country_suffix = "ca"
-        elif any(p.get("adapter") in {"bayArea511", "kingCounty"} for p in providers):
+        elif any(p.get("adapter") in {"bayArea511", "kingCounty", "mtaNY"} for p in providers):
             country_suffix = "us"
         elif any(p.get("adapter") == "ctaChicago" for p in providers):
             country_suffix = "us"
@@ -1276,6 +1279,7 @@ def transit_radar_manifest(
                 "latitude": city["latitude"],
                 "longitude": city["longitude"]
             },
+            "timeZoneIdentifier": city["timezone"] if city.get("timezone") else None,
             "providers": providers
         })
 

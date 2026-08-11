@@ -158,12 +158,18 @@ def resolve_scope(
     if provider_id.strip():
         requested = provider_id.strip()
         provider = by_id.get(requested)
-        if provider is None:
-            raise ValueError(
-                f"Unknown static-departures provider {requested!r}. "
-                f"Known providers: {', '.join(by_id)}"
-            )
-        return f"provider {requested}", [provider]
+        if provider is not None:
+            return f"provider {requested}", [provider]
+        grouped = [
+            candidate for candidate in providers
+            if str((candidate.source or {}).get("scopeGroup", "")).strip() == requested
+        ]
+        if grouped:
+            return f"provider group {requested}", grouped
+        raise ValueError(
+            f"Unknown static-departures provider {requested!r}. "
+            f"Known providers: {', '.join(by_id)}"
+        )
 
     requested_country = country.strip().upper()
     selected = [

@@ -80,6 +80,10 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
                 "ttc-subway",
                 "511-bay-area",
                 "cta-chicago",
+                "king-county-metro",
+                "mta-ny-subway",
+                "mta-ny-nyct-bus",
+                "mta-ny-mta-bus",
             },
         )
         sweden = next(source for source in sources if source["id"] == "sweden")

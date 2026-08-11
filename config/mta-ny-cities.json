@@ -1,0 +1,45 @@
+[
+  {
+    "id": "new-york",
+    "name": "New York City",
+    "aliases": [
+      "NYC",
+      "New York"
+    ],
+    "country": "US",
+    "packageMode": "external",
+    "latitude": 40.7128,
+    "longitude": -74.006,
+    "radiusMeters": 50000,
+    "transitRadar": {
+      "adapter": "mtaNY",
+      "features": [
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "liveVehicles",
+        "vehiclePositions",
+        "vehicleBearing",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/mta-ny/realtime/bus-vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/mta-ny/realtime/trip-updates",
+      "region": {
+        "minimumLatitude": 40.45,
+        "maximumLatitude": 40.95,
+        "minimumLongitude": -74.3,
+        "maximumLongitude": -73.65
+      }
+    },
+    "externalGTFSProviders": [
+      "mta-ny-subway",
+      "mta-ny-nyct-bus",
+      "mta-ny-mta-bus"
+    ],
+    "timezone": "America/New_York"
+  }
+]
