@@ -445,7 +445,7 @@ def _prepare_scoped_delete_sets(
         "populate-calendar-date-ids",
         f"""
         INSERT INTO scoped_calendar_date_ids(service_id)
-        SELECT owned.key_1
+        SELECT DISTINCT owned.key_1
         FROM provider_entities owned
         WHERE owned.entity_type = 'calendar_dates'
           AND owned.provider_id IN ({placeholders})
