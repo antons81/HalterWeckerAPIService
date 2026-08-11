@@ -63,6 +63,7 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "translink",
     "ttc",
     "bayArea511",
+    "kingCounty",
     "ctaChicago",
 }
 SUPPORTED_TRANSIT_RADAR_FEATURES = {
@@ -769,6 +770,17 @@ def validate_transit_radar_provider(
             raise ValueError(f"TTC Radar is disabled for {city_id}")
         return
 
+    if adapter == "kingCounty":
+        if city_id != "seattle":
+            raise ValueError(f"Invalid King County configuration for {city_id}")
+        if configuration.get("radarStops") is not None or configuration.get("gatewayURL") is not None:
+            raise ValueError(f"King County does not use radar stops or gateway URL for {city_id}")
+        for key in ("staticBaseURL", "boardURL", "realtimeURL", "tripUpdatesURL"):
+            value = configuration.get(key)
+            if not isinstance(value, str) or not value.startswith("https://"):
+                raise ValueError(f"King County requires an HTTPS {key} for {city_id}")
+        return
+
     if adapter == "bayArea511":
         if city_id not in {"san-francisco", "oakland", "berkeley", "san-jose"}:
             raise ValueError(f"Invalid 511 Bay Area configuration for {city_id}")
@@ -1139,6 +1151,8 @@ def transit_radar_manifest(
                 provider_id = f"ttc-{city_id}"
             elif adapter == "bayArea511":
                 provider_id = f"511-bay-area-{city_id}"
+            elif adapter == "kingCounty":
+                provider_id = "king-county-metro"
             elif adapter == "ctaChicago":
                 provider_id = "cta-chicago"
             elif adapter == "bwTrias":
@@ -1159,7 +1173,7 @@ def transit_radar_manifest(
                 supports_departures = bool(
                     provider_configuration.get(
                         "supportsDepartures",
-                        adapter in {"bwTrias", "vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "avvHafas", "oebb", "netherlands", "sweden", "ireland", "entur", "translink", "ttc"}
+                        adapter in {"bwTrias", "vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "avvHafas", "oebb", "netherlands", "sweden", "ireland", "entur", "translink", "ttc", "kingCounty"}
                     )
                 )
                 supports_live_vehicles = bool(
@@ -1248,7 +1262,7 @@ def transit_radar_manifest(
             country_suffix = "ca"
         elif any(p.get("adapter") == "ttc" for p in providers):
             country_suffix = "ca"
-        elif any(p.get("adapter") == "bayArea511" for p in providers):
+        elif any(p.get("adapter") in {"bayArea511", "kingCounty"} for p in providers):
             country_suffix = "us"
         elif any(p.get("adapter") == "ctaChicago" for p in providers):
             country_suffix = "us"
@@ -1834,6 +1848,7 @@ NON_GERMAN_STOP_PACKAGE_ADAPTERS = frozenset({
     "netherlands",
     "oebb",
     "sweden",
+    "kingCounty",
 })
 
 

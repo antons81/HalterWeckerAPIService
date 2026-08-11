@@ -21,6 +21,7 @@ from translink_gateway import TransLinkProxy
 from ttc_gateway import TTCProxy
 from tfl_gateway import TfLProxy
 from bay_area_gateway import BayAreaTripUpdatesProxy, BayAreaVehiclePositionsProxy
+from king_county_gateway import KingCountyTripUpdatesProxy, KingCountyVehiclePositionsProxy
 
 
 DEFAULT_TIMEZONE = "Europe/Berlin"
@@ -372,6 +373,8 @@ class Handler(BaseHTTPRequestHandler):
     ttc_gateway: TTCProxy | None = None
     bay_area_trip_updates_gateway: BayAreaTripUpdatesProxy | None = None
     bay_area_vehicle_positions_gateway: BayAreaVehiclePositionsProxy | None = None
+    king_county_trip_updates_gateway: KingCountyTripUpdatesProxy | None = None
+    king_county_vehicle_positions_gateway: KingCountyVehiclePositionsProxy | None = None
 
     def send_json(
         self,
@@ -472,6 +475,16 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "511 Bay Area provider unavailable"})
                 response = self.bay_area_vehicle_positions_gateway.handle(parsed.path, query)
                 return self.send_json(response.status, response.payload, response.cache_control)
+            if parsed.path == "/king-county/realtime/trip-updates":
+                if self.king_county_trip_updates_gateway is None:
+                    return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "King County provider unavailable"})
+                response = self.king_county_trip_updates_gateway.handle(parsed.path, query)
+                return self.send_json(response.status, response.payload, response.cache_control)
+            if parsed.path == "/king-county/realtime/vehicle-positions":
+                if self.king_county_vehicle_positions_gateway is None:
+                    return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "King County provider unavailable"})
+                response = self.king_county_vehicle_positions_gateway.handle(parsed.path, query)
+                return self.send_json(response.status, response.payload, response.cache_control)
             for prefix in STATIC_DATA_PATH_PREFIXES:
                 if parsed.path.startswith(prefix):
                     return self.send_static_file(parsed.path[len(prefix):])
@@ -527,5 +540,12 @@ if __name__ == "__main__":
     )
     Handler.bay_area_vehicle_positions_gateway = BayAreaVehiclePositionsProxy.from_environment(
         valid_registry=lambda: database.provider_realtime_registry("511-bay-area")
+    )
+    Handler.king_county_trip_updates_gateway = KingCountyTripUpdatesProxy.from_database(
+        valid_trip_registry=lambda: database.provider_trip_registry("king-county-metro"),
+        valid_stop_registry=lambda: database.provider_stop_registry("king-county-metro"),
+    )
+    Handler.king_county_vehicle_positions_gateway = KingCountyVehiclePositionsProxy.from_database(
+        valid_registry=lambda: database.provider_realtime_registry("king-county-metro")
     )
     ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Handler).serve_forever()

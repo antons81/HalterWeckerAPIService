@@ -1,0 +1,39 @@
+[
+  {
+    "id": "seattle",
+    "name": "Seattle",
+    "aliases": [
+      "Seattle, Washington"
+    ],
+    "country": "US",
+    "packageMode": "external",
+    "externalGTFSProvider": "king-county-metro",
+    "latitude": 47.6062,
+    "longitude": -122.3321,
+    "radiusMeters": 50000,
+    "transitRadar": {
+      "adapter": "kingCounty",
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "vehiclePositions",
+        "vehicleBearing",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/king-county/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/king-county/realtime/trip-updates",
+      "region": {
+        "minimumLatitude": 47.2,
+        "maximumLatitude": 47.9,
+        "minimumLongitude": -122.7,
+        "maximumLongitude": -121.9
+      }
+    }
+  }
+]

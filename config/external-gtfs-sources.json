@@ -119,5 +119,23 @@
     "staticIdentifierPrefix": "cta-chicago:",
     "staticStopIDPrefix": "cta-chicago:",
     "country": "US"
+  },
+  {
+    "id": "king-county-metro",
+    "url": "https://metro.kingcounty.gov/GTFS/google_transit.zip",
+    "cities": "config/king-county-cities.json",
+    "timezone": "America/Los_Angeles",
+    "identifierPrefix": "kcm:",
+    "namespace": "",
+    "preserveNativeIDs": true,
+    "stopIDMode": "exact",
+    "buildStops": true,
+    "buildRoutes": true,
+    "buildDepartures": true,
+    "buildTripIndex": true,
+    "importIntoStaticDepartures": true,
+    "staticIdentifierPrefix": "kcm:",
+    "staticStopIDPrefix": "kcm:",
+    "country": "US"
   }
 ]
