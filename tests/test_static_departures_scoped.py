@@ -992,6 +992,7 @@ class StaticDepartureScopeTests(unittest.TestCase):
             self.assertIn("city-stops", stage_names)
             self.assertIn("metadata-validation", stage_names)
             self.assertIn("readiness", stage_names)
+            self.assertLess(stage_names.index("readiness"), stage_names.index("activate-release"))
 
     def test_full_service_and_scoped_script_share_static_lock_path(self) -> None:
         service = (

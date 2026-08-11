@@ -705,53 +705,98 @@ def run_readiness(
     repository_root: Path,
     environment: dict[str, str],
     expected_release_id: str,
+    staged_release: Path | None = None,
 ) -> None:
     compose_file = repository_root / "deploy" / "static-departures.compose.yml"
-    subprocess.run(
-        ["docker", "compose", "-f", str(compose_file), "up", "-d", "--build"],
-        cwd=repository_root,
-        env=environment,
-        check=True,
-    )
-    container = environment.get(
-        "STATIC_DEPARTURES_CONTAINER_NAME", STATIC_CONTAINER_DEFAULT
-    )
-    timeout = int(environment.get("HEALTH_TIMEOUT_SECONDS", "45"))
-    interval = float(environment.get("HEALTH_INTERVAL_SECONDS", "2"))
-    deadline = time.monotonic() + timeout
-    last_error: Exception | None = None
-    while time.monotonic() < deadline:
-        try:
-            result = subprocess.run(
-                [
-                    "docker",
-                    "exec",
-                    container,
-                    "python3",
-                    "-c",
-                    "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8080/static-departures/health', timeout=5).read().decode())",
+    readiness_environment = dict(environment)
+    compose_project: str | None = None
+    if staged_release is not None:
+        suffix = "".join(
+            character if character.isalnum() else "-"
+            for character in expected_release_id.lower()
+        ).strip("-")[-32:]
+        compose_project = f"scoped-readiness-{suffix}"
+        container = f"{STATIC_CONTAINER_DEFAULT}-staged-{suffix}"[:63]
+        readiness_environment["STATIC_DEPARTURES_CONTAINER_NAME"] = container
+        readiness_environment["DEPARTURES_DATABASE"] = (
+            f"/data/releases/{staged_release.name}/departures.sqlite"
+        )
+        readiness_environment["STATIC_DATA_ROOT"] = (
+            f"/data/releases/{staged_release.name}/stop-data"
+        )
+    else:
+        container = environment.get(
+            "STATIC_DEPARTURES_CONTAINER_NAME", STATIC_CONTAINER_DEFAULT
+        )
+    compose_prefix = ["docker", "compose"]
+    if compose_project is not None:
+        compose_prefix.extend(["-p", compose_project])
+    compose_command = compose_prefix + [
+        "-f",
+        str(compose_file),
+        "up",
+        "-d",
+        "--build",
+    ]
+    try:
+        subprocess.run(
+            compose_command,
+            cwd=repository_root,
+            env=readiness_environment,
+            check=True,
+        )
+        timeout = int(environment.get("HEALTH_TIMEOUT_SECONDS", "45"))
+        interval = float(environment.get("HEALTH_INTERVAL_SECONDS", "2"))
+        deadline = time.monotonic() + timeout
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            try:
+                result = subprocess.run(
+                    [
+                        "docker",
+                        "exec",
+                        container,
+                        "python3",
+                        "-c",
+                        "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8080/static-departures/health', timeout=5).read().decode())",
+                    ],
+                    env=readiness_environment,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                payload = json.loads(result.stdout)
+                if payload.get("status") not in (None, "ok"):
+                    raise ValueError("static departures health returned a non-ok status")
+                actual_release_id = str(
+                    payload.get("database", {}).get("releaseID", "")
+                )
+                if actual_release_id != expected_release_id:
+                    raise ValueError(
+                        f"runtime release mismatch: expected {expected_release_id}, "
+                        f"got {actual_release_id or '<missing>'}"
+                    )
+                return
+            except (subprocess.CalledProcessError, OSError, ValueError, json.JSONDecodeError) as error:
+                last_error = error
+                time.sleep(interval)
+        raise RuntimeError(f"Static departures readiness timed out: {last_error}")
+    finally:
+        if compose_project is not None:
+            subprocess.run(
+                compose_prefix
+                + [
+                    "-f",
+                    str(compose_file),
+                    "down",
+                    "--remove-orphans",
                 ],
-                env=environment,
-                check=True,
+                cwd=repository_root,
+                env=readiness_environment,
+                check=False,
                 capture_output=True,
                 text=True,
             )
-            payload = json.loads(result.stdout)
-            if payload.get("status") not in (None, "ok"):
-                raise ValueError("static departures health returned a non-ok status")
-            actual_release_id = str(
-                payload.get("database", {}).get("releaseID", "")
-            )
-            if actual_release_id != expected_release_id:
-                raise ValueError(
-                    f"runtime release mismatch: expected {expected_release_id}, "
-                    f"got {actual_release_id or '<missing>'}"
-                )
-            return
-        except (subprocess.CalledProcessError, OSError, ValueError, json.JSONDecodeError) as error:
-            last_error = error
-            time.sleep(interval)
-    raise RuntimeError(f"Static departures readiness timed out: {last_error}")
 
 
 def print_dry_run(
@@ -889,15 +934,16 @@ def scoped_rebuild(
         finally:
             connection.close()
 
-        links = timed_stage("activate-release", lambda: activate_release(data_root, release_dir))
-        try:
-            timed_stage(
-                "readiness",
-                lambda: run_readiness(repository_root, environment, release_id),
-            )
-        except Exception:
-            restore_links(data_root, links)
-            raise
+        timed_stage(
+            "readiness",
+            lambda: run_readiness(
+                repository_root,
+                environment,
+                release_id,
+                staged_release=release_dir,
+            ),
+        )
+        timed_stage("activate-release", lambda: activate_release(data_root, release_dir))
         return release_dir
     except Exception:
         shutil.rmtree(release_dir, ignore_errors=True)
