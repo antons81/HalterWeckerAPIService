@@ -141,10 +141,12 @@ def populate_german_city_memberships(
     stop_data: Path,
     excluded_city_ids: set[str],
     provider_id: str = "germany",
+    included_city_ids: set[str] | None = None,
 ) -> set[str]:
     return populate_city_memberships(
         connection,
         stop_data,
+        included_city_ids=included_city_ids,
         excluded_city_ids=excluded_city_ids,
         provider_id=provider_id,
     )
@@ -347,6 +349,7 @@ def add_external_gtfs(
     dates: list[date],
     populate_memberships: bool = True,
     environ: dict[str, str] | None = None,
+    scoped: bool = False,
 ) -> set[str]:
     """Augment an existing static departures database with external GTFS feeds.
 
@@ -397,7 +400,8 @@ def add_external_gtfs(
     if not imported_city_ids:
         return imported_city_ids
 
-    resolve_canonical_stops(connection)
+    provider_scope = (source_id for source_id in url_by_provider) if scoped else None
+    resolve_canonical_stops(connection, provider_ids=provider_scope)
     if populate_memberships:
         populate_provider_city_memberships(
             connection,
@@ -405,8 +409,9 @@ def add_external_gtfs(
             included_city_ids=imported_city_ids,
             stop_id_prefix_by_provider=source_stop_id_prefixes,
         )
-    populate_active_services(connection, dates)
-    update_terminal_stops(connection)
+    provider_scope = tuple(url_by_provider) if scoped else None
+    populate_active_services(connection, dates, provider_ids=provider_scope)
+    update_terminal_stops(connection, provider_ids=provider_scope)
 
     if "stop_id_prefix" not in {
         row[1] for row in connection.execute("PRAGMA table_info(city_departure_modes)")

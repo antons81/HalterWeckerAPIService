@@ -31,7 +31,6 @@ from external_gtfs import (
 from gtfs_source_cache import DEFAULT_CACHE_ROOT, GTFSArtifactCache
 from import_static_departures_database import (
     add_external_gtfs,
-    configured_austrian_static_city_ids,
     configured_external_city_ids,
     populate_german_city_memberships,
     populate_provider_city_memberships,
@@ -40,6 +39,7 @@ from import_static_departures_database import (
 from static_departures_ownership import (
     delete_provider_data,
     has_ownership_schema,
+    provider_city_ids,
     rebuild_city_departure_modes,
     rebuild_city_stops,
     register_city_mode,
@@ -56,6 +56,17 @@ class StaticProvider:
     country: str
     kind: str
     source: dict[str, object] | None = None
+
+
+def timed_stage(stage: str, callback):
+    started = time.monotonic()
+    try:
+        return callback()
+    finally:
+        print(
+            f"[ScopedDepartures] stage={stage} duration={time.monotonic() - started:.2f}s",
+            flush=True,
+        )
 
 
 def load_static_providers(repository_root: Path) -> list[StaticProvider]:
@@ -268,15 +279,26 @@ def import_germany(
         repository_root / "config" / "cities.json",
         repository_root / "config" / "swiss-cities.json",
     )
+    manifest = json.loads((stop_data / "manifest.json").read_text(encoding="utf-8"))
+    included_city_ids = {
+        str(city["id"])
+        for city in manifest.get("cities", [])
+        if isinstance(city, dict) and isinstance(city.get("id"), str)
+    }
     populate_german_city_memberships(
         connection,
         stop_data,
         excluded,
         provider_id=provider.provider_id,
+        included_city_ids=included_city_ids,
     )
     from build_german_departure_index import populate_active_services
 
-    populate_active_services(connection, service_window(DEFAULT_TIMEZONE, days))
+    populate_active_services(
+        connection,
+        service_window(DEFAULT_TIMEZONE, days),
+        provider_ids=[provider.provider_id],
+    )
 
 
 def import_austrian(
@@ -317,16 +339,19 @@ def import_austrian(
                 "exact-stop-with-parent-fallback",
                 "Europe/Vienna",
             )
-    populate_provider_city_memberships(
-        connection,
-        stop_data,
-        configured_austrian_static_city_ids(
-            repository_root / "config" / "cities.json"
-        ),
-    )
+    selected_city_ids = {
+        str(city_id)
+        for provider in providers
+        for city_id in registry_by_id[provider.provider_id]["cities"]
+    }
+    populate_provider_city_memberships(connection, stop_data, selected_city_ids)
     from build_german_departure_index import populate_active_services
 
-    populate_active_services(connection, service_window("Europe/Vienna", days))
+    populate_active_services(
+        connection,
+        service_window("Europe/Vienna", days),
+        provider_ids=[provider.provider_id for provider in providers],
+    )
 
 
 def import_external(
@@ -355,6 +380,7 @@ def import_external(
             dates=service_window(timezone_name, days),
             populate_memberships=False,
             environ=environment,
+            scoped=True,
         ))
     if imported_city_ids:
         stop_id_prefix_by_provider = {
@@ -694,11 +720,14 @@ def scoped_rebuild(
     source_database = current_database_path(data_root)
     source_stop_data = current_stop_data_path(data_root)
     release_id = f"scoped-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
-    release_dir = prepare_staging_release(
-        data_root,
-        source_database,
-        source_stop_data,
-        release_id,
+    release_dir = timed_stage(
+        "prepare-staging",
+        lambda: prepare_staging_release(
+            data_root,
+            source_database,
+            source_stop_data,
+            release_id,
+        ),
     )
     staged_database = release_dir / "departures.sqlite"
     provider_ids = [provider.provider_id for provider in providers]
@@ -710,62 +739,103 @@ def scoped_rebuild(
                     "Active static departures database has no provider ownership metadata; "
                     "run the canonical full pipeline once before using scoped rebuild."
                 )
-            delete_provider_data(connection, provider_ids)
+            timed_stage(
+                "delete-provider-data",
+                lambda: delete_provider_data(connection, provider_ids),
+            )
             austrian = [provider for provider in providers if provider.kind == "austrian"]
             if austrian:
-                import_austrian(
-                    connection,
-                    austrian,
-                    source_stop_data,
-                    repository_root,
-                    data_root,
-                    environment,
-                    int(environment.get("STATIC_DEPARTURES_DAYS", "15")),
+                timed_stage(
+                    "import-austrian",
+                    lambda: import_austrian(
+                        connection,
+                        austrian,
+                        source_stop_data,
+                        repository_root,
+                        data_root,
+                        environment,
+                        int(environment.get("STATIC_DEPARTURES_DAYS", "15")),
+                    ),
                 )
             if any(provider.kind == "germany" for provider in providers):
-                import_germany(
-                    connection,
-                    next(provider for provider in providers if provider.kind == "germany"),
-                    source_stop_data,
-                    repository_root,
-                    environment,
-                    int(environment.get("STATIC_DEPARTURES_DAYS", "15")),
+                timed_stage(
+                    "import-germany",
+                    lambda: import_germany(
+                        connection,
+                        next(provider for provider in providers if provider.kind == "germany"),
+                        source_stop_data,
+                        repository_root,
+                        environment,
+                        int(environment.get("STATIC_DEPARTURES_DAYS", "15")),
+                    ),
                 )
             external = [provider for provider in providers if provider.kind == "external"]
             if external:
-                external_artifacts = {
-                    provider.provider_id: resolve_external_artifact(provider, environment)
-                    for provider in external
-                }
-                import_external(
-                    connection,
-                    external,
-                    source_stop_data,
-                    repository_root,
-                    environment,
-                    int(environment.get("STATIC_DEPARTURES_DAYS", "15")),
-                    artifacts=external_artifacts,
+                external_artifacts = timed_stage(
+                    "resolve-external-artifacts",
+                    lambda: {
+                        provider.provider_id: resolve_external_artifact(provider, environment)
+                        for provider in external
+                    },
                 )
-                build_external_static_assets(
-                    release_dir,
-                    external,
-                    repository_root,
-                    external_artifacts,
+                timed_stage(
+                    "import-external",
+                    lambda: import_external(
+                        connection,
+                        external,
+                        source_stop_data,
+                        repository_root,
+                        environment,
+                        int(environment.get("STATIC_DEPARTURES_DAYS", "15")),
+                        artifacts=external_artifacts,
+                    ),
                 )
-            resolve_canonical_stops(connection)
-            update_terminal_stops(connection)
-            rebuild_city_stops(connection)
-            rebuild_city_departure_modes(connection)
+                timed_stage(
+                    "build-external-static-assets",
+                    lambda: build_external_static_assets(
+                        release_dir,
+                        external,
+                        repository_root,
+                        external_artifacts,
+                    ),
+                )
+            timed_stage(
+                "canonical-stops",
+                lambda: resolve_canonical_stops(connection, provider_ids=provider_ids),
+            )
+            timed_stage(
+                "terminal-stops",
+                lambda: update_terminal_stops(connection, provider_ids=provider_ids),
+            )
+            scoped_city_ids = provider_city_ids(connection, provider_ids)
+            timed_stage(
+                "city-stops",
+                lambda: rebuild_city_stops(connection, scoped_city_ids),
+            )
+            timed_stage(
+                "city-departure-modes",
+                lambda: rebuild_city_departure_modes(connection, scoped_city_ids),
+            )
             version = str(uuid.uuid4())
-            update_release_metadata(connection, release_id, version)
-            validate_scoped_database(connection, provider_ids)
-            connection.commit()
+
+            def finalize_database() -> None:
+                update_release_metadata(connection, release_id, version)
+                validate_scoped_database(connection, provider_ids)
+                connection.commit()
+
+            timed_stage(
+                "metadata-validation",
+                finalize_database,
+            )
         finally:
             connection.close()
 
-        links = activate_release(data_root, release_dir)
+        links = timed_stage("activate-release", lambda: activate_release(data_root, release_dir))
         try:
-            run_readiness(repository_root, environment, release_id)
+            timed_stage(
+                "readiness",
+                lambda: run_readiness(repository_root, environment, release_id),
+            )
         except Exception:
             restore_links(data_root, links)
             raise

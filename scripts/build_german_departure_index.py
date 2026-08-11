@@ -537,17 +537,62 @@ def populate_gtfs(
     connection.commit()
 
 
-def resolve_canonical_stops(connection: sqlite3.Connection) -> None:
-    connection.execute("""
-        UPDATE raw_stops SET canonical_stop_id = COALESCE(
-            (SELECT parent.stop_id FROM raw_stops parent WHERE parent.stop_id = raw_stops.parent_station), raw_stops.stop_id
+def _normalized_provider_ids(provider_ids: Iterable[str] | None) -> tuple[str, ...] | None:
+    if provider_ids is None:
+        return None
+    return tuple(sorted({provider_id.strip() for provider_id in provider_ids if provider_id.strip()}))
+
+
+def resolve_canonical_stops(
+    connection: sqlite3.Connection,
+    provider_ids: Iterable[str] | None = None,
+) -> None:
+    selected = _normalized_provider_ids(provider_ids)
+    if selected is None:
+        connection.execute("""
+            UPDATE raw_stops SET canonical_stop_id = COALESCE(
+                (SELECT parent.stop_id FROM raw_stops parent WHERE parent.stop_id = raw_stops.parent_station), raw_stops.stop_id
+            )
+        """)
+    elif selected:
+        placeholders = ",".join("?" for _ in selected)
+        connection.execute(
+            f"""
+            UPDATE raw_stops SET canonical_stop_id = COALESCE(
+                (SELECT parent.stop_id FROM raw_stops parent WHERE parent.stop_id = raw_stops.parent_station), raw_stops.stop_id
+            )
+            WHERE stop_id IN (
+                SELECT key_1 FROM provider_entities
+                WHERE entity_type = 'raw_stops' AND provider_id IN ({placeholders})
+            )
+            """,
+            selected,
         )
-    """)
     connection.commit()
 
 
-def populate_active_services(connection: sqlite3.Connection, dates: list[date]) -> None:
+def populate_active_services(
+    connection: sqlite3.Connection,
+    dates: list[date],
+    provider_ids: Iterable[str] | None = None,
+) -> None:
     day_columns = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    selected = _normalized_provider_ids(provider_ids)
+    if selected == ():
+        return
+    service_placeholders = "" if selected is None else ",".join("?" for _ in selected)
+    calendar_scope = "" if selected is None else f"""
+              AND service_id IN (
+                  SELECT key_1 FROM provider_entities
+                  WHERE entity_type = 'calendar' AND provider_id IN ({service_placeholders})
+              )
+    """
+    calendar_dates_scope = "" if selected is None else f"""
+              AND service_id IN (
+                  SELECT key_1 FROM provider_entities
+                  WHERE entity_type = 'calendar_dates' AND provider_id IN ({service_placeholders})
+              )
+    """
     for service_date in dates:
         compact_date = service_date.strftime("%Y%m%d")
         day_column = day_columns[service_date.weekday()]
@@ -556,21 +601,44 @@ def populate_active_services(connection: sqlite3.Connection, dates: list[date]) 
             SELECT service_id, ? FROM calendar
             WHERE start_date <= ? AND end_date >= ? AND {day_column} = 1
               AND NOT EXISTS (SELECT 1 FROM calendar_dates overrides WHERE overrides.service_id = calendar.service_id AND overrides.service_date = ? AND overrides.exception_type = 2)
-        """, (compact_date, compact_date, compact_date, compact_date))
-        connection.execute("""
+              {calendar_scope}
+        """, (compact_date, compact_date, compact_date, compact_date) + (() if selected is None else selected))
+        connection.execute(f"""
             INSERT OR IGNORE INTO active_services(service_id, service_date)
-            SELECT service_id, service_date FROM calendar_dates WHERE service_date = ? AND exception_type = 1
-        """, (compact_date,))
+            SELECT service_id, service_date FROM calendar_dates
+            WHERE service_date = ? AND exception_type = 1
+              {calendar_dates_scope}
+        """, (compact_date,) + (() if selected is None else selected))
     connection.commit()
 
 
-def update_terminal_stops(connection: sqlite3.Connection) -> None:
-    connection.execute("""
-        UPDATE trips SET terminal_stop_id = COALESCE((
-            SELECT stop_times.raw_stop_id FROM stop_times WHERE stop_times.trip_id = trips.trip_id
-            ORDER BY stop_times.stop_sequence DESC, stop_times.rowid DESC LIMIT 1
-        ), '')
-    """)
+def update_terminal_stops(
+    connection: sqlite3.Connection,
+    provider_ids: Iterable[str] | None = None,
+) -> None:
+    selected = _normalized_provider_ids(provider_ids)
+    if selected is None:
+        connection.execute("""
+            UPDATE trips SET terminal_stop_id = COALESCE((
+                SELECT stop_times.raw_stop_id FROM stop_times WHERE stop_times.trip_id = trips.trip_id
+                ORDER BY stop_times.stop_sequence DESC, stop_times.rowid DESC LIMIT 1
+            ), '')
+        """)
+    elif selected:
+        placeholders = ",".join("?" for _ in selected)
+        connection.execute(
+            f"""
+            UPDATE trips SET terminal_stop_id = COALESCE((
+                SELECT stop_times.raw_stop_id FROM stop_times WHERE stop_times.trip_id = trips.trip_id
+                ORDER BY stop_times.stop_sequence DESC, stop_times.rowid DESC LIMIT 1
+            ), '')
+            WHERE trip_id IN (
+                SELECT key_1 FROM provider_entities
+                WHERE entity_type = 'trips' AND provider_id IN ({placeholders})
+            )
+            """,
+            selected,
+        )
     connection.commit()
 
 

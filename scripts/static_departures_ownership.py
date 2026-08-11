@@ -152,21 +152,70 @@ def register_city_mode(
     )
 
 
-def rebuild_city_stops(connection: sqlite3.Connection) -> None:
+def _normalized_city_ids(city_ids: Iterable[str] | None) -> tuple[str, ...] | None:
+    if city_ids is None:
+        return None
+    return tuple(sorted({city_id.strip() for city_id in city_ids if city_id.strip()}))
+
+
+def provider_city_ids(
+    connection: sqlite3.Connection,
+    provider_ids: Iterable[str],
+) -> set[str]:
+    selected = tuple(sorted({provider_id.strip() for provider_id in provider_ids if provider_id.strip()}))
+    if not selected or not has_ownership_schema(connection):
+        return set()
+    placeholders = ",".join("?" for _ in selected)
+    rows = connection.execute(
+        f"""
+        SELECT city_id FROM provider_city_stops WHERE provider_id IN ({placeholders})
+        UNION
+        SELECT city_id FROM provider_city_modes WHERE provider_id IN ({placeholders})
+        """,
+        selected + selected,
+    )
+    return {str(row[0]) for row in rows}
+
+
+def rebuild_city_stops(
+    connection: sqlite3.Connection,
+    city_ids: Iterable[str] | None = None,
+) -> None:
     if not has_ownership_schema(connection):
         return
-    connection.execute("DELETE FROM city_stops")
-    connection.execute(
-        """
-        INSERT OR IGNORE INTO city_stops(city_id, stop_id)
-        SELECT city_id, stop_id
-        FROM provider_city_stops
-        ORDER BY city_id, stop_id, provider_id
-        """
-    )
+    selected = _normalized_city_ids(city_ids)
+    if selected is None:
+        connection.execute("DELETE FROM city_stops")
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO city_stops(city_id, stop_id)
+            SELECT city_id, stop_id
+            FROM provider_city_stops
+            ORDER BY city_id, stop_id, provider_id
+            """
+        )
+    elif selected:
+        placeholders = ",".join("?" for _ in selected)
+        connection.execute(
+            f"DELETE FROM city_stops WHERE city_id IN ({placeholders})",
+            selected,
+        )
+        connection.execute(
+            f"""
+            INSERT OR IGNORE INTO city_stops(city_id, stop_id)
+            SELECT city_id, stop_id
+            FROM provider_city_stops
+            WHERE city_id IN ({placeholders})
+            ORDER BY city_id, stop_id, provider_id
+            """,
+            selected,
+        )
 
 
-def rebuild_city_departure_modes(connection: sqlite3.Connection) -> None:
+def rebuild_city_departure_modes(
+    connection: sqlite3.Connection,
+    city_ids: Iterable[str] | None = None,
+) -> None:
     if not has_ownership_schema(connection):
         return
     tables = {
@@ -177,17 +226,37 @@ def rebuild_city_departure_modes(connection: sqlite3.Connection) -> None:
     }
     if "city_departure_modes" not in tables:
         return
-    connection.execute("DELETE FROM city_departure_modes")
-    connection.execute(
-        """
-        INSERT OR IGNORE INTO city_departure_modes(
-            city_id, mode, timezone, stop_id_prefix, identifier_prefix
+    selected = _normalized_city_ids(city_ids)
+    if selected is None:
+        connection.execute("DELETE FROM city_departure_modes")
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO city_departure_modes(
+                city_id, mode, timezone, stop_id_prefix, identifier_prefix
+            )
+            SELECT city_id, mode, timezone, stop_id_prefix, identifier_prefix
+            FROM provider_city_modes
+            ORDER BY city_id, provider_id
+            """
         )
-        SELECT city_id, mode, timezone, stop_id_prefix, identifier_prefix
-        FROM provider_city_modes
-        ORDER BY city_id, provider_id
-        """
-    )
+    elif selected:
+        placeholders = ",".join("?" for _ in selected)
+        connection.execute(
+            f"DELETE FROM city_departure_modes WHERE city_id IN ({placeholders})",
+            selected,
+        )
+        connection.execute(
+            f"""
+            INSERT OR IGNORE INTO city_departure_modes(
+                city_id, mode, timezone, stop_id_prefix, identifier_prefix
+            )
+            SELECT city_id, mode, timezone, stop_id_prefix, identifier_prefix
+            FROM provider_city_modes
+            WHERE city_id IN ({placeholders})
+            ORDER BY city_id, provider_id
+            """,
+            selected,
+        )
 
 
 def _provider_placeholders(provider_ids: list[str]) -> str:
@@ -222,6 +291,7 @@ def delete_provider_data(
             "run the canonical full pipeline once before using scoped rebuild."
         )
 
+    affected_city_ids = provider_city_ids(connection, selected)
     placeholders = _provider_placeholders(selected)
     params = tuple(selected)
     owned = (
@@ -394,5 +464,5 @@ def delete_provider_data(
         f"DELETE FROM provider_entities WHERE provider_id IN ({placeholders})",
         params,
     )
-    rebuild_city_stops(connection)
-    rebuild_city_departure_modes(connection)
+    rebuild_city_stops(connection, affected_city_ids)
+    rebuild_city_departure_modes(connection, affected_city_ids)
