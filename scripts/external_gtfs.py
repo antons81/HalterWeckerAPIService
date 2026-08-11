@@ -856,15 +856,19 @@ def build_external_departure_index(
     output: Path,
     timezone_name: str,
     namespace: str = "",
+    departure_window_days: int = 3,
 ) -> None:
     if not cities:
         return
 
     zone = ZoneInfo(timezone_name)
     today = datetime.now(zone).date()
+    if departure_window_days < 1:
+        raise ValueError("departure_window_days must be positive")
+    offsets = (-1, 0, 1) if departure_window_days <= 3 else range(departure_window_days)
     service_dates = [
         (today + timedelta(days=offset)).strftime("%Y%m%d")
-        for offset in (-1, 0, 1)
+        for offset in offsets
     ]
     calendar = _service_calendar(archive)
     active_by_service: dict[str, list[str]] = {}
@@ -1229,6 +1233,7 @@ def process_external_gtfs_sources(
                     source_output,
                     timezone_name=str(source["timezone"]),
                     namespace=namespace,
+                    departure_window_days=int(source.get("departurePackageDays", 3)),
                 )
 
             if source.get("buildTripIndex", True):
