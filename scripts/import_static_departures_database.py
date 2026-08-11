@@ -14,8 +14,8 @@ from pathlib import Path
 
 from build_german_departure_index import (
     DEFAULT_TIMEZONE, connect, load_city_aliases,
-    populate_active_services, populate_gtfs, resolve_canonical_stops, service_window,
-    update_terminal_stops,
+    ImportStageRunner, populate_active_services, populate_gtfs, resolve_canonical_stops,
+    service_window, update_terminal_stops,
 )
 from build_stop_packages import load_cities, load_gtfs_archive, nl_city_ids
 from austrian_sources import DEFAULT_REGISTRY, load_austrian_sources, public_stop_id
@@ -157,6 +157,7 @@ def populate_provider_city_memberships(
     stop_data: Path,
     included_city_ids: set[str],
     stop_id_prefix_by_provider: dict[str, str] | None = None,
+    indexed_ownership_lookup: bool = False,
 ) -> set[str]:
     """Map package memberships to the providers that own their GTFS stop IDs."""
     manifest = json.loads((stop_data / "manifest.json").read_text(encoding="utf-8"))
@@ -168,6 +169,13 @@ def populate_provider_city_memberships(
             connection,
             stop_data,
             included_city_ids=included_city_ids,
+        )
+    if indexed_ownership_lookup:
+        return _populate_provider_city_memberships_indexed(
+            connection,
+            stop_data,
+            included_city_ids,
+            stop_id_prefix_by_provider,
         )
 
     city_ids: set[str] = set()
@@ -229,6 +237,142 @@ def populate_provider_city_memberships(
             for provider, stop_id in owners:
                 owned_ids.setdefault(provider, set()).add(stop_id)
             unresolved_public_id = str(stop["id"]) not in {stop_id for _, stop_id in owners}
+            if unresolved_public_id:
+                for provider, _ in owners:
+                    owned_ids.setdefault(provider, set()).add(str(stop["id"]))
+
+        memberships = [(city_id, stop_id) for stop_id in sorted(package_stop_ids)]
+        connection.executemany(
+            "INSERT OR IGNORE INTO city_stops(city_id, stop_id) VALUES (?, ?)",
+            memberships,
+        )
+        for provider, stop_ids in owned_ids.items():
+            register_city_stops(
+                connection,
+                provider,
+                ((city_id, stop_id) for stop_id in sorted(stop_ids)),
+            )
+        city_ids.add(city_id)
+    connection.commit()
+    return city_ids
+
+
+def _populate_provider_city_memberships_indexed(
+    connection: sqlite3.Connection,
+    stop_data: Path,
+    included_city_ids: set[str],
+    stop_id_prefix_by_provider: dict[str, str] | None,
+) -> set[str]:
+    """Resolve scoped package ownership through one indexed TEMP set."""
+    manifest = json.loads((stop_data / "manifest.json").read_text(encoding="utf-8"))
+    cities = manifest.get("cities")
+    if not isinstance(cities, list):
+        raise ValueError("Stop manifest must contain a cities array.")
+
+    city_packages: list[tuple[str, list[dict[str, object]], dict[str, str]]] = []
+    candidate_stop_ids: set[str] = set()
+    for city in cities:
+        if not isinstance(city, dict) or not isinstance(city.get("id"), str):
+            raise ValueError("Stop manifest contains an invalid city entry.")
+        city_id = str(city["id"])
+        if city_id not in included_city_ids:
+            continue
+        package_path = stop_data / str(city.get("url", ""))
+        package = json.loads(package_path.read_text(encoding="utf-8"))
+        if not isinstance(package, list):
+            raise ValueError(f"Invalid stop package for {city_id}")
+        prefix_by_provider = dict(stop_id_prefix_by_provider or {})
+        for provider_id, prefix in connection.execute(
+            "SELECT provider_id, stop_id_prefix FROM provider_city_modes WHERE city_id=?",
+            (city_id,),
+        ):
+            prefix_by_provider.setdefault(str(provider_id), str(prefix))
+        typed_package = [stop for stop in package if isinstance(stop, dict)]
+        city_packages.append((city_id, typed_package, prefix_by_provider))
+        for stop in typed_package:
+            if not stop.get("id"):
+                continue
+            stop_ids = {str(stop["id"])}
+            stop_ids.update(str(alias) for alias in stop.get("sourceStopIDs", []) if alias)
+            candidate_stop_ids.update(stop_ids)
+            for prefix in prefix_by_provider.values():
+                if prefix:
+                    candidate_stop_ids.update(f"{prefix}{stop_id}" for stop_id in stop_ids)
+
+    connection.executescript(
+        """
+        CREATE TEMP TABLE scoped_membership_candidate_stop_ids(
+            stop_id TEXT PRIMARY KEY
+        ) WITHOUT ROWID;
+        CREATE TEMP TABLE scoped_membership_stop_owners(
+            stop_id TEXT NOT NULL,
+            provider_id TEXT NOT NULL,
+            PRIMARY KEY(stop_id, provider_id)
+        ) WITHOUT ROWID;
+        """
+    )
+    connection.executemany(
+        "INSERT INTO scoped_membership_candidate_stop_ids(stop_id) VALUES (?)",
+        ((stop_id,) for stop_id in sorted(candidate_stop_ids)),
+    )
+    connection.execute(
+        """
+        INSERT INTO scoped_membership_stop_owners(stop_id, provider_id)
+        SELECT entities.key_1, entities.provider_id
+        FROM provider_entities AS entities
+        JOIN scoped_membership_candidate_stop_ids AS candidates
+          ON candidates.stop_id = entities.key_1
+        WHERE entities.entity_type = 'raw_stops'
+        """
+    )
+    owners_by_stop: dict[str, list[tuple[str, str]]] = {}
+    for stop_id, provider_id in connection.execute(
+        "SELECT stop_id, provider_id FROM scoped_membership_stop_owners"
+    ):
+        owners_by_stop.setdefault(str(stop_id), []).append(
+            (str(provider_id), str(stop_id))
+        )
+
+    city_ids: set[str] = set()
+    for city_id, package, prefix_by_provider in city_packages:
+        package_stop_ids: set[str] = set()
+        owned_ids: dict[str, set[str]] = {}
+        for stop in package:
+            if not stop.get("id"):
+                continue
+            stop_ids = {str(stop["id"])}
+            stop_ids.update(str(alias) for alias in stop.get("sourceStopIDs", []) if alias)
+            package_stop_ids.update(stop_ids)
+            candidate_ids = set(stop_ids)
+            for prefix in prefix_by_provider.values():
+                if prefix:
+                    candidate_ids.update(f"{prefix}{stop_id}" for stop_id in stop_ids)
+            owners = [
+                owner
+                for candidate_id in sorted(candidate_ids)
+                for owner in owners_by_stop.get(candidate_id, ())
+            ]
+            preferred_owners = [
+                (provider, stop_id)
+                for provider, stop_id in owners
+                if prefix_by_provider.get(provider)
+                and stop_id in {
+                    f"{prefix_by_provider[provider]}{public_stop_id}"
+                    for public_stop_id in stop_ids
+                }
+            ]
+            if preferred_owners:
+                owners = preferred_owners
+            if not owners:
+                raise ValueError(
+                    f"Could not resolve provider ownership for package stop "
+                    f"{city_id}/{stop.get('id')}"
+                )
+            for provider, stop_id in owners:
+                owned_ids.setdefault(provider, set()).add(stop_id)
+            unresolved_public_id = str(stop["id"]) not in {
+                stop_id for _, stop_id in owners
+            }
             if unresolved_public_id:
                 for provider, _ in owners:
                     owned_ids.setdefault(provider, set()).add(str(stop["id"]))
@@ -350,6 +494,7 @@ def add_external_gtfs(
     populate_memberships: bool = True,
     environ: dict[str, str] | None = None,
     scoped: bool = False,
+    stage_runner: ImportStageRunner | None = None,
 ) -> set[str]:
     """Augment an existing static departures database with external GTFS feeds.
 
@@ -383,6 +528,11 @@ def add_external_gtfs(
             environ=environ if environ is not None else os.environ,
         )
         with load_gtfs_archive(request_url, headers=headers) as archive:
+            provider_stage_runner = None
+            if stage_runner is not None:
+                provider_stage_runner = lambda stage, callback, source_id=source_id: stage_runner(
+                    f"{source_id}:{stage}", callback
+                )
             populate_gtfs(
                 connection,
                 archive,
@@ -391,9 +541,10 @@ def add_external_gtfs(
                     str(source.get("staticStopIDPrefix", (
                         str(source.get("namespace", "")).strip()
                         or str(source["identifierPrefix"])
-                    )))
+                )))
                 ),
                 provider_id=source_id,
+                stage_runner=provider_stage_runner,
             )
         imported_city_ids.update(str(city["id"]) for city in cities)
 
@@ -401,17 +552,44 @@ def add_external_gtfs(
         return imported_city_ids
 
     provider_scope = (source_id for source_id in url_by_provider) if scoped else None
-    resolve_canonical_stops(connection, provider_ids=provider_scope)
-    if populate_memberships:
-        populate_provider_city_memberships(
-            connection,
-            stop_data,
-            included_city_ids=imported_city_ids,
-            stop_id_prefix_by_provider=source_stop_id_prefixes,
+    if stage_runner is None:
+        resolve_canonical_stops(connection, provider_ids=provider_scope)
+    else:
+        stage_runner(
+            "canonical-stops",
+            lambda: resolve_canonical_stops(connection, provider_ids=provider_scope),
         )
+    if populate_memberships:
+        if stage_runner is None:
+            populate_provider_city_memberships(
+                connection,
+                stop_data,
+                included_city_ids=imported_city_ids,
+                stop_id_prefix_by_provider=source_stop_id_prefixes,
+            )
+        else:
+            stage_runner(
+                "memberships",
+                lambda: populate_provider_city_memberships(
+                    connection,
+                    stop_data,
+                    included_city_ids=imported_city_ids,
+                    stop_id_prefix_by_provider=source_stop_id_prefixes,
+                ),
+            )
     provider_scope = tuple(url_by_provider) if scoped else None
-    populate_active_services(connection, dates, provider_ids=provider_scope)
-    update_terminal_stops(connection, provider_ids=provider_scope)
+    if stage_runner is None:
+        populate_active_services(connection, dates, provider_ids=provider_scope)
+        update_terminal_stops(connection, provider_ids=provider_scope)
+    else:
+        stage_runner(
+            "active-services",
+            lambda: populate_active_services(connection, dates, provider_ids=provider_scope),
+        )
+        stage_runner(
+            "terminal-stops",
+            lambda: update_terminal_stops(connection, provider_ids=provider_scope),
+        )
 
     if "stop_id_prefix" not in {
         row[1] for row in connection.execute("PRAGMA table_info(city_departure_modes)")
@@ -430,56 +608,63 @@ def add_external_gtfs(
         source = sources_by_id[source_id]
         for city in load_external_cities(source, repository_root):
             source_ids_by_city.setdefault(str(city["id"]), []).append(source_id)
-    connection.executemany(
-        "INSERT OR IGNORE INTO city_departure_modes(city_id, mode, timezone, stop_id_prefix, identifier_prefix) VALUES (?, 'canonical', ?, ?, ?)",
-        (
+    def register_modes() -> int:
+        connection.executemany(
+            "INSERT OR IGNORE INTO city_departure_modes(city_id, mode, timezone, stop_id_prefix, identifier_prefix) VALUES (?, 'canonical', ?, ?, ?)",
             (
-                city_id,
-                str(sources_by_id[source_ids_by_city[city_id][0]]["timezone"]),
                 (
-                    str(sources_by_id[source_ids_by_city[city_id][0]].get("staticStopIDPrefix", (
-                        str(sources_by_id[source_ids_by_city[city_id][0]].get("namespace", "")).strip()
-                        or str(sources_by_id[source_ids_by_city[city_id][0]]["identifierPrefix"])
-                    )))
-                    if len(source_ids_by_city[city_id]) == 1
-                    and not str(sources_by_id[source_ids_by_city[city_id][0]].get("namespace", "")).strip()
-                    else ""
-                ),
-                (
-                    str(sources_by_id[source_ids_by_city[city_id][0]].get("staticIdentifierPrefix", ""))
-                    if len(source_ids_by_city[city_id]) == 1
-                    and not str(sources_by_id[source_ids_by_city[city_id][0]].get("namespace", "")).strip()
-                    else ""
-                ),
-            )
-            for city_id in sorted(imported_city_ids)
-        ),
-    )
-    for city_id in sorted(imported_city_ids):
-        for source_id in source_ids_by_city[city_id]:
-            source = sources_by_id[source_id]
-            register_city_mode(
-                connection,
-                source_id,
-                city_id,
-                "canonical",
-                str(source["timezone"]),
-                (
-                    str(source.get("staticStopIDPrefix", (
-                        str(source.get("namespace", "")).strip()
-                        or str(source["identifierPrefix"])
-                    )))
-                    if len(source_ids_by_city[city_id]) == 1
-                    and not str(source.get("namespace", "")).strip()
-                    else ""
-                ),
-                (
-                    str(source.get("staticIdentifierPrefix", ""))
-                    if len(source_ids_by_city[city_id]) == 1
-                    and not str(source.get("namespace", "")).strip()
-                    else ""
-                ),
-            )
+                    city_id,
+                    str(sources_by_id[source_ids_by_city[city_id][0]]["timezone"]),
+                    (
+                        str(sources_by_id[source_ids_by_city[city_id][0]].get("staticStopIDPrefix", (
+                            str(sources_by_id[source_ids_by_city[city_id][0]].get("namespace", "")).strip()
+                            or str(sources_by_id[source_ids_by_city[city_id][0]]["identifierPrefix"])
+                        )))
+                        if len(source_ids_by_city[city_id]) == 1
+                        and not str(sources_by_id[source_ids_by_city[city_id][0]].get("namespace", "")).strip()
+                        else ""
+                    ),
+                    (
+                        str(sources_by_id[source_ids_by_city[city_id][0]].get("staticIdentifierPrefix", ""))
+                        if len(source_ids_by_city[city_id]) == 1
+                        and not str(sources_by_id[source_ids_by_city[city_id][0]].get("namespace", "")).strip()
+                        else ""
+                    ),
+                )
+                for city_id in sorted(imported_city_ids)
+            ),
+        )
+        for city_id in sorted(imported_city_ids):
+            for source_id in source_ids_by_city[city_id]:
+                source = sources_by_id[source_id]
+                register_city_mode(
+                    connection,
+                    source_id,
+                    city_id,
+                    "canonical",
+                    str(source["timezone"]),
+                    (
+                        str(source.get("staticStopIDPrefix", (
+                            str(source.get("namespace", "")).strip()
+                            or str(source["identifierPrefix"])
+                        )))
+                        if len(source_ids_by_city[city_id]) == 1
+                        and not str(source.get("namespace", "")).strip()
+                        else ""
+                    ),
+                    (
+                        str(source.get("staticIdentifierPrefix", ""))
+                        if len(source_ids_by_city[city_id]) == 1
+                        and not str(source.get("namespace", "")).strip()
+                        else ""
+                    ),
+                )
+        return len(imported_city_ids)
+
+    if stage_runner is None:
+        register_modes()
+    else:
+        stage_runner("memberships:modes", register_modes)
     connection.commit()
     return imported_city_ids
 

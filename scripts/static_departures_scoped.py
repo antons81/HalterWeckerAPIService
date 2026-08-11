@@ -69,6 +69,56 @@ def timed_stage(stage: str, callback):
         )
 
 
+def _io_snapshot() -> dict[str, int]:
+    try:
+        values: dict[str, int] = {}
+        for line in Path("/proc/self/io").read_text(encoding="utf-8").splitlines():
+            key, value = line.split(":", 1)
+            if key in {"rchar", "wchar"}:
+                values[key] = int(value.strip())
+        return values
+    except (FileNotFoundError, OSError, ValueError):
+        return {"rchar": 0, "wchar": 0}
+
+
+def _timed_import_substage(
+    connection: sqlite3.Connection,
+    stage_name: str,
+    callback,
+):
+    started = time.monotonic()
+    changes_before = connection.total_changes
+    io_before = _io_snapshot()
+    try:
+        result = callback()
+    except BaseException:
+        io_after = _io_snapshot()
+        print(
+            "[ScopedDepartures] stage=import-external "
+            f"substage={stage_name} status=error "
+            f"duration={time.monotonic() - started:.2f}s "
+            f"rchar={io_after.get('rchar', 0) - io_before.get('rchar', 0)} "
+            f"wchar={io_after.get('wchar', 0) - io_before.get('wchar', 0)}",
+            flush=True,
+        )
+        raise
+    io_after = _io_snapshot()
+    row_count = (
+        result
+        if isinstance(result, int) and not isinstance(result, bool)
+        else connection.total_changes - changes_before
+    )
+    print(
+        "[ScopedDepartures] stage=import-external "
+        f"substage={stage_name} duration={time.monotonic() - started:.2f}s "
+        f"rows={row_count} "
+        f"rchar={io_after.get('rchar', 0) - io_before.get('rchar', 0)} "
+        f"wchar={io_after.get('wchar', 0) - io_before.get('wchar', 0)}",
+        flush=True,
+    )
+    return result
+
+
 def load_static_providers(repository_root: Path) -> list[StaticProvider]:
     """Build the registry from the existing source registries."""
     providers = [StaticProvider("germany", "DE", "germany")]
@@ -381,6 +431,9 @@ def import_external(
             populate_memberships=False,
             environ=environment,
             scoped=True,
+            stage_runner=lambda stage, callback: _timed_import_substage(
+                connection, stage, callback
+            ),
         ))
     if imported_city_ids:
         stop_id_prefix_by_provider = {
@@ -393,11 +446,16 @@ def import_external(
             )
             for provider in providers
         }
-        populate_provider_city_memberships(
+        _timed_import_substage(
             connection,
-            stop_data,
-            included_city_ids=imported_city_ids,
-            stop_id_prefix_by_provider=stop_id_prefix_by_provider,
+            "memberships",
+            lambda: populate_provider_city_memberships(
+                connection,
+                stop_data,
+                included_city_ids=imported_city_ids,
+                stop_id_prefix_by_provider=stop_id_prefix_by_provider,
+                indexed_ownership_lookup=True,
+            ),
         )
 
 
