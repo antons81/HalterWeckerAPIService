@@ -1063,6 +1063,7 @@ def process_external_gtfs_sources(
     load_gtfs_archive,
     environ: dict[str, str] | None = None,
     occupied_city_ids: set[str] | None = None,
+    selected_source_ids: set[str] | None = None,
 ) -> tuple[
     list[dict[str, object]],
     list[dict[str, object]],
@@ -1092,6 +1093,9 @@ def process_external_gtfs_sources(
     namespace_root = output / ".external-namespaces"
 
     for source in sources:
+        source_id = str(source["id"])
+        if selected_source_ids is not None and source_id not in selected_source_ids:
+            continue
         validate_external_gtfs_source(
             source,
             repository_root,
@@ -1099,7 +1103,6 @@ def process_external_gtfs_sources(
             known_prefixes=known_prefixes,
             known_namespaces=known_namespaces,
         )
-        source_id = str(source["id"])
         known_source_ids.add(source_id)
         identifier_prefix = str(source.get("identifierPrefix", ""))
         if identifier_prefix:

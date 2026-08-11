@@ -482,6 +482,7 @@ def build_external_static_assets(
         output=stop_data,
         load_gtfs_archive=load_gtfs_archive,
         occupied_city_ids=set(),
+        selected_source_ids=set(selected_urls),
     )
 
     manifest_path = stop_data / "manifest.json"
