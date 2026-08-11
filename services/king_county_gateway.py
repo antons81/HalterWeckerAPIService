@@ -90,6 +90,14 @@ class KingCountyVehiclePositionsProxy(BayAreaVehiclePositionsProxy):
             payload = dict(response.payload)
             payload["providerID"] = KING_COUNTY_PROVIDER_ID
             payload["cityID"] = query.get("cityID", [KING_COUNTY_CITY_ID])[0]
+            payload["vehicles"] = [
+                {
+                    **vehicle,
+                    "tripID": str(vehicle["tripID"] or "").removeprefix(KING_COUNTY_NAMESPACE) or None,
+                    "routeID": str(vehicle["routeID"] or "").removeprefix(KING_COUNTY_NAMESPACE) or None,
+                }
+                for vehicle in payload.get("vehicles", [])
+            ]
             response = GatewayResponse(response.status, payload, response.cache_control)
         return response
 
