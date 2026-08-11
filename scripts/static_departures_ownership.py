@@ -310,6 +310,11 @@ def _prepare_scoped_delete_sets(
     placeholders = _provider_placeholders(selected)
     params = tuple(selected)
     for table_name, column_definition in (
+        (
+            "scoped_foreign_entities",
+            "entity_type TEXT NOT NULL, key_1 TEXT NOT NULL, key_2 TEXT NOT NULL, "
+            "key_3 TEXT NOT NULL, PRIMARY KEY(entity_type, key_1, key_2, key_3)",
+        ),
         ("scoped_stop_ids", "stop_id TEXT PRIMARY KEY"),
         ("scoped_trip_ids", "trip_id TEXT PRIMARY KEY"),
         ("scoped_route_ids", "route_id TEXT PRIMARY KEY"),
@@ -327,12 +332,28 @@ def _prepare_scoped_delete_sets(
             "pathway_id TEXT NOT NULL, from_stop_id TEXT NOT NULL, "
             "to_stop_id TEXT NOT NULL, PRIMARY KEY(pathway_id, from_stop_id, to_stop_id)",
         ),
-    ):
+        ):
         _timed_delete_statement(
             connection,
             f"create-{table_name}",
             f"CREATE TEMP TABLE {table_name} ({column_definition})",
         )
+
+    _timed_delete_statement(
+        connection,
+        "populate-foreign-entities",
+        f"""
+        INSERT INTO scoped_foreign_entities(entity_type, key_1, key_2, key_3)
+        SELECT entity_type, key_1, key_2, key_3
+        FROM provider_entities
+        WHERE provider_id NOT IN ({placeholders})
+          AND entity_type IN (
+              'raw_stops', 'trips', 'routes', 'calendar', 'calendar_dates',
+              'transfers', 'pathways'
+          )
+        """,
+        params,
+    )
 
     _timed_delete_statement(
         connection,
@@ -344,13 +365,12 @@ def _prepare_scoped_delete_sets(
         WHERE owned.entity_type = 'raw_stops'
           AND owned.provider_id IN ({placeholders})
           AND NOT EXISTS (
-              SELECT 1 FROM provider_entities other
+              SELECT 1 FROM scoped_foreign_entities other
               WHERE other.entity_type = 'raw_stops'
                 AND other.key_1 = owned.key_1
-                AND other.provider_id NOT IN ({placeholders})
           )
         """,
-        params + params,
+        params,
     )
     _timed_delete_statement(
         connection,
@@ -362,13 +382,12 @@ def _prepare_scoped_delete_sets(
         WHERE owned.entity_type = 'trips'
           AND owned.provider_id IN ({placeholders})
           AND NOT EXISTS (
-              SELECT 1 FROM provider_entities other
+              SELECT 1 FROM scoped_foreign_entities other
               WHERE other.entity_type = 'trips'
                 AND other.key_1 = owned.key_1
-                AND other.provider_id NOT IN ({placeholders})
           )
         """,
-        params + params,
+        params,
     )
     _timed_delete_statement(
         connection,
@@ -380,13 +399,12 @@ def _prepare_scoped_delete_sets(
         WHERE owned.entity_type = 'routes'
           AND owned.provider_id IN ({placeholders})
           AND NOT EXISTS (
-              SELECT 1 FROM provider_entities other
+              SELECT 1 FROM scoped_foreign_entities other
               WHERE other.entity_type = 'routes'
                 AND other.key_1 = owned.key_1
-                AND other.provider_id NOT IN ({placeholders})
           )
         """,
-        params + params,
+        params,
     )
     _timed_delete_statement(
         connection,
@@ -398,13 +416,12 @@ def _prepare_scoped_delete_sets(
         WHERE owned.entity_type IN ('calendar', 'calendar_dates')
           AND owned.provider_id IN ({placeholders})
           AND NOT EXISTS (
-              SELECT 1 FROM provider_entities other
+              SELECT 1 FROM scoped_foreign_entities other
               WHERE other.entity_type IN ('calendar', 'calendar_dates')
                 AND other.key_1 = owned.key_1
-                AND other.provider_id NOT IN ({placeholders})
           )
         """,
-        params + params,
+        params,
     )
     _timed_delete_statement(
         connection,
@@ -416,13 +433,12 @@ def _prepare_scoped_delete_sets(
         WHERE owned.entity_type = 'calendar'
           AND owned.provider_id IN ({placeholders})
           AND NOT EXISTS (
-              SELECT 1 FROM provider_entities other
+              SELECT 1 FROM scoped_foreign_entities other
               WHERE other.entity_type = 'calendar'
                 AND other.key_1 = owned.key_1
-                AND other.provider_id NOT IN ({placeholders})
           )
         """,
-        params + params,
+        params,
     )
     _timed_delete_statement(
         connection,
@@ -434,13 +450,12 @@ def _prepare_scoped_delete_sets(
         WHERE owned.entity_type = 'calendar_dates'
           AND owned.provider_id IN ({placeholders})
           AND NOT EXISTS (
-              SELECT 1 FROM provider_entities other
+              SELECT 1 FROM scoped_foreign_entities other
               WHERE other.entity_type = 'calendar_dates'
                 AND other.key_1 = owned.key_1
-                AND other.provider_id NOT IN ({placeholders})
           )
         """,
-        params + params,
+        params,
     )
     _timed_delete_statement(
         connection,
@@ -452,13 +467,12 @@ def _prepare_scoped_delete_sets(
         WHERE owned.entity_type = 'transfers'
           AND owned.provider_id IN ({placeholders})
           AND NOT EXISTS (
-              SELECT 1 FROM provider_entities other
+              SELECT 1 FROM scoped_foreign_entities other
               WHERE other.entity_type = 'transfers'
                 AND other.key_1 = owned.key_1
-                AND other.provider_id NOT IN ({placeholders})
           )
         """,
-        params + params,
+        params,
     )
     _timed_delete_statement(
         connection,
@@ -470,15 +484,14 @@ def _prepare_scoped_delete_sets(
         WHERE owned.entity_type = 'transfers'
           AND owned.provider_id IN ({placeholders})
           AND NOT EXISTS (
-              SELECT 1 FROM provider_entities other
+              SELECT 1 FROM scoped_foreign_entities other
               WHERE other.entity_type = 'transfers'
                 AND other.key_1 = owned.key_1
                 AND other.key_2 = owned.key_2
                 AND other.key_3 = owned.key_3
-                AND other.provider_id NOT IN ({placeholders})
           )
         """,
-        params + params,
+        params,
     )
     _timed_delete_statement(
         connection,
@@ -490,15 +503,14 @@ def _prepare_scoped_delete_sets(
         WHERE owned.entity_type = 'pathways'
           AND owned.provider_id IN ({placeholders})
           AND NOT EXISTS (
-              SELECT 1 FROM provider_entities other
+              SELECT 1 FROM scoped_foreign_entities other
               WHERE other.entity_type = 'pathways'
                 AND other.key_1 = owned.key_1
                 AND other.key_2 = owned.key_2
                 AND other.key_3 = owned.key_3
-                AND other.provider_id NOT IN ({placeholders})
           )
         """,
-        params + params,
+        params,
     )
 
 
