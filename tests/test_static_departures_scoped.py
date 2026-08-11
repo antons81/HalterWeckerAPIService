@@ -4,6 +4,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 from datetime import date
@@ -364,10 +365,10 @@ class StaticDepartureScopeTests(unittest.TestCase):
                 15,
                 artifacts={"511-bay-area": feed},
             )
-            resolve_canonical_stops(connection)
-            update_terminal_stops(connection)
-            rebuild_city_stops(connection)
-            rebuild_city_departure_modes(connection)
+            resolve_canonical_stops(connection, provider_ids=["511-bay-area"])
+            update_terminal_stops(connection, provider_ids=["511-bay-area"])
+            rebuild_city_stops(connection, {"san-francisco"})
+            rebuild_city_departure_modes(connection, {"san-francisco"})
 
             self.assertEqual(
                 connection.execute(
@@ -396,6 +397,137 @@ class StaticDepartureScopeTests(unittest.TestCase):
                     ("san-francisco", "17874"),
                 ).fetchone()[0],
                 1,
+            )
+            connection.close()
+
+    def test_scoped_indexes_preserve_unselected_provider_and_city_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed_a = root / "a-current.zip"
+            feed_b = root / "b-current.zip"
+            write_feed(feed_a, "a", "current")
+            write_feed(feed_b, "b", "current")
+            database_path = root / "departures.sqlite"
+            create_database(
+                database_path,
+                [
+                    ("provider-a", "a", feed_a),
+                    ("provider-b", "b", feed_b),
+                ],
+            )
+
+            connection = sqlite3.connect(database_path)
+            connection.execute(
+                "UPDATE raw_stops SET canonical_stop_id=? WHERE stop_id LIKE 'b:%'",
+                ("sentinel-b",),
+            )
+            connection.execute(
+                "UPDATE trips SET terminal_stop_id=? WHERE trip_id LIKE 'b:%'",
+                ("sentinel-b",),
+            )
+            connection.execute(
+                "UPDATE active_services SET service_date=? WHERE service_id LIKE 'b:%'",
+                ("sentinel-date",),
+            )
+            connection.execute(
+                "INSERT INTO city_stops(city_id, stop_id) VALUES (?, ?)",
+                ("untouched-city", "untouched-stop"),
+            )
+            connection.execute(
+                "INSERT INTO city_departure_modes(city_id, mode, timezone) VALUES (?, ?, ?)",
+                ("untouched-city", "canonical", "Europe/Berlin"),
+            )
+
+            resolve_canonical_stops(connection, provider_ids=["provider-a"])
+            populate_active_services(connection, [ACTIVE_DATE], provider_ids=["provider-a"])
+            update_terminal_stops(connection, provider_ids=["provider-a"])
+            rebuild_city_stops(connection, {"fixture-city"})
+            rebuild_city_departure_modes(connection, {"fixture-city"})
+
+            self.assertEqual(
+                connection.execute(
+                    "SELECT canonical_stop_id FROM raw_stops WHERE stop_id='b:stop-current'"
+                ).fetchone(),
+                ("sentinel-b",),
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT terminal_stop_id FROM trips WHERE trip_id='b:trip-current'"
+                ).fetchone(),
+                ("sentinel-b",),
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT service_date FROM active_services WHERE service_id='b:service-current'"
+                ).fetchone(),
+                ("sentinel-date",),
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT stop_id FROM city_stops WHERE city_id='untouched-city'"
+                ).fetchone(),
+                ("untouched-stop",),
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT mode FROM city_departure_modes WHERE city_id='untouched-city'"
+                ).fetchone(),
+                ("canonical",),
+            )
+            connection.close()
+
+    def test_scoped_stage_reports_elapsed_time(self) -> None:
+        with mock.patch("builtins.print") as print_mock:
+            result = scoped.timed_stage("fixture", lambda: "ok")
+
+        self.assertEqual(result, "ok")
+        print_mock.assert_called_once()
+        self.assertIn("[ScopedDepartures] stage=fixture duration=", print_mock.call_args.args[0])
+
+    def test_scoped_delete_rebuilds_only_affected_city_memberships(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed_a = root / "a-current.zip"
+            feed_b = root / "b-current.zip"
+            write_feed(feed_a, "a", "current")
+            write_feed(feed_b, "b", "current")
+            database_path = root / "departures.sqlite"
+            create_database(
+                database_path,
+                [
+                    ("provider-a", "a", feed_a),
+                    ("provider-b", "b", feed_b),
+                ],
+            )
+
+            connection = sqlite3.connect(database_path)
+            connection.execute(
+                "INSERT INTO city_stops(city_id, stop_id) VALUES (?, ?)",
+                ("untouched-city", "untouched-stop"),
+            )
+            connection.execute(
+                "INSERT INTO city_departure_modes(city_id, mode, timezone) VALUES (?, ?, ?)",
+                ("untouched-city", "canonical", "Europe/Berlin"),
+            )
+            delete_provider_data(connection, ["provider-a"])
+
+            self.assertEqual(
+                connection.execute(
+                    "SELECT stop_id FROM city_stops WHERE city_id='untouched-city'"
+                ).fetchone(),
+                ("untouched-stop",),
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM city_stops WHERE city_id='fixture-city' AND stop_id LIKE 'b:%'"
+                ).fetchone()[0],
+                2,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT mode FROM city_departure_modes WHERE city_id='untouched-city'"
+                ).fetchone(),
+                ("canonical",),
             )
             connection.close()
 
@@ -805,6 +937,61 @@ class StaticDepartureScopeTests(unittest.TestCase):
                 sorted((data_root / "releases").iterdir()),
                 [old_release],
             )
+
+    def test_scoped_rebuild_on_sqlite_copy_completes_and_reports_stages(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data_root = root / "data"
+            old_release = data_root / "releases" / "old"
+            old_release.mkdir(parents=True)
+            (old_release / "stop-data").mkdir()
+            old_a = root / "a-old.zip"
+            feed_b = root / "b-current.zip"
+            write_feed(old_a, "a", "old")
+            write_feed(feed_b, "b", "current")
+            create_database(
+                old_release / "departures.sqlite",
+                [("provider-a", "a", old_a), ("provider-b", "b", feed_b)],
+            )
+            (old_release / "release-metadata.json").write_text(
+                json.dumps({"releaseID": "old"}),
+                encoding="utf-8",
+            )
+            (data_root / "current-release").symlink_to("releases/old")
+            (data_root / "current").symlink_to("releases/old/stop-data")
+            (data_root / "departures-current.sqlite").symlink_to(
+                "releases/old/departures.sqlite"
+            )
+
+            provider = scoped.StaticProvider(
+                "provider-a",
+                "CA",
+                "external",
+                {"id": "provider-a", "localPath": str(old_a)},
+            )
+            with (
+                mock.patch.object(scoped, "import_external"),
+                mock.patch.object(scoped, "build_external_static_assets"),
+                mock.patch.object(scoped, "run_readiness"),
+                mock.patch.object(scoped, "timed_stage", wraps=scoped.timed_stage) as stages,
+            ):
+                started = time.monotonic()
+                release = scoped.scoped_rebuild(
+                    REPOSITORY_ROOT,
+                    data_root,
+                    [provider],
+                    {"STATIC_DEPARTURES_DAYS": "15"},
+                )
+                elapsed = time.monotonic() - started
+
+            self.assertLess(elapsed, 5.0)
+            self.assertTrue(release.is_dir())
+            self.assertEqual(os.readlink(data_root / "current-release"), f"releases/{release.name}")
+            stage_names = [call.args[0] for call in stages.call_args_list]
+            self.assertIn("canonical-stops", stage_names)
+            self.assertIn("city-stops", stage_names)
+            self.assertIn("metadata-validation", stage_names)
+            self.assertIn("readiness", stage_names)
 
     def test_full_service_and_scoped_script_share_static_lock_path(self) -> None:
         service = (

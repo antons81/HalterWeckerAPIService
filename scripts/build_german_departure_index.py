@@ -10,7 +10,7 @@ import shutil
 import sqlite3
 import tempfile
 import zipfile
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -23,6 +23,17 @@ SCHEMA_VERSION = 1
 DEFAULT_TIMEZONE = "Europe/Berlin"
 DEFAULT_PROVIDER_ID = "germany"
 TRANSFER_KEY_SEPARATOR = "\x1f"
+ImportStageRunner = Callable[[str, Callable[[], object]], object]
+
+
+def _run_import_stage(
+    stage_runner: ImportStageRunner | None,
+    stage_name: str,
+    callback: Callable[[], object],
+) -> object:
+    if stage_runner is None:
+        return callback()
+    return stage_runner(stage_name, callback)
 
 
 def internal_stop_id(native_stop_id: str, prefix: str = "") -> str:
@@ -214,6 +225,7 @@ def populate_gtfs(
     identifier_prefix: str = "",
     stop_id_prefix: str = "",
     provider_id: str = DEFAULT_PROVIDER_ID,
+    stage_runner: ImportStageRunner | None = None,
 ) -> None:
     required = {"stops.txt", "routes.txt", "trips.txt", "stop_times.txt"}
     missing = required - set(archive.namelist())
@@ -282,220 +294,313 @@ def populate_gtfs(
             "ALTER TABLE routes ADD COLUMN route_type TEXT NOT NULL DEFAULT ''"
         )
 
+    _run_import_stage(
+        stage_runner,
+        "agencies",
+        lambda: sum(1 for _ in gtfs_rows(archive, "agency.txt")),
+    )
+
     stop_ids: list[str] = []
-    connection.executemany(
-        "INSERT INTO raw_stops(stop_id, parent_station, stop_name, platform_code, source_order) VALUES (?, ?, ?, ?, ?)",
-        (
+
+    def import_stops() -> int:
+        connection.executemany(
+            "INSERT INTO raw_stops(stop_id, parent_station, stop_name, platform_code, source_order) VALUES (?, ?, ?, ?, ?)",
             (
-                internal_stop_id(row["stop_id"], stop_id_prefix),
-                internal_stop_id(row.get("parent_station", ""), stop_id_prefix),
-                row.get("stop_name", "").strip(),
-                row.get("platform_code", "").strip(),
-                index,
-            )
-            for index, row in enumerate(gtfs_rows(archive, "stops.txt"))
+                (
+                    internal_stop_id(row["stop_id"], stop_id_prefix),
+                    internal_stop_id(row.get("parent_station", ""), stop_id_prefix),
+                    row.get("stop_name", "").strip(),
+                    row.get("platform_code", "").strip(),
+                    index,
+                )
+                for index, row in enumerate(gtfs_rows(archive, "stops.txt"))
+                if row.get("stop_id", "").strip()
+            ),
+        )
+        stop_ids.extend(
+            internal_stop_id(row["stop_id"], stop_id_prefix)
+            for row in gtfs_rows(archive, "stops.txt")
             if row.get("stop_id", "").strip()
+        )
+        return len(stop_ids)
+
+    _run_import_stage(stage_runner, "stops", import_stops)
+    _run_import_stage(
+        stage_runner,
+        "ownership:stops",
+        lambda: register_entities(
+            connection,
+            provider_id,
+            "raw_stops",
+            ((stop_id,) for stop_id in stop_ids),
         ),
-    )
-    stop_ids.extend(
-        internal_stop_id(row["stop_id"], stop_id_prefix)
-        for row in gtfs_rows(archive, "stops.txt")
-        if row.get("stop_id", "").strip()
-    )
-    register_entities(
-        connection,
-        provider_id,
-        "raw_stops",
-        ((stop_id,) for stop_id in stop_ids),
     )
 
     route_ids: list[str] = []
-    connection.executemany(
-        "INSERT INTO routes(route_id, short_name, long_name, route_type) VALUES (?, ?, ?, ?)",
-        (
+
+    def import_routes() -> int:
+        connection.executemany(
+            "INSERT INTO routes(route_id, short_name, long_name, route_type) VALUES (?, ?, ?, ?)",
             (
-                identifier_prefix + row["route_id"].strip(),
-                row.get("route_short_name", "").strip(),
-                row.get("route_long_name", "").strip(),
-                row.get("route_type", "").strip(),
-            )
-            for row in gtfs_rows(archive, "routes.txt") if row.get("route_id", "").strip()
+                (
+                    identifier_prefix + row["route_id"].strip(),
+                    row.get("route_short_name", "").strip(),
+                    row.get("route_long_name", "").strip(),
+                    row.get("route_type", "").strip(),
+                )
+                for row in gtfs_rows(archive, "routes.txt") if row.get("route_id", "").strip()
+            ),
+        )
+        route_ids.extend(
+            identifier_prefix + row["route_id"].strip()
+            for row in gtfs_rows(archive, "routes.txt")
+            if row.get("route_id", "").strip()
+        )
+        return len(route_ids)
+
+    _run_import_stage(stage_runner, "routes", import_routes)
+    _run_import_stage(
+        stage_runner,
+        "ownership:routes",
+        lambda: register_entities(
+            connection,
+            provider_id,
+            "routes",
+            ((route_id,) for route_id in route_ids),
         ),
-    )
-    route_ids.extend(
-        identifier_prefix + row["route_id"].strip()
-        for row in gtfs_rows(archive, "routes.txt")
-        if row.get("route_id", "").strip()
-    )
-    register_entities(
-        connection,
-        provider_id,
-        "routes",
-        ((route_id,) for route_id in route_ids),
     )
 
     trip_ids: list[str] = []
-    connection.executemany(
-        "INSERT INTO trips(trip_id, service_id, route_id, headsign, direction_id) VALUES (?, ?, ?, ?, ?)",
-        (
-            (identifier_prefix + row["trip_id"].strip(), identifier_prefix + row.get("service_id", "").strip(), identifier_prefix + row.get("route_id", "").strip(), row.get("trip_headsign", "").strip(), row.get("direction_id", "").strip())
+
+    def import_trips() -> int:
+        connection.executemany(
+            "INSERT INTO trips(trip_id, service_id, route_id, headsign, direction_id) VALUES (?, ?, ?, ?, ?)",
+            (
+                (identifier_prefix + row["trip_id"].strip(), identifier_prefix + row.get("service_id", "").strip(), identifier_prefix + row.get("route_id", "").strip(), row.get("trip_headsign", "").strip(), row.get("direction_id", "").strip())
+                for row in gtfs_rows(archive, "trips.txt")
+                if row.get("trip_id", "").strip() and row.get("service_id", "").strip()
+            ),
+        )
+        trip_ids.extend(
+            identifier_prefix + row["trip_id"].strip()
             for row in gtfs_rows(archive, "trips.txt")
             if row.get("trip_id", "").strip() and row.get("service_id", "").strip()
+        )
+        return len(trip_ids)
+
+    _run_import_stage(stage_runner, "trips", import_trips)
+    _run_import_stage(
+        stage_runner,
+        "ownership:trips",
+        lambda: register_entities(
+            connection,
+            provider_id,
+            "trips",
+            ((trip_id,) for trip_id in trip_ids),
         ),
-    )
-    trip_ids.extend(
-        identifier_prefix + row["trip_id"].strip()
-        for row in gtfs_rows(archive, "trips.txt")
-        if row.get("trip_id", "").strip() and row.get("service_id", "").strip()
-    )
-    register_entities(
-        connection,
-        provider_id,
-        "trips",
-        ((trip_id,) for trip_id in trip_ids),
     )
     calendar_ids: list[str] = []
     if "calendar.txt" in archive.namelist():
-        connection.executemany(
-            "INSERT INTO calendar VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ((identifier_prefix + row["service_id"].strip(), row.get("start_date", "").strip(), row.get("end_date", "").strip(), int(row.get("monday", "0") or 0), int(row.get("tuesday", "0") or 0), int(row.get("wednesday", "0") or 0), int(row.get("thursday", "0") or 0), int(row.get("friday", "0") or 0), int(row.get("saturday", "0") or 0), int(row.get("sunday", "0") or 0))
-             for row in gtfs_rows(archive, "calendar.txt") if row.get("service_id", "").strip()),
-        )
-        calendar_ids.extend(
-            identifier_prefix + row["service_id"].strip()
-            for row in gtfs_rows(archive, "calendar.txt")
-            if row.get("service_id", "").strip()
-        )
-        register_entities(
-            connection,
-            provider_id,
-            "calendar",
-            ((service_id,) for service_id in calendar_ids),
+
+        def import_calendar() -> int:
+            connection.executemany(
+                "INSERT INTO calendar VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ((identifier_prefix + row["service_id"].strip(), row.get("start_date", "").strip(), row.get("end_date", "").strip(), int(row.get("monday", "0") or 0), int(row.get("tuesday", "0") or 0), int(row.get("wednesday", "0") or 0), int(row.get("thursday", "0") or 0), int(row.get("friday", "0") or 0), int(row.get("saturday", "0") or 0), int(row.get("sunday", "0") or 0))
+                 for row in gtfs_rows(archive, "calendar.txt") if row.get("service_id", "").strip()),
+            )
+            calendar_ids.extend(
+                identifier_prefix + row["service_id"].strip()
+                for row in gtfs_rows(archive, "calendar.txt")
+                if row.get("service_id", "").strip()
+            )
+            return len(calendar_ids)
+
+        _run_import_stage(stage_runner, "calendar", import_calendar)
+        _run_import_stage(
+            stage_runner,
+            "ownership:calendar",
+            lambda: register_entities(
+                connection,
+                provider_id,
+                "calendar",
+                ((service_id,) for service_id in calendar_ids),
+            ),
         )
     calendar_date_keys: list[tuple[str, str, str]] = []
     if "calendar_dates.txt" in archive.namelist():
-        connection.executemany(
-            "INSERT INTO calendar_dates VALUES (?, ?, ?)",
-            ((identifier_prefix + row["service_id"].strip(), row.get("date", "").strip(), int(row.get("exception_type", "0") or 0))
-             for row in gtfs_rows(archive, "calendar_dates.txt") if row.get("service_id", "").strip() and row.get("date", "").strip()),
-        )
-        calendar_date_keys.extend(
-            (
-                identifier_prefix + row["service_id"].strip(),
-                row.get("date", "").strip(),
-                row.get("exception_type", "0").strip(),
+
+        def import_calendar_dates() -> int:
+            connection.executemany(
+                "INSERT INTO calendar_dates VALUES (?, ?, ?)",
+                ((identifier_prefix + row["service_id"].strip(), row.get("date", "").strip(), int(row.get("exception_type", "0") or 0))
+                 for row in gtfs_rows(archive, "calendar_dates.txt") if row.get("service_id", "").strip() and row.get("date", "").strip()),
             )
-            for row in gtfs_rows(archive, "calendar_dates.txt")
-            if row.get("service_id", "").strip() and row.get("date", "").strip()
-        )
-        register_entities(
-            connection,
-            provider_id,
-            "calendar_dates",
-            calendar_date_keys,
+            calendar_date_keys.extend(
+                (
+                    identifier_prefix + row["service_id"].strip(),
+                    row.get("date", "").strip(),
+                    row.get("exception_type", "0").strip(),
+                )
+                for row in gtfs_rows(archive, "calendar_dates.txt")
+                if row.get("service_id", "").strip() and row.get("date", "").strip()
+            )
+            return len(calendar_date_keys)
+
+        _run_import_stage(stage_runner, "calendar_dates", import_calendar_dates)
+        _run_import_stage(
+            stage_runner,
+            "ownership:calendar_dates",
+            lambda: register_entities(
+                connection,
+                provider_id,
+                "calendar_dates",
+                calendar_date_keys,
+            ),
         )
 
-    batch: list[tuple[str, str, str, int, int]] = []
-    for row in gtfs_rows(archive, "stop_times.txt"):
-        trip_id = row.get("trip_id", "").strip()
-        raw_stop_id = row.get("stop_id", "").strip()
-        departure_time = row.get("departure_time", "").strip()
-        departure_seconds = parse_gtfs_time(departure_time)
-        if not trip_id or not raw_stop_id or departure_seconds is None:
-            continue
-        try:
-            sequence = int(row.get("stop_sequence", "0") or 0)
-        except ValueError:
-            sequence = 0
-        batch.append((identifier_prefix + trip_id, internal_stop_id(raw_stop_id, stop_id_prefix), departure_time, departure_seconds, sequence))
-        if len(batch) == 20_000:
+    def import_stop_times() -> int:
+        batch: list[tuple[str, str, str, int, int]] = []
+        imported_rows = 0
+        for row in gtfs_rows(archive, "stop_times.txt"):
+            trip_id = row.get("trip_id", "").strip()
+            raw_stop_id = row.get("stop_id", "").strip()
+            departure_time = row.get("departure_time", "").strip()
+            departure_seconds = parse_gtfs_time(departure_time)
+            if not trip_id or not raw_stop_id or departure_seconds is None:
+                continue
+            try:
+                sequence = int(row.get("stop_sequence", "0") or 0)
+            except ValueError:
+                sequence = 0
+            batch.append((identifier_prefix + trip_id, internal_stop_id(raw_stop_id, stop_id_prefix), departure_time, departure_seconds, sequence))
+            if len(batch) == 20_000:
+                connection.executemany("INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)", batch)
+                imported_rows += len(batch)
+                batch.clear()
+        if batch:
             connection.executemany("INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)", batch)
-            batch.clear()
-    if batch:
-        connection.executemany("INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)", batch)
+            imported_rows += len(batch)
+        return imported_rows
+
+    _run_import_stage(stage_runner, "stop_times", import_stop_times)
 
     if "transfers.txt" in archive.namelist():
         transfer_rows: list[tuple[str, str, str, str, str, str, int, int]] = []
-        seen_transfers: dict[tuple[str, str, str, str, str, str], tuple[int, int]] = {}
-        for row in gtfs_rows(archive, "transfers.txt"):
-            native_from_stop_id = row.get("from_stop_id", "").strip()
-            native_to_stop_id = row.get("to_stop_id", "").strip()
-            if not native_from_stop_id or not native_to_stop_id:
-                continue
-            try:
-                transfer_type = int(row.get("transfer_type", "0") or 0)
-                min_transfer_time = int(row.get("min_transfer_time", "0") or 0)
-            except ValueError as error:
-                raise ValueError(
-                    f"Invalid transfer numeric field for provider {provider_id}."
-                ) from error
-            transfer_key = (
-                internal_stop_id(native_from_stop_id, stop_id_prefix),
-                internal_stop_id(native_to_stop_id, stop_id_prefix),
-                prefixed_optional_identifier(row.get("from_trip_id", ""), identifier_prefix),
-                prefixed_optional_identifier(row.get("to_trip_id", ""), identifier_prefix),
-                prefixed_optional_identifier(row.get("from_route_id", ""), identifier_prefix),
-                prefixed_optional_identifier(row.get("to_route_id", ""), identifier_prefix),
-            )
-            semantic_values = (transfer_type, min_transfer_time)
-            previous_values = seen_transfers.get(transfer_key)
-            if previous_values is not None:
-                if previous_values != semantic_values:
+
+        def import_transfers() -> int:
+            seen_transfers: dict[tuple[str, str, str, str, str, str], tuple[int, int]] = {}
+            for row in gtfs_rows(archive, "transfers.txt"):
+                native_from_stop_id = row.get("from_stop_id", "").strip()
+                native_to_stop_id = row.get("to_stop_id", "").strip()
+                if not native_from_stop_id or not native_to_stop_id:
+                    continue
+                try:
+                    transfer_type = int(row.get("transfer_type", "0") or 0)
+                    min_transfer_time = int(row.get("min_transfer_time", "0") or 0)
+                except ValueError as error:
                     raise ValueError(
-                        "Conflicting duplicate GTFS transfer rows for provider "
-                        f"{provider_id} and transfer key {transfer_key!r}."
-                    )
-                continue
-            seen_transfers[transfer_key] = semantic_values
-            transfer_rows.append((*transfer_key, transfer_type, min_transfer_time))
-        connection.executemany(
-            """
-            INSERT INTO transfers(
-                from_stop_id, to_stop_id, from_trip_id, to_trip_id,
-                from_route_id, to_route_id, transfer_type, min_transfer_time
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            transfer_rows,
-        )
-        register_entities(
-            connection,
-            provider_id,
-            "transfers",
-            (
+                        f"Invalid transfer numeric field for provider {provider_id}."
+                    ) from error
+                transfer_key = (
+                    internal_stop_id(native_from_stop_id, stop_id_prefix),
+                    internal_stop_id(native_to_stop_id, stop_id_prefix),
+                    prefixed_optional_identifier(row.get("from_trip_id", ""), identifier_prefix),
+                    prefixed_optional_identifier(row.get("to_trip_id", ""), identifier_prefix),
+                    prefixed_optional_identifier(row.get("from_route_id", ""), identifier_prefix),
+                    prefixed_optional_identifier(row.get("to_route_id", ""), identifier_prefix),
+                )
+                semantic_values = (transfer_type, min_transfer_time)
+                previous_values = seen_transfers.get(transfer_key)
+                if previous_values is not None:
+                    if previous_values != semantic_values:
+                        raise ValueError(
+                            "Conflicting duplicate GTFS transfer rows for provider "
+                            f"{provider_id} and transfer key {transfer_key!r}."
+                        )
+                    continue
+                seen_transfers[transfer_key] = semantic_values
+                transfer_rows.append((*transfer_key, transfer_type, min_transfer_time))
+            connection.executemany(
+                """
+                INSERT INTO transfers(
+                    from_stop_id, to_stop_id, from_trip_id, to_trip_id,
+                    from_route_id, to_route_id, transfer_type, min_transfer_time
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                transfer_rows,
+            )
+            return len(transfer_rows)
+
+        _run_import_stage(stage_runner, "transfers", import_transfers)
+        _run_import_stage(
+            stage_runner,
+            "ownership:transfers",
+            lambda: register_entities(
+                connection,
+                provider_id,
+                "transfers",
                 (
-                    transfer_ownership_key(
+                    (
+                        transfer_ownership_key(
+                            from_stop_id,
+                            to_stop_id,
+                            from_trip_id,
+                            to_trip_id,
+                            from_route_id,
+                            to_route_id,
+                        ),
+                    )
+                    for (
                         from_stop_id,
                         to_stop_id,
                         from_trip_id,
                         to_trip_id,
                         from_route_id,
                         to_route_id,
-                    ),
-                )
-                for (
-                    from_stop_id,
-                    to_stop_id,
-                    from_trip_id,
-                    to_trip_id,
-                    from_route_id,
-                    to_route_id,
-                    _transfer_type,
-                    _min_transfer_time,
-                ) in transfer_rows
+                        _transfer_type,
+                        _min_transfer_time,
+                    ) in transfer_rows
+                ),
             ),
         )
 
     if "pathways.txt" in archive.namelist():
         pathway_keys: list[tuple[str, str, str]] = []
-        connection.executemany(
-            """
-            INSERT INTO pathways(
-                pathway_id, from_stop_id, to_stop_id, pathway_mode,
-                is_bidirectional, length, traversal_time, stair_count,
-                max_slope, min_width, signposted_as, reversed_signposted_as
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
+
+        def import_pathways() -> int:
+            connection.executemany(
+                """
+                INSERT INTO pathways(
+                    pathway_id, from_stop_id, to_stop_id, pathway_mode,
+                    is_bidirectional, length, traversal_time, stair_count,
+                    max_slope, min_width, signposted_as, reversed_signposted_as
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        internal_stop_id(
+                            row.get("pathway_id", ""),
+                            identifier_prefix or stop_id_prefix,
+                        ),
+                        internal_stop_id(row.get("from_stop_id", ""), stop_id_prefix),
+                        internal_stop_id(row.get("to_stop_id", ""), stop_id_prefix),
+                        row.get("pathway_mode", "").strip(),
+                        int(row.get("is_bidirectional", "0") or 0),
+                        row.get("length", "").strip(),
+                        int(row.get("traversal_time", "0") or 0),
+                        int(row.get("stair_count", "0") or 0),
+                        row.get("max_slope", "").strip(),
+                        row.get("min_width", "").strip(),
+                        row.get("signposted_as", "").strip(),
+                        row.get("reversed_signposted_as", "").strip(),
+                    )
+                    for row in gtfs_rows(archive, "pathways.txt")
+                    if row.get("pathway_id", "").strip()
+                    and row.get("from_stop_id", "").strip()
+                    and row.get("to_stop_id", "").strip()
+                ),
+            )
+            pathway_keys.extend(
                 (
                     internal_stop_id(
                         row.get("pathway_id", ""),
@@ -503,51 +608,79 @@ def populate_gtfs(
                     ),
                     internal_stop_id(row.get("from_stop_id", ""), stop_id_prefix),
                     internal_stop_id(row.get("to_stop_id", ""), stop_id_prefix),
-                    row.get("pathway_mode", "").strip(),
-                    int(row.get("is_bidirectional", "0") or 0),
-                    row.get("length", "").strip(),
-                    int(row.get("traversal_time", "0") or 0),
-                    int(row.get("stair_count", "0") or 0),
-                    row.get("max_slope", "").strip(),
-                    row.get("min_width", "").strip(),
-                    row.get("signposted_as", "").strip(),
-                    row.get("reversed_signposted_as", "").strip(),
                 )
                 for row in gtfs_rows(archive, "pathways.txt")
                 if row.get("pathway_id", "").strip()
                 and row.get("from_stop_id", "").strip()
                 and row.get("to_stop_id", "").strip()
-            ),
-        )
-        pathway_keys.extend(
-            (
-                internal_stop_id(
-                    row.get("pathway_id", ""),
-                    identifier_prefix or stop_id_prefix,
-                ),
-                internal_stop_id(row.get("from_stop_id", ""), stop_id_prefix),
-                internal_stop_id(row.get("to_stop_id", ""), stop_id_prefix),
             )
-            for row in gtfs_rows(archive, "pathways.txt")
-            if row.get("pathway_id", "").strip()
-            and row.get("from_stop_id", "").strip()
-            and row.get("to_stop_id", "").strip()
+            return len(pathway_keys)
+
+        _run_import_stage(stage_runner, "pathways", import_pathways)
+        _run_import_stage(
+            stage_runner,
+            "ownership:pathways",
+            lambda: register_entities(connection, provider_id, "pathways", pathway_keys),
         )
-        register_entities(connection, provider_id, "pathways", pathway_keys)
     connection.commit()
 
 
-def resolve_canonical_stops(connection: sqlite3.Connection) -> None:
-    connection.execute("""
-        UPDATE raw_stops SET canonical_stop_id = COALESCE(
-            (SELECT parent.stop_id FROM raw_stops parent WHERE parent.stop_id = raw_stops.parent_station), raw_stops.stop_id
+def _normalized_provider_ids(provider_ids: Iterable[str] | None) -> tuple[str, ...] | None:
+    if provider_ids is None:
+        return None
+    return tuple(sorted({provider_id.strip() for provider_id in provider_ids if provider_id.strip()}))
+
+
+def resolve_canonical_stops(
+    connection: sqlite3.Connection,
+    provider_ids: Iterable[str] | None = None,
+) -> None:
+    selected = _normalized_provider_ids(provider_ids)
+    if selected is None:
+        connection.execute("""
+            UPDATE raw_stops SET canonical_stop_id = COALESCE(
+                (SELECT parent.stop_id FROM raw_stops parent WHERE parent.stop_id = raw_stops.parent_station), raw_stops.stop_id
+            )
+        """)
+    elif selected:
+        placeholders = ",".join("?" for _ in selected)
+        connection.execute(
+            f"""
+            UPDATE raw_stops SET canonical_stop_id = COALESCE(
+                (SELECT parent.stop_id FROM raw_stops parent WHERE parent.stop_id = raw_stops.parent_station), raw_stops.stop_id
+            )
+            WHERE stop_id IN (
+                SELECT key_1 FROM provider_entities
+                WHERE entity_type = 'raw_stops' AND provider_id IN ({placeholders})
+            )
+            """,
+            selected,
         )
-    """)
     connection.commit()
 
 
-def populate_active_services(connection: sqlite3.Connection, dates: list[date]) -> None:
+def populate_active_services(
+    connection: sqlite3.Connection,
+    dates: list[date],
+    provider_ids: Iterable[str] | None = None,
+) -> None:
     day_columns = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    selected = _normalized_provider_ids(provider_ids)
+    if selected == ():
+        return
+    service_placeholders = "" if selected is None else ",".join("?" for _ in selected)
+    calendar_scope = "" if selected is None else f"""
+              AND service_id IN (
+                  SELECT key_1 FROM provider_entities
+                  WHERE entity_type = 'calendar' AND provider_id IN ({service_placeholders})
+              )
+    """
+    calendar_dates_scope = "" if selected is None else f"""
+              AND service_id IN (
+                  SELECT key_1 FROM provider_entities
+                  WHERE entity_type = 'calendar_dates' AND provider_id IN ({service_placeholders})
+              )
+    """
     for service_date in dates:
         compact_date = service_date.strftime("%Y%m%d")
         day_column = day_columns[service_date.weekday()]
@@ -556,21 +689,44 @@ def populate_active_services(connection: sqlite3.Connection, dates: list[date]) 
             SELECT service_id, ? FROM calendar
             WHERE start_date <= ? AND end_date >= ? AND {day_column} = 1
               AND NOT EXISTS (SELECT 1 FROM calendar_dates overrides WHERE overrides.service_id = calendar.service_id AND overrides.service_date = ? AND overrides.exception_type = 2)
-        """, (compact_date, compact_date, compact_date, compact_date))
-        connection.execute("""
+              {calendar_scope}
+        """, (compact_date, compact_date, compact_date, compact_date) + (() if selected is None else selected))
+        connection.execute(f"""
             INSERT OR IGNORE INTO active_services(service_id, service_date)
-            SELECT service_id, service_date FROM calendar_dates WHERE service_date = ? AND exception_type = 1
-        """, (compact_date,))
+            SELECT service_id, service_date FROM calendar_dates
+            WHERE service_date = ? AND exception_type = 1
+              {calendar_dates_scope}
+        """, (compact_date,) + (() if selected is None else selected))
     connection.commit()
 
 
-def update_terminal_stops(connection: sqlite3.Connection) -> None:
-    connection.execute("""
-        UPDATE trips SET terminal_stop_id = COALESCE((
-            SELECT stop_times.raw_stop_id FROM stop_times WHERE stop_times.trip_id = trips.trip_id
-            ORDER BY stop_times.stop_sequence DESC, stop_times.rowid DESC LIMIT 1
-        ), '')
-    """)
+def update_terminal_stops(
+    connection: sqlite3.Connection,
+    provider_ids: Iterable[str] | None = None,
+) -> None:
+    selected = _normalized_provider_ids(provider_ids)
+    if selected is None:
+        connection.execute("""
+            UPDATE trips SET terminal_stop_id = COALESCE((
+                SELECT stop_times.raw_stop_id FROM stop_times WHERE stop_times.trip_id = trips.trip_id
+                ORDER BY stop_times.stop_sequence DESC, stop_times.rowid DESC LIMIT 1
+            ), '')
+        """)
+    elif selected:
+        placeholders = ",".join("?" for _ in selected)
+        connection.execute(
+            f"""
+            UPDATE trips SET terminal_stop_id = COALESCE((
+                SELECT stop_times.raw_stop_id FROM stop_times WHERE stop_times.trip_id = trips.trip_id
+                ORDER BY stop_times.stop_sequence DESC, stop_times.rowid DESC LIMIT 1
+            ), '')
+            WHERE trip_id IN (
+                SELECT key_1 FROM provider_entities
+                WHERE entity_type = 'trips' AND provider_id IN ({placeholders})
+            )
+            """,
+            selected,
+        )
     connection.commit()
 
 

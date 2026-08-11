@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from collections.abc import Iterable
 
 
@@ -152,21 +153,70 @@ def register_city_mode(
     )
 
 
-def rebuild_city_stops(connection: sqlite3.Connection) -> None:
+def _normalized_city_ids(city_ids: Iterable[str] | None) -> tuple[str, ...] | None:
+    if city_ids is None:
+        return None
+    return tuple(sorted({city_id.strip() for city_id in city_ids if city_id.strip()}))
+
+
+def provider_city_ids(
+    connection: sqlite3.Connection,
+    provider_ids: Iterable[str],
+) -> set[str]:
+    selected = tuple(sorted({provider_id.strip() for provider_id in provider_ids if provider_id.strip()}))
+    if not selected or not has_ownership_schema(connection):
+        return set()
+    placeholders = ",".join("?" for _ in selected)
+    rows = connection.execute(
+        f"""
+        SELECT city_id FROM provider_city_stops WHERE provider_id IN ({placeholders})
+        UNION
+        SELECT city_id FROM provider_city_modes WHERE provider_id IN ({placeholders})
+        """,
+        selected + selected,
+    )
+    return {str(row[0]) for row in rows}
+
+
+def rebuild_city_stops(
+    connection: sqlite3.Connection,
+    city_ids: Iterable[str] | None = None,
+) -> None:
     if not has_ownership_schema(connection):
         return
-    connection.execute("DELETE FROM city_stops")
-    connection.execute(
-        """
-        INSERT OR IGNORE INTO city_stops(city_id, stop_id)
-        SELECT city_id, stop_id
-        FROM provider_city_stops
-        ORDER BY city_id, stop_id, provider_id
-        """
-    )
+    selected = _normalized_city_ids(city_ids)
+    if selected is None:
+        connection.execute("DELETE FROM city_stops")
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO city_stops(city_id, stop_id)
+            SELECT city_id, stop_id
+            FROM provider_city_stops
+            ORDER BY city_id, stop_id, provider_id
+            """
+        )
+    elif selected:
+        placeholders = ",".join("?" for _ in selected)
+        connection.execute(
+            f"DELETE FROM city_stops WHERE city_id IN ({placeholders})",
+            selected,
+        )
+        connection.execute(
+            f"""
+            INSERT OR IGNORE INTO city_stops(city_id, stop_id)
+            SELECT city_id, stop_id
+            FROM provider_city_stops
+            WHERE city_id IN ({placeholders})
+            ORDER BY city_id, stop_id, provider_id
+            """,
+            selected,
+        )
 
 
-def rebuild_city_departure_modes(connection: sqlite3.Connection) -> None:
+def rebuild_city_departure_modes(
+    connection: sqlite3.Connection,
+    city_ids: Iterable[str] | None = None,
+) -> None:
     if not has_ownership_schema(connection):
         return
     tables = {
@@ -177,17 +227,37 @@ def rebuild_city_departure_modes(connection: sqlite3.Connection) -> None:
     }
     if "city_departure_modes" not in tables:
         return
-    connection.execute("DELETE FROM city_departure_modes")
-    connection.execute(
-        """
-        INSERT OR IGNORE INTO city_departure_modes(
-            city_id, mode, timezone, stop_id_prefix, identifier_prefix
+    selected = _normalized_city_ids(city_ids)
+    if selected is None:
+        connection.execute("DELETE FROM city_departure_modes")
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO city_departure_modes(
+                city_id, mode, timezone, stop_id_prefix, identifier_prefix
+            )
+            SELECT city_id, mode, timezone, stop_id_prefix, identifier_prefix
+            FROM provider_city_modes
+            ORDER BY city_id, provider_id
+            """
         )
-        SELECT city_id, mode, timezone, stop_id_prefix, identifier_prefix
-        FROM provider_city_modes
-        ORDER BY city_id, provider_id
-        """
-    )
+    elif selected:
+        placeholders = ",".join("?" for _ in selected)
+        connection.execute(
+            f"DELETE FROM city_departure_modes WHERE city_id IN ({placeholders})",
+            selected,
+        )
+        connection.execute(
+            f"""
+            INSERT OR IGNORE INTO city_departure_modes(
+                city_id, mode, timezone, stop_id_prefix, identifier_prefix
+            )
+            SELECT city_id, mode, timezone, stop_id_prefix, identifier_prefix
+            FROM provider_city_modes
+            WHERE city_id IN ({placeholders})
+            ORDER BY city_id, provider_id
+            """,
+            selected,
+        )
 
 
 def _provider_placeholders(provider_ids: list[str]) -> str:
@@ -208,6 +278,242 @@ def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
     }
 
 
+def _timed_delete_statement(
+    connection: sqlite3.Connection,
+    statement_name: str,
+    sql: str,
+    parameters: tuple[object, ...] = (),
+) -> sqlite3.Cursor:
+    started = time.monotonic()
+    before_changes = connection.total_changes
+    try:
+        cursor = connection.execute(sql, parameters)
+    except Exception:
+        print(
+            f"[ScopedDepartures] stage=delete-provider-data statement={statement_name} "
+            f"duration={time.monotonic() - started:.2f}s status=error",
+            flush=True,
+        )
+        raise
+    print(
+        f"[ScopedDepartures] stage=delete-provider-data statement={statement_name} "
+        f"duration={time.monotonic() - started:.2f}s changes={connection.total_changes - before_changes}",
+        flush=True,
+    )
+    return cursor
+
+
+def _prepare_scoped_delete_sets(
+    connection: sqlite3.Connection,
+    selected: list[str],
+) -> None:
+    placeholders = _provider_placeholders(selected)
+    params = tuple(selected)
+    for table_name, column_definition in (
+        (
+            "scoped_foreign_entities",
+            "entity_type TEXT NOT NULL, key_1 TEXT NOT NULL, key_2 TEXT NOT NULL, "
+            "key_3 TEXT NOT NULL, PRIMARY KEY(entity_type, key_1, key_2, key_3)",
+        ),
+        ("scoped_stop_ids", "stop_id TEXT PRIMARY KEY"),
+        ("scoped_trip_ids", "trip_id TEXT PRIMARY KEY"),
+        ("scoped_route_ids", "route_id TEXT PRIMARY KEY"),
+        ("scoped_service_ids", "service_id TEXT PRIMARY KEY"),
+        ("scoped_calendar_ids", "service_id TEXT PRIMARY KEY"),
+        ("scoped_calendar_date_ids", "service_id TEXT PRIMARY KEY"),
+        ("scoped_transfer_keys", "transfer_key TEXT PRIMARY KEY"),
+        (
+            "scoped_transfer_simple_keys",
+            "from_stop_id TEXT NOT NULL, to_stop_id TEXT NOT NULL, "
+            "transfer_type TEXT NOT NULL, PRIMARY KEY(from_stop_id, to_stop_id, transfer_type)",
+        ),
+        (
+            "scoped_pathway_keys",
+            "pathway_id TEXT NOT NULL, from_stop_id TEXT NOT NULL, "
+            "to_stop_id TEXT NOT NULL, PRIMARY KEY(pathway_id, from_stop_id, to_stop_id)",
+        ),
+        ):
+        _timed_delete_statement(
+            connection,
+            f"create-{table_name}",
+            f"CREATE TEMP TABLE {table_name} ({column_definition})",
+        )
+
+    _timed_delete_statement(
+        connection,
+        "populate-foreign-entities",
+        f"""
+        INSERT INTO scoped_foreign_entities(entity_type, key_1, key_2, key_3)
+        SELECT DISTINCT entity_type, key_1, key_2, key_3
+        FROM provider_entities
+        WHERE provider_id NOT IN ({placeholders})
+          AND entity_type IN (
+              'raw_stops', 'trips', 'routes', 'calendar', 'calendar_dates',
+              'transfers', 'pathways'
+          )
+        """,
+        params,
+    )
+
+    _timed_delete_statement(
+        connection,
+        "populate-stop-ids",
+        f"""
+        INSERT INTO scoped_stop_ids(stop_id)
+        SELECT owned.key_1
+        FROM provider_entities owned
+        WHERE owned.entity_type = 'raw_stops'
+          AND owned.provider_id IN ({placeholders})
+          AND NOT EXISTS (
+              SELECT 1 FROM scoped_foreign_entities other
+              WHERE other.entity_type = 'raw_stops'
+                AND other.key_1 = owned.key_1
+          )
+        """,
+        params,
+    )
+    _timed_delete_statement(
+        connection,
+        "populate-trip-ids",
+        f"""
+        INSERT INTO scoped_trip_ids(trip_id)
+        SELECT owned.key_1
+        FROM provider_entities owned
+        WHERE owned.entity_type = 'trips'
+          AND owned.provider_id IN ({placeholders})
+          AND NOT EXISTS (
+              SELECT 1 FROM scoped_foreign_entities other
+              WHERE other.entity_type = 'trips'
+                AND other.key_1 = owned.key_1
+          )
+        """,
+        params,
+    )
+    _timed_delete_statement(
+        connection,
+        "populate-route-ids",
+        f"""
+        INSERT INTO scoped_route_ids(route_id)
+        SELECT owned.key_1
+        FROM provider_entities owned
+        WHERE owned.entity_type = 'routes'
+          AND owned.provider_id IN ({placeholders})
+          AND NOT EXISTS (
+              SELECT 1 FROM scoped_foreign_entities other
+              WHERE other.entity_type = 'routes'
+                AND other.key_1 = owned.key_1
+          )
+        """,
+        params,
+    )
+    _timed_delete_statement(
+        connection,
+        "populate-service-ids",
+        f"""
+        INSERT INTO scoped_service_ids(service_id)
+        SELECT DISTINCT owned.key_1
+        FROM provider_entities owned
+        WHERE owned.entity_type IN ('calendar', 'calendar_dates')
+          AND owned.provider_id IN ({placeholders})
+          AND NOT EXISTS (
+              SELECT 1 FROM scoped_foreign_entities other
+              WHERE other.entity_type IN ('calendar', 'calendar_dates')
+                AND other.key_1 = owned.key_1
+          )
+        """,
+        params,
+    )
+    _timed_delete_statement(
+        connection,
+        "populate-calendar-ids",
+        f"""
+        INSERT INTO scoped_calendar_ids(service_id)
+        SELECT owned.key_1
+        FROM provider_entities owned
+        WHERE owned.entity_type = 'calendar'
+          AND owned.provider_id IN ({placeholders})
+          AND NOT EXISTS (
+              SELECT 1 FROM scoped_foreign_entities other
+              WHERE other.entity_type = 'calendar'
+                AND other.key_1 = owned.key_1
+          )
+        """,
+        params,
+    )
+    _timed_delete_statement(
+        connection,
+        "populate-calendar-date-ids",
+        f"""
+        INSERT INTO scoped_calendar_date_ids(service_id)
+        SELECT DISTINCT owned.key_1
+        FROM provider_entities owned
+        WHERE owned.entity_type = 'calendar_dates'
+          AND owned.provider_id IN ({placeholders})
+          AND NOT EXISTS (
+              SELECT 1 FROM scoped_foreign_entities other
+              WHERE other.entity_type = 'calendar_dates'
+                AND other.key_1 = owned.key_1
+          )
+        """,
+        params,
+    )
+    _timed_delete_statement(
+        connection,
+        "populate-transfer-keys",
+        f"""
+        INSERT INTO scoped_transfer_keys(transfer_key)
+        SELECT owned.key_1
+        FROM provider_entities owned
+        WHERE owned.entity_type = 'transfers'
+          AND owned.provider_id IN ({placeholders})
+          AND NOT EXISTS (
+              SELECT 1 FROM scoped_foreign_entities other
+              WHERE other.entity_type = 'transfers'
+                AND other.key_1 = owned.key_1
+          )
+        """,
+        params,
+    )
+    _timed_delete_statement(
+        connection,
+        "populate-transfer-simple-keys",
+        f"""
+        INSERT INTO scoped_transfer_simple_keys(from_stop_id, to_stop_id, transfer_type)
+        SELECT owned.key_1, owned.key_2, owned.key_3
+        FROM provider_entities owned
+        WHERE owned.entity_type = 'transfers'
+          AND owned.provider_id IN ({placeholders})
+          AND NOT EXISTS (
+              SELECT 1 FROM scoped_foreign_entities other
+              WHERE other.entity_type = 'transfers'
+                AND other.key_1 = owned.key_1
+                AND other.key_2 = owned.key_2
+                AND other.key_3 = owned.key_3
+          )
+        """,
+        params,
+    )
+    _timed_delete_statement(
+        connection,
+        "populate-pathway-keys",
+        f"""
+        INSERT INTO scoped_pathway_keys(pathway_id, from_stop_id, to_stop_id)
+        SELECT owned.key_1, owned.key_2, owned.key_3
+        FROM provider_entities owned
+        WHERE owned.entity_type = 'pathways'
+          AND owned.provider_id IN ({placeholders})
+          AND NOT EXISTS (
+              SELECT 1 FROM scoped_foreign_entities other
+              WHERE other.entity_type = 'pathways'
+                AND other.key_1 = owned.key_1
+                AND other.key_2 = owned.key_2
+                AND other.key_3 = owned.key_3
+          )
+        """,
+        params,
+    )
+
+
 def delete_provider_data(
     connection: sqlite3.Connection,
     provider_ids: Iterable[str],
@@ -222,69 +528,34 @@ def delete_provider_data(
             "run the canonical full pipeline once before using scoped rebuild."
         )
 
+    affected_city_ids = provider_city_ids(connection, selected)
     placeholders = _provider_placeholders(selected)
     params = tuple(selected)
-    owned = (
-        "SELECT key_1 FROM provider_entities "
-        f"WHERE entity_type = ? AND provider_id IN ({placeholders})"
-    )
-    def other_owner(entity_type: str, column: str) -> str:
-        return (
-            "NOT EXISTS (SELECT 1 FROM provider_entities other "
-            f"WHERE other.entity_type = ? AND other.key_1 = target.{column} "
-            f"AND other.provider_id NOT IN ({placeholders}))"
-        )
+    _prepare_scoped_delete_sets(connection, selected)
 
-    connection.execute(
+    _timed_delete_statement(
+        connection,
+        "delete-stop-times",
         """
         DELETE FROM stop_times
-        WHERE trip_id IN (
-            SELECT key_1 FROM provider_entities
-            WHERE entity_type = 'trips' AND provider_id IN (%s)
-        )
-        AND NOT EXISTS (
-            SELECT 1 FROM provider_entities other
-            WHERE other.entity_type = 'trips'
-              AND other.key_1 = stop_times.trip_id
-              AND other.provider_id NOT IN (%s)
-        )
-        """ % (placeholders, placeholders),
-        params + params,
+        WHERE trip_id IN (SELECT trip_id FROM scoped_trip_ids)
+        """,
     )
-    connection.execute(
+    _timed_delete_statement(
+        connection,
+        "delete-active-services",
         """
         DELETE FROM active_services
-        WHERE service_id IN (
-            SELECT key_1 FROM provider_entities
-            WHERE entity_type = 'calendar' AND provider_id IN (%s)
-            UNION
-            SELECT key_1 FROM provider_entities
-            WHERE entity_type = 'calendar_dates' AND provider_id IN (%s)
-        )
-        AND NOT EXISTS (
-            SELECT 1 FROM provider_entities other
-            WHERE other.entity_type IN ('calendar', 'calendar_dates')
-              AND other.key_1 = active_services.service_id
-              AND other.provider_id NOT IN (%s)
-        )
-        """ % (placeholders, placeholders, placeholders),
-        params + params + params,
+        WHERE service_id IN (SELECT service_id FROM scoped_service_ids)
+        """,
     )
-    connection.execute(
+    _timed_delete_statement(
+        connection,
+        "delete-calendar-dates",
         """
         DELETE FROM calendar_dates
-        WHERE service_id IN (
-            SELECT key_1 FROM provider_entities
-            WHERE entity_type = 'calendar_dates' AND provider_id IN (%s)
-        )
-        AND NOT EXISTS (
-            SELECT 1 FROM provider_entities other
-            WHERE other.entity_type = 'calendar_dates'
-              AND other.key_1 = calendar_dates.service_id
-              AND other.provider_id NOT IN (%s)
-        )
-        """ % (placeholders, placeholders),
-        params + params,
+        WHERE service_id IN (SELECT service_id FROM scoped_calendar_date_ids)
+        """,
     )
     if _table_exists(connection, "transfers"):
         transfer_columns = _table_columns(connection, "transfers")
@@ -296,103 +567,68 @@ def delete_provider_data(
             "from_route_id",
             "to_route_id",
         }.issubset(transfer_columns):
-            transfer_identity = (
-                "target.from_stop_id || char(31) || target.to_stop_id || char(31) || "
-                "target.from_trip_id || char(31) || target.to_trip_id || char(31) || "
-                "target.from_route_id || char(31) || target.to_route_id"
-            )
-            connection.execute(
+            _timed_delete_statement(
+                connection,
+                "delete-transfers",
                 """
                 DELETE FROM transfers AS target
-                WHERE EXISTS (
-                    SELECT 1 FROM provider_entities owned
-                    WHERE owned.entity_type = 'transfers'
-                      AND owned.provider_id IN (%s)
-                      AND owned.key_1 = %s
-                )
-                AND NOT EXISTS (
-                    SELECT 1 FROM provider_entities other
-                    WHERE other.entity_type = 'transfers'
-                      AND other.provider_id NOT IN (%s)
-                      AND other.key_1 = %s
-                )
-                """ % (placeholders, transfer_identity, placeholders, transfer_identity),
-                params + params,
+                WHERE (target.from_stop_id || char(31) || target.to_stop_id || char(31) ||
+                       target.from_trip_id || char(31) || target.to_trip_id || char(31) ||
+                       target.from_route_id || char(31) || target.to_route_id)
+                      IN (SELECT transfer_key FROM scoped_transfer_keys)
+                """,
             )
         elif {"from_stop_id", "to_stop_id", "transfer_type"}.issubset(transfer_columns):
-            connection.execute(
+            _timed_delete_statement(
+                connection,
+                "delete-transfers",
                 """
                 DELETE FROM transfers AS target
-                WHERE EXISTS (
-                    SELECT 1 FROM provider_entities owned
-                    WHERE owned.entity_type = 'transfers'
-                      AND owned.provider_id IN (%s)
-                      AND owned.key_1 = target.from_stop_id
-                      AND owned.key_2 = target.to_stop_id
-                      AND owned.key_3 = CAST(target.transfer_type AS TEXT)
-                )
-                AND NOT EXISTS (
-                    SELECT 1 FROM provider_entities other
-                    WHERE other.entity_type = 'transfers'
-                      AND other.provider_id NOT IN (%s)
-                      AND other.key_1 = target.from_stop_id
-                      AND other.key_2 = target.to_stop_id
-                      AND other.key_3 = CAST(target.transfer_type AS TEXT)
-                )
-                """ % (placeholders, placeholders),
-                params + params,
+                WHERE (target.from_stop_id, target.to_stop_id, CAST(target.transfer_type AS TEXT))
+                      IN (SELECT from_stop_id, to_stop_id, transfer_type FROM scoped_transfer_simple_keys)
+                """,
             )
         else:
             raise ValueError("Unsupported transfers table schema.")
     if _table_exists(connection, "pathways"):
-        connection.execute(
+        _timed_delete_statement(
+            connection,
+            "delete-pathways",
             """
             DELETE FROM pathways AS target
-            WHERE EXISTS (
-                SELECT 1 FROM provider_entities owned
-                WHERE owned.entity_type = 'pathways'
-                  AND owned.provider_id IN (%s)
-                  AND owned.key_1 = target.pathway_id
-                  AND owned.key_2 = target.from_stop_id
-                  AND owned.key_3 = target.to_stop_id
-            )
-            AND NOT EXISTS (
-                SELECT 1 FROM provider_entities other
-                WHERE other.entity_type = 'pathways'
-                  AND other.provider_id NOT IN (%s)
-                  AND other.key_1 = target.pathway_id
-                  AND other.key_2 = target.from_stop_id
-                  AND other.key_3 = target.to_stop_id
-            )
-            """ % (placeholders, placeholders),
-            params + params,
-        )
-    for table, entity_type, column in (
-        ("trips", "trips", "trip_id"),
-        ("routes", "routes", "route_id"),
-        ("calendar", "calendar", "service_id"),
-        ("raw_stops", "raw_stops", "stop_id"),
-    ):
-        connection.execute(
-            f"""
-            DELETE FROM {table} AS target
-            WHERE {column} IN ({owned})
-              AND {other_owner(entity_type, column)}
+            WHERE (target.pathway_id, target.from_stop_id, target.to_stop_id)
+                  IN (SELECT pathway_id, from_stop_id, to_stop_id FROM scoped_pathway_keys)
             """,
-            (entity_type,) + params + (entity_type,) + params,
+        )
+    for table, statement_name, column, temp_table in (
+        ("trips", "delete-trips", "trip_id", "scoped_trip_ids"),
+        ("routes", "delete-routes", "route_id", "scoped_route_ids"),
+        ("calendar", "delete-calendar", "service_id", "scoped_calendar_ids"),
+        ("raw_stops", "delete-raw-stops", "stop_id", "scoped_stop_ids"),
+    ):
+        _timed_delete_statement(
+            connection,
+            statement_name,
+            f"DELETE FROM {table} WHERE {column} IN (SELECT {column} FROM {temp_table})",
         )
 
-    connection.execute(
+    _timed_delete_statement(
+        connection,
+        "delete-provider-city-stops",
         f"DELETE FROM provider_city_stops WHERE provider_id IN ({placeholders})",
         params,
     )
-    connection.execute(
+    _timed_delete_statement(
+        connection,
+        "delete-provider-city-modes",
         f"DELETE FROM provider_city_modes WHERE provider_id IN ({placeholders})",
         params,
     )
-    connection.execute(
+    _timed_delete_statement(
+        connection,
+        "delete-provider-entities",
         f"DELETE FROM provider_entities WHERE provider_id IN ({placeholders})",
         params,
     )
-    rebuild_city_stops(connection)
-    rebuild_city_departure_modes(connection)
+    rebuild_city_stops(connection, affected_city_ids)
+    rebuild_city_departure_modes(connection, affected_city_ids)
