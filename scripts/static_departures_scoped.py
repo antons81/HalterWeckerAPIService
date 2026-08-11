@@ -883,24 +883,24 @@ def scoped_rebuild(
                     },
                 )
                 timed_stage(
-                    "import-external",
-                    lambda: import_external(
-                        connection,
-                        external,
-                        source_stop_data,
-                        repository_root,
-                        environment,
-                        int(environment.get("STATIC_DEPARTURES_DAYS", "15")),
-                        artifacts=external_artifacts,
-                    ),
-                )
-                timed_stage(
                     "build-external-static-assets",
                     lambda: build_external_static_assets(
                         release_dir,
                         external,
                         repository_root,
                         external_artifacts,
+                    ),
+                )
+                timed_stage(
+                    "import-external",
+                    lambda: import_external(
+                        connection,
+                        external,
+                        release_dir / "stop-data",
+                        repository_root,
+                        environment,
+                        int(environment.get("STATIC_DEPARTURES_DAYS", "15")),
+                        artifacts=external_artifacts,
                     ),
                 )
             timed_stage(

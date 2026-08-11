@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))
 
 import static_departures_scoped as scoped
 from build_german_departure_index import (
@@ -29,6 +30,7 @@ from static_departures_ownership import (
     register_city_stops,
 )
 from import_static_departures_database import main as import_static_database
+from static_departures_api import Database
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -105,6 +107,37 @@ def write_511_fixture_feed(path: Path) -> None:
             "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
             "trip-17874,08:00:00,08:00:00,17874,1\n"
             "trip-17874,08:10:00,08:10:00,terminal-17874,2\n",
+        )
+
+
+def write_cta_fixture_feed(path: Path) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "stops.txt",
+            "stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station\n"
+            "15049,Wacker & Randolph,41.8871,-87.6278,0,\n"
+            "16000,CTA Terminal,41.9000,-87.6300,0,\n",
+        )
+        archive.writestr(
+            "routes.txt",
+            "route_id,route_short_name,route_long_name,route_type\n"
+            "20,20,Madison,3\n",
+        )
+        archive.writestr(
+            "trips.txt",
+            "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+            "20,service-20,trip-20,Terminal,0\n",
+        )
+        archive.writestr(
+            "calendar.txt",
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
+            "service-20,1,1,1,1,1,1,1,20200101,20301231\n",
+        )
+        archive.writestr(
+            "stop_times.txt",
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "trip-20,25:30:00,25:30:00,15049,1\n"
+            "trip-20,25:40:00,25:40:00,16000,2\n",
         )
 
 
@@ -191,6 +224,135 @@ class StaticDepartureScopeTests(unittest.TestCase):
             [provider.provider_id for provider in providers],
             ["511-bay-area", "cta-chicago"],
         )
+
+    def test_scoped_cta_rebuild_publishes_native_membership_and_board(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config"
+            config.mkdir()
+            (config / "cta-chicago-cities.json").write_text(
+                json.dumps(
+                    [{
+                        "id": "chicago",
+                        "name": "Chicago",
+                        "country": "US",
+                        "latitude": 41.8781,
+                        "longitude": -87.6298,
+                        "radiusMeters": 55000,
+                        "packageMode": "external",
+                        "externalGTFSProvider": "cta-chicago",
+                    }]
+                ),
+                encoding="utf-8",
+            )
+            source = {
+                "id": "cta-chicago",
+                "url": "https://example.test/cta-chicago.zip",
+                "cities": "config/cta-chicago-cities.json",
+                "timezone": "America/Chicago",
+                "identifierPrefix": "cta-chicago:",
+                "namespace": "",
+                "stopIDMode": "exact",
+                "publishPassengerStopIDs": True,
+                "buildStops": True,
+                "buildRoutes": True,
+                "buildDepartures": True,
+                "buildTripIndex": False,
+                "importIntoStaticDepartures": True,
+                "staticIdentifierPrefix": "cta-chicago:",
+                "staticStopIDPrefix": "cta-chicago:",
+                "country": "US",
+            }
+            (config / "external-gtfs-sources.json").write_text(
+                json.dumps([source]),
+                encoding="utf-8",
+            )
+
+            feed = root / "cta-chicago.zip"
+            write_cta_fixture_feed(feed)
+            provider = scoped.StaticProvider(
+                "cta-chicago",
+                "US",
+                "external",
+                {**source, "localPath": str(feed)},
+            )
+
+            data_root = root / "data"
+            source_release = data_root / "releases" / "source"
+            source_stop_data = source_release / "stop-data"
+            (source_stop_data / "stops").mkdir(parents=True)
+            (source_stop_data / "manifest.json").write_text(
+                json.dumps({"cities": []}),
+                encoding="utf-8",
+            )
+            source_release.mkdir(parents=True, exist_ok=True)
+            connection = connect(source_release / "departures.sqlite")
+            connection.executescript(
+                """
+                CREATE TABLE city_aliases (
+                    alias_city_id TEXT PRIMARY KEY,
+                    canonical_city_id TEXT NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE city_departure_modes (
+                    city_id TEXT PRIMARY KEY,
+                    mode TEXT NOT NULL,
+                    timezone TEXT NOT NULL,
+                    stop_id_prefix TEXT NOT NULL DEFAULT '',
+                    identifier_prefix TEXT NOT NULL DEFAULT ''
+                ) WITHOUT ROWID;
+                """
+            )
+            connection.commit()
+            connection.close()
+            (data_root / "current-release").parent.mkdir(parents=True, exist_ok=True)
+            (data_root / "current-release").symlink_to("releases/source")
+
+            with mock.patch.object(scoped, "run_readiness"):
+                release = scoped.scoped_rebuild(
+                    root,
+                    data_root,
+                    [provider],
+                    {"STATIC_DEPARTURES_DAYS": "15"},
+                )
+
+            connection = sqlite3.connect(release / "departures.sqlite")
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM raw_stops WHERE stop_id=?",
+                        ("cta-chicago:15049",),
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertGreater(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM provider_city_stops WHERE provider_id=? AND city_id=?",
+                        ("cta-chicago", "chicago"),
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM city_stops WHERE city_id=? AND stop_id=?",
+                        ("chicago", "15049"),
+                    ).fetchone()[0],
+                    1,
+                )
+            finally:
+                connection.close()
+
+            database = Database(str(release / "departures.sqlite"), ttl=0)
+            try:
+                board = database.board("chicago", "15049", 30)
+            finally:
+                database.close()
+            self.assertGreater(len(board), 0)
+            self.assertEqual(board[0]["stopID"], "15049")
+            self.assertEqual(board[0]["scheduledTime"], "25:30:00")
 
     def test_external_scoped_memberships_use_provider_stop_namespace(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -910,7 +1072,7 @@ class StaticDepartureScopeTests(unittest.TestCase):
                     "localPath": str(old_a),
                 },
             )
-            with mock.patch.object(
+            with mock.patch.object(scoped, "build_external_static_assets"), mock.patch.object(
                 scoped,
                 "import_external",
                 side_effect=RuntimeError("fixture import failed"),
