@@ -187,7 +187,10 @@ class StaticDepartureScopeTests(unittest.TestCase):
 
     def test_us_scope_resolves_the_511_static_source(self) -> None:
         _label, providers = scoped.resolve_scope(REPOSITORY_ROOT, country="US")
-        self.assertEqual([provider.provider_id for provider in providers], ["511-bay-area"])
+        self.assertEqual(
+            [provider.provider_id for provider in providers],
+            ["511-bay-area", "cta-chicago"],
+        )
 
     def test_external_scoped_memberships_use_provider_stop_namespace(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

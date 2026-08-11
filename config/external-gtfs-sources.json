@@ -101,5 +101,23 @@
     "staticIdentifierPrefix": "",
     "staticStopIDPrefix": "511-bay-area:",
     "country": "US"
+  },
+  {
+    "id": "cta-chicago",
+    "url": "https://www.transitchicago.com/downloads/sch_data/google_transit.zip",
+    "cities": "config/cta-chicago-cities.json",
+    "timezone": "America/Chicago",
+    "identifierPrefix": "cta-chicago:",
+    "namespace": "",
+    "stopIDMode": "exact",
+    "publishPassengerStopIDs": true,
+    "buildStops": true,
+    "buildRoutes": true,
+    "buildDepartures": true,
+    "buildTripIndex": false,
+    "importIntoStaticDepartures": true,
+    "staticIdentifierPrefix": "cta-chicago:",
+    "staticStopIDPrefix": "cta-chicago:",
+    "country": "US"
   }
 ]

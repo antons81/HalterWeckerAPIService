@@ -370,6 +370,65 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
             self.assertEqual(board["departures"][0]["stopID"], "11535")
             self.assertEqual(lines["lines"][0]["routeID"], "6612")
 
+    def test_cta_internal_prefix_keeps_native_board_id_and_overflow_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "current.sqlite"
+            write_database(path, "cta-chicago")
+            database = sqlite3.connect(path)
+            try:
+                database.execute(
+                    "CREATE TABLE city_departure_modes (city_id TEXT PRIMARY KEY, mode TEXT NOT NULL, timezone TEXT NOT NULL, stop_id_prefix TEXT NOT NULL DEFAULT '', identifier_prefix TEXT NOT NULL DEFAULT '')"
+                )
+                database.execute(
+                    "INSERT INTO city_departure_modes VALUES ('chicago', 'canonical', 'America/Chicago', 'cta-chicago:', 'cta-chicago:')"
+                )
+                database.execute(
+                    "INSERT INTO raw_stops VALUES (?, ?, ?, ?, ?, ?)",
+                    ("cta-chicago:100", "", "CTA Stop", "", 10, "cta-chicago:100"),
+                )
+                database.execute("INSERT INTO city_stops VALUES ('chicago', '100')")
+                database.execute(
+                    "INSERT INTO routes VALUES (?, ?, ?)",
+                    ("cta-chicago:route-1", "Blue", "CTA Blue Line"),
+                )
+                database.execute(
+                    "INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        "cta-chicago:trip-1",
+                        "cta-chicago:service-1",
+                        "cta-chicago:route-1",
+                        "O'Hare",
+                        "0",
+                        "cta-chicago:100",
+                    ),
+                )
+                database.execute(
+                    "INSERT INTO active_services VALUES (?, ?)",
+                    ("cta-chicago:service-1", "20260810"),
+                )
+                database.execute(
+                    "INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)",
+                    ("cta-chicago:trip-1", "cta-chicago:100", "25:30:00", 91_800, 1),
+                )
+                database.commit()
+            finally:
+                database.close()
+
+            with StaticDeparturesHTTPServer(path) as server:
+                board = server.get(
+                    "/static-departures/board?cityID=chicago&stopID=100"
+                    "&from=2026-08-11T01:20:00%2D05:00"
+                    "&to=2026-08-11T01:40:00%2D05:00"
+                    "&limit=1"
+                )
+
+            self.assertEqual(board["cityID"], "chicago")
+            self.assertEqual(board["stopID"], "100")
+            self.assertEqual(len(board["departures"]), 1)
+            self.assertEqual(board["departures"][0]["scheduledTime"], "25:30:00")
+            self.assertEqual(board["departures"][0]["tripID"], "trip-1")
+            self.assertEqual(board["departures"][0]["routeID"], "route-1")
+
     def test_lines_are_topology_and_keep_multiple_destinations_without_active_services(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "current.sqlite"

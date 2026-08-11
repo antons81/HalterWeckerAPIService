@@ -160,6 +160,13 @@ def validate_external_gtfs_source(
         if not isinstance(value, bool):
             raise ValueError(f"External GTFS source {source_id} has invalid {flag}.")
 
+    publish_passenger_stop_ids = source.get("publishPassengerStopIDs", False)
+    if not isinstance(publish_passenger_stop_ids, bool):
+        raise ValueError(
+            f"External GTFS source {source_id} has invalid "
+            "publishPassengerStopIDs."
+        )
+
 
 def load_external_cities(
     source: dict[str, object],
@@ -421,6 +428,7 @@ def build_external_stop_packages(
     output: Path,
     stop_id_mode: str = "exact",
     namespace: str = "",
+    publish_passenger_stop_ids: bool = False,
 ) -> tuple[list[dict[str, object]], dict[str, list[dict[str, object]]]]:
     if stop_id_mode != "exact":
         raise ValueError(f"Unsupported stopIDMode: {stop_id_mode!r}")
@@ -489,6 +497,20 @@ def build_external_stop_packages(
         for stop in raw_stops:
             location_type = int(stop["location_type"])
             parent_station = str(stop["parent_station"])
+            if publish_passenger_stop_ids:
+                if location_type == 0:
+                    public_stops.append(stop)
+                    continue
+                if location_type == 1:
+                    # Keep stations that are directly referenced or needed to select
+                    # served child boarding stops.
+                    stop_id_str = str(stop["id"])
+                    if stop_id_str in served_platform_ids or any(
+                        child_id in served_platform_ids
+                        for child_id in children.get(stop_id_str, [])
+                    ):
+                        public_stops.append(stop)
+                continue
             if location_type in (2, 3, 4):
                 # entrances, generic nodes, and boarding areas are not public stops
                 continue
@@ -514,7 +536,7 @@ def build_external_stop_packages(
     has_potential_duplicates = any(
         _duplicate_bin_count(stops) > 1 for stops in city_public.values()
     )
-    if has_potential_duplicates:
+    if has_potential_duplicates and not publish_passenger_stop_ids:
         for city_id, public_stops in city_public.items():
             city_public[city_id] = _consolidate_duplicate_stops(
                 public_stops,
@@ -1169,6 +1191,9 @@ def process_external_gtfs_sources(
                     source_output,
                     stop_id_mode=str(source.get("stopIDMode", "exact")),
                     namespace=namespace,
+                    publish_passenger_stop_ids=bool(
+                        source.get("publishPassengerStopIDs", False)
+                    ),
                 )
                 if namespace:
                     for city in cities:

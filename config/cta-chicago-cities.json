@@ -1,0 +1,21 @@
+[
+  {
+    "id": "chicago",
+    "name": "Chicago",
+    "aliases": ["Chicago, IL"],
+    "latitude": 41.8781,
+    "longitude": -87.6298,
+    "radiusMeters": 55000,
+    "packageMode": "external",
+    "externalGTFSProvider": "cta-chicago",
+    "transitRadar": {
+      "adapter": "ctaChicago",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": ["firstDepartures", "stopLookup"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "statusMessage": "Statische CTA-Fahrpläne für Chicago"
+    }
+  }
+]

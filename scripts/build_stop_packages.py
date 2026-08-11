@@ -63,6 +63,7 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "translink",
     "ttc",
     "bayArea511",
+    "ctaChicago",
 }
 SUPPORTED_TRANSIT_RADAR_FEATURES = {
     "liveVehicles",
@@ -781,6 +782,33 @@ def validate_transit_radar_provider(
                 raise ValueError(f"511 Bay Area requires an HTTPS {key} for {city_id}")
         return
 
+    if adapter == "ctaChicago":
+        if city_id != "chicago":
+            raise ValueError(f"Invalid CTA Chicago configuration for {city_id}")
+        if configuration.get("region") is not None:
+            raise ValueError(f"CTA Chicago does not use a radar region for {city_id}")
+        if configuration.get("radarStops") is not None:
+            raise ValueError(f"CTA Chicago does not use radar stops for {city_id}")
+        if configuration.get("gatewayURL") is not None:
+            raise ValueError(f"CTA Chicago does not use a gateway URL for {city_id}")
+        for key in ("staticBaseURL", "boardURL"):
+            value = configuration.get(key)
+            if not isinstance(value, str) or not value.startswith("https://"):
+                raise ValueError(f"CTA Chicago requires an HTTPS {key} for {city_id}")
+        features = configuration.get("features")
+        if isinstance(features, list) and any(
+            feature in {
+                "liveVehicles",
+                "vehiclePositions",
+                "realtimeDepartures",
+                "realtimeDelay",
+                "tripUpdates",
+            }
+            for feature in features
+        ):
+            raise ValueError(f"CTA Chicago static-only features are invalid for {city_id}")
+        return
+
     if adapter == "entur":
         codespaces = configuration.get("radarCodespaces")
         if not isinstance(codespaces, list) or not codespaces:
@@ -1111,6 +1139,8 @@ def transit_radar_manifest(
                 provider_id = f"ttc-{city_id}"
             elif adapter == "bayArea511":
                 provider_id = f"511-bay-area-{city_id}"
+            elif adapter == "ctaChicago":
+                provider_id = "cta-chicago"
             elif adapter == "bwTrias":
                 provider_id = "bw-trias"
             else:
@@ -1219,6 +1249,8 @@ def transit_radar_manifest(
         elif any(p.get("adapter") == "ttc" for p in providers):
             country_suffix = "ca"
         elif any(p.get("adapter") == "bayArea511" for p in providers):
+            country_suffix = "us"
+        elif any(p.get("adapter") == "ctaChicago" for p in providers):
             country_suffix = "us"
         else:
             country_suffix = "de"

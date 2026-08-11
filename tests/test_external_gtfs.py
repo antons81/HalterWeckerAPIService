@@ -79,6 +79,7 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
                 "ttc-surface",
                 "ttc-subway",
                 "511-bay-area",
+                "cta-chicago",
             },
         )
         sweden = next(source for source in sources if source["id"] == "sweden")
@@ -210,6 +211,32 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
         self.assertEqual(provider["adapter"], "bayArea511")
         self.assertEqual(provider["tripUpdatesURL"], "https://api.asoftlabs.app/511/realtime/trip-updates")
         self.assertIn("vehiclePositions", provider["features"])
+
+    def test_validate_cta_chicago_static_registry_and_manifest(self) -> None:
+        sources = load_external_gtfs_sources(
+            REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
+        )
+        source = next(source for source in sources if source["id"] == "cta-chicago")
+        validate_external_gtfs_source(source, REPOSITORY_ROOT)
+        self.assertEqual(source["timezone"], "America/Chicago")
+        self.assertEqual(source["identifierPrefix"], "cta-chicago:")
+        self.assertEqual(source["staticStopIDPrefix"], "cta-chicago:")
+        self.assertTrue(source["publishPassengerStopIDs"])
+        cities = load_external_cities(source, REPOSITORY_ROOT)
+        manifest = transit_radar_manifest(cities)
+        city = manifest["cities"][0]
+        provider = city["providers"][0]
+        self.assertEqual(city["cityID"], "chicago-us")
+        self.assertEqual(provider["providerID"], "cta-chicago")
+        self.assertEqual(provider["adapter"], "ctaChicago")
+        self.assertEqual(
+            provider["features"],
+            ["firstDepartures", "stopLookup"],
+        )
+        self.assertEqual(
+            provider["boardURL"],
+            "https://api.asoftlabs.app/static-departures",
+        )
 
     def test_511_auth_requires_only_the_backend_environment_name(self) -> None:
         with self.assertRaisesRegex(ValueError, "API_511_KEY") as raised:
@@ -462,6 +489,51 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
 
 
 class ExternalStopAndDepartureTests(unittest.TestCase):
+    def test_passenger_stop_mode_keeps_real_stops_and_required_stations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            archive_path = root / "cta.zip"
+            _gtfs_zip(
+                archive_path,
+                stops=(
+                    "stop_id,stop_name,stop_lat,stop_lon,parent_station,location_type\n"
+                    "station,Station,41.88,-87.63,,1\n"
+                    "platform,Platform,41.88,-87.63,station,0\n"
+                    "street,Street Stop,41.881,-87.631,,0\n"
+                    "unused-station,Unused Station,41.882,-87.632,,1\n"
+                    "entrance,Entrance,41.88,-87.63,station,2\n"
+                    "node,Node,41.88,-87.63,station,3\n"
+                    "boarding-area,Boarding Area,41.88,-87.63,station,4\n"
+                ),
+                stop_times=(
+                    "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+                    "T1,08:00:00,08:00:00,platform,1\n"
+                    "T1,08:10:00,08:10:00,street,2\n"
+                ),
+            )
+            city = {
+                "id": "chicago",
+                "name": "Chicago",
+                "aliases": [],
+                "latitude": 41.8781,
+                "longitude": -87.6298,
+                "radiusMeters": 55_000,
+                "packageMode": "external",
+            }
+            with zipfile.ZipFile(archive_path) as archive:
+                _manifest, package_stops = build_external_stop_packages(
+                    archive,
+                    [city],
+                    root / "out",
+                    stop_id_mode="exact",
+                    publish_passenger_stop_ids=True,
+                )
+
+            self.assertEqual(
+                {stop["id"] for stop in package_stops["chicago"]},
+                {"station", "platform", "street"},
+            )
+
     def test_translink_native_stop_codes_and_departure_sequence_are_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
