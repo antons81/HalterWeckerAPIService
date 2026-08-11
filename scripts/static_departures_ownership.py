@@ -344,7 +344,7 @@ def _prepare_scoped_delete_sets(
         "populate-foreign-entities",
         f"""
         INSERT INTO scoped_foreign_entities(entity_type, key_1, key_2, key_3)
-        SELECT entity_type, key_1, key_2, key_3
+        SELECT DISTINCT entity_type, key_1, key_2, key_3
         FROM provider_entities
         WHERE provider_id NOT IN ({placeholders})
           AND entity_type IN (
