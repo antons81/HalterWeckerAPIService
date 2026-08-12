@@ -222,6 +222,9 @@ def load_external_cities(
                 f"External city {city_id} externalGTFSProvider {provider!r} "
                 f"does not match source {source_id!r}."
             )
+        if source_id in {"wmata-bus", "wmata-rail"}:
+            city["country"] = "US"
+            city["timezone"] = str(source.get("timezone", "America/New_York"))
         city["externalGTFSProvider"] = source_id
     return cities
 

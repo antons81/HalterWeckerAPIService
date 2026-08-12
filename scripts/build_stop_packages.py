@@ -1301,7 +1301,7 @@ def transit_radar_manifest(
             country_suffix = "ca"
         elif any(p.get("adapter") == "ttc" for p in providers):
             country_suffix = "ca"
-        elif any(p.get("adapter") in {"bayArea511", "kingCounty", "mtaNY"} for p in providers):
+        elif any(p.get("adapter") in {"bayArea511", "kingCounty", "mtaNY", "wmata"} for p in providers):
             country_suffix = "us"
         elif any(p.get("adapter") == "ctaChicago" for p in providers):
             country_suffix = "us"

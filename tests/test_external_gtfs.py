@@ -65,6 +65,16 @@ def _gtfs_zip(
 
 
 class ExternalGTFSRegistryTests(unittest.TestCase):
+    def test_wmata_external_city_uses_us_radar_city_id_and_timezone(self) -> None:
+        city = load_external_cities(
+            {"id": "wmata-bus", "cities": "config/wmata-cities.json"},
+            REPOSITORY_ROOT,
+        )[0]
+        entry = transit_radar_manifest([city])["cities"][0]
+        self.assertEqual(entry["cityID"], "washington-dc-us")
+        self.assertEqual(entry["timeZoneIdentifier"], "America/New_York")
+        self.assertEqual(entry["providers"][0]["providerID"], "wmata")
+
     def test_load_and_validate_sweden_registry(self) -> None:
         sources = load_external_gtfs_sources(
             REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
