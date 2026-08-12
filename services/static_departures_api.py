@@ -22,7 +22,12 @@ from ttc_gateway import TTCProxy
 from tfl_gateway import TfLProxy
 from bay_area_gateway import BayAreaTripUpdatesProxy, BayAreaVehiclePositionsProxy
 from king_county_gateway import KingCountyTripUpdatesProxy, KingCountyVehiclePositionsProxy
-from mta_ny_gateway import MtaNYTripUpdatesGateway, MtaNYBusVehiclePositionsGateway, registry_from_database, api_key_from_environment
+from mta_ny_gateway import (
+    MtaNYBusVehiclePositionsGateway,
+    MtaNYRegistryCache,
+    MtaNYTripUpdatesGateway,
+    api_key_from_environment,
+)
 
 
 DEFAULT_TIMEZONE = "Europe/Berlin"
@@ -612,12 +617,13 @@ if __name__ == "__main__":
     Handler.king_county_vehicle_positions_gateway = KingCountyVehiclePositionsProxy.from_database(
         valid_registry=lambda: database.provider_realtime_registry("king-county-metro")
     )
+    mta_ny_registry_cache = MtaNYRegistryCache()
     Handler.mta_ny_trip_updates_gateway = MtaNYTripUpdatesGateway(
-        registry=lambda: registry_from_database(database),
+        registry=lambda: mta_ny_registry_cache.get(database),
         api_key=api_key_from_environment,
     )
     Handler.mta_ny_bus_vehicle_positions_gateway = MtaNYBusVehiclePositionsGateway(
-        registry=lambda: registry_from_database(database),
+        registry=lambda: mta_ny_registry_cache.get(database),
         api_key=api_key_from_environment,
     )
     ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Handler).serve_forever()

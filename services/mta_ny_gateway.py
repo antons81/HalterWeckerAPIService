@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -315,6 +316,24 @@ def _iso(timestamp: int | None) -> str | None:
     if timestamp is None:
         return None
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp))
+
+
+class MtaNYRegistryCache:
+    """Cache static realtime ownership until the active SQLite release changes."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._identity: tuple[int, int, int] | None = None
+        self._registry: dict[str, _Registry] | None = None
+
+    def get(self, database) -> dict[str, _Registry]:
+        stat_result = os.stat(database.path)
+        identity = (stat_result.st_dev, stat_result.st_ino, stat_result.st_mtime_ns)
+        with self._lock:
+            if self._registry is None or identity != self._identity:
+                self._registry = registry_from_database(database)
+                self._identity = identity
+            return self._registry
 
 
 def registry_from_database(database) -> dict[str, _Registry]:
