@@ -19,6 +19,8 @@ from build_german_departure_index import (
 )
 from build_stop_packages import load_cities, load_gtfs_archive, nl_city_ids
 from austrian_sources import DEFAULT_REGISTRY, load_austrian_sources, public_stop_id
+from gtfs_agency import agency_scoped_archive
+
 from external_gtfs import (
     authenticated_external_request,
     external_city_ids,
@@ -527,7 +529,9 @@ def add_external_gtfs(
             url_by_provider[source_id],
             environ=environ if environ is not None else os.environ,
         )
-        with load_gtfs_archive(request_url, headers=headers) as archive:
+        raw_archive = load_gtfs_archive(request_url, headers=headers)
+        archive = agency_scoped_archive(raw_archive, source.get("agencyID"))
+        try:
             provider_stage_runner = None
             if stage_runner is not None:
                 provider_stage_runner = lambda stage, callback, source_id=source_id: stage_runner(
@@ -546,6 +550,8 @@ def add_external_gtfs(
                 provider_id=source_id,
                 stage_runner=provider_stage_runner,
             )
+        finally:
+            archive.close()
         imported_city_ids.update(str(city["id"]) for city in cities)
 
     if not imported_city_ids:

@@ -66,6 +66,7 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "kingCounty",
     "mtaNY",
     "ctaChicago",
+    "mbta",
 }
 SUPPORTED_TRANSIT_RADAR_FEATURES = {
     "liveVehicles",
@@ -718,6 +719,22 @@ def validate_transit_radar_provider(
     if adapter == "netherlands":
         return
 
+    if adapter == "mbta":
+        if city_id != "boston":
+            raise ValueError(f"Invalid MBTA configuration for {city_id}")
+        if not isinstance(region, dict):
+            raise ValueError(f"MBTA requires a geographic region for {city_id}")
+        for key in ("staticBaseURL", "boardURL", "realtimeURL", "tripUpdatesURL"):
+            value = configuration.get(key)
+            if not isinstance(value, str) or not value.startswith("https://"):
+                raise ValueError(f"MBTA requires an HTTPS {key} for {city_id}")
+        features = configuration.get("features")
+        if not isinstance(features, list) or "liveVehicles" not in features:
+            raise ValueError(f"MBTA requires liveVehicles for {city_id}")
+        if "vehicleBearing" in features:
+            raise ValueError(f"MBTA vehicleBearing is not verified for {city_id}")
+        return
+
     if adapter == "sweden":
         if configuration.get("radarStops") is not None:
             raise ValueError(f"Sweden does not use radar stops for {city_id}")
@@ -1158,6 +1175,8 @@ def transit_radar_manifest(
                 provider_id = "mta-ny"
             elif adapter == "ctaChicago":
                 provider_id = "cta-chicago"
+            elif adapter == "mbta":
+                provider_id = "mbta-boston"
             elif adapter == "bwTrias":
                 provider_id = "bw-trias"
             else:

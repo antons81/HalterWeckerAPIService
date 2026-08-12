@@ -14,6 +14,11 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 try:
+    from .gtfs_agency import agency_scoped_archive
+except ImportError:
+    from gtfs_agency import agency_scoped_archive
+
+try:
     from .build_stop_packages import (
         build_lines_by_stop_id_noncanonical,
         distance_meters,
@@ -99,6 +104,12 @@ def validate_external_gtfs_source(
         not isinstance(configured_url, str) or not configured_url.strip()
     ):
         raise ValueError(f"External GTFS source {source_id} has an invalid URL.")
+
+    agency_id = source.get("agencyID")
+    if agency_id is not None and (
+        not isinstance(agency_id, (str, int)) or not str(agency_id).strip()
+    ):
+        raise ValueError(f"External GTFS source {source_id} has an invalid agencyID.")
 
     timezone_name = source.get("timezone")
     if not isinstance(timezone_name, str) or not timezone_name.strip():
@@ -1179,6 +1190,7 @@ def process_external_gtfs_sources(
         )
         source_started = time.monotonic()
         archive = load_gtfs_archive(request_url, headers=headers)
+        archive = agency_scoped_archive(archive, source.get("agencyID"))
         source_output = output
         if namespace or str(source.get("mergeGroup", "")).strip():
             source_output = namespace_root / source_id

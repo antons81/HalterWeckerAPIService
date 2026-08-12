@@ -22,6 +22,14 @@ from ttc_gateway import TTCProxy
 from tfl_gateway import TfLProxy
 from bay_area_gateway import BayAreaTripUpdatesProxy, BayAreaVehiclePositionsProxy
 from king_county_gateway import KingCountyTripUpdatesProxy, KingCountyVehiclePositionsProxy
+from mbta_gateway import (
+    MBTAAlertsGateway,
+    MBTATripUpdatesGateway,
+    MBTAVehiclePositionsGateway,
+    MBTA_ALERTS_PATH,
+    MBTA_TRIP_UPDATES_PATH,
+    MBTA_VEHICLE_POSITIONS_PATH,
+)
 from mta_ny_gateway import (
     MtaNYBusVehiclePositionsGateway,
     MtaNYRegistryCache,
@@ -31,6 +39,10 @@ from mta_ny_gateway import (
 
 
 DEFAULT_TIMEZONE = "Europe/Berlin"
+MBTA_NAMESPACE = "mbta-boston:"
+
+def _native_id(value: str) -> str:
+    return value[len(MBTA_NAMESPACE):] if value.startswith(MBTA_NAMESPACE) else value
 STATIC_DATA_ROOT = os.environ.get("STATIC_DATA_ROOT", "")
 STATIC_DATA_PATH_PREFIXES = (
     "/static-stop-data/",
@@ -153,6 +165,17 @@ class Database:
         route_by_trip = {str(row[0]): str(row[1]) for row in rows if row[1]}
         routes = {str(row[0]) for row in route_rows}
         return trips, routes, route_by_trip
+
+    def provider_trip_stop_registry(self, provider_id: str, trip_ids: set[str]) -> dict[tuple[str, int], str]:
+        if not trip_ids:
+            return {}
+        placeholders = ",".join("?" for _ in trip_ids)
+        with self.lock:
+            rows = self._connection().execute(
+                f"SELECT stop_times.trip_id, stop_times.stop_sequence, stop_times.raw_stop_id FROM stop_times JOIN provider_entities ON provider_entities.entity_type=\'trips\' AND provider_entities.key_1=stop_times.trip_id WHERE provider_entities.provider_id=? AND stop_times.trip_id IN ({placeholders})",
+                (provider_id, *sorted(trip_ids)),
+            ).fetchall()
+        return {(str(row[0]), int(row[1])): str(row[2]) for row in rows}
 
     def provider_stop_registry(self, provider_id: str) -> set[str]:
         """Return internal stop identities for realtime ownership checks."""
@@ -434,6 +457,9 @@ class Handler(BaseHTTPRequestHandler):
     king_county_vehicle_positions_gateway: KingCountyVehiclePositionsProxy | None = None
     mta_ny_trip_updates_gateway: MtaNYTripUpdatesGateway | None = None
     mta_ny_bus_vehicle_positions_gateway: MtaNYBusVehiclePositionsGateway | None = None
+    mbta_trip_updates_gateway: MBTATripUpdatesGateway | None = None
+    mbta_vehicle_positions_gateway: MBTAVehiclePositionsGateway | None = None
+    mbta_alerts_gateway: MBTAAlertsGateway | None = None
 
     def send_json(
         self,
@@ -554,6 +580,16 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "MTA New York provider unavailable"})
                 response = self.mta_ny_bus_vehicle_positions_gateway.handle(parsed.path, query)
                 return self.send_json(response.status, response.payload, response.cache_control)
+            if parsed.path in {MBTA_TRIP_UPDATES_PATH, MBTA_VEHICLE_POSITIONS_PATH, MBTA_ALERTS_PATH}:
+                gateway = {
+                    MBTA_TRIP_UPDATES_PATH: self.mbta_trip_updates_gateway,
+                    MBTA_VEHICLE_POSITIONS_PATH: self.mbta_vehicle_positions_gateway,
+                    MBTA_ALERTS_PATH: self.mbta_alerts_gateway,
+                }[parsed.path]
+                if gateway is None:
+                    return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "MBTA provider unavailable"})
+                response = gateway.handle(parsed.path, query)
+                return self.send_json(response.status, response.payload, response.cache_control)
             for prefix in STATIC_DATA_PATH_PREFIXES:
                 if parsed.path.startswith(prefix):
                     return self.send_static_file(parsed.path[len(prefix):])
@@ -626,4 +662,34 @@ if __name__ == "__main__":
         registry=lambda: mta_ny_registry_cache.get(database),
         api_key=api_key_from_environment,
     )
+
+    def mbta_native_trip_registry():
+        trips, routes, route_by_trip = database.provider_realtime_registry("mbta-boston")
+        return ({_native_id(value) for value in trips}, {_native_id(value) for value in routes}, {_native_id(key): _native_id(value) for key, value in route_by_trip.items()})
+
+    def mbta_native_stop_registry():
+        return {_native_id(value) for value in database.provider_stop_registry("mbta-boston")}
+
+    def mbta_trip_stop_resolver(trip_ids, sequence_keys):
+        internal_trips = {MBTA_NAMESPACE + trip_id for trip_id in trip_ids}
+        mapping = database.provider_trip_stop_registry("mbta-boston", internal_trips)
+        return {(_native_id(trip_id), sequence): _native_id(stop_id) for (trip_id, sequence), stop_id in mapping.items()}
+
+    def mbta_trip_updates_registry():
+        trips, _, route_by_trip = mbta_native_trip_registry()
+        return trips, route_by_trip
+
+    Handler.mbta_trip_updates_gateway = MBTATripUpdatesGateway(
+        provider_id="mbta-boston", city_id="boston", path=MBTA_TRIP_UPDATES_PATH,
+        upstream_url="https://cdn.mbta.com/realtime/TripUpdates.pb",
+        trip_stop_resolver=mbta_trip_stop_resolver,
+        valid_trip_registry=mbta_trip_updates_registry,
+        valid_stop_registry=mbta_native_stop_registry,
+        stop_id_mapper=lambda value: value, cache_ttl=15.0, max_stale=300.0,
+        user_agent="HalteWecker-MBTA-GTFSRT/1.0",
+    )
+    Handler.mbta_vehicle_positions_gateway = MBTAVehiclePositionsGateway(
+        valid_registry=lambda: (*mbta_native_trip_registry(), lambda value: value)
+    )
+    Handler.mbta_alerts_gateway = MBTAAlertsGateway()
     ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Handler).serve_forever()

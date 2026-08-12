@@ -1,0 +1,40 @@
+[
+  {
+    "id": "boston",
+    "name": "Boston",
+    "aliases": ["Boston", "Greater Boston"],
+    "latitude": 42.3601,
+    "longitude": -71.0589,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "mbta-boston",
+    "staticDepartures": true,
+    "transitRadar": {
+      "adapter": "mbta",
+      "providerID": "mbta-boston",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "vehiclePositions",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/mbta/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/mbta/realtime/trip-updates",
+      "region": {
+        "minimumLongitude": -71.35,
+        "minimumLatitude": 42.15,
+        "maximumLongitude": -70.75,
+        "maximumLatitude": 42.60
+      },
+      "statusMessage": "MBTA Live-Radar und Live-Abfahrten für Boston"
+    }
+  }
+]

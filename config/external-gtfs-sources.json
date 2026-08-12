@@ -200,5 +200,26 @@
     "identifierPrefix": "mta-ny-mta-bus:",
     "staticIdentifierPrefix": "mta-ny-mta-bus:",
     "staticStopIDPrefix": "mta-ny-mta-bus:"
+  },
+  {
+    "id": "mbta-boston",
+    "url": "https://cdn.mbta.com/MBTA_GTFS.zip",
+    "cities": "config/mbta-cities.json",
+    "timezone": "America/New_York",
+    "identifierPrefix": "mbta-boston:",
+    "namespace": "",
+    "preserveNativeIDs": true,
+    "stopIDMode": "exact",
+    "publishPassengerStopIDs": false,
+    "buildStops": true,
+    "buildRoutes": true,
+    "buildDepartures": true,
+    "buildTripIndex": true,
+    "departurePackageDays": 15,
+    "importIntoStaticDepartures": true,
+    "staticIdentifierPrefix": "mbta-boston:",
+    "staticStopIDPrefix": "mbta-boston:",
+    "agencyID": "1",
+    "country": "US"
   }
 ]
