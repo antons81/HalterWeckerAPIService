@@ -5,6 +5,7 @@ services:
       - /srv/haltewecker/secrets/canada-metrolink/.env
       - /srv/haltewecker/secrets/usa_511/.env
       - /srv/haltewecker/secrets/mta-ny/.env
+      - /srv/haltewecker/secrets/wmata/.env
     build:
       context: ..
       dockerfile: services/static-departures.Dockerfile

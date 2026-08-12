@@ -33,6 +33,13 @@ if [[ -f "$STATIC_511_SECRET_FILE" ]]; then
   set +a
 fi
 
+WMATA_SECRET_FILE="${WMATA_SECRET_FILE:-/srv/haltewecker/secrets/wmata/.env}"
+if [[ -f "$WMATA_SECRET_FILE" ]]; then
+  set -a
+  source "$WMATA_SECRET_FILE"
+  set +a
+fi
+
 mkdir -p "$(dirname "$LOCK_PATH")"
 exec 9>"$LOCK_PATH"
 if ! "$FLOCK_BIN" -n 9; then

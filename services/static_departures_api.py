@@ -30,6 +30,14 @@ from mbta_gateway import (
     MBTA_TRIP_UPDATES_PATH,
     MBTA_VEHICLE_POSITIONS_PATH,
 )
+from wmata_gateway import (
+    WMATAAlertsGateway,
+    WMATATripUpdatesGateway,
+    WMATAVehiclePositionsGateway,
+    WMATA_ALERTS_PATH,
+    WMATA_TRIP_UPDATES_PATH,
+    WMATA_VEHICLE_POSITIONS_PATH,
+)
 from mta_ny_gateway import (
     MtaNYBusVehiclePositionsGateway,
     MtaNYRegistryCache,
@@ -460,6 +468,9 @@ class Handler(BaseHTTPRequestHandler):
     mbta_trip_updates_gateway: MBTATripUpdatesGateway | None = None
     mbta_vehicle_positions_gateway: MBTAVehiclePositionsGateway | None = None
     mbta_alerts_gateway: MBTAAlertsGateway | None = None
+    wmata_trip_updates_gateway: WMATATripUpdatesGateway | None = None
+    wmata_vehicle_positions_gateway: WMATAVehiclePositionsGateway | None = None
+    wmata_alerts_gateway: WMATAAlertsGateway | None = None
 
     def send_json(
         self,
@@ -590,6 +601,16 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "MBTA provider unavailable"})
                 response = gateway.handle(parsed.path, query)
                 return self.send_json(response.status, response.payload, response.cache_control)
+            if parsed.path in {WMATA_TRIP_UPDATES_PATH, WMATA_VEHICLE_POSITIONS_PATH, WMATA_ALERTS_PATH}:
+                gateway = {
+                    WMATA_TRIP_UPDATES_PATH: self.wmata_trip_updates_gateway,
+                    WMATA_VEHICLE_POSITIONS_PATH: self.wmata_vehicle_positions_gateway,
+                    WMATA_ALERTS_PATH: self.wmata_alerts_gateway,
+                }[parsed.path]
+                if gateway is None:
+                    return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "WMATA provider unavailable"})
+                response = gateway.handle(parsed.path, query)
+                return self.send_json(response.status, response.payload, response.cache_control)
             for prefix in STATIC_DATA_PATH_PREFIXES:
                 if parsed.path.startswith(prefix):
                     return self.send_static_file(parsed.path[len(prefix):])
@@ -692,4 +713,58 @@ if __name__ == "__main__":
         valid_registry=lambda: (*mbta_native_trip_registry(), lambda value: value)
     )
     Handler.mbta_alerts_gateway = MBTAAlertsGateway()
+    wmata_api_key = os.environ.get("WMATA_API_KEY", "").strip()
+    if wmata_api_key:
+        from wmata_gateway import WMATA_NAMESPACE
+
+        def wmata_native_trip_registry():
+            trip_ids: set[str] = set()
+            route_ids: set[str] = set()
+            routes_by_trip: dict[str, str] = {}
+            for provider_id in ("wmata-bus", "wmata-rail"):
+                provider_trips, provider_routes, provider_routes_by_trip = database.provider_realtime_registry(provider_id)
+                trip_ids.update(provider_trips)
+                route_ids.update(provider_routes)
+                routes_by_trip.update(provider_routes_by_trip)
+            native_trips = {value[len(WMATA_NAMESPACE):] if value.startswith(WMATA_NAMESPACE) else value for value in trip_ids}
+            native_routes = {value[len(WMATA_NAMESPACE):] if value.startswith(WMATA_NAMESPACE) else value for value in route_ids}
+            native_routes_by_trip = {
+                (trip_id[len(WMATA_NAMESPACE):] if trip_id.startswith(WMATA_NAMESPACE) else trip_id):
+                (route_id[len(WMATA_NAMESPACE):] if route_id.startswith(WMATA_NAMESPACE) else route_id)
+                for trip_id, route_id in routes_by_trip.items()
+            }
+            return native_trips, native_routes, native_routes_by_trip
+
+        def wmata_native_stop_registry():
+            values = set()
+            for provider_id in ("wmata-bus", "wmata-rail"):
+                values.update(database.provider_stop_registry(provider_id))
+            return {value[len(WMATA_NAMESPACE):] if value.startswith(WMATA_NAMESPACE) else value for value in values}
+
+        def wmata_trip_stop_resolver(trip_ids, sequence_keys):
+            internal_trips = {WMATA_NAMESPACE + trip_id for trip_id in trip_ids}
+            mapping = {}
+            for provider_id in ("wmata-bus", "wmata-rail"):
+                mapping.update(database.provider_trip_stop_registry(provider_id, internal_trips))
+            return {
+                ((trip_id[len(WMATA_NAMESPACE):] if trip_id.startswith(WMATA_NAMESPACE) else trip_id), sequence):
+                (stop_id[len(WMATA_NAMESPACE):] if stop_id.startswith(WMATA_NAMESPACE) else stop_id)
+                for (trip_id, sequence), stop_id in mapping.items()
+            }
+
+        def wmata_trip_updates_registry():
+            trips, _routes, route_by_trip = wmata_native_trip_registry()
+            return trips, route_by_trip
+
+        Handler.wmata_trip_updates_gateway = WMATATripUpdatesGateway(
+            api_key=wmata_api_key,
+            trip_stop_resolver=wmata_trip_stop_resolver,
+            valid_trip_registry=wmata_trip_updates_registry,
+            valid_stop_registry=wmata_native_stop_registry,
+        )
+        Handler.wmata_vehicle_positions_gateway = WMATAVehiclePositionsGateway(
+            api_key=wmata_api_key,
+            valid_registry=lambda: (*wmata_native_trip_registry(), lambda value: value),
+        )
+        Handler.wmata_alerts_gateway = WMATAAlertsGateway(api_key=wmata_api_key)
     ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Handler).serve_forever()

@@ -230,6 +230,8 @@ class StaticDepartureScopeTests(unittest.TestCase):
                 "mta-ny-nyct-bus",
                 "mta-ny-mta-bus",
                 "mbta-boston",
+                "wmata-bus",
+                "wmata-rail",
             ],
         )
 

@@ -1,0 +1,30 @@
+[
+  {
+    "id": "washington-dc",
+    "name": "Washington, DC",
+    "aliases": ["Washington", "Washington DC", "District of Columbia"],
+    "latitude": 38.9072,
+    "longitude": -77.0369,
+    "radiusMeters": 55000,
+    "packageMode": "external",
+    "externalGTFSProviders": ["wmata-bus", "wmata-rail"],
+    "transitRadar": {
+      "adapter": "wmata",
+      "providerID": "wmata",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay", "tripUpdates", "vehiclePositions", "stopSequence"],
+      "staticBaseURL": "https://api.asoftlabs.app/static-stop-data",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/wmata/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/wmata/realtime/trip-updates",
+      "region": {
+        "minimumLongitude": -77.53,
+        "minimumLatitude": 38.65,
+        "maximumLongitude": -76.75,
+        "maximumLatitude": 39.25
+      },
+      "statusMessage": "WMATA Live-Radar und Live-Abfahrten für Washington, DC"
+    }
+  }
+]

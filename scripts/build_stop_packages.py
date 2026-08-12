@@ -67,6 +67,7 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "mtaNY",
     "ctaChicago",
     "mbta",
+    "wmata",
 }
 SUPPORTED_TRANSIT_RADAR_FEATURES = {
     "liveVehicles",
@@ -735,6 +736,20 @@ def validate_transit_radar_provider(
             raise ValueError(f"MBTA vehicleBearing is not verified for {city_id}")
         return
 
+    if adapter == "wmata":
+        if city_id != "washington-dc":
+            raise ValueError(f"Invalid WMATA configuration for {city_id}")
+        if not isinstance(region, dict):
+            raise ValueError(f"WMATA requires a geographic region for {city_id}")
+        for key in ("staticBaseURL", "boardURL", "realtimeURL", "tripUpdatesURL"):
+            value = configuration.get(key)
+            if not isinstance(value, str) or not value.startswith("https://"):
+                raise ValueError(f"WMATA requires an HTTPS {key} for {city_id}")
+        features = configuration.get("features")
+        if not isinstance(features, list) or "liveVehicles" not in features:
+            raise ValueError(f"WMATA requires liveVehicles for {city_id}")
+        return
+
     if adapter == "sweden":
         if configuration.get("radarStops") is not None:
             raise ValueError(f"Sweden does not use radar stops for {city_id}")
@@ -1177,6 +1192,8 @@ def transit_radar_manifest(
                 provider_id = "cta-chicago"
             elif adapter == "mbta":
                 provider_id = "mbta-boston"
+            elif adapter == "wmata":
+                provider_id = "wmata"
             elif adapter == "bwTrias":
                 provider_id = "bw-trias"
             else:
@@ -1195,7 +1212,7 @@ def transit_radar_manifest(
                 supports_departures = bool(
                     provider_configuration.get(
                         "supportsDepartures",
-                        adapter in {"bwTrias", "vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "avvHafas", "oebb", "netherlands", "sweden", "ireland", "entur", "translink", "ttc", "kingCounty", "mtaNY"}
+                        adapter in {"bwTrias", "vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "avvHafas", "oebb", "netherlands", "sweden", "ireland", "entur", "translink", "ttc", "kingCounty", "mtaNY", "wmata"}
                     )
                 )
                 supports_live_vehicles = bool(

@@ -59,6 +59,16 @@ EXTERNAL_SOURCE_AUTH: dict[str, dict[str, object]] = {
             "User-Agent": "HalteWeckerStopPipeline/1.0",
         },
     },
+    "wmata-bus": {
+        "api_key_env": "WMATA_API_KEY",
+        "header_name": "api_key",
+        "headers": {"Accept-Encoding": "gzip"},
+    },
+    "wmata-rail": {
+        "api_key_env": "WMATA_API_KEY",
+        "header_name": "api_key",
+        "headers": {"Accept-Encoding": "gzip"},
+    },
 }
 
 
@@ -131,7 +141,7 @@ def validate_external_gtfs_source(
         raise ValueError(
             f"External GTFS source {source_id} requires a non-empty identifierPrefix."
         )
-    if prefix.strip() and known_prefixes is not None and prefix in known_prefixes:
+    if prefix.strip() and known_prefixes is not None and prefix in known_prefixes and not str(source.get("mergeGroup", "")).strip():
         raise ValueError(f"Duplicate external GTFS identifierPrefix: {prefix}")
 
     namespace = source.get("namespace", "")
@@ -146,7 +156,7 @@ def validate_external_gtfs_source(
             f"External GTFS source {source_id} namespace must be a whitespace-free "
             "prefix ending with ':'."
         )
-    if namespace and known_namespaces is not None and namespace in known_namespaces:
+    if namespace and known_namespaces is not None and namespace in known_namespaces and not str(source.get("mergeGroup", "")).strip():
         raise ValueError(f"Duplicate external GTFS namespace: {namespace}")
 
     merge_group = source.get("mergeGroup")
@@ -272,12 +282,16 @@ def authenticated_external_request(
                 f"Missing required environment variable {api_key_env} "
                 f"for external GTFS source {source_id}."
             )
-        query_parameter = str(auth.get("query_parameter") or "key")
-        query = dict(parse_qsl(parts.query, keep_blank_values=True))
-        query[query_parameter] = api_key
-        url = urlunsplit(
-            (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
-        )
+        header_name = str(auth.get("header_name") or "").strip()
+        if header_name:
+            headers[header_name] = api_key
+        else:
+            query_parameter = str(auth.get("query_parameter") or "key")
+            query = dict(parse_qsl(parts.query, keep_blank_values=True))
+            query[query_parameter] = api_key
+            url = urlunsplit(
+                (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+            )
     return url, headers
 
 

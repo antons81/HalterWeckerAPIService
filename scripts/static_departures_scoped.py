@@ -826,6 +826,7 @@ def scoped_rebuild(
     data_root: Path,
     providers: list[StaticProvider],
     environment: dict[str, str],
+    activate: bool = True,
 ) -> Path:
     source_database = current_database_path(data_root)
     source_stop_data = current_stop_data_path(data_root)
@@ -949,7 +950,10 @@ def scoped_rebuild(
                 staged_release=release_dir,
             ),
         )
-        timed_stage("activate-release", lambda: activate_release(data_root, release_dir))
+        if activate:
+            timed_stage("activate-release", lambda: activate_release(data_root, release_dir))
+        else:
+            print(f"Staged release (not activated): {release_dir}")
         return release_dir
     except Exception:
         shutil.rmtree(release_dir, ignore_errors=True)
@@ -967,6 +971,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Resolve and print the scope without downloading, importing, or publishing",
+    )
+    parser.add_argument(
+        "--stage-only",
+        action="store_true",
+        help="Build and readiness-check a release without changing production symlinks",
     )
     return parser.parse_args(argv)
 
@@ -991,8 +1000,17 @@ def main(argv: list[str] | None = None) -> int:
     print("Mode: SCOPED PIPELINE")
     print(f"Requested scope: {scope_label}")
     print("Selected providers: " + ", ".join(provider.provider_id for provider in providers))
-    release = scoped_rebuild(repository_root, data_root, providers, dict(os.environ))
-    print(f"Published scoped release: {release}")
+    release = scoped_rebuild(
+        repository_root,
+        data_root,
+        providers,
+        dict(os.environ),
+        activate=not args.stage_only,
+    )
+    if args.stage_only:
+        print(f"Staged scoped release (not activated): {release}")
+    else:
+        print(f"Published scoped release: {release}")
     return 0
 
 
