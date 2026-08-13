@@ -6,6 +6,7 @@ services:
       - /srv/haltewecker/secrets/usa_511/.env
       - /srv/haltewecker/secrets/mta-ny/.env
       - /srv/haltewecker/secrets/wmata/.env
+      - /srv/haltewecker/secrets/geofox-hamburg/.env
     build:
       context: ..
       dockerfile: services/static-departures.Dockerfile
