@@ -558,18 +558,22 @@ def add_external_gtfs(
                 provider_stage_runner = lambda stage, callback, source_id=source_id: stage_runner(
                     f"{source_id}:{stage}", callback
                 )
-            populate_gtfs(
-                connection,
-                archive,
-                identifier_prefix=str(source["identifierPrefix"]),
-                stop_id_prefix=(
-                    str(source.get("staticStopIDPrefix", (
-                        str(source.get("namespace", "")).strip()
-                        or str(source["identifierPrefix"])
-                )))
+            timed_stage(
+                f"external:{source_id}",
+                "populate_gtfs",
+                lambda: populate_gtfs(
+                    connection,
+                    archive,
+                    identifier_prefix=str(source["identifierPrefix"]),
+                    stop_id_prefix=(
+                        str(source.get("staticStopIDPrefix", (
+                            str(source.get("namespace", "")).strip()
+                            or str(source["identifierPrefix"])
+                        )))
+                    ),
+                    provider_id=source_id,
+                    stage_runner=provider_stage_runner,
                 ),
-                provider_id=source_id,
-                stage_runner=provider_stage_runner,
             )
         finally:
             archive.close()
