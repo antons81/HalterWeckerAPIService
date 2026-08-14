@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from datetime import date
 from pathlib import Path
 from unittest import mock
 
@@ -15,6 +16,7 @@ from build_stop_packages import (  # noqa: E402
     merge_manifest_entries,
     transit_radar_manifest,
 )
+import import_static_departures_database as static_importer  # noqa: E402
 from external_gtfs import (  # noqa: E402
     authenticated_external_request,
     build_external_departure_index,
@@ -1239,6 +1241,57 @@ class ExternalExclusionTests(unittest.TestCase):
         self.assertIn("wien", excluded)
         self.assertIn("zurich", excluded)
 
+
+class ExternalMembershipIntegrationTests(unittest.TestCase):
+    def test_external_membership_stage_uses_indexed_path(self) -> None:
+        source = {
+            "id": "fixture-provider",
+            "cities": "fixture-cities.json",
+            "identifierPrefix": "fixture:",
+            "namespace": "fixture:",
+            "staticIdentifierPrefix": "fixture:",
+            "staticStopIDPrefix": "fixture:",
+            "timezone": "UTC",
+        }
+        city = {
+            "id": "fixture-city",
+            "packageMode": "external",
+            "externalGTFSProvider": "fixture-provider",
+        }
+        connection = mock.Mock()
+        connection.execute.return_value = []
+        archive = mock.Mock()
+        with (
+            mock.patch.object(static_importer, "load_external_gtfs_sources", return_value=[source]),
+            mock.patch.object(static_importer, "validate_external_gtfs_source"),
+            mock.patch.object(static_importer, "load_external_cities", return_value=[city]),
+            mock.patch.object(
+                static_importer,
+                "authenticated_external_request",
+                return_value=("fixture.gtfs.zip", {}),
+            ),
+            mock.patch.object(static_importer, "load_gtfs_archive", return_value=archive),
+            mock.patch.object(static_importer, "agency_scoped_archive", return_value=archive),
+            mock.patch.object(static_importer, "populate_gtfs"),
+            mock.patch.object(static_importer, "resolve_canonical_stops"),
+            mock.patch.object(static_importer, "populate_provider_city_memberships", return_value={"fixture-city"}) as memberships,
+            mock.patch.object(static_importer, "populate_active_services"),
+            mock.patch.object(static_importer, "update_terminal_stops"),
+            mock.patch.object(static_importer, "timed_stage", wraps=static_importer.timed_stage) as timed,
+        ):
+            result = static_importer.add_external_gtfs(
+                connection,
+                Path("/tmp/fixture-stop-data"),
+                {"fixture-provider": "fixture.gtfs.zip"},
+                repository_root=Path("/tmp"),
+                sources_path=Path("/tmp/fixture-sources.json"),
+                dates=[date(2026, 8, 14)],
+            )
+
+        self.assertEqual(result, {"fixture-city"})
+        self.assertTrue(memberships.call_args.kwargs["indexed_ownership_lookup"])
+        stage_names = {(call.args[0], call.args[1]) for call in timed.call_args_list}
+        self.assertIn(("external", "provider-city-memberships"), stage_names)
 
 if __name__ == "__main__":
     unittest.main()

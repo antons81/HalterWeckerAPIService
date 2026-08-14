@@ -592,20 +592,26 @@ def add_external_gtfs(
         )
     if populate_memberships:
         if stage_runner is None:
-            populate_provider_city_memberships(
-                connection,
-                stop_data,
-                included_city_ids=imported_city_ids,
-                stop_id_prefix_by_provider=source_stop_id_prefixes,
-            )
-        else:
-            stage_runner(
-                "memberships",
+            timed_stage(
+                "external",
+                "provider-city-memberships",
                 lambda: populate_provider_city_memberships(
                     connection,
                     stop_data,
                     included_city_ids=imported_city_ids,
                     stop_id_prefix_by_provider=source_stop_id_prefixes,
+                    indexed_ownership_lookup=True,
+                ),
+            )
+        else:
+            stage_runner(
+                "provider-city-memberships",
+                lambda: populate_provider_city_memberships(
+                    connection,
+                    stop_data,
+                    included_city_ids=imported_city_ids,
+                    stop_id_prefix_by_provider=source_stop_id_prefixes,
+                    indexed_ownership_lookup=True,
                 ),
             )
     provider_scope = tuple(url_by_provider) if scoped else None
