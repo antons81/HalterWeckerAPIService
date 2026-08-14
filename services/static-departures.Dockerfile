@@ -10,6 +10,7 @@ COPY services/king_county_gateway.py /app/king_county_gateway.py
 COPY services/mta_ny_gateway.py /app/mta_ny_gateway.py
 COPY services/mbta_gateway.py /app/mbta_gateway.py
 COPY services/wmata_gateway.py /app/wmata_gateway.py
+COPY services/geofox_gateway.py /app/geofox_gateway.py
 COPY services/kyiv_gateway.py /app/kyiv_gateway.py
 COPY services/kyiv_radar_inference.py /app/kyiv_radar_inference.py
 EXPOSE 8080

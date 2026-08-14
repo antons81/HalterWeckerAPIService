@@ -38,6 +38,7 @@ from wmata_gateway import (
     WMATA_TRIP_UPDATES_PATH,
     WMATA_VEHICLE_POSITIONS_PATH,
 )
+from geofox_gateway import GeofoxProxy
 from mta_ny_gateway import (
     MtaNYBusVehiclePositionsGateway,
     MtaNYRegistryCache,
@@ -493,6 +494,7 @@ class Handler(BaseHTTPRequestHandler):
     wmata_trip_updates_gateway: WMATATripUpdatesGateway | None = None
     wmata_vehicle_positions_gateway: WMATAVehiclePositionsGateway | None = None
     wmata_alerts_gateway: WMATAAlertsGateway | None = None
+    geofox_gateway: GeofoxProxy | None = None
     kyiv_vehicle_positions_gateway: KyivVehiclePositionsGateway | None = None
 
     def send_json(
@@ -681,10 +683,27 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as error:
             self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(error)})
 
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        if not parsed.path.startswith("/geofox/"):
+            return self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        if self.geofox_gateway is None:
+            return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Geofox provider unavailable"})
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 1_000_000:
+                return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request body"})
+            body = self.rfile.read(length)
+            response = self.geofox_gateway.handle(parsed.path, body)
+            return self.send_json(response.status, response.payload, response.cache_control)
+        except (ValueError, OSError):
+            return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request body"})
+
 
 if __name__ == "__main__":
     database = Database(os.environ.get("DEPARTURES_DATABASE", "/data/departures-current.sqlite"))
     Handler.database = database
+    Handler.geofox_gateway = GeofoxProxy.from_environment()
     Handler.tfl_gateway = TfLProxy.from_environment()
     Handler.translink_gateway = TransLinkProxy.from_environment()
     Handler.ttc_gateway = TTCProxy.from_environment()
