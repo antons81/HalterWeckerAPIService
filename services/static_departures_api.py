@@ -476,6 +476,9 @@ def bounded_limit(raw: str | None) -> int:
 
 
 class Handler(BaseHTTPRequestHandler):
+    def version_string(self) -> str:
+        return "HalteWecker"
+
     database: Database
     tfl_gateway: TfLProxy | None = None
     translink_gateway: TransLinkProxy | None = None

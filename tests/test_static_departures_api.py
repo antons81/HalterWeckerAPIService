@@ -239,6 +239,12 @@ class StaticDeparturesImportTests(unittest.TestCase):
 
 
 class StaticDeparturesEndpointTests(unittest.TestCase):
+    def test_server_header_does_not_expose_runtime_version(self) -> None:
+        self.assertEqual(
+            Handler.version_string(Handler.__new__(Handler)),
+            "HalteWecker",
+        )
+
     def test_health_meta_lines_and_board(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "current.sqlite"
