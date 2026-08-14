@@ -43,8 +43,24 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 def timed_stage(source: str, stage: str, callback):
     started = time.monotonic()
-    result = callback()
-    print(f"[StaticDepartures] source={source} stage={stage} duration={time.monotonic() - started:.2f}s")
+    print(
+        f"[StaticDepartures] source={source} stage={stage} status=started",
+        flush=True,
+    )
+    try:
+        result = callback()
+    except Exception:
+        print(
+            f"[StaticDepartures] source={source} stage={stage} status=failed "
+            f"duration={time.monotonic() - started:.2f}s",
+            flush=True,
+        )
+        raise
+    print(
+        f"[StaticDepartures] source={source} stage={stage} status=completed "
+        f"duration={time.monotonic() - started:.2f}s",
+        flush=True,
+    )
     return result
 
 

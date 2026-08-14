@@ -11,4 +11,4 @@ WorkingDirectory=/srv/haltewecker/pipeline/HalterWeckerAPIService
 EnvironmentFile=/etc/haltewecker-stop-data.env
 Environment=REPO=/srv/haltewecker/pipeline/HalterWeckerAPIService
 Environment=DATA_ROOT=/srv/haltewecker/data
-ExecStart=/usr/bin/flock -n /run/lock/haltewecker-static-departures.lock /srv/haltewecker/pipeline/HalterWeckerAPIService/scripts/run_static_departures_pipeline.sh
+ExecStart=/usr/bin/flock -n /run/lock/haltewecker-stop-data.lock /srv/haltewecker/pipeline/HalterWeckerAPIService/scripts/run_static_departures_pipeline.sh

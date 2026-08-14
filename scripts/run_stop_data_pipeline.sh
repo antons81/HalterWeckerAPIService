@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
 REPO="${REPO:-/srv/haltewecker/pipeline/HalterWeckerAPIService}"
 DATA_ROOT="${DATA_ROOT:-/srv/haltewecker/data}"
@@ -14,6 +15,7 @@ ROLLBACK="$DATA_ROOT/temp/current-rollback/$RELEASE_ID"
 CURRENT_RELEASE="$DATA_ROOT/current-release"
 DEPARTURES_CURRENT="$DATA_ROOT/departures-current.sqlite"
 STOP_DATA_LOCK="${STOP_DATA_LOCK:-/run/lock/haltewecker-stop-data.lock}"
+STATIC_DEPARTURES_LOCK="${STATIC_DEPARTURES_LOCK:-/run/lock/haltewecker-static-departures.lock}"
 STOP_DATA_ENV_FILE="${STOP_DATA_ENV_FILE:-/etc/haltewecker-stop-data.env}"
 
 set -a
@@ -32,6 +34,12 @@ mkdir -p "$(dirname "$STOP_DATA_LOCK")"
 exec 9>"$STOP_DATA_LOCK"
 if ! "$FLOCK_BIN" -n 9; then
   echo "[StopData] another stop-data publication is already running" >&2
+  exit 1
+fi
+mkdir -p "$(dirname "$STATIC_DEPARTURES_LOCK")"
+exec 10>"$STATIC_DEPARTURES_LOCK"
+if ! "$FLOCK_BIN" -n 10; then
+  echo "[StopData] static-departures lock is held by another job" >&2
   exit 1
 fi
 

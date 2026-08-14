@@ -9,6 +9,7 @@ import json
 import shutil
 import sqlite3
 import tempfile
+import time
 import zipfile
 from collections.abc import Callable, Iterable
 from datetime import date, datetime, timedelta, timezone
@@ -713,29 +714,110 @@ def update_terminal_stops(
     provider_ids: Iterable[str] | None = None,
 ) -> None:
     selected = _normalized_provider_ids(provider_ids)
-    if selected is None:
+    if selected == ():
+        return
+
+    started = time.monotonic()
+    print("[StaticDepartures] stage=terminal-stops status=started", flush=True)
+    heartbeat_at = started + 60.0
+
+    def heartbeat() -> int:
+        nonlocal heartbeat_at
+        now = time.monotonic()
+        if now >= heartbeat_at:
+            print(
+                "[StaticDepartures] stage=terminal-stops status=heartbeat "
+                f"elapsed={now - started:.0f}s",
+                flush=True,
+            )
+            heartbeat_at = now + 60.0
+        return 0
+
+    connection.set_progress_handler(heartbeat, 100_000)
+    try:
+        connection.execute("DROP TABLE IF EXISTS temp.terminal_stop_candidates")
         connection.execute("""
-            UPDATE trips SET terminal_stop_id = COALESCE((
-                SELECT stop_times.raw_stop_id FROM stop_times WHERE stop_times.trip_id = trips.trip_id
-                ORDER BY stop_times.stop_sequence DESC, stop_times.rowid DESC LIMIT 1
-            ), '')
+            CREATE TEMP TABLE terminal_stop_candidates (
+                trip_id TEXT PRIMARY KEY,
+                raw_stop_id TEXT NOT NULL
+            ) WITHOUT ROWID
         """)
-    elif selected:
-        placeholders = ",".join("?" for _ in selected)
+
+        provider_filter = ""
+        provider_params: tuple[str, ...] = ()
+        if selected is not None:
+            placeholders = ",".join("?" for _ in selected)
+            provider_filter = f"""
+                WHERE st.trip_id IN (
+                    SELECT key_1 FROM provider_entities
+                    WHERE entity_type = 'trips' AND provider_id IN ({placeholders})
+                )
+            """
+            provider_params = selected
+
         connection.execute(
             f"""
-            UPDATE trips SET terminal_stop_id = COALESCE((
-                SELECT stop_times.raw_stop_id FROM stop_times WHERE stop_times.trip_id = trips.trip_id
-                ORDER BY stop_times.stop_sequence DESC, stop_times.rowid DESC LIMIT 1
-            ), '')
-            WHERE trip_id IN (
-                SELECT key_1 FROM provider_entities
-                WHERE entity_type = 'trips' AND provider_id IN ({placeholders})
+            INSERT INTO terminal_stop_candidates(trip_id, raw_stop_id)
+            SELECT st.trip_id, st.raw_stop_id
+            FROM stop_times st
+            JOIN (
+                SELECT trip_id, MAX(stop_sequence) AS max_sequence
+                FROM stop_times st
+                {provider_filter}
+                GROUP BY trip_id
+            ) latest
+              ON latest.trip_id = st.trip_id
+             AND latest.max_sequence = st.stop_sequence
+            WHERE st.rowid = (
+                SELECT MAX(tie.rowid)
+                FROM stop_times tie
+                WHERE tie.trip_id = st.trip_id
+                  AND tie.stop_sequence = st.stop_sequence
             )
             """,
-            selected,
+            provider_params,
         )
-    connection.commit()
+
+        if selected is None:
+            connection.execute("UPDATE trips SET terminal_stop_id = ''")
+            update_params: tuple[str, ...] = ()
+            update_scope = ""
+        else:
+            placeholders = ",".join("?" for _ in selected)
+            update_scope = f"""
+                WHERE trip_id IN (
+                    SELECT key_1 FROM provider_entities
+                    WHERE entity_type = 'trips' AND provider_id IN ({placeholders})
+                )
+            """
+            update_params = selected
+            connection.execute(
+                f"UPDATE trips SET terminal_stop_id = '' {update_scope}",
+                update_params,
+            )
+
+        connection.execute(
+            f"""
+            UPDATE trips
+            SET terminal_stop_id = COALESCE((
+                SELECT candidates.raw_stop_id
+                FROM terminal_stop_candidates candidates
+                WHERE candidates.trip_id = trips.trip_id
+            ), '')
+            {update_scope}
+            """,
+            update_params,
+        )
+        connection.commit()
+    finally:
+        connection.set_progress_handler(None, 0)
+        connection.execute("DROP TABLE IF EXISTS temp.terminal_stop_candidates")
+
+    print(
+        "[StaticDepartures] stage=terminal-stops status=completed "
+        f"duration={time.monotonic() - started:.2f}s",
+        flush=True,
+    )
 
 
 def write_city_indexes(connection: sqlite3.Connection, output: Path, city_ids: set[str], timezone_name: str, dates: list[date]) -> dict[str, dict[str, object]]:
