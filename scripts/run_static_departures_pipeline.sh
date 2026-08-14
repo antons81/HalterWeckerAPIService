@@ -3,6 +3,12 @@ set -euo pipefail
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+WMATA_ENV_FILE="${WMATA_ENV_FILE:-/srv/haltewecker/secrets/wmata/.env}"
+if [[ -f "$WMATA_ENV_FILE" ]]; then
+  set -a
+  source "$WMATA_ENV_FILE"
+  set +a
+fi
 DATA_ROOT="${DATA_ROOT:-/srv/haltewecker/data}"
 GTFS_URL="${GTFS_URL:?GTFS_URL is required}"
 STOP_DATA_PATH="${STOP_DATA_PATH:-$DATA_ROOT/current}"
