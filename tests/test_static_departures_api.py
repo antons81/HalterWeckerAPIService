@@ -147,7 +147,8 @@ class StaticDeparturesDatabaseTests(unittest.TestCase):
                 os.replace(next_link, current)
                 meta = database.meta()
                 self.assertEqual(meta["databaseVersion"], "second")
-                self.assertEqual(meta["databaseInode"], str(current.stat().st_ino))
+                self.assertNotIn("databasePath", meta)
+                self.assertNotIn("databaseInode", meta)
             finally:
                 database.close()
 
@@ -246,7 +247,10 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                 health = server.get("/static-departures/health")
                 self.assertTrue(health["ok"])
                 self.assertEqual(health["database"]["databaseVersion"], "endpoint")
-                self.assertEqual(server.get("/static-departures/meta")["databaseVersion"], "endpoint")
+                metadata = server.get("/static-departures/meta")
+                self.assertEqual(metadata["databaseVersion"], "endpoint")
+                for key in ("databasePath", "databaseDevice", "databaseInode", "databaseMTimeNS"):
+                    self.assertNotIn(key, metadata)
                 lines = server.get("/static-departures/lines?cityID=dresden&stopID=stop-parent")["lines"]
                 self.assertEqual(lines, [{
                     "routeID": "route-1",

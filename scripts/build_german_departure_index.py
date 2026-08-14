@@ -566,6 +566,50 @@ def populate_gtfs(
 
     if "pathways.txt" in archive.namelist():
         pathway_keys: list[tuple[str, str, str]] = []
+        pathway_rows = []
+        pathways_by_id = {}
+        duplicate_pathway_ids = set()
+        for row in gtfs_rows(archive, "pathways.txt"):
+            raw_pathway_id = row.get("pathway_id", "")
+            raw_from_stop_id = row.get("from_stop_id", "")
+            raw_to_stop_id = row.get("to_stop_id", "")
+            if not raw_pathway_id.strip() or not raw_from_stop_id.strip() or not raw_to_stop_id.strip():
+                continue
+            pathway_row = (
+                internal_stop_id(raw_pathway_id, identifier_prefix or stop_id_prefix),
+                internal_stop_id(raw_from_stop_id, stop_id_prefix),
+                internal_stop_id(raw_to_stop_id, stop_id_prefix),
+                row.get("pathway_mode", "").strip(),
+                int(row.get("is_bidirectional", "0") or 0),
+                row.get("length", "").strip(),
+                int(row.get("traversal_time", "0") or 0),
+                int(row.get("stair_count", "0") or 0),
+                row.get("max_slope", "").strip(),
+                row.get("min_width", "").strip(),
+                row.get("signposted_as", "").strip(),
+                row.get("reversed_signposted_as", "").strip(),
+            )
+            raw_identity = tuple(sorted((key, value or "") for key, value in row.items()))
+            previous = pathways_by_id.get(pathway_row[0])
+            if previous is not None:
+                if previous[0] != raw_identity:
+                    raise ValueError(
+                        "Conflicting duplicate GTFS pathway row: "
+                        f"provider={provider_id} pathway_id={pathway_row[0]!r}"
+                    )
+                duplicate_pathway_ids.add(pathway_row[0])
+                continue
+            pathways_by_id[pathway_row[0]] = (raw_identity, pathway_row)
+            pathway_rows.append(pathway_row)
+
+        if duplicate_pathway_ids:
+            duplicate_ids = ",".join(sorted(duplicate_pathway_ids))
+            print(
+                "[StaticDepartures] "
+                f"provider={provider_id} stage=pathways "
+                f"deduplicated_identical={duplicate_ids}"
+            )
+        pathway_keys.extend((row[0], row[1], row[2]) for row in pathway_rows)
 
         def import_pathways() -> int:
             connection.executemany(
@@ -576,45 +620,9 @@ def populate_gtfs(
                     max_slope, min_width, signposted_as, reversed_signposted_as
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    (
-                        internal_stop_id(
-                            row.get("pathway_id", ""),
-                            identifier_prefix or stop_id_prefix,
-                        ),
-                        internal_stop_id(row.get("from_stop_id", ""), stop_id_prefix),
-                        internal_stop_id(row.get("to_stop_id", ""), stop_id_prefix),
-                        row.get("pathway_mode", "").strip(),
-                        int(row.get("is_bidirectional", "0") or 0),
-                        row.get("length", "").strip(),
-                        int(row.get("traversal_time", "0") or 0),
-                        int(row.get("stair_count", "0") or 0),
-                        row.get("max_slope", "").strip(),
-                        row.get("min_width", "").strip(),
-                        row.get("signposted_as", "").strip(),
-                        row.get("reversed_signposted_as", "").strip(),
-                    )
-                    for row in gtfs_rows(archive, "pathways.txt")
-                    if row.get("pathway_id", "").strip()
-                    and row.get("from_stop_id", "").strip()
-                    and row.get("to_stop_id", "").strip()
-                ),
+                pathway_rows,
             )
-            pathway_keys.extend(
-                (
-                    internal_stop_id(
-                        row.get("pathway_id", ""),
-                        identifier_prefix or stop_id_prefix,
-                    ),
-                    internal_stop_id(row.get("from_stop_id", ""), stop_id_prefix),
-                    internal_stop_id(row.get("to_stop_id", ""), stop_id_prefix),
-                )
-                for row in gtfs_rows(archive, "pathways.txt")
-                if row.get("pathway_id", "").strip()
-                and row.get("from_stop_id", "").strip()
-                and row.get("to_stop_id", "").strip()
-            )
-            return len(pathway_keys)
+            return len(pathway_rows)
 
         _run_import_stage(stage_runner, "pathways", import_pathways)
         _run_import_stage(

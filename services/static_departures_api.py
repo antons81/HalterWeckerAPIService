@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -53,6 +54,8 @@ MBTA_NAMESPACE = "mbta-boston:"
 
 def _native_id(value: str) -> str:
     return value[len(MBTA_NAMESPACE):] if value.startswith(MBTA_NAMESPACE) else value
+LOGGER = logging.getLogger("haltewecker.static_departures_api")
+
 STATIC_DATA_ROOT = os.environ.get("STATIC_DATA_ROOT", "")
 STATIC_DATA_PATH_PREFIXES = (
     "/static-stop-data/",
@@ -100,11 +103,6 @@ class Database:
                 metadata = dict(cursor.fetchall())
             finally:
                 cursor.close()
-            stat_result = os.stat(self.path)
-            metadata["databasePath"] = self.path
-            metadata["databaseDevice"] = str(stat_result.st_dev)
-            metadata["databaseInode"] = str(stat_result.st_ino)
-            metadata["databaseMTimeNS"] = str(stat_result.st_mtime_ns)
             return metadata
 
     def close(self) -> None:
@@ -680,8 +678,9 @@ class Handler(BaseHTTPRequestHandler):
                     payload["requestedCityID"] = city
                 return self.send_json(HTTPStatus.OK, payload)
             return self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
-        except Exception as error:
-            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(error)})
+        except Exception:
+            LOGGER.exception("Unhandled GET request path=%s", parsed.path)
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "service temporarily unavailable"})
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)

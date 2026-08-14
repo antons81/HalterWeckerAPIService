@@ -239,6 +239,8 @@ NEXT_DATABASE_PATH="$RELEASE_DIR/departures.sqlite" \
 RELEASE_ID="$RELEASE_ID" \
 SKIP_ACTIVATION=1 \
   "$STATIC_DEPARTURES_PIPELINE"
+python3 "$REPO/scripts/validate_release_consistency.py" --release-dir "$RELEASE_DIR"
+
 echo "[StaticDepartures] release=$RELEASE_ID stage=import duration=$(elapsed_seconds "$STATIC_STARTED")"
 
 if [ -n "${SWEDEN_GTFS_URL:-}" ]; then

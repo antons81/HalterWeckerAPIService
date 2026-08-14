@@ -22,6 +22,46 @@ from static_departures_api import Database
 
 
 class AustrianStaticDepartureTests(unittest.TestCase):
+    def _write_pathway_feed(self, path: Path, rows: str) -> None:
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("stops.txt", "stop_id,stop_name\na,Stop A\nb,Stop B\n")
+            archive.writestr("routes.txt", "route_id,route_short_name,route_long_name\nr,1,Route\n")
+            archive.writestr("trips.txt", "route_id,service_id,trip_id,trip_headsign,direction_id\nr,s,t,Destination,0\n")
+            archive.writestr("stop_times.txt", "trip_id,arrival_time,departure_time,stop_id,stop_sequence\nt,08:00:00,08:00:00,a,1\nt,08:10:00,08:10:00,b,2\n")
+            archive.writestr(
+                "pathways.txt",
+                "pathway_id,from_stop_id,to_stop_id,pathway_mode,is_bidirectional\n" + rows,
+            )
+
+    def test_identical_duplicate_pathways_are_deduplicated_within_feed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            feed = root / "vor.zip"
+            self._write_pathway_feed(feed, "p1,a,b,1,1\np1,a,b,1,1\n")
+            connection = connect(root / "departures.sqlite")
+            try:
+                with zipfile.ZipFile(feed) as archive:
+                    populate_gtfs(connection, archive, identifier_prefix="vor:", provider_id="vor")
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM pathways").fetchone()[0], 1)
+            finally:
+                connection.close()
+
+    def test_conflicting_duplicate_pathways_fail_with_provider_and_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            feed = root / "vor.zip"
+            self._write_pathway_feed(feed, "p1,a,b,1,1\np1,b,a,1,1\n")
+            connection = connect(root / "departures.sqlite")
+            try:
+                with zipfile.ZipFile(feed) as archive:
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        r"provider=vor pathway_id='vor:p1'",
+                    ):
+                        populate_gtfs(connection, archive, identifier_prefix="vor:", provider_id="vor")
+            finally:
+                connection.close()
+
     def test_all_registry_cities_are_configured_for_static_departures(self) -> None:
         repository_root = Path(__file__).resolve().parents[1]
         registry_city_ids = {
