@@ -454,10 +454,15 @@ def import_austrian_gtfs(
             "Austrian registry/city configuration mismatch: "
             f"registry={sorted(imported_city_ids)} configured={sorted(expected_city_ids)}"
         )
-    imported_city_ids = populate_provider_city_memberships(
-        connection,
-        stop_data,
-        included_city_ids=expected_city_ids,
+    imported_city_ids = timed_stage(
+        "austria",
+        "provider-city-memberships",
+        lambda: populate_provider_city_memberships(
+            connection,
+            stop_data,
+            included_city_ids=expected_city_ids,
+            indexed_ownership_lookup=True,
+        ),
     )
     for source in registry:
         source_id = str(source["id"])

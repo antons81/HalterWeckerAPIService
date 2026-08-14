@@ -373,6 +373,77 @@ class ProviderStopIdentityTests(unittest.TestCase):
             )
             connection.close()
 
+    def test_indexed_membership_path_matches_legacy_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "feed.zip"
+            _feed(feed)
+            stop_data = root / "stop-data"
+            (stop_data / "stops").mkdir(parents=True)
+            (stop_data / "manifest.json").write_text(
+                json.dumps({"cities": [{"id": "san-francisco", "url": "stops/san-francisco.json"}]}),
+                encoding="utf-8",
+            )
+            (stop_data / "stops" / "san-francisco.json").write_text(
+                json.dumps([{"id": "13114", "sourceStopIDs": ["13115"]}]),
+                encoding="utf-8",
+            )
+
+            def build(database_name: str, indexed: bool) -> tuple[list[tuple], list[tuple]]:
+                connection = connect(root / database_name)
+                with zipfile.ZipFile(feed) as archive:
+                    populate_gtfs(
+                        connection,
+                        archive,
+                        identifier_prefix="a:",
+                        provider_id="provider-a",
+                    )
+                with zipfile.ZipFile(feed) as archive:
+                    populate_gtfs(
+                        connection,
+                        archive,
+                        identifier_prefix="b:",
+                        stop_id_prefix="b:",
+                        provider_id="provider-b",
+                    )
+                register_city_mode(
+                    connection,
+                    "provider-a",
+                    "san-francisco",
+                    "canonical",
+                    "America/Los_Angeles",
+                    "a:",
+                )
+                register_city_mode(
+                    connection,
+                    "provider-b",
+                    "san-francisco",
+                    "canonical",
+                    "America/Los_Angeles",
+                    "b:",
+                )
+                populate_provider_city_memberships(
+                    connection,
+                    stop_data,
+                    {"san-francisco"},
+                    stop_id_prefix_by_provider={"provider-a": "a:", "provider-b": "b:"},
+                    indexed_ownership_lookup=indexed,
+                )
+                snapshot = (
+                    list(connection.execute("SELECT city_id, stop_id FROM city_stops ORDER BY city_id, stop_id")),
+                    list(connection.execute(
+                        "SELECT provider_id, city_id, stop_id FROM provider_city_stops "
+                        "ORDER BY provider_id, city_id, stop_id"
+                    )),
+                )
+                connection.close()
+                return snapshot
+
+            self.assertEqual(
+                build("legacy.sqlite", indexed=False),
+                build("indexed.sqlite", indexed=True),
+            )
+
     def test_511_realtime_maps_stop_internally_but_keeps_public_native_response(self) -> None:
         gateway = BayAreaTripUpdatesProxy(
             provider_id=BAY_AREA_PROVIDER_ID,
