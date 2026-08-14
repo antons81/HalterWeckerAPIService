@@ -10,6 +10,7 @@ import io
 import json
 import math
 import re
+import ssl
 import time as monotonic_clock
 import unicodedata
 import urllib.request
@@ -18,6 +19,22 @@ import zipfile
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Iterable
+
+try:
+    import certifi
+except ImportError:  # pragma: no cover - production images use system CA roots
+    certifi = None
+
+TLS_CONTEXT = ssl.create_default_context(
+    cafile=certifi.where() if certifi is not None else None
+)
+
+
+def urlopen_with_tls(request: urllib.request.Request, *, timeout: int):
+    try:
+        return urllib.request.urlopen(request, timeout=timeout, context=TLS_CONTEXT)
+    except TypeError:
+        return urllib.request.urlopen(request, timeout=timeout)
 
 try:
     from .austrian_sources import load_austrian_sources, public_stop_id, sources_for_city
@@ -68,6 +85,7 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "ctaChicago",
     "mbta",
     "wmata",
+    "kyiv",
 }
 SUPPORTED_TRANSIT_RADAR_FEATURES = {
     "liveVehicles",
@@ -153,7 +171,7 @@ def load_gtfs_archive(
     if headers:
         request_headers.update(headers)
     request = urllib.request.Request(url, headers=request_headers)
-    with urllib.request.urlopen(request, timeout=180) as response:
+    with urlopen_with_tls(request, timeout=180) as response:
         payload = response.read()
     if payload.startswith(b"\x1f\x8b"):
         payload = gzip.decompress(payload)
@@ -192,7 +210,7 @@ def load_municipality_features(source: str) -> list[dict[str, object]]:
             paged_url(source, start_index),
             headers={"User-Agent": "HalteWeckerStopPipeline/1.0"}
         )
-        with urllib.request.urlopen(request, timeout=180) as response:
+        with urlopen_with_tls(request, timeout=180) as response:
             payload = json.load(response)
 
         page = payload.get("features", [])
@@ -720,6 +738,26 @@ def validate_transit_radar_provider(
     if adapter == "netherlands":
         return
 
+    if adapter == "kyiv":
+        if city_id != "kyiv":
+            raise ValueError(f"Invalid Kyiv configuration for {city_id}")
+        if not isinstance(region, dict):
+            raise ValueError(f"Kyiv requires a geographic region for {city_id}")
+        if configuration.get("staticOnly") is not True:
+            raise ValueError(f"Kyiv must be configured as static-only for {city_id}")
+        for key in ("staticBaseURL", "boardURL", "realtimeURL"):
+            value = configuration.get(key)
+            if not isinstance(value, str) or not value.startswith("https://"):
+                raise ValueError(f"Kyiv requires an HTTPS {key} for {city_id}")
+        features = configuration.get("features")
+        required = {"liveVehicles", "firstDepartures", "stopLookup", "vehiclePositions", "stopSequence"}
+        forbidden = {"realtimeDepartures", "realtimeDelay", "tripUpdates", "vehicleBearing"}
+        if not isinstance(features, list) or not required.issubset(features) or forbidden.intersection(features):
+            raise ValueError(f"Kyiv features are invalid for {city_id}")
+        if configuration.get("tripUpdatesURL") is not None:
+            raise ValueError(f"Kyiv does not use TripUpdates for {city_id}")
+        return
+
     if adapter == "mbta":
         if city_id != "boston":
             raise ValueError(f"Invalid MBTA configuration for {city_id}")
@@ -1194,6 +1232,8 @@ def transit_radar_manifest(
                 provider_id = "mbta-boston"
             elif adapter == "wmata":
                 provider_id = "wmata"
+            elif adapter == "kyiv":
+                provider_id = "kyiv"
             elif adapter == "bwTrias":
                 provider_id = "bw-trias"
             else:
@@ -1212,7 +1252,7 @@ def transit_radar_manifest(
                 supports_departures = bool(
                     provider_configuration.get(
                         "supportsDepartures",
-                        adapter in {"bwTrias", "vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "avvHafas", "oebb", "netherlands", "sweden", "ireland", "entur", "translink", "ttc", "kingCounty", "mtaNY", "wmata"}
+                        adapter in {"bwTrias", "vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "avvHafas", "oebb", "netherlands", "sweden", "ireland", "entur", "translink", "ttc", "kingCounty", "mtaNY", "wmata", "kyiv"}
                     )
                 )
                 supports_live_vehicles = bool(
@@ -1281,6 +1321,9 @@ def transit_radar_manifest(
                 gateway_url = vag_gateway_url
             if isinstance(gateway_url, str):
                 provider["gatewayURL"] = gateway_url
+            static_only = provider_configuration.get("staticOnly")
+            if isinstance(static_only, bool):
+                provider["staticOnly"] = static_only
             for url_key in ("staticBaseURL", "boardURL", "realtimeURL", "tripUpdatesURL"):
                 configured_url = provider_configuration.get(url_key)
                 if isinstance(configured_url, str) and configured_url.strip():
@@ -1305,6 +1348,8 @@ def transit_radar_manifest(
             country_suffix = "us"
         elif any(p.get("adapter") == "ctaChicago" for p in providers):
             country_suffix = "us"
+        elif any(p.get("adapter") == "kyiv" for p in providers):
+            country_suffix = "ua"
         else:
             country_suffix = "de"
         radar_cities.append({
@@ -2364,11 +2409,13 @@ def main(argv: list[str] | None = None) -> None:
         from .external_gtfs import (
             parse_external_gtfs_url_args,
             process_external_gtfs_sources,
+            validate_external_stop_packages,
         )
     except ImportError:
         from external_gtfs import (
             parse_external_gtfs_url_args,
             process_external_gtfs_sources,
+            validate_external_stop_packages,
         )
 
     repository_root = Path(__file__).resolve().parents[1]
@@ -2500,6 +2547,12 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     if external_manifest_entries:
+        validate_external_stop_packages(
+            cities=external_cities,
+            manifest_entries=external_manifest_entries,
+            package_stops_by_city_id=external_package_stops,
+            output=output,
+        )
         entries_by_source: dict[str, list[dict[str, object]]] = {}
         for entry in external_manifest_entries:
             source_label = str(entry.pop("_source", "External GTFS branch"))
@@ -2513,6 +2566,18 @@ def main(argv: list[str] | None = None) -> None:
             )
         package_stops_by_city_id.update(external_package_stops)
         manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
+        if any(str(city.get("id")) == "kyiv" for city in external_cities):
+            try:
+                from .kyiv_open_data import build_kyiv_systems_artifact
+            except ImportError:
+                from kyiv_open_data import build_kyiv_systems_artifact
+            timed_stage(
+                "kyiv", "systems",
+                lambda: build_kyiv_systems_artifact(
+                    repository_root=repository_root,
+                    output=output / "transit" / "kyiv-systems.json",
+                ),
+            )
 
     if not args.skip_german:
         assert german_archive is not None

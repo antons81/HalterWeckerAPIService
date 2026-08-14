@@ -26,6 +26,7 @@ def resolve_one(
     headers: dict[str, str] | None = None,
     source_version: dict[str, object] | None = None,
     state_url: str | None = None,
+    metadata_probe: bool = True,
 ) -> ArtifactResult:
     started = time.monotonic()
     try:
@@ -36,6 +37,7 @@ def resolve_one(
             source_version=source_version,
             allow_stale=allow_stale,
             state_url=state_url,
+            metadata_probe=metadata_probe,
         )
     except Exception as error:
         duration = time.monotonic() - started
@@ -116,13 +118,15 @@ def main() -> None:
         if not url:
             continue
         request_url, headers = authenticated_external_request(source_id, url, environ=os.environ)
+        preflight = str(source.get("preflight", "head"))
         artifact = resolve_one(
             cache,
             source_id,
             request_url,
             headers=headers,
-            allow_stale=True,
+            allow_stale=bool(source.get("allowStale", True)),
             state_url=url,
+            metadata_probe=preflight == "head",
         )
         result["external"][source_id] = {"path": str(artifact.path), "status": artifact.status}
 

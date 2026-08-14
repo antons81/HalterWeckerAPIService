@@ -251,6 +251,9 @@ def resolve_gtfs_artifact(
     provider_id: str,
     url: str,
     environment: dict[str, str],
+    *,
+    allow_stale: bool = True,
+    metadata_probe: bool = True,
 ) -> Path:
     request_url, headers = authenticated_external_request(
         provider_id,
@@ -262,8 +265,9 @@ def resolve_gtfs_artifact(
         provider_id,
         request_url,
         headers=headers,
-        allow_stale=True,
+        allow_stale=allow_stale,
         state_url=url,
+        metadata_probe=metadata_probe,
     )
     return artifact.path
 
@@ -292,7 +296,13 @@ def resolve_external_artifact(
         raise ValueError(
             f"Static provider {provider.provider_id} has no configured GTFS URL."
         )
-    return resolve_gtfs_artifact(provider.provider_id, configured_url, environment)
+    return resolve_gtfs_artifact(
+        provider.provider_id,
+        configured_url,
+        environment,
+        allow_stale=bool(provider.source.get("allowStale", True)),
+        metadata_probe=str(provider.source.get("preflight", "head")) == "head",
+    )
 
 
 def resolve_austrian_archive(
@@ -490,6 +500,13 @@ def build_external_static_assets(
         occupied_city_ids=set(),
         selected_source_ids=set(selected_urls),
     )
+    if any(str(city.get("id")) == "kyiv" for city in external_cities):
+        from kyiv_open_data import build_kyiv_systems_artifact
+
+        build_kyiv_systems_artifact(
+            repository_root=repository_root,
+            output=stop_data / "transit" / "kyiv-systems.json",
+        )
 
     manifest_path = stop_data / "manifest.json"
     if not manifest_path.is_file():

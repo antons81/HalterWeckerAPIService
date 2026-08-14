@@ -100,6 +100,63 @@ class GTFSArtifactCacheTests(unittest.TestCase):
             state = json.loads((root / "cache" / "swiss" / "state.json").read_text())
             self.assertTrue(state["validated"])
 
+    def test_download_preflight_uses_get_and_preserves_request_headers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.zip"
+            write_gtfs(source)
+            requests = []
+
+            def fake_urlopen(request, timeout=0):
+                requests.append((request, timeout))
+                self.assertEqual(request.get_method(), "GET")
+                return FakeResponse(body=source.read_bytes())
+
+            with patch(
+                "gtfs_source_cache.urllib.request.urlopen",
+                side_effect=fake_urlopen,
+            ):
+                result = GTFSArtifactCache(root / "cache").resolve(
+                    "kyiv",
+                    "https://data.example.test/resource/data/download",
+                    headers={
+                        "Referer": "https://data.example.test/",
+                        "User-Agent": "Mozilla/5.0 test",
+                    },
+                    allow_stale=False,
+                    metadata_probe=False,
+                )
+
+            self.assertEqual(result.status, "updated")
+            self.assertEqual(len(requests), 1)
+            request = requests[0][0]
+            self.assertEqual(request.get_header("Referer"), "https://data.example.test/")
+            self.assertEqual(request.get_header("User-agent"), "Mozilla/5.0 test")
+
+    def test_invalid_download_stops_even_when_previous_cache_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.zip"
+            write_gtfs(source, "old")
+            cache = GTFSArtifactCache(root / "cache")
+            first = cache.resolve("kyiv", str(source), source_version={"version": 1})
+
+            def fake_urlopen(request, timeout=0):
+                self.assertEqual(request.get_method(), "GET")
+                return FakeResponse(body=b"<html>download failed</html>")
+
+            with patch("gtfs_source_cache.urllib.request.urlopen", side_effect=fake_urlopen):
+                with self.assertRaises(zipfile.BadZipFile):
+                    cache.resolve(
+                        "kyiv",
+                        "https://data.example.test/resource/data/download",
+                        allow_stale=False,
+                        metadata_probe=False,
+                    )
+
+            state = json.loads((root / "cache" / "kyiv" / "state.json").read_text())
+            self.assertEqual(state["sha256"], first.state["sha256"])
+
     def test_invalid_candidate_keeps_previous_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

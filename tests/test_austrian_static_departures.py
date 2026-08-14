@@ -22,6 +22,32 @@ from static_departures_api import Database
 
 
 class AustrianStaticDepartureTests(unittest.TestCase):
+    def test_terminal_stop_calculation_is_set_based_and_preserves_last_duplicate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            connection = connect(Path(temporary_directory) / "departures.sqlite")
+            connection.executemany(
+                "INSERT INTO trips(trip_id, service_id, route_id, headsign, direction_id) VALUES (?, ?, ?, ?, ?)",
+                [("trip-a", "service-a", "route-a", "", "0"), ("trip-empty", "service-a", "route-a", "", "0")],
+            )
+            connection.executemany(
+                "INSERT INTO stop_times(trip_id, raw_stop_id, departure_time, departure_seconds, stop_sequence) VALUES (?, ?, ?, ?, ?)",
+                [
+                    ("trip-a", "stop-first", "08:00:00", 28800, 1),
+                    ("trip-a", "stop-last-a", "08:10:00", 29400, 2),
+                    ("trip-a", "stop-last-b", "08:11:00", 29460, 2),
+                ],
+            )
+            update_terminal_stops(connection)
+            self.assertEqual(
+                connection.execute("SELECT terminal_stop_id FROM trips WHERE trip_id='trip-a'").fetchone()[0],
+                "stop-last-b",
+            )
+            self.assertEqual(
+                connection.execute("SELECT terminal_stop_id FROM trips WHERE trip_id='trip-empty'").fetchone()[0],
+                "",
+            )
+            connection.close()
+
     def test_all_registry_cities_are_configured_for_static_departures(self) -> None:
         repository_root = Path(__file__).resolve().parents[1]
         registry_city_ids = {

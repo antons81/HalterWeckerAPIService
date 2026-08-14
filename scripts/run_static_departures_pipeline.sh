@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 DATA_ROOT="${DATA_ROOT:-/srv/haltewecker/data}"
@@ -84,7 +85,7 @@ else:
 PY
 )
 IMPORT_ARGS+=("${EXTERNAL_GTFS_IMPORT_ARGS[@]}")
-python3 "$REPO/scripts/import_static_departures_database.py" "${IMPORT_ARGS[@]}"
+python3 -u "$REPO/scripts/import_static_departures_database.py" "${IMPORT_ARGS[@]}"
 echo "$LOG_PREFIX release=${RELEASE_ID:-legacy} stage=import duration=$((SECONDS - stage_started))s"
 
 if [[ "${SKIP_ACTIVATION:-0}" == "1" ]]; then

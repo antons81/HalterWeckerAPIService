@@ -1,0 +1,39 @@
+[
+  {
+    "id": "kyiv",
+    "name": "Kyiv",
+    "aliases": ["Kiev", "Київ"],
+    "country": "UA",
+    "timezone": "Europe/Kyiv",
+    "latitude": 50.4501,
+    "longitude": 30.5234,
+    "radiusMeters": 55000,
+    "packageMode": "external",
+    "externalGTFSProvider": "kyiv",
+    "staticDepartures": true,
+    "transitRadar": {
+      "adapter": "kyiv",
+      "providerID": "kyiv",
+      "isEnabled": true,
+      "isExperimental": true,
+      "staticOnly": true,
+      "features": [
+        "liveVehicles",
+        "firstDepartures",
+        "stopLookup",
+        "vehiclePositions",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/kyiv/realtime/vehicle-positions",
+      "region": {
+        "minimumLongitude": 29.8,
+        "minimumLatitude": 50.1,
+        "maximumLongitude": 31.2,
+        "maximumLatitude": 50.9
+      },
+      "statusMessage": "Live-Radar und statische Fahrpläne für Kyiv"
+    }
+  }
+]

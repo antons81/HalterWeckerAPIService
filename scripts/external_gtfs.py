@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import time
@@ -69,6 +70,16 @@ EXTERNAL_SOURCE_AUTH: dict[str, dict[str, object]] = {
         "header_name": "api_key",
         "headers": {"Accept-Encoding": "gzip"},
     },
+    "kyiv": {
+        "headers": {
+            "Accept": "application/zip,application/octet-stream;q=0.9,*/*;q=0.8",
+            "Referer": "https://data.kyivcity.gov.ua/",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36"
+            ),
+        },
+    },
 }
 
 
@@ -114,6 +125,16 @@ def validate_external_gtfs_source(
         not isinstance(configured_url, str) or not configured_url.strip()
     ):
         raise ValueError(f"External GTFS source {source_id} has an invalid URL.")
+
+    preflight = source.get("preflight", "head")
+    if preflight not in {"head", "download"}:
+        raise ValueError(
+            f"External GTFS source {source_id} has invalid preflight {preflight!r}."
+        )
+
+    allow_stale = source.get("allowStale", True)
+    if not isinstance(allow_stale, bool):
+        raise ValueError(f"External GTFS source {source_id} has invalid allowStale.")
 
     agency_id = source.get("agencyID")
     if agency_id is not None and (
@@ -176,8 +197,8 @@ def validate_external_gtfs_source(
             "is not supported (only 'exact')."
         )
 
-    for flag in ("buildStops", "buildRoutes", "buildDepartures"):
-        value = source.get(flag, True)
+    for flag in ("buildStops", "buildRoutes", "buildDepartures", "buildRadarTopology"):
+        value = source.get(flag, flag != "buildRadarTopology")
         if not isinstance(value, bool):
             raise ValueError(f"External GTFS source {source_id} has invalid {flag}.")
 
@@ -595,6 +616,96 @@ def build_external_stop_packages(
             "url": f"stops/{filename}",
         })
     return manifest, package_stops
+
+
+def validate_external_stop_packages(
+    *,
+    cities: list[dict[str, object]],
+    manifest_entries: list[dict[str, object]],
+    package_stops_by_city_id: dict[str, list[dict[str, object]]],
+    output: Path,
+    center_radius_meters: float = 8_000.0,
+) -> dict[str, int]:
+    """Validate published external stop packages and report center coverage."""
+    cities_by_id = {str(city["id"]): city for city in cities}
+    entries_by_id = {str(entry.get("id", "")): entry for entry in manifest_entries}
+    center_counts: dict[str, int] = {}
+
+    for city_id, entry in entries_by_id.items():
+        city = cities_by_id.get(city_id)
+        if city is None:
+            raise ValueError(
+                f"External manifest city {city_id} has no source configuration."
+            )
+
+        stops = package_stops_by_city_id.get(city_id, [])
+        if not stops:
+            raise ValueError(
+                f"External stop package for {city_id} is empty or missing."
+            )
+
+        declared_count = entry.get("stopCount")
+        if declared_count != len(stops):
+            raise ValueError(
+                f"External stop count mismatch for {city_id}: "
+                f"manifest={declared_count!r}, package={len(stops)}."
+            )
+
+        center_latitude = float(city["latitude"])
+        center_longitude = float(city["longitude"])
+        center_count = 0
+        stop_ids: set[str] = set()
+        for stop in stops:
+            stop_id = str(stop.get("id", "")).strip()
+            if not stop_id or stop_id in stop_ids:
+                raise ValueError(f"External stop IDs are invalid for {city_id}.")
+            stop_ids.add(stop_id)
+            try:
+                latitude = float(stop["latitude"])
+                longitude = float(stop["longitude"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"External stop coordinates are invalid for {city_id}: {stop_id}."
+                ) from error
+            if (
+                not math.isfinite(latitude)
+                or not math.isfinite(longitude)
+                or not -90 <= latitude <= 90
+                or not -180 <= longitude <= 180
+            ):
+                raise ValueError(
+                    f"External stop coordinates are out of range for {city_id}: {stop_id}."
+                )
+            if distance_meters(
+                latitude,
+                longitude,
+                center_latitude,
+                center_longitude,
+            ) <= center_radius_meters:
+                center_count += 1
+
+        if center_count == 0:
+            raise ValueError(
+                f"External stop package for {city_id} has no stop within "
+                f"{center_radius_meters:.0f} m of its configured center."
+            )
+
+        package_url = entry.get("url")
+        if not isinstance(package_url, str) or not package_url.startswith("stops/"):
+            raise ValueError(f"External stop package URL is invalid for {city_id}.")
+        package_path = output / package_url
+        if not package_path.is_file():
+            raise ValueError(
+                f"External stop package file is missing for {city_id}: {package_path}."
+            )
+
+        center_counts[city_id] = center_count
+        print(
+            f"[StopData] external city={city_id} stops={len(stops)} "
+            f"centerStops{int(center_radius_meters / 1000)}km={center_count}"
+        )
+
+    return center_counts
 
 
 def build_external_route_index(
@@ -1272,6 +1383,26 @@ def process_external_gtfs_sources(
                     source_output,
                     namespace=namespace,
                 )
+
+            if source.get("buildRadarTopology", False):
+                try:
+                    from kyiv_radar_topology import build_radar_topology
+                except ImportError:
+                    from .kyiv_radar_topology import build_radar_topology
+
+                build_radar_topology(
+                    archive,
+                    cities,
+                    source_output,
+                    namespace=namespace,
+                )
+
+                if not (namespace or str(source.get("mergeGroup", "")).strip()):
+                    for entry in manifest_entries:
+                        if str(entry.get("id")) in {str(city["id"]) for city in cities}:
+                            entry["radarTopologyURL"] = (
+                                f"radar/{entry['id']!s}.json"
+                            )
 
             if package_stops:
                 lines_by_stop_id.update(
