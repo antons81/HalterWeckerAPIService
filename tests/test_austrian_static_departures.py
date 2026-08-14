@@ -22,6 +22,32 @@ from static_departures_api import Database
 
 
 class AustrianStaticDepartureTests(unittest.TestCase):
+    def test_terminal_stop_calculation_preserves_last_duplicate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            connection = connect(Path(temporary_directory) / "departures.sqlite")
+            connection.executemany(
+                "INSERT INTO trips(trip_id, service_id, route_id, headsign, direction_id) VALUES (?, ?, ?, ?, ?)",
+                [("trip-a", "service-a", "route-a", "", "0"), ("trip-empty", "service-a", "route-a", "", "0")],
+            )
+            connection.executemany(
+                "INSERT INTO stop_times(trip_id, raw_stop_id, departure_time, departure_seconds, stop_sequence) VALUES (?, ?, ?, ?, ?)",
+                [
+                    ("trip-a", "stop-first", "08:00:00", 28800, 1),
+                    ("trip-a", "stop-last-a", "08:10:00", 29400, 2),
+                    ("trip-a", "stop-last-b", "08:11:00", 29460, 2),
+                ],
+            )
+            update_terminal_stops(connection)
+            self.assertEqual(
+                connection.execute("SELECT terminal_stop_id FROM trips WHERE trip_id='trip-a'").fetchone()[0],
+                "stop-last-b",
+            )
+            self.assertEqual(
+                connection.execute("SELECT terminal_stop_id FROM trips WHERE trip_id='trip-empty'").fetchone()[0],
+                "",
+            )
+            connection.close()
+
     def _write_pathway_feed(self, path: Path, rows: str) -> None:
         with zipfile.ZipFile(path, "w") as archive:
             archive.writestr("stops.txt", "stop_id,stop_name\na,Stop A\nb,Stop B\n")
