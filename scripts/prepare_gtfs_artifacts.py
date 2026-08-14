@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import time
+import zipfile
 from pathlib import Path
 
 from external_gtfs import (
@@ -64,6 +65,35 @@ def resolve_one(
     return result
 
 
+def validate_local_gtfs_path(source_id: str, path: Path) -> str:
+    if not path.exists():
+        raise ValueError(
+            f"Local external GTFS source {source_id} is missing: {path}"
+        )
+    if path.is_file():
+        if path.stat().st_size == 0:
+            raise ValueError(
+                f"Local external GTFS source {source_id} is empty: {path}"
+            )
+        try:
+            with zipfile.ZipFile(path) as archive:
+                corrupt_member = archive.testzip()
+        except (OSError, RuntimeError, zipfile.BadZipFile) as error:
+            raise ValueError(
+                f"Local external GTFS source {source_id} is invalid: {path}"
+            ) from error
+        if corrupt_member:
+            raise ValueError(
+                f"Local external GTFS source {source_id} is corrupt: {path}"
+            )
+        return "file"
+    if path.is_dir():
+        return "directory"
+    raise ValueError(
+        f"Local external GTFS source {source_id} is not a file or directory: {path}"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cache-root", default=os.environ.get("GTFS_CACHE_ROOT", str(DEFAULT_CACHE_ROOT)))
@@ -101,17 +131,14 @@ def main() -> None:
         local_path = str(source.get("localPath") or "").strip()
         if local_path and source_id not in external_urls:
             path = Path(local_path)
-            if not path.is_dir():
-                raise ValueError(
-                    f"Local external GTFS source {source_id} is missing: {path}"
-                )
+            local_kind = validate_local_gtfs_path(source_id, path)
             result["external"][source_id] = {
                 "path": str(path),
                 "status": "local",
             }
             print(
                 f"[GTFSCache] source={source_id} stage=resolve "
-                "status=local path=directory"
+                f"status=local path={local_kind}"
             )
             continue
         url = external_urls.get(source_id, str(configured or "")).strip()
