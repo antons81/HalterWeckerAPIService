@@ -1,0 +1,29 @@
+{
+  "expectedCounts": {
+    "metroStations": 52,
+    "funicularStations": 2,
+    "expressPlatforms": 34,
+    "expressStopTimes": 1010
+  },
+  "expectedIDs": {
+    "funicularStations": ["fn01", "fn02"]
+  },
+  "resources": {
+    "metroStations": {"name": "stopsUnderground", "resourceID": "93a62dca-e442-43b6-a00e-112c7eb6c13f", "isAPI": true},
+    "metroTopology": {"name": "underground", "resourceID": "5e385793-58e2-49eb-b856-a963dd7486bb", "isAPI": true},
+    "metroStopTimes": {"name": "stopTimesUnderground", "resourceID": "b7429519-c76d-4a10-a898-896fddf2f37e", "isAPI": true},
+    "metroPeriods": {"name": "timePeriodUnderground", "resourceID": "b1352a36-3b4d-4a4d-b73d-162479c71bd0", "isAPI": true},
+    "metroCalendar": {"name": "calendarUnderground", "resourceID": "b675a915-11fb-470e-af53-5c7f657b7d11", "isAPI": true},
+    "metroInterchanges": {"name": "stopsInterchangeUnderground", "resourceID": "f7d0b201-c3c4-4f97-977c-91a3f144588c", "isAPI": true},
+    "funicularStations": {"name": "stopsFuniculer", "resourceID": "984462ae-86cd-40b8-a3f5-68064a97408d", "isAPI": true},
+    "funicularTopology": {"name": "kyivFunicular", "resourceID": "f6f83ab2-3818-4d8c-93db-19dcda89cce9", "isAPI": true},
+    "funicularStopTimes": {"name": "stopTimesKyivFunicular", "resourceID": "045dfda9-a8cf-4704-8012-f6f8ea05864e", "isAPI": true},
+    "funicularPeriods": {"name": "timePeriodKyivFunicular", "resourceID": "53cb69a6-6478-4799-abd5-3380a26d6f58", "isAPI": true},
+    "funicularCalendar": {"name": "calendarKyivFunicular", "resourceID": "f8fdfebf-ffe5-4ee0-82c3-505213542271", "isAPI": true},
+    "funicularInterchanges": {"name": "stopsInterchangeKyivFunicular", "resourceID": "3ca6d5c4-7e00-4e8f-a2e7-bedfe61237f4", "isAPI": true},
+    "expressStations": {"name": "stopsKyivCityExpress", "resourceID": "294c28b3-b32d-4957-ba59-b8f866140324", "isAPI": true},
+    "expressTopology": {"name": "kyivCityExpress", "resourceID": "a4fd8556-025a-4e14-bc75-99e4c018d2b9", "isAPI": true},
+    "expressStopTimes": {"name": "stopTimesKyivCityExpress", "resourceID": "c4d2ed78-4335-4c79-8e41-1d2954d03931", "isAPI": true},
+    "expressInterchanges": {"name": "stopsInterchangeKyivCityExpress", "resourceID": "4b2dec17-7553-4317-a361-3f23be3b300f", "isAPI": true}
+  }
+}

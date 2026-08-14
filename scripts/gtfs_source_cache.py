@@ -170,6 +170,7 @@ class GTFSArtifactCache:
         seed_path: Path | None = None,
         state_url: str | None = None,
         minimum_size: int | None = None,
+        metadata_probe: bool = True,
     ) -> ArtifactResult:
         artifact, state_path, lock_path = self._paths(source_id)
         artifact.parent.mkdir(parents=True, exist_ok=True)
@@ -229,17 +230,20 @@ class GTFSArtifactCache:
                         return ArtifactResult(source_id, artifact, "preserved-stale", "local artifact validation failed", state)
                     raise
 
-            try:
-                metadata_request = urllib.request.Request(url, headers=request_headers, method="HEAD")
-                with urllib.request.urlopen(metadata_request, timeout=30) as response:
-                    metadata = _headers(response)
-                if valid_cache and (state or {}).get("url") == _state_url(url, state_url) and _fingerprint_matches(state or {}, metadata):
-                    return ArtifactResult(source_id, artifact, "unchanged", "remote metadata", state)
-            except urllib.error.HTTPError as error:
-                if error.code == 304 and valid_cache:
-                    return ArtifactResult(source_id, artifact, "unchanged", "HTTP 304", state)
-                metadata = {}
-            except (OSError, ValueError):
+            if metadata_probe:
+                try:
+                    metadata_request = urllib.request.Request(url, headers=request_headers, method="HEAD")
+                    with urllib.request.urlopen(metadata_request, timeout=30) as response:
+                        metadata = _headers(response)
+                    if valid_cache and (state or {}).get("url") == _state_url(url, state_url) and _fingerprint_matches(state or {}, metadata):
+                        return ArtifactResult(source_id, artifact, "unchanged", "remote metadata", state)
+                except urllib.error.HTTPError as error:
+                    if error.code == 304 and valid_cache:
+                        return ArtifactResult(source_id, artifact, "unchanged", "HTTP 304", state)
+                    metadata = {}
+                except (OSError, ValueError):
+                    metadata = {}
+            else:
                 metadata = {}
 
             request_headers.update(

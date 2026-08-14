@@ -69,6 +69,16 @@ EXTERNAL_SOURCE_AUTH: dict[str, dict[str, object]] = {
         "header_name": "api_key",
         "headers": {"Accept-Encoding": "gzip"},
     },
+    "kyiv": {
+        "headers": {
+            "Accept": "application/zip,application/octet-stream;q=0.9,*/*;q=0.8",
+            "Referer": "https://data.kyivcity.gov.ua/",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36"
+            ),
+        },
+    },
 }
 
 
@@ -114,6 +124,16 @@ def validate_external_gtfs_source(
         not isinstance(configured_url, str) or not configured_url.strip()
     ):
         raise ValueError(f"External GTFS source {source_id} has an invalid URL.")
+
+    preflight = source.get("preflight", "head")
+    if preflight not in {"head", "download"}:
+        raise ValueError(
+            f"External GTFS source {source_id} has invalid preflight {preflight!r}."
+        )
+
+    allow_stale = source.get("allowStale", True)
+    if not isinstance(allow_stale, bool):
+        raise ValueError(f"External GTFS source {source_id} has invalid allowStale.")
 
     agency_id = source.get("agencyID")
     if agency_id is not None and (
@@ -176,8 +196,8 @@ def validate_external_gtfs_source(
             "is not supported (only 'exact')."
         )
 
-    for flag in ("buildStops", "buildRoutes", "buildDepartures"):
-        value = source.get(flag, True)
+    for flag in ("buildStops", "buildRoutes", "buildDepartures", "buildRadarTopology"):
+        value = source.get(flag, flag != "buildRadarTopology")
         if not isinstance(value, bool):
             raise ValueError(f"External GTFS source {source_id} has invalid {flag}.")
 
@@ -1272,6 +1292,26 @@ def process_external_gtfs_sources(
                     source_output,
                     namespace=namespace,
                 )
+
+            if source.get("buildRadarTopology", False):
+                try:
+                    from kyiv_radar_topology import build_radar_topology
+                except ImportError:
+                    from .kyiv_radar_topology import build_radar_topology
+
+                build_radar_topology(
+                    archive,
+                    cities,
+                    source_output,
+                    namespace=namespace,
+                )
+
+                if not (namespace or str(source.get("mergeGroup", "")).strip()):
+                    for entry in manifest_entries:
+                        if str(entry.get("id")) in {str(city["id"]) for city in cities}:
+                            entry["radarTopologyURL"] = (
+                                f"radar/{entry['id']!s}.json"
+                            )
 
             if package_stops:
                 lines_by_stop_id.update(

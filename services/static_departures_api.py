@@ -44,6 +44,7 @@ from mta_ny_gateway import (
     MtaNYTripUpdatesGateway,
     api_key_from_environment,
 )
+from kyiv_gateway import KyivVehiclePositionsGateway, KYIV_VEHICLE_POSITIONS_PATH
 
 
 DEFAULT_TIMEZONE = "Europe/Berlin"
@@ -173,6 +174,27 @@ class Database:
         route_by_trip = {str(row[0]): str(row[1]) for row in rows if row[1]}
         routes = {str(row[0]) for row in route_rows}
         return trips, routes, route_by_trip
+
+    def provider_route_type_registry(self, provider_id: str) -> dict[str, str]:
+        """Return internal route identities and their static GTFS route types."""
+        with self.lock:
+            try:
+                rows = self._connection().execute(
+                    """
+                    SELECT owned.key_1, routes.route_type
+                    FROM provider_entities AS owned
+                    JOIN routes ON routes.route_id = owned.key_1
+                    WHERE owned.entity_type='routes' AND owned.provider_id=?
+                    """,
+                    (provider_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return {}
+        return {
+            str(route_id): str(route_type)
+            for route_id, route_type in rows
+            if route_id is not None and route_type is not None
+        }
 
     def provider_trip_stop_registry(self, provider_id: str, trip_ids: set[str]) -> dict[tuple[str, int], str]:
         if not trip_ids:
@@ -471,6 +493,7 @@ class Handler(BaseHTTPRequestHandler):
     wmata_trip_updates_gateway: WMATATripUpdatesGateway | None = None
     wmata_vehicle_positions_gateway: WMATAVehiclePositionsGateway | None = None
     wmata_alerts_gateway: WMATAAlertsGateway | None = None
+    kyiv_vehicle_positions_gateway: KyivVehiclePositionsGateway | None = None
 
     def send_json(
         self,
@@ -610,6 +633,11 @@ class Handler(BaseHTTPRequestHandler):
                 if gateway is None:
                     return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "WMATA provider unavailable"})
                 response = gateway.handle(parsed.path, query)
+                return self.send_json(response.status, response.payload, response.cache_control)
+            if parsed.path == KYIV_VEHICLE_POSITIONS_PATH:
+                if self.kyiv_vehicle_positions_gateway is None:
+                    return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Kyiv provider unavailable"})
+                response = self.kyiv_vehicle_positions_gateway.handle(parsed.path, query)
                 return self.send_json(response.status, response.payload, response.cache_control)
             for prefix in STATIC_DATA_PATH_PREFIXES:
                 if parsed.path.startswith(prefix):
@@ -767,4 +795,12 @@ if __name__ == "__main__":
             valid_registry=lambda: (*wmata_native_trip_registry(), lambda value: value),
         )
         Handler.wmata_alerts_gateway = WMATAAlertsGateway(api_key=wmata_api_key)
+    Handler.kyiv_vehicle_positions_gateway = KyivVehiclePositionsGateway(
+        valid_route_registry=lambda: database.provider_route_type_registry("kyiv"),
+        topology_path=(
+            str(Path(STATIC_DATA_ROOT) / "radar" / "kyiv.json")
+            if STATIC_DATA_ROOT
+            else None
+        ),
+    )
     ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Handler).serve_forever()
