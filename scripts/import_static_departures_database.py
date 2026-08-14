@@ -317,38 +317,52 @@ def _populate_provider_city_memberships_indexed(
                 if prefix:
                     candidate_stop_ids.update(f"{prefix}{stop_id}" for stop_id in stop_ids)
 
-    connection.executescript(
-        """
-        CREATE TEMP TABLE scoped_membership_candidate_stop_ids(
-            stop_id TEXT PRIMARY KEY
-        ) WITHOUT ROWID;
-        CREATE TEMP TABLE scoped_membership_stop_owners(
-            stop_id TEXT NOT NULL,
-            provider_id TEXT NOT NULL,
-            PRIMARY KEY(stop_id, provider_id)
-        ) WITHOUT ROWID;
-        """
-    )
-    connection.executemany(
-        "INSERT INTO scoped_membership_candidate_stop_ids(stop_id) VALUES (?)",
-        ((stop_id,) for stop_id in sorted(candidate_stop_ids)),
+    connection.execute(
+        "DROP TABLE IF EXISTS temp.scoped_membership_candidate_stop_ids"
     )
     connection.execute(
-        """
-        INSERT INTO scoped_membership_stop_owners(stop_id, provider_id)
-        SELECT entities.key_1, entities.provider_id
-        FROM provider_entities AS entities
-        JOIN scoped_membership_candidate_stop_ids AS candidates
-          ON candidates.stop_id = entities.key_1
-        WHERE entities.entity_type = 'raw_stops'
-        """
+        "DROP TABLE IF EXISTS temp.scoped_membership_stop_owners"
     )
-    owners_by_stop: dict[str, list[tuple[str, str]]] = {}
-    for stop_id, provider_id in connection.execute(
-        "SELECT stop_id, provider_id FROM scoped_membership_stop_owners"
-    ):
-        owners_by_stop.setdefault(str(stop_id), []).append(
-            (str(provider_id), str(stop_id))
+    try:
+        connection.executescript(
+            """
+            CREATE TEMP TABLE scoped_membership_candidate_stop_ids(
+                stop_id TEXT PRIMARY KEY
+            ) WITHOUT ROWID;
+            CREATE TEMP TABLE scoped_membership_stop_owners(
+                stop_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                PRIMARY KEY(stop_id, provider_id)
+            ) WITHOUT ROWID;
+            """
+        )
+        connection.executemany(
+            "INSERT INTO scoped_membership_candidate_stop_ids(stop_id) VALUES (?)",
+            ((stop_id,) for stop_id in sorted(candidate_stop_ids)),
+        )
+        connection.execute(
+            """
+            INSERT INTO scoped_membership_stop_owners(stop_id, provider_id)
+            SELECT entities.key_1, entities.provider_id
+            FROM provider_entities AS entities
+            JOIN scoped_membership_candidate_stop_ids AS candidates
+              ON candidates.stop_id = entities.key_1
+            WHERE entities.entity_type = 'raw_stops'
+            """
+        )
+        owners_by_stop: dict[str, list[tuple[str, str]]] = {}
+        for stop_id, provider_id in connection.execute(
+            "SELECT stop_id, provider_id FROM scoped_membership_stop_owners"
+        ):
+            owners_by_stop.setdefault(str(stop_id), []).append(
+                (str(provider_id), str(stop_id))
+            )
+    finally:
+        connection.execute(
+            "DROP TABLE IF EXISTS temp.scoped_membership_stop_owners"
+        )
+        connection.execute(
+            "DROP TABLE IF EXISTS temp.scoped_membership_candidate_stop_ids"
         )
 
     city_ids: set[str] = set()

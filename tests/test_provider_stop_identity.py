@@ -444,6 +444,119 @@ class ProviderStopIdentityTests(unittest.TestCase):
                 build("indexed.sqlite", indexed=True),
             )
 
+    def test_indexed_membership_temp_tables_are_cleaned_between_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "feed.zip"
+            _feed(feed)
+            first_stop_data = root / "first-stop-data"
+            second_stop_data = root / "second-stop-data"
+            for stop_data, city_id, stop_id in (
+                (first_stop_data, "first-city", "13114"),
+                (second_stop_data, "second-city", "13115"),
+            ):
+                (stop_data / "stops").mkdir(parents=True)
+                (stop_data / "manifest.json").write_text(
+                    json.dumps({"cities": [{"id": city_id, "url": f"stops/{city_id}.json"}]}),
+                    encoding="utf-8",
+                )
+                (stop_data / "stops" / f"{city_id}.json").write_text(
+                    json.dumps([{"id": stop_id}]),
+                    encoding="utf-8",
+                )
+
+            connection = connect(root / "departures.sqlite")
+            with zipfile.ZipFile(feed) as archive:
+                populate_gtfs(
+                    connection,
+                    archive,
+                    identifier_prefix="a:",
+                    provider_id="provider-a",
+                )
+            with zipfile.ZipFile(feed) as archive:
+                populate_gtfs(
+                    connection,
+                    archive,
+                    identifier_prefix="b:",
+                    stop_id_prefix="b:",
+                    provider_id="provider-b",
+                )
+            for city_id in ("first-city", "second-city"):
+                register_city_mode(
+                    connection,
+                    "provider-a",
+                    city_id,
+                    "canonical",
+                    "America/Los_Angeles",
+                    "a:",
+                )
+                register_city_mode(
+                    connection,
+                    "provider-b",
+                    city_id,
+                    "canonical",
+                    "America/Los_Angeles",
+                    "b:",
+                )
+
+            prefixes = {"provider-a": "a:", "provider-b": "b:"}
+            self.assertEqual(
+                populate_provider_city_memberships(
+                    connection,
+                    first_stop_data,
+                    {"first-city"},
+                    stop_id_prefix_by_provider=prefixes,
+                    indexed_ownership_lookup=True,
+                ),
+                {"first-city"},
+            )
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM sqlite_temp_master
+                    WHERE type='table'
+                      AND name IN (
+                          'scoped_membership_candidate_stop_ids',
+                          'scoped_membership_stop_owners'
+                      )
+                    """
+                ).fetchone()[0],
+                0,
+            )
+
+            self.assertEqual(
+                populate_provider_city_memberships(
+                    connection,
+                    second_stop_data,
+                    {"second-city"},
+                    stop_id_prefix_by_provider=prefixes,
+                    indexed_ownership_lookup=True,
+                ),
+                {"second-city"},
+            )
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM sqlite_temp_master
+                    WHERE type='table'
+                      AND name IN (
+                          'scoped_membership_candidate_stop_ids',
+                          'scoped_membership_stop_owners'
+                      )
+                    """
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT city_id, stop_id FROM city_stops WHERE city_id LIKE '%-city' ORDER BY city_id, stop_id"
+                ).fetchall(),
+                [("first-city", "13114"), ("second-city", "13115")],
+            )
+            connection.close()
+
     def test_511_realtime_maps_stop_internally_but_keeps_public_native_response(self) -> None:
         gateway = BayAreaTripUpdatesProxy(
             provider_id=BAY_AREA_PROVIDER_ID,
