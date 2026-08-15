@@ -20,6 +20,11 @@ class StaticDeparturesPipelineTests(unittest.TestCase):
                 "WMATA_API_KEY=stale-base-value\n",
                 encoding="utf-8",
             )
+            environment_file.write_text(
+                environment_file.read_text(encoding="utf-8")
+                + 'WMATA_ENV_FILE="${WMATA_ENV_FILE:-/srv/haltewecker/secrets/wmata/.env}"\n',
+                encoding="utf-8",
+            )
             wmata_file = root / "wmata.env"
             wmata_file.write_text("WMATA_API_KEY=operator-secret-value\n", encoding="utf-8")
             importer_observation = root / "importer.env"
@@ -44,7 +49,7 @@ class StaticDeparturesPipelineTests(unittest.TestCase):
                 {
                     "REPO": str(REPOSITORY_ROOT),
                     "STOP_DATA_ENV_FILE": str(environment_file),
-                    "WMATA_ENV_FILE": str(wmata_file),
+                    "WMATA_SECRET_FILE": str(wmata_file),
                     "NEXT_DATABASE_PATH": str(root / "departures-next.sqlite"),
                     "STOP_DATA_PATH": str(root / "stop-data"),
                     "RELEASE_ID": "test-release",

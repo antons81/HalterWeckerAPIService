@@ -10,7 +10,10 @@ if [[ -f "$STOP_DATA_ENV_FILE" ]]; then
   set +a
 fi
 
-WMATA_ENV_FILE="${WMATA_ENV_FILE:-/srv/haltewecker/secrets/wmata/.env}"
+WMATA_ENV_FILE="${WMATA_SECRET_FILE:-${WMATA_ENV_FILE:-/srv/haltewecker/secrets/wmata/.env}}"
+if [[ ! -f "$WMATA_ENV_FILE" ]]; then
+  WMATA_ENV_FILE="/srv/haltewecker/secrets/wmata/.env"
+fi
 if [[ -f "$WMATA_ENV_FILE" ]]; then
   set -a
   source "$WMATA_ENV_FILE"
