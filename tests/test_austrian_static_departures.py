@@ -47,6 +47,7 @@ class AustrianStaticDepartureTests(unittest.TestCase):
                 "",
             )
             connection.close()
+
     def _write_pathway_feed(self, path: Path, rows: str) -> None:
         with zipfile.ZipFile(path, "w") as archive:
             archive.writestr("stops.txt", "stop_id,stop_name\na,Stop A\nb,Stop B\n")
@@ -86,6 +87,7 @@ class AustrianStaticDepartureTests(unittest.TestCase):
                         populate_gtfs(connection, archive, identifier_prefix="vor:", provider_id="vor")
             finally:
                 connection.close()
+
     def test_all_registry_cities_are_configured_for_static_departures(self) -> None:
         repository_root = Path(__file__).resolve().parents[1]
         registry_city_ids = {

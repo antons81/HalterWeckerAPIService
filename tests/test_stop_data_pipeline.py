@@ -89,6 +89,9 @@ case \"${1:-}\" in
     mkdir -p \"$output\"
     : > \"$output/manifest.json\"
     ;;
+  *validate_release_consistency.py)
+    exit 0
+    ;;
   -)
     exec "$REAL_PYTHON" "$@"
     ;;
@@ -154,6 +157,7 @@ printf 'releaseID=%s\\n' "$RELEASE_ID" > "$NEXT_DATABASE_PATH"
             "REPO": str(REPOSITORY_ROOT),
             "DATA_ROOT": str(self.data_root),
             "STOP_DATA_LOCK": str(self.root / "stop-data.lock"),
+            "STATIC_DEPARTURES_LOCK": str(self.root / "static-departures.lock"),
             "STOP_DATA_ENV_FILE": str(self.environment_file),
             "SYSTEMCTL_LOG": str(self.systemctl_log),
             "BUILD_ARGS_LOG": str(self.root / "build-args.log"),

@@ -1169,7 +1169,7 @@ class StaticDepartureScopeTests(unittest.TestCase):
             self.assertIn("readiness", stage_names)
             self.assertLess(stage_names.index("readiness"), stage_names.index("activate-release"))
 
-    def test_full_service_and_scoped_script_share_static_lock_path(self) -> None:
+    def test_full_service_and_scoped_script_use_separate_lock_paths(self) -> None:
         service = (
             REPOSITORY_ROOT / "deploy" / "systemd" / "haltewecker-static-departures.service"
         ).read_text(encoding="utf-8")
@@ -1177,7 +1177,7 @@ class StaticDepartureScopeTests(unittest.TestCase):
             REPOSITORY_ROOT / "scripts" / "run_static_departures_scoped.sh"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("/run/lock/haltewecker-static-departures.lock", service)
+        self.assertIn("/run/lock/haltewecker-stop-data.lock", service)
         self.assertIn("/run/lock/haltewecker-static-departures.lock", script)
 
 

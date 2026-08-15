@@ -418,7 +418,7 @@ class ProviderStopIdentityTests(unittest.TestCase):
             self.assertTrue(database.city_has_stop("kyiv", catalog_stop_id))
             self.assertEqual(database.lines("kyiv", catalog_stop_id), [])
             self.assertEqual(database.board("kyiv", catalog_stop_id, 10), [])
-            connection.close()
+        connection.close()
 
     def test_indexed_membership_path_matches_legacy_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
