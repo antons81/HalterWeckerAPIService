@@ -265,5 +265,25 @@
     "staticIdentifierPrefix": "wmata:",
     "staticStopIDPrefix": "wmata:",
     "country": "US"
+  },
+  {
+    "id": "kyiv",
+    "url": "https://data.kyivcity.gov.ua/dataset/rozklad-rukhu-miskoho-elektrychnoho-ta-avtomobilnoho-transportu-dep-transport/resource/58f0c3d0-9409-4de9-92c8-de4afa035efd/data/download",
+    "cities": "config/kyiv-cities.json",
+    "timezone": "Europe/Kyiv",
+    "identifierPrefix": "kyiv:",
+    "namespace": "",
+    "stopIDMode": "exact",
+    "buildStops": true,
+    "buildRoutes": true,
+    "buildDepartures": true,
+    "buildTripIndex": false,
+    "buildRadarTopology": true,
+    "importIntoStaticDepartures": true,
+    "preflight": "download",
+    "allowStale": false,
+    "staticIdentifierPrefix": "kyiv:",
+    "staticStopIDPrefix": "",
+    "country": "UA"
   }
 ]

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
 REPO="${REPO:-/srv/haltewecker/pipeline/HalterWeckerAPIService}"
 DATA_ROOT="${DATA_ROOT:-/srv/haltewecker/data}"
@@ -14,11 +15,19 @@ ROLLBACK="$DATA_ROOT/temp/current-rollback/$RELEASE_ID"
 CURRENT_RELEASE="$DATA_ROOT/current-release"
 DEPARTURES_CURRENT="$DATA_ROOT/departures-current.sqlite"
 STOP_DATA_LOCK="${STOP_DATA_LOCK:-/run/lock/haltewecker-stop-data.lock}"
+STATIC_DEPARTURES_LOCK="${STATIC_DEPARTURES_LOCK:-/run/lock/haltewecker-static-departures.lock}"
 STOP_DATA_ENV_FILE="${STOP_DATA_ENV_FILE:-/etc/haltewecker-stop-data.env}"
 
 set -a
 source "$STOP_DATA_ENV_FILE"
 set +a
+
+WMATA_ENV_FILE="${WMATA_ENV_FILE:-/srv/haltewecker/secrets/wmata/.env}"
+if [[ -f "$WMATA_ENV_FILE" ]]; then
+  set -a
+  source "$WMATA_ENV_FILE"
+  set +a
+fi
 
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 SUDO_BIN="${SUDO_BIN:-sudo}"
@@ -32,6 +41,12 @@ mkdir -p "$(dirname "$STOP_DATA_LOCK")"
 exec 9>"$STOP_DATA_LOCK"
 if ! "$FLOCK_BIN" -n 9; then
   echo "[StopData] another stop-data publication is already running" >&2
+  exit 1
+fi
+mkdir -p "$(dirname "$STATIC_DEPARTURES_LOCK")"
+exec 10>"$STATIC_DEPARTURES_LOCK"
+if ! "$FLOCK_BIN" -n 10; then
+  echo "[StopData] static-departures lock is held by another job" >&2
   exit 1
 fi
 
@@ -239,6 +254,8 @@ NEXT_DATABASE_PATH="$RELEASE_DIR/departures.sqlite" \
 RELEASE_ID="$RELEASE_ID" \
 SKIP_ACTIVATION=1 \
   "$STATIC_DEPARTURES_PIPELINE"
+python3 "$REPO/scripts/validate_release_consistency.py" --release-dir "$RELEASE_DIR"
+
 echo "[StaticDepartures] release=$RELEASE_ID stage=import duration=$(elapsed_seconds "$STATIC_STARTED")"
 
 if [ -n "${SWEDEN_GTFS_URL:-}" ]; then

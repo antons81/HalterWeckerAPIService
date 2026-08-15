@@ -9,6 +9,7 @@ import json
 import shutil
 import sqlite3
 import tempfile
+import time
 import zipfile
 from collections.abc import Callable, Iterable
 from datetime import date, datetime, timedelta, timezone
@@ -566,6 +567,50 @@ def populate_gtfs(
 
     if "pathways.txt" in archive.namelist():
         pathway_keys: list[tuple[str, str, str]] = []
+        pathway_rows = []
+        pathways_by_id = {}
+        duplicate_pathway_ids = set()
+        for row in gtfs_rows(archive, "pathways.txt"):
+            raw_pathway_id = row.get("pathway_id", "")
+            raw_from_stop_id = row.get("from_stop_id", "")
+            raw_to_stop_id = row.get("to_stop_id", "")
+            if not raw_pathway_id.strip() or not raw_from_stop_id.strip() or not raw_to_stop_id.strip():
+                continue
+            pathway_row = (
+                internal_stop_id(raw_pathway_id, identifier_prefix or stop_id_prefix),
+                internal_stop_id(raw_from_stop_id, stop_id_prefix),
+                internal_stop_id(raw_to_stop_id, stop_id_prefix),
+                row.get("pathway_mode", "").strip(),
+                int(row.get("is_bidirectional", "0") or 0),
+                row.get("length", "").strip(),
+                int(row.get("traversal_time", "0") or 0),
+                int(row.get("stair_count", "0") or 0),
+                row.get("max_slope", "").strip(),
+                row.get("min_width", "").strip(),
+                row.get("signposted_as", "").strip(),
+                row.get("reversed_signposted_as", "").strip(),
+            )
+            raw_identity = tuple(sorted((key, value or "") for key, value in row.items()))
+            previous = pathways_by_id.get(pathway_row[0])
+            if previous is not None:
+                if previous[0] != raw_identity:
+                    raise ValueError(
+                        "Conflicting duplicate GTFS pathway row: "
+                        f"provider={provider_id} pathway_id={pathway_row[0]!r}"
+                    )
+                duplicate_pathway_ids.add(pathway_row[0])
+                continue
+            pathways_by_id[pathway_row[0]] = (raw_identity, pathway_row)
+            pathway_rows.append(pathway_row)
+
+        if duplicate_pathway_ids:
+            duplicate_ids = ",".join(sorted(duplicate_pathway_ids))
+            print(
+                "[StaticDepartures] "
+                f"provider={provider_id} stage=pathways "
+                f"deduplicated_identical={duplicate_ids}"
+            )
+        pathway_keys.extend((row[0], row[1], row[2]) for row in pathway_rows)
 
         def import_pathways() -> int:
             connection.executemany(
@@ -576,45 +621,9 @@ def populate_gtfs(
                     max_slope, min_width, signposted_as, reversed_signposted_as
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    (
-                        internal_stop_id(
-                            row.get("pathway_id", ""),
-                            identifier_prefix or stop_id_prefix,
-                        ),
-                        internal_stop_id(row.get("from_stop_id", ""), stop_id_prefix),
-                        internal_stop_id(row.get("to_stop_id", ""), stop_id_prefix),
-                        row.get("pathway_mode", "").strip(),
-                        int(row.get("is_bidirectional", "0") or 0),
-                        row.get("length", "").strip(),
-                        int(row.get("traversal_time", "0") or 0),
-                        int(row.get("stair_count", "0") or 0),
-                        row.get("max_slope", "").strip(),
-                        row.get("min_width", "").strip(),
-                        row.get("signposted_as", "").strip(),
-                        row.get("reversed_signposted_as", "").strip(),
-                    )
-                    for row in gtfs_rows(archive, "pathways.txt")
-                    if row.get("pathway_id", "").strip()
-                    and row.get("from_stop_id", "").strip()
-                    and row.get("to_stop_id", "").strip()
-                ),
+                pathway_rows,
             )
-            pathway_keys.extend(
-                (
-                    internal_stop_id(
-                        row.get("pathway_id", ""),
-                        identifier_prefix or stop_id_prefix,
-                    ),
-                    internal_stop_id(row.get("from_stop_id", ""), stop_id_prefix),
-                    internal_stop_id(row.get("to_stop_id", ""), stop_id_prefix),
-                )
-                for row in gtfs_rows(archive, "pathways.txt")
-                if row.get("pathway_id", "").strip()
-                and row.get("from_stop_id", "").strip()
-                and row.get("to_stop_id", "").strip()
-            )
-            return len(pathway_keys)
+            return len(pathway_rows)
 
         _run_import_stage(stage_runner, "pathways", import_pathways)
         _run_import_stage(
@@ -705,29 +714,110 @@ def update_terminal_stops(
     provider_ids: Iterable[str] | None = None,
 ) -> None:
     selected = _normalized_provider_ids(provider_ids)
-    if selected is None:
+    if selected == ():
+        return
+
+    started = time.monotonic()
+    print("[StaticDepartures] stage=terminal-stops status=started", flush=True)
+    heartbeat_at = started + 60.0
+
+    def heartbeat() -> int:
+        nonlocal heartbeat_at
+        now = time.monotonic()
+        if now >= heartbeat_at:
+            print(
+                "[StaticDepartures] stage=terminal-stops status=heartbeat "
+                f"elapsed={now - started:.0f}s",
+                flush=True,
+            )
+            heartbeat_at = now + 60.0
+        return 0
+
+    connection.set_progress_handler(heartbeat, 100_000)
+    try:
+        connection.execute("DROP TABLE IF EXISTS temp.terminal_stop_candidates")
         connection.execute("""
-            UPDATE trips SET terminal_stop_id = COALESCE((
-                SELECT stop_times.raw_stop_id FROM stop_times WHERE stop_times.trip_id = trips.trip_id
-                ORDER BY stop_times.stop_sequence DESC, stop_times.rowid DESC LIMIT 1
-            ), '')
+            CREATE TEMP TABLE terminal_stop_candidates (
+                trip_id TEXT PRIMARY KEY,
+                raw_stop_id TEXT NOT NULL
+            ) WITHOUT ROWID
         """)
-    elif selected:
-        placeholders = ",".join("?" for _ in selected)
+
+        provider_filter = ""
+        provider_params: tuple[str, ...] = ()
+        if selected is not None:
+            placeholders = ",".join("?" for _ in selected)
+            provider_filter = f"""
+                WHERE st.trip_id IN (
+                    SELECT key_1 FROM provider_entities
+                    WHERE entity_type = 'trips' AND provider_id IN ({placeholders})
+                )
+            """
+            provider_params = selected
+
         connection.execute(
             f"""
-            UPDATE trips SET terminal_stop_id = COALESCE((
-                SELECT stop_times.raw_stop_id FROM stop_times WHERE stop_times.trip_id = trips.trip_id
-                ORDER BY stop_times.stop_sequence DESC, stop_times.rowid DESC LIMIT 1
-            ), '')
-            WHERE trip_id IN (
-                SELECT key_1 FROM provider_entities
-                WHERE entity_type = 'trips' AND provider_id IN ({placeholders})
+            INSERT INTO terminal_stop_candidates(trip_id, raw_stop_id)
+            SELECT st.trip_id, st.raw_stop_id
+            FROM stop_times st
+            JOIN (
+                SELECT trip_id, MAX(stop_sequence) AS max_sequence
+                FROM stop_times st
+                {provider_filter}
+                GROUP BY trip_id
+            ) latest
+              ON latest.trip_id = st.trip_id
+             AND latest.max_sequence = st.stop_sequence
+            WHERE st.rowid = (
+                SELECT MAX(tie.rowid)
+                FROM stop_times tie
+                WHERE tie.trip_id = st.trip_id
+                  AND tie.stop_sequence = st.stop_sequence
             )
             """,
-            selected,
+            provider_params,
         )
-    connection.commit()
+
+        if selected is None:
+            connection.execute("UPDATE trips SET terminal_stop_id = ''")
+            update_params: tuple[str, ...] = ()
+            update_scope = ""
+        else:
+            placeholders = ",".join("?" for _ in selected)
+            update_scope = f"""
+                WHERE trip_id IN (
+                    SELECT key_1 FROM provider_entities
+                    WHERE entity_type = 'trips' AND provider_id IN ({placeholders})
+                )
+            """
+            update_params = selected
+            connection.execute(
+                f"UPDATE trips SET terminal_stop_id = '' {update_scope}",
+                update_params,
+            )
+
+        connection.execute(
+            f"""
+            UPDATE trips
+            SET terminal_stop_id = COALESCE((
+                SELECT candidates.raw_stop_id
+                FROM terminal_stop_candidates candidates
+                WHERE candidates.trip_id = trips.trip_id
+            ), '')
+            {update_scope}
+            """,
+            update_params,
+        )
+        connection.commit()
+    finally:
+        connection.set_progress_handler(None, 0)
+        connection.execute("DROP TABLE IF EXISTS temp.terminal_stop_candidates")
+
+    print(
+        "[StaticDepartures] stage=terminal-stops status=completed "
+        f"duration={time.monotonic() - started:.2f}s",
+        flush=True,
+    )
 
 
 def write_city_indexes(connection: sqlite3.Connection, output: Path, city_ids: set[str], timezone_name: str, dates: list[date]) -> dict[str, dict[str, object]]:

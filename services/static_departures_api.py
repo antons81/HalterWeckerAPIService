@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -45,6 +46,7 @@ from mta_ny_gateway import (
     MtaNYTripUpdatesGateway,
     api_key_from_environment,
 )
+from kyiv_gateway import KyivVehiclePositionsGateway, KYIV_VEHICLE_POSITIONS_PATH
 
 
 DEFAULT_TIMEZONE = "Europe/Berlin"
@@ -52,6 +54,8 @@ MBTA_NAMESPACE = "mbta-boston:"
 
 def _native_id(value: str) -> str:
     return value[len(MBTA_NAMESPACE):] if value.startswith(MBTA_NAMESPACE) else value
+LOGGER = logging.getLogger("haltewecker.static_departures_api")
+
 STATIC_DATA_ROOT = os.environ.get("STATIC_DATA_ROOT", "")
 STATIC_DATA_PATH_PREFIXES = (
     "/static-stop-data/",
@@ -99,11 +103,6 @@ class Database:
                 metadata = dict(cursor.fetchall())
             finally:
                 cursor.close()
-            stat_result = os.stat(self.path)
-            metadata["databasePath"] = self.path
-            metadata["databaseDevice"] = str(stat_result.st_dev)
-            metadata["databaseInode"] = str(stat_result.st_ino)
-            metadata["databaseMTimeNS"] = str(stat_result.st_mtime_ns)
             return metadata
 
     def close(self) -> None:
@@ -174,6 +173,27 @@ class Database:
         route_by_trip = {str(row[0]): str(row[1]) for row in rows if row[1]}
         routes = {str(row[0]) for row in route_rows}
         return trips, routes, route_by_trip
+
+    def provider_route_type_registry(self, provider_id: str) -> dict[str, str]:
+        """Return internal route identities and their static GTFS route types."""
+        with self.lock:
+            try:
+                rows = self._connection().execute(
+                    """
+                    SELECT owned.key_1, routes.route_type
+                    FROM provider_entities AS owned
+                    JOIN routes ON routes.route_id = owned.key_1
+                    WHERE owned.entity_type='routes' AND owned.provider_id=?
+                    """,
+                    (provider_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return {}
+        return {
+            str(route_id): str(route_type)
+            for route_id, route_type in rows
+            if route_id is not None and route_type is not None
+        }
 
     def provider_trip_stop_registry(self, provider_id: str, trip_ids: set[str]) -> dict[tuple[str, int], str]:
         if not trip_ids:
@@ -456,6 +476,9 @@ def bounded_limit(raw: str | None) -> int:
 
 
 class Handler(BaseHTTPRequestHandler):
+    def version_string(self) -> str:
+        return "HalteWecker"
+
     database: Database
     tfl_gateway: TfLProxy | None = None
     translink_gateway: TransLinkProxy | None = None
@@ -473,6 +496,7 @@ class Handler(BaseHTTPRequestHandler):
     wmata_vehicle_positions_gateway: WMATAVehiclePositionsGateway | None = None
     wmata_alerts_gateway: WMATAAlertsGateway | None = None
     geofox_gateway: GeofoxProxy | None = None
+    kyiv_vehicle_positions_gateway: KyivVehiclePositionsGateway | None = None
 
     def send_json(
         self,
@@ -613,6 +637,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "WMATA provider unavailable"})
                 response = gateway.handle(parsed.path, query)
                 return self.send_json(response.status, response.payload, response.cache_control)
+            if parsed.path == KYIV_VEHICLE_POSITIONS_PATH:
+                if self.kyiv_vehicle_positions_gateway is None:
+                    return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Kyiv provider unavailable"})
+                response = self.kyiv_vehicle_positions_gateway.handle(parsed.path, query)
+                return self.send_json(response.status, response.payload, response.cache_control)
             for prefix in STATIC_DATA_PATH_PREFIXES:
                 if parsed.path.startswith(prefix):
                     return self.send_static_file(parsed.path[len(prefix):])
@@ -652,8 +681,9 @@ class Handler(BaseHTTPRequestHandler):
                     payload["requestedCityID"] = city
                 return self.send_json(HTTPStatus.OK, payload)
             return self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
-        except Exception as error:
-            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(error)})
+        except Exception:
+            LOGGER.exception("Unhandled GET request path=%s", parsed.path)
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "service temporarily unavailable"})
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
@@ -786,4 +816,12 @@ if __name__ == "__main__":
             valid_registry=lambda: (*wmata_native_trip_registry(), lambda value: value),
         )
         Handler.wmata_alerts_gateway = WMATAAlertsGateway(api_key=wmata_api_key)
+    Handler.kyiv_vehicle_positions_gateway = KyivVehiclePositionsGateway(
+        valid_route_registry=lambda: database.provider_route_type_registry("kyiv"),
+        topology_path=(
+            str(Path(STATIC_DATA_ROOT) / "radar" / "kyiv.json")
+            if STATIC_DATA_ROOT
+            else None
+        ),
+    )
     ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Handler).serve_forever()

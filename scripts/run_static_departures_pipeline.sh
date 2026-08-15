@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+WMATA_ENV_FILE="${WMATA_ENV_FILE:-/srv/haltewecker/secrets/wmata/.env}"
+if [[ -f "$WMATA_ENV_FILE" ]]; then
+  set -a
+  source "$WMATA_ENV_FILE"
+  set +a
+fi
 DATA_ROOT="${DATA_ROOT:-/srv/haltewecker/data}"
 GTFS_URL="${GTFS_URL:?GTFS_URL is required}"
 STOP_DATA_PATH="${STOP_DATA_PATH:-$DATA_ROOT/current}"
@@ -84,7 +91,7 @@ else:
 PY
 )
 IMPORT_ARGS+=("${EXTERNAL_GTFS_IMPORT_ARGS[@]}")
-python3 "$REPO/scripts/import_static_departures_database.py" "${IMPORT_ARGS[@]}"
+python3 -u "$REPO/scripts/import_static_departures_database.py" "${IMPORT_ARGS[@]}"
 echo "$LOG_PREFIX release=${RELEASE_ID:-legacy} stage=import duration=$((SECONDS - stage_started))s"
 
 if [[ "${SKIP_ACTIVATION:-0}" == "1" ]]; then

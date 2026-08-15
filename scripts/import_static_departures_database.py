@@ -43,8 +43,24 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 def timed_stage(source: str, stage: str, callback):
     started = time.monotonic()
-    result = callback()
-    print(f"[StaticDepartures] source={source} stage={stage} duration={time.monotonic() - started:.2f}s")
+    print(
+        f"[StaticDepartures] source={source} stage={stage} status=started",
+        flush=True,
+    )
+    try:
+        result = callback()
+    except Exception:
+        print(
+            f"[StaticDepartures] source={source} stage={stage} status=failed "
+            f"duration={time.monotonic() - started:.2f}s",
+            flush=True,
+        )
+        raise
+    print(
+        f"[StaticDepartures] source={source} stage={stage} status=completed "
+        f"duration={time.monotonic() - started:.2f}s",
+        flush=True,
+    )
     return result
 
 
@@ -301,38 +317,52 @@ def _populate_provider_city_memberships_indexed(
                 if prefix:
                     candidate_stop_ids.update(f"{prefix}{stop_id}" for stop_id in stop_ids)
 
-    connection.executescript(
-        """
-        CREATE TEMP TABLE scoped_membership_candidate_stop_ids(
-            stop_id TEXT PRIMARY KEY
-        ) WITHOUT ROWID;
-        CREATE TEMP TABLE scoped_membership_stop_owners(
-            stop_id TEXT NOT NULL,
-            provider_id TEXT NOT NULL,
-            PRIMARY KEY(stop_id, provider_id)
-        ) WITHOUT ROWID;
-        """
-    )
-    connection.executemany(
-        "INSERT INTO scoped_membership_candidate_stop_ids(stop_id) VALUES (?)",
-        ((stop_id,) for stop_id in sorted(candidate_stop_ids)),
+    connection.execute(
+        "DROP TABLE IF EXISTS temp.scoped_membership_candidate_stop_ids"
     )
     connection.execute(
-        """
-        INSERT INTO scoped_membership_stop_owners(stop_id, provider_id)
-        SELECT entities.key_1, entities.provider_id
-        FROM provider_entities AS entities
-        JOIN scoped_membership_candidate_stop_ids AS candidates
-          ON candidates.stop_id = entities.key_1
-        WHERE entities.entity_type = 'raw_stops'
-        """
+        "DROP TABLE IF EXISTS temp.scoped_membership_stop_owners"
     )
-    owners_by_stop: dict[str, list[tuple[str, str]]] = {}
-    for stop_id, provider_id in connection.execute(
-        "SELECT stop_id, provider_id FROM scoped_membership_stop_owners"
-    ):
-        owners_by_stop.setdefault(str(stop_id), []).append(
-            (str(provider_id), str(stop_id))
+    try:
+        connection.executescript(
+            """
+            CREATE TEMP TABLE scoped_membership_candidate_stop_ids(
+                stop_id TEXT PRIMARY KEY
+            ) WITHOUT ROWID;
+            CREATE TEMP TABLE scoped_membership_stop_owners(
+                stop_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                PRIMARY KEY(stop_id, provider_id)
+            ) WITHOUT ROWID;
+            """
+        )
+        connection.executemany(
+            "INSERT INTO scoped_membership_candidate_stop_ids(stop_id) VALUES (?)",
+            ((stop_id,) for stop_id in sorted(candidate_stop_ids)),
+        )
+        connection.execute(
+            """
+            INSERT INTO scoped_membership_stop_owners(stop_id, provider_id)
+            SELECT entities.key_1, entities.provider_id
+            FROM provider_entities AS entities
+            JOIN scoped_membership_candidate_stop_ids AS candidates
+              ON candidates.stop_id = entities.key_1
+            WHERE entities.entity_type = 'raw_stops'
+            """
+        )
+        owners_by_stop: dict[str, list[tuple[str, str]]] = {}
+        for stop_id, provider_id in connection.execute(
+            "SELECT stop_id, provider_id FROM scoped_membership_stop_owners"
+        ):
+            owners_by_stop.setdefault(str(stop_id), []).append(
+                (str(provider_id), str(stop_id))
+            )
+    finally:
+        connection.execute(
+            "DROP TABLE IF EXISTS temp.scoped_membership_stop_owners"
+        )
+        connection.execute(
+            "DROP TABLE IF EXISTS temp.scoped_membership_candidate_stop_ids"
         )
 
     city_ids: set[str] = set()
@@ -438,10 +468,15 @@ def import_austrian_gtfs(
             "Austrian registry/city configuration mismatch: "
             f"registry={sorted(imported_city_ids)} configured={sorted(expected_city_ids)}"
         )
-    imported_city_ids = populate_provider_city_memberships(
-        connection,
-        stop_data,
-        included_city_ids=expected_city_ids,
+    imported_city_ids = timed_stage(
+        "austria",
+        "provider-city-memberships",
+        lambda: populate_provider_city_memberships(
+            connection,
+            stop_data,
+            included_city_ids=expected_city_ids,
+            indexed_ownership_lookup=True,
+        ),
     )
     for source in registry:
         source_id = str(source["id"])
@@ -537,18 +572,22 @@ def add_external_gtfs(
                 provider_stage_runner = lambda stage, callback, source_id=source_id: stage_runner(
                     f"{source_id}:{stage}", callback
                 )
-            populate_gtfs(
-                connection,
-                archive,
-                identifier_prefix=str(source["identifierPrefix"]),
-                stop_id_prefix=(
-                    str(source.get("staticStopIDPrefix", (
-                        str(source.get("namespace", "")).strip()
-                        or str(source["identifierPrefix"])
-                )))
+            timed_stage(
+                f"external:{source_id}",
+                "populate_gtfs",
+                lambda: populate_gtfs(
+                    connection,
+                    archive,
+                    identifier_prefix=str(source["identifierPrefix"]),
+                    stop_id_prefix=(
+                        str(source.get("staticStopIDPrefix", (
+                            str(source.get("namespace", "")).strip()
+                            or str(source["identifierPrefix"])
+                        )))
+                    ),
+                    provider_id=source_id,
+                    stage_runner=provider_stage_runner,
                 ),
-                provider_id=source_id,
-                stage_runner=provider_stage_runner,
             )
         finally:
             archive.close()
@@ -567,20 +606,26 @@ def add_external_gtfs(
         )
     if populate_memberships:
         if stage_runner is None:
-            populate_provider_city_memberships(
-                connection,
-                stop_data,
-                included_city_ids=imported_city_ids,
-                stop_id_prefix_by_provider=source_stop_id_prefixes,
-            )
-        else:
-            stage_runner(
-                "memberships",
+            timed_stage(
+                "external",
+                "provider-city-memberships",
                 lambda: populate_provider_city_memberships(
                     connection,
                     stop_data,
                     included_city_ids=imported_city_ids,
                     stop_id_prefix_by_provider=source_stop_id_prefixes,
+                    indexed_ownership_lookup=True,
+                ),
+            )
+        else:
+            stage_runner(
+                "provider-city-memberships",
+                lambda: populate_provider_city_memberships(
+                    connection,
+                    stop_data,
+                    included_city_ids=imported_city_ids,
+                    stop_id_prefix_by_provider=source_stop_id_prefixes,
+                    indexed_ownership_lookup=True,
                 ),
             )
     provider_scope = tuple(url_by_provider) if scoped else None
