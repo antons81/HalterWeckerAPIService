@@ -284,6 +284,23 @@
     "allowStale": false,
     "staticIdentifierPrefix": "kyiv:",
     "staticStopIDPrefix": "",
+    "supplementalStopCatalog": {
+      "name": "kyiv-surface-stop-catalog",
+      "resourceID": "269ffb2e-dac0-4978-9552-10d29a30724b",
+      "isAPI": false,
+      "downloadURL": "https://data.kyivcity.gov.ua/dataset/3870075f-4f65-4656-a125-4648ae220c3d/resource/269ffb2e-dac0-4978-9552-10d29a30724b/download/31725604_stops.json",
+      "idField": "uid",
+      "nameField": "label",
+      "latitudeField": "lat",
+      "longitudeField": "lon",
+      "typeField": "type",
+      "stopCodeField": "code",
+      "allowedTypes": [0],
+      "idPrefix": "kyiv-catalog:",
+      "deduplicationDistanceMeters": 150,
+      "staticDepartureProviderID": "kyiv",
+      "dataSource": "official-kyiv-stop-catalog"
+    },
     "country": "UA"
   }
 ]

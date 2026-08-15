@@ -2409,11 +2409,13 @@ def main(argv: list[str] | None = None) -> None:
         from .external_gtfs import (
             parse_external_gtfs_url_args,
             process_external_gtfs_sources,
+            validate_external_stop_packages,
         )
     except ImportError:
         from external_gtfs import (
             parse_external_gtfs_url_args,
             process_external_gtfs_sources,
+            validate_external_stop_packages,
         )
 
     repository_root = Path(__file__).resolve().parents[1]
@@ -2545,6 +2547,12 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     if external_manifest_entries:
+        validate_external_stop_packages(
+            cities=external_cities,
+            manifest_entries=external_manifest_entries,
+            package_stops_by_city_id=external_package_stops,
+            output=output,
+        )
         entries_by_source: dict[str, list[dict[str, object]]] = {}
         for entry in external_manifest_entries:
             source_label = str(entry.pop("_source", "External GTFS branch"))

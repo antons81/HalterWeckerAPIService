@@ -170,6 +170,32 @@ def populate_german_city_memberships(
     )
 
 
+def _supplemental_stop_provider(
+    connection: sqlite3.Connection,
+    city_id: str,
+    stop: dict[str, object],
+    prefix_by_provider: dict[str, str],
+) -> str | None:
+    """Resolve explicit ownership for an official catalog-only stop."""
+    provider_id = str(stop.get("staticDepartureProviderID", "") or "").strip()
+    if not provider_id:
+        return None
+    configured = provider_id in prefix_by_provider or connection.execute(
+        """
+        SELECT 1
+        FROM provider_city_modes
+        WHERE provider_id=? AND city_id=?
+        """,
+        (provider_id, city_id),
+    ).fetchone() is not None
+    if not configured:
+        raise ValueError(
+            f"Supplemental stop {city_id}/{stop.get('id')} "
+            f"references unconfigured provider {provider_id}"
+        )
+    return provider_id
+
+
 def populate_provider_city_memberships(
     connection: sqlite3.Connection,
     stop_data: Path,
@@ -248,6 +274,17 @@ def populate_provider_city_memberships(
             if preferred_owners:
                 owners = preferred_owners
             if not owners:
+                catalog_provider = _supplemental_stop_provider(
+                    connection,
+                    city_id,
+                    stop,
+                    prefix_by_provider,
+                )
+                if catalog_provider:
+                    owned_ids.setdefault(catalog_provider, set()).add(
+                        str(stop["id"])
+                    )
+                    continue
                 raise ValueError(
                     f"Could not resolve provider ownership for package stop "
                     f"{city_id}/{stop.get('id')}"
@@ -396,6 +433,17 @@ def _populate_provider_city_memberships_indexed(
             if preferred_owners:
                 owners = preferred_owners
             if not owners:
+                catalog_provider = _supplemental_stop_provider(
+                    connection,
+                    city_id,
+                    stop,
+                    prefix_by_provider,
+                )
+                if catalog_provider:
+                    owned_ids.setdefault(catalog_provider, set()).add(
+                        str(stop["id"])
+                    )
+                    continue
                 raise ValueError(
                     f"Could not resolve provider ownership for package stop "
                     f"{city_id}/{stop.get('id')}"
