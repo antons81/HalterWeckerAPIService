@@ -3,6 +3,13 @@ set -euo pipefail
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+STOP_DATA_ENV_FILE="${STOP_DATA_ENV_FILE:-/etc/haltewecker-stop-data.env}"
+if [[ -f "$STOP_DATA_ENV_FILE" ]]; then
+  set -a
+  source "$STOP_DATA_ENV_FILE"
+  set +a
+fi
+
 WMATA_ENV_FILE="${WMATA_ENV_FILE:-/srv/haltewecker/secrets/wmata/.env}"
 if [[ -f "$WMATA_ENV_FILE" ]]; then
   set -a
