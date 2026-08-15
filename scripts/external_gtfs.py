@@ -11,6 +11,7 @@ import time
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
@@ -39,6 +40,11 @@ except ImportError:
         normalized,
         write_stop_package,
     )
+
+try:
+    from .kyiv_open_data import load_json_resource
+except ImportError:
+    from kyiv_open_data import load_json_resource
 
 
 # Auth is resolved at runtime from environment variables. Secrets never appear
@@ -208,6 +214,63 @@ def validate_external_gtfs_source(
             f"External GTFS source {source_id} has invalid "
             "publishPassengerStopIDs."
         )
+
+    supplemental_catalog = source.get("supplementalStopCatalog")
+    if supplemental_catalog is not None:
+        if not isinstance(supplemental_catalog, dict):
+            raise ValueError(
+                f"External GTFS source {source_id} has an invalid "
+                "supplementalStopCatalog."
+            )
+        download_url = supplemental_catalog.get("downloadURL")
+        resource_id = supplemental_catalog.get("resourceID")
+        if not isinstance(download_url, str) or not download_url.strip():
+            raise ValueError(
+                f"External GTFS source {source_id} supplemental stop catalog "
+                "is missing downloadURL."
+            )
+        if not isinstance(resource_id, str) or not resource_id.strip():
+            raise ValueError(
+                f"External GTFS source {source_id} supplemental stop catalog "
+                "is missing resourceID."
+            )
+        parsed_catalog_url = urlsplit(download_url)
+        if (
+            parsed_catalog_url.scheme != "https"
+            or parsed_catalog_url.hostname != "data.kyivcity.gov.ua"
+            or not (
+                "/data/download" in parsed_catalog_url.path
+                or "/download/" in parsed_catalog_url.path
+            )
+        ):
+            raise ValueError(
+                f"External GTFS source {source_id} supplemental stop catalog "
+                "must use the official Kyiv CKAN download URL."
+            )
+        for key in ("idField", "nameField", "latitudeField", "longitudeField"):
+            value = supplemental_catalog.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"External GTFS source {source_id} supplemental stop catalog "
+                    f"is missing {key}."
+                )
+        id_prefix = supplemental_catalog.get("idPrefix", "")
+        if not isinstance(id_prefix, str) or not id_prefix.strip():
+            raise ValueError(
+                f"External GTFS source {source_id} supplemental stop catalog "
+                "requires a non-empty idPrefix."
+            )
+        static_provider = supplemental_catalog.get("staticDepartureProviderID")
+        if not isinstance(static_provider, str) or not static_provider.strip():
+            raise ValueError(
+                f"External GTFS source {source_id} supplemental stop catalog "
+                "requires staticDepartureProviderID."
+            )
+        if static_provider != source_id:
+            raise ValueError(
+                f"External GTFS source {source_id} supplemental stop catalog "
+                "must use its own provider ID."
+            )
 
 
 def load_external_cities(
@@ -471,6 +534,106 @@ def _duplicate_bin_count(public_stops: list[dict[str, object]]) -> int:
     return max(bins.values(), default=0)
 
 
+def _supplemental_stop_records(payload: object) -> list[dict[str, object]]:
+    if (
+        isinstance(payload, list)
+        and payload
+        and all(isinstance(item, dict) for item in payload)
+    ):
+        return [dict(item) for item in payload]
+    if isinstance(payload, dict) and isinstance(payload.get("records"), list):
+        records = payload["records"]
+        if records and all(isinstance(item, dict) for item in records):
+            return [dict(item) for item in records]
+    raise ValueError(
+        "Supplemental stop catalog must contain a non-empty array of records."
+    )
+
+
+def _build_supplemental_stop_entries(
+    records: list[dict[str, object]],
+    city: dict[str, object],
+    existing_stops: list[dict[str, object]],
+    configuration: dict[str, object],
+) -> list[dict[str, object]]:
+    """Merge official stop locations that are absent from the GTFS timetable."""
+    id_field = str(configuration["idField"])
+    name_field = str(configuration["nameField"])
+    latitude_field = str(configuration["latitudeField"])
+    longitude_field = str(configuration["longitudeField"])
+    id_prefix = str(configuration["idPrefix"])
+    static_provider_id = str(configuration["staticDepartureProviderID"])
+    deduplication_distance = float(
+        configuration.get("deduplicationDistanceMeters", DUPLICATE_STOP_DISTANCE_METERS)
+    )
+    allowed_types = {
+        int(value)
+        for value in configuration.get("allowedTypes", [0])
+        if isinstance(value, (int, str)) and str(value).strip().lstrip("-").isdigit()
+    }
+    city_latitude = float(city["latitude"])
+    city_longitude = float(city["longitude"])
+    city_radius = float(city["radiusMeters"])
+    seen_ids: set[str] = set()
+    entries: list[dict[str, object]] = []
+
+    for record in records:
+        raw_id = str(record.get(id_field, "") or "").strip()
+        name = str(record.get(name_field, "") or "").strip()
+        if not raw_id or not name:
+            continue
+        raw_type = record.get(str(configuration.get("typeField", "type")), 0)
+        try:
+            record_type = int(raw_type or 0)
+        except (TypeError, ValueError):
+            continue
+        if allowed_types and record_type not in allowed_types:
+            continue
+        try:
+            latitude = float(record[latitude_field])
+            longitude = float(record[longitude_field])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            not math.isfinite(latitude)
+            or not math.isfinite(longitude)
+            or not -90 <= latitude <= 90
+            or not -180 <= longitude <= 180
+            or distance_meters(latitude, longitude, city_latitude, city_longitude)
+            > city_radius
+        ):
+            continue
+        published_id = f"{id_prefix}{raw_id}"
+        if published_id in seen_ids:
+            continue
+        if any(
+            distance_meters(
+                latitude,
+                longitude,
+                float(existing["latitude"]),
+                float(existing["longitude"]),
+            )
+            <= deduplication_distance
+            for existing in existing_stops
+        ):
+            continue
+        seen_ids.add(published_id)
+        raw_stop_code = record.get(str(configuration.get("stopCodeField", "code")))
+        stop_code = str(raw_stop_code).strip() if raw_stop_code else None
+        entries.append({
+            "id": published_id,
+            "name": name,
+            "latitude": latitude,
+            "longitude": longitude,
+            "searchName": normalized(name),
+            "stopCode": stop_code,
+            "staticDeparturesAvailable": False,
+            "staticDepartureProviderID": static_provider_id,
+            "dataSource": str(configuration.get("dataSource", "official-stop-catalog")),
+        })
+    return entries
+
+
 def build_external_stop_packages(
     archive: zipfile.ZipFile,
     cities: list[dict[str, object]],
@@ -478,6 +641,8 @@ def build_external_stop_packages(
     stop_id_mode: str = "exact",
     namespace: str = "",
     publish_passenger_stop_ids: bool = False,
+    supplemental_stop_catalog: object | None = None,
+    supplemental_catalog_configuration: dict[str, object] | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, list[dict[str, object]]]]:
     if stop_id_mode != "exact":
         raise ValueError(f"Unsupported stopIDMode: {stop_id_mode!r}")
@@ -606,6 +771,20 @@ def build_external_stop_packages(
             }
             for stop in city_public[city_id]
         ]
+        if supplemental_stop_catalog is not None:
+            catalog_entries = _build_supplemental_stop_entries(
+                _supplemental_stop_records(supplemental_stop_catalog),
+                city,
+                public_entries,
+                supplemental_catalog_configuration or {},
+            )
+            public_entries.extend(catalog_entries)
+            if catalog_entries:
+                print(
+                    f"[StopData] supplemental city={city_id} "
+                    f"source={supplemental_catalog_configuration.get('resourceID') if supplemental_catalog_configuration else 'unknown'} "
+                    f"stops={len(catalog_entries)}"
+                )
         filename = write_stop_package(packages_directory, city_id, public_entries)
         package_stops[city_id] = public_entries
         manifest.append({
@@ -1229,6 +1408,7 @@ def process_external_gtfs_sources(
     environ: dict[str, str] | None = None,
     occupied_city_ids: set[str] | None = None,
     selected_source_ids: set[str] | None = None,
+    load_stop_catalog: Callable[[dict[str, object]], object] | None = None,
 ) -> tuple[
     list[dict[str, object]],
     list[dict[str, object]],
@@ -1319,6 +1499,22 @@ def process_external_gtfs_sources(
         source_started = time.monotonic()
         archive = load_gtfs_archive(request_url, headers=headers)
         archive = agency_scoped_archive(archive, source.get("agencyID"))
+        supplemental_catalog_configuration = source.get("supplementalStopCatalog")
+        supplemental_stop_catalog: object | None = None
+        try:
+            if supplemental_catalog_configuration is not None:
+                if not isinstance(supplemental_catalog_configuration, dict):
+                    raise ValueError(
+                        f"External GTFS source {source_id} has an invalid "
+                        "supplementalStopCatalog."
+                    )
+                catalog_loader = load_stop_catalog or load_json_resource
+                supplemental_stop_catalog = catalog_loader(
+                    supplemental_catalog_configuration
+                )
+        except Exception:
+            archive.close()
+            raise
         source_output = output
         if namespace or str(source.get("mergeGroup", "")).strip():
             source_output = namespace_root / source_id
@@ -1335,6 +1531,12 @@ def process_external_gtfs_sources(
                     namespace=namespace,
                     publish_passenger_stop_ids=bool(
                         source.get("publishPassengerStopIDs", False)
+                    ),
+                    supplemental_stop_catalog=supplemental_stop_catalog,
+                    supplemental_catalog_configuration=(
+                        supplemental_catalog_configuration
+                        if isinstance(supplemental_catalog_configuration, dict)
+                        else None
                     ),
                 )
                 if namespace or str(source.get("mergeGroup", "")).strip():

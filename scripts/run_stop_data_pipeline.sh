@@ -22,6 +22,13 @@ set -a
 source "$STOP_DATA_ENV_FILE"
 set +a
 
+WMATA_ENV_FILE="${WMATA_ENV_FILE:-/srv/haltewecker/secrets/wmata/.env}"
+if [[ -f "$WMATA_ENV_FILE" ]]; then
+  set -a
+  source "$WMATA_ENV_FILE"
+  set +a
+fi
+
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 SUDO_BIN="${SUDO_BIN:-sudo}"
 STATIC_DEPARTURES_SERVICE="${STATIC_DEPARTURES_SERVICE:-haltewecker-static-departures.service}"
@@ -247,6 +254,8 @@ NEXT_DATABASE_PATH="$RELEASE_DIR/departures.sqlite" \
 RELEASE_ID="$RELEASE_ID" \
 SKIP_ACTIVATION=1 \
   "$STATIC_DEPARTURES_PIPELINE"
+python3 "$REPO/scripts/validate_release_consistency.py" --release-dir "$RELEASE_DIR"
+
 echo "[StaticDepartures] release=$RELEASE_ID stage=import duration=$(elapsed_seconds "$STATIC_STARTED")"
 
 if [ -n "${SWEDEN_GTFS_URL:-}" ]; then

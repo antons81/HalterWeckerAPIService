@@ -170,6 +170,32 @@ def populate_german_city_memberships(
     )
 
 
+def _supplemental_stop_provider(
+    connection: sqlite3.Connection,
+    city_id: str,
+    stop: dict[str, object],
+    prefix_by_provider: dict[str, str],
+) -> str | None:
+    """Resolve explicit ownership for an official catalog-only stop."""
+    provider_id = str(stop.get("staticDepartureProviderID", "") or "").strip()
+    if not provider_id:
+        return None
+    configured = provider_id in prefix_by_provider or connection.execute(
+        """
+        SELECT 1
+        FROM provider_city_modes
+        WHERE provider_id=? AND city_id=?
+        """,
+        (provider_id, city_id),
+    ).fetchone() is not None
+    if not configured:
+        raise ValueError(
+            f"Supplemental stop {city_id}/{stop.get('id')} "
+            f"references unconfigured provider {provider_id}"
+        )
+    return provider_id
+
+
 def populate_provider_city_memberships(
     connection: sqlite3.Connection,
     stop_data: Path,
@@ -248,6 +274,17 @@ def populate_provider_city_memberships(
             if preferred_owners:
                 owners = preferred_owners
             if not owners:
+                catalog_provider = _supplemental_stop_provider(
+                    connection,
+                    city_id,
+                    stop,
+                    prefix_by_provider,
+                )
+                if catalog_provider:
+                    owned_ids.setdefault(catalog_provider, set()).add(
+                        str(stop["id"])
+                    )
+                    continue
                 raise ValueError(
                     f"Could not resolve provider ownership for package stop "
                     f"{city_id}/{stop.get('id')}"
@@ -317,38 +354,52 @@ def _populate_provider_city_memberships_indexed(
                 if prefix:
                     candidate_stop_ids.update(f"{prefix}{stop_id}" for stop_id in stop_ids)
 
-    connection.executescript(
-        """
-        CREATE TEMP TABLE scoped_membership_candidate_stop_ids(
-            stop_id TEXT PRIMARY KEY
-        ) WITHOUT ROWID;
-        CREATE TEMP TABLE scoped_membership_stop_owners(
-            stop_id TEXT NOT NULL,
-            provider_id TEXT NOT NULL,
-            PRIMARY KEY(stop_id, provider_id)
-        ) WITHOUT ROWID;
-        """
-    )
-    connection.executemany(
-        "INSERT INTO scoped_membership_candidate_stop_ids(stop_id) VALUES (?)",
-        ((stop_id,) for stop_id in sorted(candidate_stop_ids)),
+    connection.execute(
+        "DROP TABLE IF EXISTS temp.scoped_membership_candidate_stop_ids"
     )
     connection.execute(
-        """
-        INSERT INTO scoped_membership_stop_owners(stop_id, provider_id)
-        SELECT entities.key_1, entities.provider_id
-        FROM provider_entities AS entities
-        JOIN scoped_membership_candidate_stop_ids AS candidates
-          ON candidates.stop_id = entities.key_1
-        WHERE entities.entity_type = 'raw_stops'
-        """
+        "DROP TABLE IF EXISTS temp.scoped_membership_stop_owners"
     )
-    owners_by_stop: dict[str, list[tuple[str, str]]] = {}
-    for stop_id, provider_id in connection.execute(
-        "SELECT stop_id, provider_id FROM scoped_membership_stop_owners"
-    ):
-        owners_by_stop.setdefault(str(stop_id), []).append(
-            (str(provider_id), str(stop_id))
+    try:
+        connection.executescript(
+            """
+            CREATE TEMP TABLE scoped_membership_candidate_stop_ids(
+                stop_id TEXT PRIMARY KEY
+            ) WITHOUT ROWID;
+            CREATE TEMP TABLE scoped_membership_stop_owners(
+                stop_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                PRIMARY KEY(stop_id, provider_id)
+            ) WITHOUT ROWID;
+            """
+        )
+        connection.executemany(
+            "INSERT INTO scoped_membership_candidate_stop_ids(stop_id) VALUES (?)",
+            ((stop_id,) for stop_id in sorted(candidate_stop_ids)),
+        )
+        connection.execute(
+            """
+            INSERT INTO scoped_membership_stop_owners(stop_id, provider_id)
+            SELECT entities.key_1, entities.provider_id
+            FROM provider_entities AS entities
+            JOIN scoped_membership_candidate_stop_ids AS candidates
+              ON candidates.stop_id = entities.key_1
+            WHERE entities.entity_type = 'raw_stops'
+            """
+        )
+        owners_by_stop: dict[str, list[tuple[str, str]]] = {}
+        for stop_id, provider_id in connection.execute(
+            "SELECT stop_id, provider_id FROM scoped_membership_stop_owners"
+        ):
+            owners_by_stop.setdefault(str(stop_id), []).append(
+                (str(provider_id), str(stop_id))
+            )
+    finally:
+        connection.execute(
+            "DROP TABLE IF EXISTS temp.scoped_membership_stop_owners"
+        )
+        connection.execute(
+            "DROP TABLE IF EXISTS temp.scoped_membership_candidate_stop_ids"
         )
 
     city_ids: set[str] = set()
@@ -382,6 +433,17 @@ def _populate_provider_city_memberships_indexed(
             if preferred_owners:
                 owners = preferred_owners
             if not owners:
+                catalog_provider = _supplemental_stop_provider(
+                    connection,
+                    city_id,
+                    stop,
+                    prefix_by_provider,
+                )
+                if catalog_provider:
+                    owned_ids.setdefault(catalog_provider, set()).add(
+                        str(stop["id"])
+                    )
+                    continue
                 raise ValueError(
                     f"Could not resolve provider ownership for package stop "
                     f"{city_id}/{stop.get('id')}"
@@ -454,10 +516,15 @@ def import_austrian_gtfs(
             "Austrian registry/city configuration mismatch: "
             f"registry={sorted(imported_city_ids)} configured={sorted(expected_city_ids)}"
         )
-    imported_city_ids = populate_provider_city_memberships(
-        connection,
-        stop_data,
-        included_city_ids=expected_city_ids,
+    imported_city_ids = timed_stage(
+        "austria",
+        "provider-city-memberships",
+        lambda: populate_provider_city_memberships(
+            connection,
+            stop_data,
+            included_city_ids=expected_city_ids,
+            indexed_ownership_lookup=True,
+        ),
     )
     for source in registry:
         source_id = str(source["id"])
@@ -553,18 +620,22 @@ def add_external_gtfs(
                 provider_stage_runner = lambda stage, callback, source_id=source_id: stage_runner(
                     f"{source_id}:{stage}", callback
                 )
-            populate_gtfs(
-                connection,
-                archive,
-                identifier_prefix=str(source["identifierPrefix"]),
-                stop_id_prefix=(
-                    str(source.get("staticStopIDPrefix", (
-                        str(source.get("namespace", "")).strip()
-                        or str(source["identifierPrefix"])
-                )))
+            timed_stage(
+                f"external:{source_id}",
+                "populate_gtfs",
+                lambda: populate_gtfs(
+                    connection,
+                    archive,
+                    identifier_prefix=str(source["identifierPrefix"]),
+                    stop_id_prefix=(
+                        str(source.get("staticStopIDPrefix", (
+                            str(source.get("namespace", "")).strip()
+                            or str(source["identifierPrefix"])
+                        )))
+                    ),
+                    provider_id=source_id,
+                    stage_runner=provider_stage_runner,
                 ),
-                provider_id=source_id,
-                stage_runner=provider_stage_runner,
             )
         finally:
             archive.close()
@@ -583,20 +654,26 @@ def add_external_gtfs(
         )
     if populate_memberships:
         if stage_runner is None:
-            populate_provider_city_memberships(
-                connection,
-                stop_data,
-                included_city_ids=imported_city_ids,
-                stop_id_prefix_by_provider=source_stop_id_prefixes,
-            )
-        else:
-            stage_runner(
-                "memberships",
+            timed_stage(
+                "external",
+                "provider-city-memberships",
                 lambda: populate_provider_city_memberships(
                     connection,
                     stop_data,
                     included_city_ids=imported_city_ids,
                     stop_id_prefix_by_provider=source_stop_id_prefixes,
+                    indexed_ownership_lookup=True,
+                ),
+            )
+        else:
+            stage_runner(
+                "provider-city-memberships",
+                lambda: populate_provider_city_memberships(
+                    connection,
+                    stop_data,
+                    included_city_ids=imported_city_ids,
+                    stop_id_prefix_by_provider=source_stop_id_prefixes,
+                    indexed_ownership_lookup=True,
                 ),
             )
     provider_scope = tuple(url_by_provider) if scoped else None

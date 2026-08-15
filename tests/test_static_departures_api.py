@@ -147,7 +147,8 @@ class StaticDeparturesDatabaseTests(unittest.TestCase):
                 os.replace(next_link, current)
                 meta = database.meta()
                 self.assertEqual(meta["databaseVersion"], "second")
-                self.assertEqual(meta["databaseInode"], str(current.stat().st_ino))
+                self.assertNotIn("databasePath", meta)
+                self.assertNotIn("databaseInode", meta)
             finally:
                 database.close()
 
@@ -238,6 +239,12 @@ class StaticDeparturesImportTests(unittest.TestCase):
 
 
 class StaticDeparturesEndpointTests(unittest.TestCase):
+    def test_server_header_does_not_expose_runtime_version(self) -> None:
+        self.assertEqual(
+            Handler.version_string(Handler.__new__(Handler)),
+            "HalteWecker",
+        )
+
     def test_health_meta_lines_and_board(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "current.sqlite"
@@ -246,7 +253,10 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                 health = server.get("/static-departures/health")
                 self.assertTrue(health["ok"])
                 self.assertEqual(health["database"]["databaseVersion"], "endpoint")
-                self.assertEqual(server.get("/static-departures/meta")["databaseVersion"], "endpoint")
+                metadata = server.get("/static-departures/meta")
+                self.assertEqual(metadata["databaseVersion"], "endpoint")
+                for key in ("databasePath", "databaseDevice", "databaseInode", "databaseMTimeNS"):
+                    self.assertNotIn(key, metadata)
                 lines = server.get("/static-departures/lines?cityID=dresden&stopID=stop-parent")["lines"]
                 self.assertEqual(lines, [{
                     "routeID": "route-1",

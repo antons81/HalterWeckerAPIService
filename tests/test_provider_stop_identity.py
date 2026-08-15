@@ -373,6 +373,237 @@ class ProviderStopIdentityTests(unittest.TestCase):
             )
             connection.close()
 
+    def test_catalog_only_package_stop_is_queryable_without_static_departures(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            connection = connect(root / "departures.sqlite")
+            stop_data = root / "stop-data"
+            (stop_data / "stops").mkdir(parents=True)
+            (stop_data / "manifest.json").write_text(
+                json.dumps({"cities": [{"id": "kyiv", "url": "stops/kyiv.json"}]}),
+                encoding="utf-8",
+            )
+            catalog_stop_id = "kyiv-catalog:2477"
+            (stop_data / "stops" / "kyiv.json").write_text(
+                json.dumps([
+                    {
+                        "id": catalog_stop_id,
+                        "name": "Вул. Олени Теліги",
+                        "latitude": 50.4776622073,
+                        "longitude": 30.451028891,
+                        "staticDeparturesAvailable": False,
+                        "staticDepartureProviderID": "kyiv",
+                    }
+                ]),
+                encoding="utf-8",
+            )
+            register_city_mode(
+                connection,
+                "kyiv",
+                "kyiv",
+                "canonical",
+                "Europe/Kyiv",
+                "",
+                "kyiv:",
+            )
+
+            imported = populate_provider_city_memberships(
+                connection,
+                stop_data,
+                {"kyiv"},
+            )
+            self.assertEqual(imported, {"kyiv"})
+            rebuild_city_stops(connection, {"kyiv"})
+            database = Database(str(root / "departures.sqlite"), ttl=0)
+            self.assertTrue(database.city_has_stop("kyiv", catalog_stop_id))
+            self.assertEqual(database.lines("kyiv", catalog_stop_id), [])
+            self.assertEqual(database.board("kyiv", catalog_stop_id, 10), [])
+            connection.close()
+
+    def test_indexed_membership_path_matches_legacy_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "feed.zip"
+            _feed(feed)
+            stop_data = root / "stop-data"
+            (stop_data / "stops").mkdir(parents=True)
+            (stop_data / "manifest.json").write_text(
+                json.dumps({"cities": [{"id": "san-francisco", "url": "stops/san-francisco.json"}]}),
+                encoding="utf-8",
+            )
+            (stop_data / "stops" / "san-francisco.json").write_text(
+                json.dumps([{"id": "13114", "sourceStopIDs": ["13115"]}]),
+                encoding="utf-8",
+            )
+
+            def build(database_name: str, indexed: bool) -> tuple[list[tuple], list[tuple]]:
+                connection = connect(root / database_name)
+                with zipfile.ZipFile(feed) as archive:
+                    populate_gtfs(
+                        connection,
+                        archive,
+                        identifier_prefix="a:",
+                        provider_id="provider-a",
+                    )
+                with zipfile.ZipFile(feed) as archive:
+                    populate_gtfs(
+                        connection,
+                        archive,
+                        identifier_prefix="b:",
+                        stop_id_prefix="b:",
+                        provider_id="provider-b",
+                    )
+                register_city_mode(
+                    connection,
+                    "provider-a",
+                    "san-francisco",
+                    "canonical",
+                    "America/Los_Angeles",
+                    "a:",
+                )
+                register_city_mode(
+                    connection,
+                    "provider-b",
+                    "san-francisco",
+                    "canonical",
+                    "America/Los_Angeles",
+                    "b:",
+                )
+                populate_provider_city_memberships(
+                    connection,
+                    stop_data,
+                    {"san-francisco"},
+                    stop_id_prefix_by_provider={"provider-a": "a:", "provider-b": "b:"},
+                    indexed_ownership_lookup=indexed,
+                )
+                snapshot = (
+                    list(connection.execute("SELECT city_id, stop_id FROM city_stops ORDER BY city_id, stop_id")),
+                    list(connection.execute(
+                        "SELECT provider_id, city_id, stop_id FROM provider_city_stops "
+                        "ORDER BY provider_id, city_id, stop_id"
+                    )),
+                )
+                connection.close()
+                return snapshot
+
+            self.assertEqual(
+                build("legacy.sqlite", indexed=False),
+                build("indexed.sqlite", indexed=True),
+            )
+
+    def test_indexed_membership_temp_tables_are_cleaned_between_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "feed.zip"
+            _feed(feed)
+            first_stop_data = root / "first-stop-data"
+            second_stop_data = root / "second-stop-data"
+            for stop_data, city_id, stop_id in (
+                (first_stop_data, "first-city", "13114"),
+                (second_stop_data, "second-city", "13115"),
+            ):
+                (stop_data / "stops").mkdir(parents=True)
+                (stop_data / "manifest.json").write_text(
+                    json.dumps({"cities": [{"id": city_id, "url": f"stops/{city_id}.json"}]}),
+                    encoding="utf-8",
+                )
+                (stop_data / "stops" / f"{city_id}.json").write_text(
+                    json.dumps([{"id": stop_id}]),
+                    encoding="utf-8",
+                )
+
+            connection = connect(root / "departures.sqlite")
+            with zipfile.ZipFile(feed) as archive:
+                populate_gtfs(
+                    connection,
+                    archive,
+                    identifier_prefix="a:",
+                    provider_id="provider-a",
+                )
+            with zipfile.ZipFile(feed) as archive:
+                populate_gtfs(
+                    connection,
+                    archive,
+                    identifier_prefix="b:",
+                    stop_id_prefix="b:",
+                    provider_id="provider-b",
+                )
+            for city_id in ("first-city", "second-city"):
+                register_city_mode(
+                    connection,
+                    "provider-a",
+                    city_id,
+                    "canonical",
+                    "America/Los_Angeles",
+                    "a:",
+                )
+                register_city_mode(
+                    connection,
+                    "provider-b",
+                    city_id,
+                    "canonical",
+                    "America/Los_Angeles",
+                    "b:",
+                )
+
+            prefixes = {"provider-a": "a:", "provider-b": "b:"}
+            self.assertEqual(
+                populate_provider_city_memberships(
+                    connection,
+                    first_stop_data,
+                    {"first-city"},
+                    stop_id_prefix_by_provider=prefixes,
+                    indexed_ownership_lookup=True,
+                ),
+                {"first-city"},
+            )
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM sqlite_temp_master
+                    WHERE type='table'
+                      AND name IN (
+                          'scoped_membership_candidate_stop_ids',
+                          'scoped_membership_stop_owners'
+                      )
+                    """
+                ).fetchone()[0],
+                0,
+            )
+
+            self.assertEqual(
+                populate_provider_city_memberships(
+                    connection,
+                    second_stop_data,
+                    {"second-city"},
+                    stop_id_prefix_by_provider=prefixes,
+                    indexed_ownership_lookup=True,
+                ),
+                {"second-city"},
+            )
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM sqlite_temp_master
+                    WHERE type='table'
+                      AND name IN (
+                          'scoped_membership_candidate_stop_ids',
+                          'scoped_membership_stop_owners'
+                      )
+                    """
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT city_id, stop_id FROM city_stops WHERE city_id LIKE '%-city' ORDER BY city_id, stop_id"
+                ).fetchall(),
+                [("first-city", "13114"), ("second-city", "13115")],
+            )
+            connection.close()
+
     def test_511_realtime_maps_stop_internally_but_keeps_public_native_response(self) -> None:
         gateway = BayAreaTripUpdatesProxy(
             provider_id=BAY_AREA_PROVIDER_ID,

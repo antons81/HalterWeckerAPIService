@@ -45,13 +45,20 @@ def _write_sweden_fixture(root: Path) -> Path:
 
 
 def _write_sweden_source_config(root: Path) -> Path:
+    source_cities = json.loads(
+        (
+            Path(__file__).resolve().parents[1] / "config" / "sweden-cities.json"
+        ).read_text(encoding="utf-8")
+    )
+    cities_path = root / "sweden-cities.json"
+    cities_path.write_text(json.dumps([source_cities[0]]), encoding="utf-8")
     source_config = root / "external-gtfs-sources.json"
     source_config.write_text(
         json.dumps(
             [
                 {
                     "id": "sweden",
-                    "cities": "config/sweden-cities.json",
+                    "cities": str(cities_path),
                     "timezone": "Europe/Stockholm",
                     "identifierPrefix": "se:",
                     "stopIDMode": "exact",

@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from datetime import date
 from pathlib import Path
 from unittest import mock
 
@@ -15,6 +16,7 @@ from build_stop_packages import (  # noqa: E402
     merge_manifest_entries,
     transit_radar_manifest,
 )
+import import_static_departures_database as static_importer  # noqa: E402
 from external_gtfs import (  # noqa: E402
     authenticated_external_request,
     build_external_departure_index,
@@ -540,6 +542,10 @@ class ExternalStopAndDepartureTests(unittest.TestCase):
         )
         self.assertEqual(source["preflight"], "download")
         self.assertFalse(source["allowStale"])
+        catalog = source["supplementalStopCatalog"]
+        self.assertEqual(catalog["resourceID"], "269ffb2e-dac0-4978-9552-10d29a30724b")
+        self.assertEqual(catalog["idPrefix"], "kyiv-catalog:")
+        self.assertEqual(catalog["staticDepartureProviderID"], "kyiv")
         request_url, headers = authenticated_external_request("kyiv", source["url"])
         self.assertEqual(request_url, source["url"])
         self.assertIn("Mozilla/5.0", headers["User-Agent"])
@@ -583,6 +589,89 @@ class ExternalStopAndDepartureTests(unittest.TestCase):
             for stop in package_stops["kyiv"]:
                 self.assertTrue(-90 <= stop["latitude"] <= 90)
                 self.assertTrue(-180 <= stop["longitude"] <= 180)
+
+    def test_kyiv_official_surface_catalog_adds_unrepresented_stops(self) -> None:
+        source = next(
+            source
+            for source in load_external_gtfs_sources(
+                REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
+            )
+            if source["id"] == "kyiv"
+        )
+        cities = load_external_cities(source, REPOSITORY_ROOT)
+        catalog = [
+            {
+                "uid": 2477,
+                "label": "Вул. Олени Теліги",
+                "lat": 50.4776622073,
+                "lon": 30.451028891,
+                "type": 0,
+            },
+            {
+                "uid": 2493,
+                "label": "Парк відпочинку",
+                "lat": 50.4795460908,
+                "lon": 30.4533223812,
+                "type": 0,
+            },
+            {
+                "uid": 2244,
+                "label": "АЗС",
+                "lat": 50.4821995518,
+                "lon": 30.4611564072,
+                "type": 0,
+            },
+            {
+                "uid": 9991,
+                "label": "Existing GTFS twin",
+                "lat": 50.45011,
+                "lon": 30.52341,
+                "type": 0,
+            },
+            {
+                "uid": 9992,
+                "label": "Outside Kyiv",
+                "lat": 51.5,
+                "lon": 30.5,
+                "type": 0,
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            archive_path = root / "kyiv.zip"
+            _gtfs_zip(
+                archive_path,
+                stops=(
+                    "stop_id,stop_name,stop_lat,stop_lon,parent_station,location_type\n"
+                    "3_6_1,Khreshchatyk,50.4501,30.5234,,0\n"
+                ),
+            )
+            with zipfile.ZipFile(archive_path) as archive:
+                manifest, package_stops = build_external_stop_packages(
+                    archive,
+                    cities,
+                    root / "out",
+                    stop_id_mode="exact",
+                    supplemental_stop_catalog=catalog,
+                    supplemental_catalog_configuration=source[
+                        "supplementalStopCatalog"
+                    ],
+                )
+
+        stops = package_stops["kyiv"]
+        supplemental = [
+            stop for stop in stops if stop["id"].startswith("kyiv-catalog:")
+        ]
+        self.assertEqual(
+            {stop["id"] for stop in supplemental},
+            {"kyiv-catalog:2477", "kyiv-catalog:2493", "kyiv-catalog:2244"},
+        )
+        self.assertEqual(manifest[0]["stopCount"], len(stops))
+        self.assertTrue(all(stop["staticDeparturesAvailable"] is False for stop in supplemental))
+        self.assertTrue(all(stop["staticDepartureProviderID"] == "kyiv" for stop in supplemental))
+        self.assertTrue(all(-90 <= stop["latitude"] <= 90 for stop in stops))
+        self.assertTrue(all(-180 <= stop["longitude"] <= 180 for stop in stops))
 
     def test_passenger_stop_mode_keeps_real_stops_and_required_stations(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1357,6 +1446,57 @@ class ExternalExclusionTests(unittest.TestCase):
         self.assertIn("wien", excluded)
         self.assertIn("zurich", excluded)
 
+
+class ExternalMembershipIntegrationTests(unittest.TestCase):
+    def test_external_membership_stage_uses_indexed_path(self) -> None:
+        source = {
+            "id": "fixture-provider",
+            "cities": "fixture-cities.json",
+            "identifierPrefix": "fixture:",
+            "namespace": "fixture:",
+            "staticIdentifierPrefix": "fixture:",
+            "staticStopIDPrefix": "fixture:",
+            "timezone": "UTC",
+        }
+        city = {
+            "id": "fixture-city",
+            "packageMode": "external",
+            "externalGTFSProvider": "fixture-provider",
+        }
+        connection = mock.Mock()
+        connection.execute.return_value = []
+        archive = mock.Mock()
+        with (
+            mock.patch.object(static_importer, "load_external_gtfs_sources", return_value=[source]),
+            mock.patch.object(static_importer, "validate_external_gtfs_source"),
+            mock.patch.object(static_importer, "load_external_cities", return_value=[city]),
+            mock.patch.object(
+                static_importer,
+                "authenticated_external_request",
+                return_value=("fixture.gtfs.zip", {}),
+            ),
+            mock.patch.object(static_importer, "load_gtfs_archive", return_value=archive),
+            mock.patch.object(static_importer, "agency_scoped_archive", return_value=archive),
+            mock.patch.object(static_importer, "populate_gtfs"),
+            mock.patch.object(static_importer, "resolve_canonical_stops"),
+            mock.patch.object(static_importer, "populate_provider_city_memberships", return_value={"fixture-city"}) as memberships,
+            mock.patch.object(static_importer, "populate_active_services"),
+            mock.patch.object(static_importer, "update_terminal_stops"),
+            mock.patch.object(static_importer, "timed_stage", wraps=static_importer.timed_stage) as timed,
+        ):
+            result = static_importer.add_external_gtfs(
+                connection,
+                Path("/tmp/fixture-stop-data"),
+                {"fixture-provider": "fixture.gtfs.zip"},
+                repository_root=Path("/tmp"),
+                sources_path=Path("/tmp/fixture-sources.json"),
+                dates=[date(2026, 8, 14)],
+            )
+
+        self.assertEqual(result, {"fixture-city"})
+        self.assertTrue(memberships.call_args.kwargs["indexed_ownership_lookup"])
+        stage_names = {(call.args[0], call.args[1]) for call in timed.call_args_list}
+        self.assertIn(("external", "provider-city-memberships"), stage_names)
 
 if __name__ == "__main__":
     unittest.main()
