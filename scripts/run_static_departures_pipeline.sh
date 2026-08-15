@@ -98,6 +98,15 @@ else:
 PY
 )
 IMPORT_ARGS+=("${EXTERNAL_GTFS_IMPORT_ARGS[@]}")
+
+# Reload the operator secret immediately before the importer so intermediate
+# environment setup cannot replace the credential inherited by the child.
+if [[ -f "$WMATA_ENV_FILE" ]]; then
+  set -a
+  source "$WMATA_ENV_FILE"
+  set +a
+fi
+: "${WMATA_API_KEY:?WMATA_API_KEY is required before static departures importer}"
 python3 -u "$REPO/scripts/import_static_departures_database.py" "${IMPORT_ARGS[@]}"
 echo "$LOG_PREFIX release=${RELEASE_ID:-legacy} stage=import duration=$((SECONDS - stage_started))s"
 
