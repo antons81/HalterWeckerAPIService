@@ -188,6 +188,9 @@ run_build_stop_packages() {
   else
     cmd+=(--austrian-gtfs-url "${AUSTRIAN_GTFS_URL:-}")
   fi
+  if [[ -n "${VBB_GTFS_URL:-}" ]]; then
+    cmd+=(--vbb-gtfs-url "$VBB_GTFS_URL")
+  fi
   if [ -n "$nl_url" ]; then
     cmd+=(--nl-gtfs-url "$nl_url")
   fi
