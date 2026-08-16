@@ -24,6 +24,7 @@ from external_gtfs import (  # noqa: E402
     build_external_route_index,
     build_external_stop_packages,
     build_external_trip_index,
+    _deduplicate_merged_stops,
     external_city_ids,
     load_external_cities,
     load_external_gtfs_sources,
@@ -68,6 +69,31 @@ def _gtfs_zip(
 
 
 class ExternalGTFSRegistryTests(unittest.TestCase):
+    def test_identical_merged_stop_ids_are_deduplicated(self) -> None:
+        stop = {
+            "id": "123",
+            "name": "Main",
+            "latitude": 40.0,
+            "longitude": -73.0,
+            "searchName": "main",
+            "stopCode": None,
+        }
+        result = _deduplicate_merged_stops(
+            [("subway", dict(stop)), ("bus", dict(stop))],
+            "new-york",
+        )
+        self.assertEqual(result, [stop])
+
+    def test_conflicting_merged_stop_ids_fail_with_sources(self) -> None:
+        with self.assertRaisesRegex(ValueError, "new-york/123.*subway.*bus"):
+            _deduplicate_merged_stops(
+                [
+                    ("subway", {"id": "123", "name": "Main", "latitude": 40.0, "longitude": -73.0}),
+                    ("bus", {"id": "123", "name": "Different", "latitude": 40.1, "longitude": -73.1}),
+                ],
+                "new-york",
+            )
+
     def test_wmata_external_city_uses_us_radar_city_id_and_timezone(self) -> None:
         city = load_external_cities(
             {"id": "wmata-bus", "cities": "config/wmata-cities.json"},

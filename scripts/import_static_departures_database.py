@@ -557,6 +557,13 @@ def validate(connection: sqlite3.Connection) -> None:
         raise ValueError("Static departures database contains no active services.")
 
 
+def stop_data_metadata(stop_data: Path) -> tuple[str, str]:
+    manifest = json.loads((stop_data / "manifest.json").read_text(encoding="utf-8"))
+    release_id = str(manifest.get("releaseID", "")).strip()
+    manifest_version = str(manifest.get("version", "")).strip()
+    return release_id, manifest_version
+
+
 def populate_city_aliases(
     connection: sqlite3.Connection,
     aliases: dict[str, str],
@@ -810,6 +817,7 @@ def main() -> None:
     if not args.add_external:
         next_path.parent.mkdir(parents=True, exist_ok=True)
         next_path.unlink(missing_ok=True)
+    stop_data_release_id, stop_data_manifest_version = stop_data_metadata(Path(args.stop_data))
     dates = service_window(DEFAULT_TIMEZONE, args.days)
 
     if args.add_external:
@@ -839,6 +847,8 @@ def main() -> None:
                 (
                     ("databaseVersion", version),
                     ("releaseID", args.release_id.strip()),
+                    ("stopDataReleaseID", stop_data_release_id),
+                    ("stopDataManifestVersion", stop_data_manifest_version),
                     ("generatedAt", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")),
                     ("validFrom", dates[0].isoformat()),
                     ("validThrough", dates[-1].isoformat()),
@@ -933,6 +943,8 @@ def main() -> None:
             connection.executemany("INSERT INTO metadata VALUES (?, ?)", (
                 ("schemaVersion", "1"), ("databaseVersion", version),
                 ("releaseID", args.release_id.strip()),
+                ("stopDataReleaseID", stop_data_release_id),
+                ("stopDataManifestVersion", stop_data_manifest_version),
                 ("generatedAt", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")),
                 ("validFrom", dates[0].isoformat()), ("validThrough", dates[-1].isoformat()),
                 ("timezone", DEFAULT_TIMEZONE),

@@ -28,6 +28,8 @@ def validate_release(release_dir: Path) -> None:
         problems.append("manifest.releaseID does not match release-metadata.releaseID")
     if metadata.get("stopManifestVersion") != manifest.get("version"):
         problems.append("stopManifestVersion does not match manifest.version")
+    if metadata.get("sourceArtifacts") != manifest.get("sourceArtifacts"):
+        problems.append("sourceArtifacts do not match between release metadata and manifest")
 
     database_path = release_dir / "departures.sqlite"
     try:
@@ -41,6 +43,10 @@ def validate_release(release_dir: Path) -> None:
     else:
         if database_metadata.get("releaseID") != release_id:
             problems.append("departures.sqlite releaseID does not match release metadata")
+        if database_metadata.get("stopDataReleaseID") != release_id:
+            problems.append("departures.sqlite stopDataReleaseID does not match release metadata")
+        if database_metadata.get("stopDataManifestVersion") != manifest.get("version"):
+            problems.append("departures.sqlite stopDataManifestVersion does not match manifest.version")
 
     if problems:
         raise ValueError("Release consistency validation failed: " + "; ".join(problems))

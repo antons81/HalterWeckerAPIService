@@ -93,6 +93,7 @@ prepare_runtime() {
   echo "[StopData] release=$RELEASE_ID preparing candidate runtime readiness"
   if ! READINESS_ONLY=1 \
     RELEASE_ID="$RELEASE_ID" \
+    EXTERNAL_GTFS_ARTIFACTS_JSON="$ARTIFACTS_JSON" \
     STATIC_DEPARTURES_CONTAINER_NAME="static-departures-api-$RELEASE_ID" \
     DEPARTURES_DATABASE="/data/releases/$RELEASE_ID/departures.sqlite" \
     STATIC_DATA_ROOT="/data/releases/$RELEASE_ID/stop-data" \
@@ -104,7 +105,7 @@ prepare_runtime() {
 
 activate_runtime() {
   echo "[StopData] release=$RELEASE_ID activating canonical runtime"
-  if ! READINESS_ONLY=1 RELEASE_ID="$RELEASE_ID" "$STATIC_DEPARTURES_PIPELINE"; then
+  if ! READINESS_ONLY=1 RELEASE_ID="$RELEASE_ID" EXTERNAL_GTFS_ARTIFACTS_JSON="$ARTIFACTS_JSON" "$STATIC_DEPARTURES_PIPELINE"; then
     echo "[StopData] ERROR: release=$RELEASE_ID canonical runtime readiness failed" >&2
     return 1
   fi
@@ -229,7 +230,7 @@ fi
 
 echo "[StopData] release=$RELEASE_ID stage=build duration=$(elapsed_seconds "$TOTAL_STARTED")"
 VALIDATION_STARTED=$SECONDS
-python3 - "$BUILD_DIR/manifest.json" "$RELEASE_ID" "$RELEASE_DIR/release-metadata.json" "$BUILD_FINGERPRINT" <<'PY'
+python3 - "$BUILD_DIR/manifest.json" "$RELEASE_ID" "$RELEASE_DIR/release-metadata.json" "$BUILD_FINGERPRINT" "$ARTIFACTS_JSON" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -238,12 +239,30 @@ manifest_path = Path(sys.argv[1])
 release_id = sys.argv[2]
 metadata_path = Path(sys.argv[3])
 build_fingerprint = sys.argv[4]
+artifacts_path = Path(sys.argv[5])
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 if not isinstance(manifest.get("cities"), list) or not manifest["cities"]:
     raise SystemExit("staged stop manifest has no cities")
 manifest["releaseID"] = release_id
+artifacts = json.loads(artifacts_path.read_text(encoding="utf-8"))
+source_artifacts = {}
+for group in ("sources", "external"):
+    for source_id, entry in (artifacts.get(group) or {}).items():
+        if not isinstance(entry, dict) or not entry.get("path"):
+            continue
+        if not isinstance(entry.get("sha256"), str) or not entry["sha256"]:
+            raise SystemExit(f"GTFS artifact provenance is missing for {source_id}")
+        if not isinstance(entry.get("size"), int) or entry["size"] <= 0:
+            raise SystemExit(f"GTFS artifact size provenance is missing for {source_id}")
+        source_artifacts[str(source_id)] = {
+            "sha256": entry["sha256"],
+            "size": entry.get("size"),
+        }
+if not source_artifacts:
+    raise SystemExit("No GTFS artifact provenance was produced for stop-data")
+manifest["sourceArtifacts"] = source_artifacts
 manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-metadata_path.write_text(json.dumps({"releaseID": release_id, "buildFingerprint": build_fingerprint, "stopManifestVersion": manifest.get("version")}, indent=2), encoding="utf-8")
+metadata_path.write_text(json.dumps({"releaseID": release_id, "buildFingerprint": build_fingerprint, "stopManifestVersion": manifest.get("version"), "sourceArtifacts": source_artifacts}, indent=2), encoding="utf-8")
 PY
 echo "[StopData] release=$RELEASE_ID stage=validation duration=$(elapsed_seconds "$VALIDATION_STARTED")"
 

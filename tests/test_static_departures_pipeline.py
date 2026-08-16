@@ -52,7 +52,7 @@ class StaticDeparturesPipelineTests(unittest.TestCase):
                     "WMATA_SECRET_FILE": str(wmata_file),
                     "NEXT_DATABASE_PATH": str(root / "departures-next.sqlite"),
                     "STOP_DATA_PATH": str(root / "stop-data"),
-                    "RELEASE_ID": "test-release",
+                    "RELEASE_ID": "",
                     "SKIP_ACTIVATION": "1",
                     "PATH": f"{mock_python.parent}:{environment['PATH']}",
                     "WMATA_API_KEY": "inherited-old-value",

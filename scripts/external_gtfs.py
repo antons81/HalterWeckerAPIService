@@ -534,6 +534,42 @@ def _duplicate_bin_count(public_stops: list[dict[str, object]]) -> int:
     return max(bins.values(), default=0)
 
 
+def _deduplicate_merged_stops(
+    records: list[tuple[str, dict[str, object]]],
+    city_id: str,
+) -> list[dict[str, object]]:
+    """Deduplicate equivalent native IDs and reject conflicting collisions."""
+    grouped: dict[str, list[tuple[str, dict[str, object]]]] = {}
+    for source_id, stop in records:
+        grouped.setdefault(str(stop["id"]), []).append((source_id, stop))
+
+    result: list[dict[str, object]] = []
+    for stop_id, candidates in grouped.items():
+        signatures = {
+            json.dumps(
+                {
+                    key: candidate.get(key)
+                    for key in ("id", "name", "latitude", "longitude", "searchName", "stopCode")
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for _, candidate in candidates
+        }
+        if len(signatures) > 1:
+            details = "; ".join(
+                f"provider={source_id} name={candidate.get('name')!r} "
+                f"lat={candidate.get('latitude')} lon={candidate.get('longitude')}"
+                for source_id, candidate in candidates
+            )
+            raise ValueError(
+                f"Conflicting external stop ID collision for {city_id}/{stop_id}: {details}"
+            )
+        result.append(candidates[0][1])
+    return result
+
+
 def _supplemental_stop_records(payload: object) -> list[dict[str, object]]:
     if (
         isinstance(payload, list)
@@ -1625,7 +1661,7 @@ def process_external_gtfs_sources(
 
     for city_id, records in namespaced_records.items():
         city = records[0]["city"]
-        merged_stops: list[dict[str, object]] = []
+        merged_stop_records: list[tuple[str, dict[str, object]]] = []
         merged_routes: dict[str, object] = {}
         merged_departures: dict[str, list[dict[str, object]]] = {}
         merged_platforms: dict[str, set[str]] = {}
@@ -1638,7 +1674,10 @@ def process_external_gtfs_sources(
             source_id = str(record["sourceID"])
             stop_path = source_output / "stops" / f"{city_id}.json"
             if stop_path.exists():
-                merged_stops.extend(json.loads(stop_path.read_text(encoding="utf-8")))
+                merged_stop_records.extend(
+                    (source_id, stop)
+                    for stop in json.loads(stop_path.read_text(encoding="utf-8"))
+                )
 
             route_path = source_output / "routes" / f"{city_id}.json"
             if route_path.exists():
@@ -1683,6 +1722,7 @@ def process_external_gtfs_sources(
                 f"Merged external city {city_id} has conflicting timezones: "
                 f"{sorted(timezones)}"
             )
+        merged_stops = _deduplicate_merged_stops(merged_stop_records, city_id)
         if not merged_stops or not merged_departures:
             raise ValueError(f"Merged external city {city_id} has incomplete assets.")
 

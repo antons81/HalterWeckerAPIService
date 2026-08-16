@@ -50,7 +50,7 @@ case \"${1:-}\" in
       shift
     done
     mkdir -p \"$(dirname \"$output\")\"
-    printf '{\"sources\":{\"germany\":{\"path\":\"/tmp/germany.zip\"},\"swiss\":{\"path\":\"/tmp/swiss.zip\"}},\"external\":{},\"nlFailure\":null}' > \"$output\"
+    printf '{\"sources\":{\"germany\":{\"path\":\"/tmp/germany.zip\",\"sha256\":\"germany\",\"size\":10},\"swiss\":{\"path\":\"/tmp/swiss.zip\",\"sha256\":\"swiss\",\"size\":10}},\"external\":{},\"nlFailure\":null}' > \"$output\"
     ;;
   *build_stop_packages.py)
     printf 'build\\n' >> "$BUILD_CALLS_LOG"

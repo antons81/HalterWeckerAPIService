@@ -48,6 +48,17 @@ if [[ "${READINESS_ONLY:-0}" == "1" ]]; then
   echo "$LOG_PREFIX release=${RELEASE_ID:-legacy} stage=readiness started"
 else
 
+if [[ -n "$RELEASE_ID" ]]; then
+  if [[ -z "${EXTERNAL_GTFS_ARTIFACTS_JSON:-}" ]]; then
+    echo "$LOG_PREFIX ERROR: release-scoped import requires EXTERNAL_GTFS_ARTIFACTS_JSON" >&2
+    exit 1
+  fi
+  python3 "$REPO/scripts/validate_stop_data_provenance.py" \
+    --stop-data "$STOP_DATA_PATH" \
+    --artifacts "$EXTERNAL_GTFS_ARTIFACTS_JSON" \
+    --release-id "$RELEASE_ID"
+fi
+
 if [[ -z "$AUSTRIAN_GTFS_PATH" && -d "$AUSTRIAN_GTFS_DIR" && ! -f "$AUSTRIAN_GTFS_DIR/.env" ]]; then
   while IFS= read -r candidate; do
     AUSTRIAN_GTFS_PATH="$candidate"

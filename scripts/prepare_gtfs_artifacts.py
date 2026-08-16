@@ -18,6 +18,26 @@ from external_gtfs import (
 from gtfs_source_cache import DEFAULT_CACHE_ROOT, ArtifactResult, GTFSArtifactCache
 
 
+def artifact_payload(result: ArtifactResult) -> dict[str, object]:
+    state = result.state or {}
+    digest = state.get("sha256")
+    size = state.get("size")
+    if not isinstance(digest, str) or not digest:
+        raise ValueError(
+            f"GTFS artifact {result.source_id} has no validated SHA-256 provenance."
+        )
+    if not isinstance(size, int) or size <= 0:
+        raise ValueError(
+            f"GTFS artifact {result.source_id} has no validated size provenance."
+        )
+    return {
+        "path": str(result.path),
+        "status": result.status,
+        "sha256": digest,
+        "size": size,
+    }
+
+
 def resolve_one(
     cache: GTFSArtifactCache,
     source_id: str,
@@ -113,12 +133,12 @@ def main() -> None:
         ("swiss", args.swiss_gtfs_url, True),
     ):
         artifact = resolve_one(cache, source_id, url, allow_stale=allow_stale)
-        result["sources"][source_id] = {"path": str(artifact.path), "status": artifact.status}
+        result["sources"][source_id] = artifact_payload(artifact)
 
     if args.nl_gtfs_url.strip():
         try:
             artifact = resolve_one(cache, "netherlands", args.nl_gtfs_url, allow_stale=True)
-            result["sources"]["netherlands"] = {"path": str(artifact.path), "status": artifact.status}
+            result["sources"]["netherlands"] = artifact_payload(artifact)
         except Exception as error:
             result["nlFailure"] = str(error)
             result["sources"]["netherlands"] = {"path": "", "status": "failed", "reason": str(error)}
@@ -162,9 +182,7 @@ def main() -> None:
                 f"[GTFSCache] source={source_id} stage=resolve "
                 "status=preserved-stale reason=authentication unavailable"
             )
-            result["external"][source_id] = {
-                "path": str(artifact.path),
-                "status": "preserved-stale",
+            result["external"][source_id] = artifact_payload(artifact) | {
                 "reason": "authentication unavailable",
             }
             continue
@@ -178,7 +196,7 @@ def main() -> None:
             state_url=url,
             metadata_probe=preflight == "head",
         )
-        result["external"][source_id] = {"path": str(artifact.path), "status": artifact.status}
+        result["external"][source_id] = artifact_payload(artifact)
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

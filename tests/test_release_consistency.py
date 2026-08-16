@@ -16,7 +16,11 @@ class ReleaseConsistencyTests(unittest.TestCase):
         stop_data = release / "stop-data"
         stop_data.mkdir(parents=True)
         (stop_data / "manifest.json").write_text(
-            json.dumps({"version": manifest_version, "releaseID": "release-1"}),
+            json.dumps({
+                "version": manifest_version,
+                "releaseID": "release-1",
+                "sourceArtifacts": {"germany": {"sha256": "digest", "size": 10}},
+            }),
             encoding="utf-8",
         )
         (release / "release-metadata.json").write_text(
@@ -24,12 +28,20 @@ class ReleaseConsistencyTests(unittest.TestCase):
                 "releaseID": "release-1",
                 "buildFingerprint": "fingerprint",
                 "stopManifestVersion": manifest_version,
+                "sourceArtifacts": {"germany": {"sha256": "digest", "size": 10}},
             }),
             encoding="utf-8",
         )
         database = sqlite3.connect(release / "departures.sqlite")
         database.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        database.execute("INSERT INTO metadata VALUES ('releaseID', 'release-1')")
+        database.executemany(
+            "INSERT INTO metadata VALUES (?, ?)",
+            [
+                ("releaseID", "release-1"),
+                ("stopDataReleaseID", "release-1"),
+                ("stopDataManifestVersion", manifest_version),
+            ],
+        )
         database.commit()
         database.close()
 
