@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import time
@@ -18,10 +19,31 @@ from external_gtfs import (
 from gtfs_source_cache import DEFAULT_CACHE_ROOT, ArtifactResult, GTFSArtifactCache
 
 
+def directory_artifact_provenance(path: Path) -> tuple[str, int]:
+    digest_builder = hashlib.sha256()
+    total_size = 0
+    files = sorted(item for item in path.rglob("*") if item.is_file())
+    if not files:
+        raise ValueError(f"GTFS directory artifact is empty: {path}")
+    for file_path in files:
+        relative_path = file_path.relative_to(path).as_posix().encode("utf-8")
+        digest_builder.update(len(relative_path).to_bytes(8, "big"))
+        digest_builder.update(relative_path)
+        file_size = file_path.stat().st_size
+        total_size += file_size
+        digest_builder.update(file_size.to_bytes(8, "big"))
+        with file_path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest_builder.update(chunk)
+    return digest_builder.hexdigest(), total_size
+
+
 def artifact_payload(result: ArtifactResult) -> dict[str, object]:
     state = result.state or {}
     digest = state.get("sha256")
     size = state.get("size")
+    if result.path.is_dir():
+        digest, size = directory_artifact_provenance(result.path)
     if not isinstance(digest, str) or not digest:
         raise ValueError(
             f"GTFS artifact {result.source_id} has no validated SHA-256 provenance."
