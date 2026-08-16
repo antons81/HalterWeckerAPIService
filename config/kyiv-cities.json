@@ -10,6 +10,7 @@
     "radiusMeters": 55000,
     "packageMode": "external",
     "externalGTFSProvider": "kyiv",
+    "catalogOnly": true,
     "staticDepartures": true,
     "transitRadar": {
       "adapter": "kyiv",

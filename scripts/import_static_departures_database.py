@@ -202,6 +202,7 @@ def populate_provider_city_memberships(
     included_city_ids: set[str],
     stop_id_prefix_by_provider: dict[str, str] | None = None,
     indexed_ownership_lookup: bool = False,
+    catalog_only_city_ids: set[str] | None = None,
 ) -> set[str]:
     """Map package memberships to the providers that own their GTFS stop IDs."""
     manifest = json.loads((stop_data / "manifest.json").read_text(encoding="utf-8"))
@@ -220,6 +221,7 @@ def populate_provider_city_memberships(
             stop_data,
             included_city_ids,
             stop_id_prefix_by_provider,
+            catalog_only_city_ids or set(),
         )
 
     city_ids: set[str] = set()
@@ -317,6 +319,7 @@ def _populate_provider_city_memberships_indexed(
     stop_data: Path,
     included_city_ids: set[str],
     stop_id_prefix_by_provider: dict[str, str] | None,
+    catalog_only_city_ids: set[str],
 ) -> set[str]:
     """Resolve scoped package ownership through one indexed TEMP set."""
     manifest = json.loads((stop_data / "manifest.json").read_text(encoding="utf-8"))
@@ -324,7 +327,7 @@ def _populate_provider_city_memberships_indexed(
     if not isinstance(cities, list):
         raise ValueError("Stop manifest must contain a cities array.")
 
-    city_packages: list[tuple[str, list[dict[str, object]], dict[str, str]]] = []
+    city_packages: list[tuple[str, list[dict[str, object]], dict[str, str], bool]] = []
     candidate_stop_ids: set[str] = set()
     for city in cities:
         if not isinstance(city, dict) or not isinstance(city.get("id"), str):
@@ -343,7 +346,8 @@ def _populate_provider_city_memberships_indexed(
         ):
             prefix_by_provider.setdefault(str(provider_id), str(prefix))
         typed_package = [stop for stop in package if isinstance(stop, dict)]
-        city_packages.append((city_id, typed_package, prefix_by_provider))
+        catalog_only = city_id in catalog_only_city_ids or city.get("catalogOnly") is True
+        city_packages.append((city_id, typed_package, prefix_by_provider, catalog_only))
         for stop in typed_package:
             if not stop.get("id"):
                 continue
@@ -403,7 +407,7 @@ def _populate_provider_city_memberships_indexed(
         )
 
     city_ids: set[str] = set()
-    for city_id, package, prefix_by_provider in city_packages:
+    for city_id, package, prefix_by_provider, catalog_only in city_packages:
         package_stop_ids: set[str] = set()
         owned_ids: dict[str, set[str]] = {}
         for stop in package:
@@ -433,6 +437,8 @@ def _populate_provider_city_memberships_indexed(
             if preferred_owners:
                 owners = preferred_owners
             if not owners:
+                if catalog_only:
+                    continue
                 catalog_provider = _supplemental_stop_provider(
                     connection,
                     city_id,
@@ -595,6 +601,7 @@ def add_external_gtfs(
         raise ValueError(f"Unknown external GTFS sources: {', '.join(unknown)}")
 
     imported_city_ids: set[str] = set()
+    catalog_only_city_ids: set[str] = set()
     source_stop_id_prefixes = {
         source_id: str(source.get("staticStopIDPrefix", (
             str(source.get("namespace", "")).strip()
@@ -607,6 +614,11 @@ def add_external_gtfs(
         source = sources_by_id[source_id]
         validate_external_gtfs_source(source, repository_root)
         cities = load_external_cities(source, repository_root)
+        catalog_only_city_ids.update(
+            str(city["id"])
+            for city in cities
+            if city.get("catalogOnly") is True
+        )
         request_url, headers = authenticated_external_request(
             source_id,
             url_by_provider[source_id],
@@ -663,6 +675,7 @@ def add_external_gtfs(
                     included_city_ids=imported_city_ids,
                     stop_id_prefix_by_provider=source_stop_id_prefixes,
                     indexed_ownership_lookup=True,
+                    catalog_only_city_ids=catalog_only_city_ids,
                 ),
             )
         else:
@@ -674,6 +687,7 @@ def add_external_gtfs(
                     included_city_ids=imported_city_ids,
                     stop_id_prefix_by_provider=source_stop_id_prefixes,
                     indexed_ownership_lookup=True,
+                    catalog_only_city_ids=catalog_only_city_ids,
                 ),
             )
     provider_scope = tuple(url_by_provider) if scoped else None

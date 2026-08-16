@@ -793,6 +793,7 @@ def build_external_stop_packages(
             "aliases": city.get("aliases", []),
             "stopCount": len(public_entries),
             "url": f"stops/{filename}",
+            **({"catalogOnly": True} if city.get("catalogOnly") is True else {}),
         })
     return manifest, package_stops
 

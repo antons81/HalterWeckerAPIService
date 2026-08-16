@@ -420,6 +420,71 @@ class ProviderStopIdentityTests(unittest.TestCase):
             self.assertEqual(database.board("kyiv", catalog_stop_id, 10), [])
             connection.close()
 
+    def test_indexed_catalog_only_kyiv_package_stop_keeps_city_membership(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            connection = connect(root / "departures.sqlite")
+            stop_data = root / "stop-data"
+            (stop_data / "stops").mkdir(parents=True)
+            (stop_data / "manifest.json").write_text(
+                json.dumps({"cities": [{"id": "kyiv", "url": "stops/kyiv.json"}]}),
+                encoding="utf-8",
+            )
+            (stop_data / "stops" / "kyiv.json").write_text(
+                json.dumps([{"id": "2_10363", "name": "вул. Північна"}]),
+                encoding="utf-8",
+            )
+            register_city_mode(
+                connection,
+                "kyiv",
+                "kyiv",
+                "canonical",
+                "Europe/Kyiv",
+                "",
+                "kyiv:",
+            )
+
+            imported = populate_provider_city_memberships(
+                connection,
+                stop_data,
+                {"kyiv"},
+                indexed_ownership_lookup=True,
+                catalog_only_city_ids={"kyiv"},
+            )
+
+            self.assertEqual(imported, {"kyiv"})
+            self.assertEqual(
+                connection.execute(
+                    "SELECT city_id, stop_id FROM city_stops"
+                ).fetchall(),
+                [("kyiv", "2_10363")],
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM provider_city_stops").fetchone()[0],
+                0,
+            )
+            connection.close()
+
+            ordinary_stop_data = root / "ordinary-stop-data"
+            (ordinary_stop_data / "stops").mkdir(parents=True)
+            (ordinary_stop_data / "manifest.json").write_text(
+                json.dumps({"cities": [{"id": "ordinary-city", "url": "stops/ordinary-city.json"}]}),
+                encoding="utf-8",
+            )
+            (ordinary_stop_data / "stops" / "ordinary-city.json").write_text(
+                json.dumps([{"id": "unresolved-stop"}]),
+                encoding="utf-8",
+            )
+            ordinary_connection = connect(root / "ordinary.sqlite")
+            with self.assertRaisesRegex(ValueError, "ordinary-city/unresolved-stop"):
+                populate_provider_city_memberships(
+                    ordinary_connection,
+                    ordinary_stop_data,
+                    {"ordinary-city"},
+                    indexed_ownership_lookup=True,
+                )
+            ordinary_connection.close()
+
     def test_indexed_membership_path_matches_legacy_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
