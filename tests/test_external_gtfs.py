@@ -33,6 +33,7 @@ from external_gtfs import (  # noqa: E402
     validate_external_stop_packages,
     validate_external_gtfs_source,
 )
+from external_staging import ExternalMergeStage, iter_departure_payload  # noqa: E402
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -69,6 +70,55 @@ def _gtfs_zip(
 
 
 class ExternalGTFSRegistryTests(unittest.TestCase):
+    def test_streaming_merge_stages_large_departure_json_on_disk(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            stops = [
+                {"id": f"stop-{index}", "name": "Main", "latitude": 1.0, "longitude": 2.0, "searchName": "main"}
+                for index in range(1200)
+            ]
+            (source / "stops.json").write_text(json.dumps(stops), encoding="utf-8")
+            (source / "routes.json").write_text(
+                json.dumps({"route-1": {"short_name": "1"}}), encoding="utf-8"
+            )
+            (source / "departures.json").write_text(
+                json.dumps({
+                    "generatedAt": "2026-08-16T00:00:00Z",
+                    "timezone": "UTC",
+                    "stops": {
+                        f"stop-{index}": [
+                            {"t": f"trip-{index}", "r": "route-1", "h": "Terminal", "d": "0", "p": "08:00:00", "q": "1"}
+                        ]
+                        for index in range(1200)
+                    },
+                    "platforms": {},
+                }),
+                encoding="utf-8",
+            )
+            (source / "trips.json").write_text(
+                json.dumps({f"trip-{index}": {"r": "route-1"} for index in range(1200)}),
+                encoding="utf-8",
+            )
+            output = root / "output"
+            stage = ExternalMergeStage()
+            try:
+                stage.add_stops(source / "stops.json", "source-a")
+                stage.add_object_file(source / "routes.json", "routes", "source-a")
+                stage.add_departures(source / "departures.json")
+                stage.add_object_file(source / "trips.json", "trips", "source-a")
+                stage.write_outputs(output, "city")
+            finally:
+                stage.close()
+
+            payload = json.loads((output / "departures" / "city.json").read_text())
+            self.assertEqual(len(payload["stops"]), 1200)
+            self.assertEqual(
+                sum(1 for kind, _key, _value in iter_departure_payload(output / "departures" / "city.json") if kind == "stop"),
+                1200,
+            )
+
     def test_identical_merged_stop_ids_are_deduplicated(self) -> None:
         stop = {
             "id": "123",

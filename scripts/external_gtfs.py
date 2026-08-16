@@ -6,7 +6,9 @@ from __future__ import annotations
 import json
 import math
 import os
+import sqlite3
 import shutil
+import tempfile
 import time
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -14,6 +16,11 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
+
+try:
+    from .external_staging import ExternalDepartureStage, ExternalMergeStage, iter_departure_payload, iter_json_array, iter_json_object
+except ImportError:
+    from external_staging import ExternalDepartureStage, ExternalMergeStage, iter_departure_payload, iter_json_array, iter_json_object
 
 try:
     from .gtfs_agency import agency_scoped_archive
@@ -1388,6 +1395,63 @@ def build_external_departure_index(
         )
 
 
+def build_external_departure_index_bounded(
+    archive: zipfile.ZipFile,
+    cities: list[dict[str, object]],
+    output: Path,
+    timezone_name: str,
+    namespace: str = "",
+    departure_window_days: int = 3,
+) -> None:
+    """Build departure JSON through a disk-backed SQLite staging database."""
+    if not cities:
+        return
+    zone = ZoneInfo(timezone_name)
+    today = datetime.now(zone).date()
+    if departure_window_days < 1:
+        raise ValueError("departure_window_days must be positive")
+    offsets = (-1, 0, 1) if departure_window_days <= 3 else range(departure_window_days)
+    service_dates = [
+        (today + timedelta(days=offset)).strftime("%Y%m%d")
+        for offset in offsets
+    ]
+    active_by_service: dict[str, list[str]] = {}
+    for service_id, service in _service_calendar(archive).items():
+        active_dates = [
+            service_date
+            for service_date in service_dates
+            if _service_active(service, service_date)
+        ]
+        if active_dates:
+            active_by_service[service_id] = active_dates
+
+    packages_directory = output / "stops"
+    city_stop_ids: dict[str, set[str]] = {}
+    public_stop_ids: set[str] = set()
+    for city in cities:
+        city_id = str(city["id"])
+        stop_path = packages_directory / f"{city_id}.json"
+        ids = {
+            str(item["id"])
+            for item in iter_json_array(stop_path)
+            if isinstance(item, dict) and item.get("id")
+        }
+        city_stop_ids[city_id] = ids
+        public_stop_ids.update(
+            raw_id for raw_id in (_raw_id(stop_id, namespace) for stop_id in ids) if raw_id
+        )
+
+    stage = ExternalDepartureStage()
+    try:
+        stage.populate(archive, active_by_service, public_stop_ids)
+        stage.write_outputs(output, cities, city_stop_ids, namespace, timezone_name)
+    finally:
+        stage.close()
+
+
+build_external_departure_index = build_external_departure_index_bounded
+
+
 def build_external_lines(
     archive: zipfile.ZipFile,
     package_stops_by_city_id: dict[str, list[dict[str, object]]],
@@ -1433,6 +1497,277 @@ def build_external_lines(
         }
         for stop_id, route_lines in lines.items()
     }
+
+
+def build_external_lines_bounded(
+    archive: zipfile.ZipFile,
+    package_stops_by_city_id: dict[str, list[dict[str, object]]],
+    namespace: str = "",
+) -> dict[str, dict[str, dict[str, object]]]:
+    """Build line membership through SQLite instead of trip-sized dictionaries."""
+    included_stop_ids = {
+        raw_id
+        for stops in package_stops_by_city_id.values()
+        for stop in stops
+        for raw_id in [_raw_id(str(stop["id"]), namespace)]
+        if raw_id
+    }
+    if not included_stop_ids:
+        return {}
+    temporary = tempfile.TemporaryDirectory(prefix="haltewecker-external-lines-")
+    connection = sqlite3.connect(Path(temporary.name) / "lines.sqlite")
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE routes(route_id TEXT PRIMARY KEY, short_name TEXT, long_name TEXT, route_type TEXT, agency_id TEXT) WITHOUT ROWID;
+            CREATE TABLE trip_routes(trip_id TEXT PRIMARY KEY, route_id TEXT) WITHOUT ROWID;
+            CREATE TABLE feed_stops(stop_id TEXT PRIMARY KEY, parent_station TEXT) WITHOUT ROWID;
+            CREATE TABLE resolved(stop_id TEXT PRIMARY KEY, public_stop_id TEXT) WITHOUT ROWID;
+            CREATE TABLE stop_routes(stop_id TEXT, route_id TEXT, PRIMARY KEY(stop_id, route_id)) WITHOUT ROWID;
+            CREATE TABLE raw_stop_times(trip_id TEXT NOT NULL, stop_id TEXT NOT NULL);
+            """
+        )
+        connection.executescript(
+            """
+            CREATE INDEX raw_stop_times_trip_stop ON raw_stop_times(trip_id, stop_id);
+            CREATE INDEX raw_stop_times_stop_trip ON raw_stop_times(stop_id, trip_id);
+            """
+        )
+        connection.executemany(
+            "INSERT INTO routes VALUES (?, ?, ?, ?, ?)",
+            (
+                (
+                    str(row.get("route_id", "")).strip(),
+                    str(row.get("route_short_name", "")).strip(),
+                    str(row.get("route_long_name", "")).strip(),
+                    str(row.get("route_type", "3")).strip(),
+                    str(row.get("agency_id", "")).strip(),
+                )
+                for row in iter_table(archive, "routes.txt")
+                if str(row.get("route_id", "")).strip()
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO trip_routes VALUES (?, ?)",
+            (
+                (str(row.get("trip_id", "")).strip(), str(row.get("route_id", "")).strip())
+                for row in iter_table(archive, "trips.txt")
+                if str(row.get("trip_id", "")).strip() and str(row.get("route_id", "")).strip()
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO feed_stops VALUES (?, ?)",
+            (
+                (str(row.get("stop_id", "")).strip(), str(row.get("parent_station", "") or "").strip())
+                for row in iter_table(archive, "stops.txt")
+                if str(row.get("stop_id", "")).strip()
+            ),
+        )
+        for (stop_id,) in connection.execute("SELECT stop_id FROM feed_stops"):
+            current = stop_id
+            seen: set[str] = set()
+            resolved = None
+            while current and current not in seen:
+                if current in included_stop_ids:
+                    resolved = current
+                    break
+                seen.add(current)
+                row = connection.execute("SELECT parent_station FROM feed_stops WHERE stop_id=?", (current,)).fetchone()
+                current = str(row[0]).strip() if row else ""
+            connection.execute("INSERT OR IGNORE INTO resolved VALUES (?, ?)", (stop_id, resolved))
+        connection.executemany(
+            "INSERT INTO raw_stop_times VALUES (?, ?)",
+            (
+                (str(row.get("trip_id", "")).strip(), str(row.get("stop_id", "")).strip())
+                for row in iter_table(archive, "stop_times.txt")
+                if str(row.get("trip_id", "")).strip() and str(row.get("stop_id", "")).strip()
+            ),
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO stop_routes(stop_id, route_id)
+            SELECT DISTINCT resolved.public_stop_id, trip_routes.route_id
+            FROM raw_stop_times
+            JOIN trip_routes ON trip_routes.trip_id=raw_stop_times.trip_id
+            JOIN resolved ON resolved.stop_id=raw_stop_times.stop_id
+            WHERE resolved.public_stop_id IS NOT NULL
+            """
+        )
+        connection.commit()
+        print(f"[ExternalGTFS] lines stage SQL materialization complete", flush=True)
+
+        result: dict[str, dict[str, dict[str, object]]] = {}
+        started = time.perf_counter()
+        for city_id, stops in package_stops_by_city_id.items():
+            for stop in stops:
+                stop_id = str(stop["id"])
+                raw_stop_id = _raw_id(stop_id, namespace)
+                stop_result: dict[str, dict[str, object]] = {}
+                for route_id, short_name, long_name, route_type, agency_id in connection.execute(
+                    """
+                    SELECT stop_routes.route_id, routes.short_name, routes.long_name,
+                           routes.route_type, routes.agency_id
+                    FROM stop_routes
+                    JOIN routes ON routes.route_id=stop_routes.route_id
+                    WHERE stop_routes.stop_id=?
+                    ORDER BY stop_routes.route_id
+                    """,
+                    (raw_stop_id,),
+                ):
+                    names = [value for value in (short_name, long_name) if value]
+                    if not names:
+                        continue
+                    line: dict[str, object] = {
+                        "routeID": _published_id(route_id, namespace),
+                        "agencyID": agency_id or None,
+                        "names": names,
+                    }
+                    if str(route_type).isdigit():
+                        line["routeType"] = int(route_type)
+                    stop_result[_published_id(route_id, namespace)] = line
+                if stop_result:
+                    result[stop_id] = stop_result
+        print(f"[ExternalGTFS] lines stage output assembly duration={time.perf_counter() - started:.2f}s", flush=True)
+        return result
+    finally:
+        connection.close()
+        temporary.cleanup()
+
+
+build_external_lines = build_external_lines_bounded
+
+
+def build_external_trip_index_bounded(
+    archive: zipfile.ZipFile,
+    cities: list[dict[str, object]],
+    output: Path,
+    namespace: str = "",
+) -> None:
+    """Write trip indexes from SQLite cursors without a trip-sized dictionary."""
+    temporary = tempfile.TemporaryDirectory(prefix="haltewecker-external-trips-")
+    connection = sqlite3.connect(Path(temporary.name) / "trips.sqlite")
+    try:
+        connection.executescript(
+            "CREATE TABLE trips(trip_id TEXT PRIMARY KEY, route_id TEXT NOT NULL) WITHOUT ROWID;"
+        )
+        connection.executemany(
+            "INSERT OR IGNORE INTO trips VALUES (?, ?)",
+            (
+                (str(row.get("trip_id", "")).strip(), str(row.get("route_id", "")).strip())
+                for row in iter_table(archive, "trips.txt")
+                if str(row.get("trip_id", "")).strip() and str(row.get("route_id", "")).strip()
+            ),
+        )
+        connection.commit()
+        trips_directory = output / "trips"
+        trips_directory.mkdir(parents=True, exist_ok=True)
+        for city in cities:
+            city_id = str(city["id"])
+            route_path = output / "routes" / f"{city_id}.json"
+            route_ids = {
+                str(route_id)[len(namespace):] if namespace and str(route_id).startswith(namespace) else str(route_id)
+                for route_id, _payload in iter_json_object(route_path)
+            } if route_path.exists() else set()
+            if not route_ids:
+                continue
+            headsigns: dict[str, str] = {}
+            departures_path = output / "departures" / f"{city_id}.json"
+            if departures_path.exists():
+                for kind, _stop_id, value in iter_departure_payload(departures_path):
+                    if kind != "stop" or not isinstance(value, list):
+                        continue
+                    for item in value:
+                        if not isinstance(item, dict):
+                            continue
+                        trip_id = str(item.get("t", ""))
+                        raw_trip_id = trip_id[len(namespace):] if namespace and trip_id.startswith(namespace) else trip_id
+                        headsign = str(item.get("h", "") or "")
+                        if raw_trip_id and headsign:
+                            headsigns.setdefault(raw_trip_id, headsign)
+            path = trips_directory / f"{city_id}.json"
+            placeholders = ",".join("?" for _ in route_ids)
+            with path.open("w", encoding="utf-8") as stream:
+                stream.write("{")
+                first = True
+                for trip_id, route_id in connection.execute(
+                    f"SELECT trip_id, route_id FROM trips WHERE route_id IN ({placeholders}) ORDER BY trip_id",
+                    tuple(route_ids),
+                ):
+                    entry: dict[str, str] = {"r": _published_id(route_id, namespace)}
+                    if trip_id in headsigns:
+                        entry["h"] = headsigns[trip_id]
+                    if not first:
+                        stream.write(",")
+                    stream.write(json.dumps(_published_id(trip_id, namespace), ensure_ascii=False))
+                    stream.write(":")
+                    stream.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")))
+                    first = False
+                stream.write("}")
+            print(f"[ExternalGTFS] trip index {city_id}: completed from SQLite staging")
+    finally:
+        connection.close()
+        temporary.cleanup()
+
+
+build_external_trip_index = build_external_trip_index_bounded
+
+
+def _merge_namespaced_city_records_bounded(
+    city_id: str,
+    records: list[dict[str, object]],
+    output: Path,
+    manifest_entries: list[dict[str, object]],
+    package_stops_by_city_id: dict[str, list[dict[str, object]]],
+) -> None:
+    """Merge namespaced assets via SQLite and stream every output JSON."""
+    stage = ExternalMergeStage()
+    try:
+        for record in records:
+            source_output = Path(record["output"])
+            source_id = str(record["sourceID"])
+            stop_path = source_output / "stops" / f"{city_id}.json"
+            route_path = source_output / "routes" / f"{city_id}.json"
+            departure_path = source_output / "departures" / f"{city_id}.json"
+            trip_path = source_output / "trips" / f"{city_id}.json"
+            if stop_path.exists():
+                stage.add_stops(stop_path, source_id)
+            if route_path.exists():
+                stage.add_object_file(route_path, "routes", source_id)
+            if departure_path.exists():
+                stage.add_departures(departure_path)
+            if trip_path.exists():
+                stage.add_object_file(trip_path, "trips", source_id)
+
+        if len(stage.timezones) > 1:
+            raise ValueError(
+                f"Merged external city {city_id} has conflicting timezones: "
+                f"{sorted(stage.timezones)}"
+            )
+        departure_count = stage.connection.execute(
+            "SELECT count(*) FROM departures"
+        ).fetchone()[0]
+        if not departure_count:
+            raise ValueError(f"Merged external city {city_id} has incomplete assets.")
+
+        stop_count, _metadata = stage.write_outputs(output, city_id)
+        merged_stops = [
+            item for item in iter_json_array(output / "stops" / f"{city_id}.json")
+            if isinstance(item, dict)
+        ]
+        package_stops_by_city_id[city_id] = merged_stops
+        source_ids = ", ".join(str(record["sourceID"]) for record in records)
+        city = records[0]["city"]
+        manifest_entries.append({
+            "id": city_id,
+            "name": city["name"],
+            "aliases": city.get("aliases", []),
+            "stopCount": stop_count,
+            "url": f"stops/{city_id}.json",
+            "country": str(records[0]["source"]["country"]),
+            "_source": f"External GTFS namespaces: {source_ids}",
+        })
+    finally:
+        stage.close()
 
 
 def process_external_gtfs_sources(
@@ -1660,6 +1995,15 @@ def process_external_gtfs_sources(
         )
 
     for city_id, records in namespaced_records.items():
+        _merge_namespaced_city_records_bounded(
+            city_id,
+            records,
+            output,
+            manifest_entries,
+            package_stops_by_city_id,
+        )
+        continue
+
         city = records[0]["city"]
         merged_stop_records: list[tuple[str, dict[str, object]]] = []
         merged_routes: dict[str, object] = {}
