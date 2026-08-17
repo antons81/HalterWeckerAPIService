@@ -30,6 +30,13 @@ if [[ -f "$WMATA_ENV_FILE" ]]; then
   set +a
 fi
 
+API_511_ENV_FILE="${API_511_ENV_FILE:-/srv/haltewecker/secrets/usa_511/.env}"
+if [[ -f "$API_511_ENV_FILE" ]]; then
+  set -a
+  source "$API_511_ENV_FILE"
+  set +a
+fi
+
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 SUDO_BIN="${SUDO_BIN:-sudo}"
 STATIC_DEPARTURES_SERVICE="${STATIC_DEPARTURES_SERVICE:-haltewecker-static-departures.service}"
@@ -122,12 +129,14 @@ cd "$REPO"
 TOTAL_STARTED=$SECONDS
 echo "[StopData] release=$RELEASE_ID stage=build started"
 
+mkdir -p "$BUILD_DIR" "$RELEASES"
 if [[ -f "$MVO_ENV_FILE" ]]; then
   echo "[StopData] refreshing Austrian MVO GTFS sources"
   python3 "$REPO/scripts/download_austrian_gtfs.py" \
     --registry "$REPO/config/austrian-sources.json" \
     --env-file "$MVO_ENV_FILE" \
-    --output "$AUSTRIAN_DATA_ROOT"
+    --output "$AUSTRIAN_DATA_ROOT" \
+    --output-json "$RELEASE_DIR/austrian-artifacts.json"
 fi
 
 EXTERNAL_URL_OVERRIDES=()
@@ -146,6 +155,14 @@ if [[ ${#EXTERNAL_URL_OVERRIDES[@]} -gt 0 ]]; then
 fi
 PREPARE_ARGS+=(--output "$ARTIFACTS_JSON")
 python3 "$REPO/scripts/prepare_gtfs_artifacts.py" "${PREPARE_ARGS[@]}"
+VBB_INPUT_URL="${VBB_GTFS_URL:-https://unternehmen.vbb.de/fileadmin/user_upload/VBB/Dokumente/API-Datensaetze/gtfs-mastscharf/GTFS.zip}"
+RNV_INPUT_URL="${RNV_GTFS_URL:-https://gtfs-sandbox-dds.rnv-online.de/latest/gtfs.zip}"
+CUSTOM_ARTIFACTS_JSON="$RELEASE_DIR/custom-gtfs-artifacts.json"
+python3 "$REPO/scripts/prepare_custom_gtfs_artifacts.py" \
+  --cache-root "${GTFS_CACHE_ROOT:-/srv/haltewecker/cache/gtfs}" \
+  --vbb-url "$VBB_INPUT_URL" \
+  --rnv-url "$RNV_INPUT_URL" \
+  --output "$CUSTOM_ARTIFACTS_JSON"
 BUILD_FINGERPRINT="$(python3 "$REPO/scripts/build_fingerprint.py" --repository "$REPO")"
 echo "[StopData] release=$RELEASE_ID buildFingerprint=$BUILD_FINGERPRINT"
 
@@ -163,7 +180,8 @@ print(sources["swiss"]["path"])
 print(sources.get("netherlands", {}).get("path", ""))
 print(payload.get("nlFailure") or "")
 for source_id, entry in sorted(payload.get("external", {}).items()):
-    print(f"external:{source_id}={entry['path']}")
+    if isinstance(entry, dict) and entry.get("path"):
+        print(f"external:{source_id}={entry['path']}")
 PY
 )
 GTFS_URL="${ARTIFACT_VALUES[0]}"
@@ -174,6 +192,21 @@ EXTERNAL_GTFS_ARGS=()
 for value in "${ARTIFACT_VALUES[@]:4}"; do
   EXTERNAL_GTFS_ARGS+=(--external-gtfs-url "${value#external:}")
 done
+
+CUSTOM_ARTIFACT_VALUES=()
+while IFS= read -r artifact_value; do
+  CUSTOM_ARTIFACT_VALUES+=("$artifact_value")
+done < <(python3 - "$CUSTOM_ARTIFACTS_JSON" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+for source_id in ("vbb", "rnv"):
+    print(payload["sources"][source_id]["path"])
+PY
+)
+VBB_GTFS_ARTIFACT="${CUSTOM_ARTIFACT_VALUES[0]}"
+RNV_GTFS_ARTIFACT="${CUSTOM_ARTIFACT_VALUES[1]}"
 
 mkdir -p "$BUILD_DIR" "$RELEASES"
 
@@ -194,9 +227,8 @@ run_build_stop_packages() {
   else
     cmd+=(--austrian-gtfs-url "${AUSTRIAN_GTFS_URL:-}")
   fi
-  if [[ -n "${VBB_GTFS_URL:-}" ]]; then
-    cmd+=(--vbb-gtfs-url "$VBB_GTFS_URL")
-  fi
+  cmd+=(--vbb-gtfs-url "$VBB_GTFS_ARTIFACT")
+  cmd+=(--rnv-gtfs-url "$RNV_GTFS_ARTIFACT")
   if [ -n "$nl_url" ]; then
     cmd+=(--nl-gtfs-url "$nl_url")
   fi
@@ -231,6 +263,7 @@ echo "[StopData] source=swiss stage=departure-index duration=$(elapsed_seconds "
 test -f "$BUILD_DIR/manifest.json"
 test -f "$BUILD_DIR/transit-radar-cities.json"
 test -f "$BUILD_DIR/swiss-static/manifest.json"
+test -f "$BUILD_DIR/provenance/input-artifacts.json"
 if [[ -f "$MVO_ENV_FILE" ]]; then
   python3 "$REPO/scripts/validate_austrian_stop_packages.py" \
     --stop-data "$BUILD_DIR" \
@@ -239,7 +272,11 @@ fi
 
 echo "[StopData] release=$RELEASE_ID stage=build duration=$(elapsed_seconds "$TOTAL_STARTED")"
 VALIDATION_STARTED=$SECONDS
-python3 - "$BUILD_DIR/manifest.json" "$RELEASE_ID" "$RELEASE_DIR/release-metadata.json" "$BUILD_FINGERPRINT" "$ARTIFACTS_JSON" <<'PY'
+test -f "$CUSTOM_ARTIFACTS_JSON"
+if [[ -f "$MVO_ENV_FILE" ]]; then
+  test -f "$RELEASE_DIR/austrian-artifacts.json"
+fi
+python3 - "$BUILD_DIR/manifest.json" "$RELEASE_ID" "$RELEASE_DIR/release-metadata.json" "$BUILD_FINGERPRINT" "$ARTIFACTS_JSON" "$CURRENT_RELEASE" "$REPO" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -249,6 +286,8 @@ release_id = sys.argv[2]
 metadata_path = Path(sys.argv[3])
 build_fingerprint = sys.argv[4]
 artifacts_path = Path(sys.argv[5])
+previous_release_link = Path(sys.argv[6])
+repository_root = Path(sys.argv[7])
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 if not isinstance(manifest.get("cities"), list) or not manifest["cities"]:
     raise SystemExit("staged stop manifest has no cities")
@@ -263,15 +302,197 @@ for group in ("sources", "external"):
             raise SystemExit(f"GTFS artifact provenance is missing for {source_id}")
         if not isinstance(entry.get("size"), int) or entry["size"] <= 0:
             raise SystemExit(f"GTFS artifact size provenance is missing for {source_id}")
+        artifact_path = Path(str(entry["path"]))
+        if not artifact_path.exists():
+            raise SystemExit(f"GTFS artifact path is missing for {source_id}: {artifact_path}")
+        sys.path.insert(0, str(repository_root / "scripts"))
+        from artifact_provenance import artifact_provenance
+        actual_digest, actual_size = artifact_provenance(artifact_path)
+        if actual_digest != entry["sha256"] or actual_size != entry["size"]:
+            raise SystemExit(f"GTFS artifact checksum/path mismatch for {source_id}")
         source_artifacts[str(source_id)] = {
             "sha256": entry["sha256"],
             "size": entry.get("size"),
         }
 if not source_artifacts:
     raise SystemExit("No GTFS artifact provenance was produced for stop-data")
+registry_path = repository_root / "config" / "external-gtfs-sources.json"
+registry = json.loads(registry_path.read_text(encoding="utf-8"))
+candidate_external = artifacts.get("external") or {}
+manifest_city_ids = {
+    str(city.get("id"))
+    for city in manifest.get("cities", [])
+    if isinstance(city, dict) and city.get("id")
+}
+sys.path.insert(0, str(repository_root / "scripts"))
+from release_integrity import validate_candidate_sources
+from release_integrity import (
+    validate_previous_release_cities,
+    validate_previous_release_sources,
+)
+from release_integrity import validate_artifact_entry
+try:
+    validate_candidate_sources(
+        registry, candidate_external, manifest_city_ids, repository_root
+    )
+except ValueError as error:
+    raise SystemExit(str(error)) from error
+for source in registry:
+    source_id = str(source["id"])
+    classification = str(source.get("classification", "required"))
+    active = classification == "required"
+    if classification == "conditional":
+        activation_env = str(source.get("activationEnv", ""))
+        active = bool(
+            activation_env and __import__("os").environ.get(activation_env, "").strip()
+        )
+    entry = candidate_external.get(source_id)
+    if active and (not isinstance(entry, dict) or not entry.get("path")):
+        raise SystemExit(f"Expected external source is missing from candidate: {source_id}")
+    if source.get("importIntoStaticDepartures") is True:
+        if not isinstance(entry, dict) or not entry.get("path"):
+            raise SystemExit(f"Static-enabled source is missing from import plan: {source_id}")
+    if source_id == "511-bay-area":
+        city_file = repository_root / str(source["cities"])
+        expected_cities = {
+            str(city["id"])
+            for city in json.loads(city_file.read_text(encoding="utf-8"))
+        }
+        missing = sorted(expected_cities - manifest_city_ids)
+        if missing:
+            raise SystemExit(
+                "511 candidate city coverage is incomplete: " + ", ".join(missing)
+            )
+
+supplemental = {}
+custom_path = artifacts_path.parent / "custom-gtfs-artifacts.json"
+if custom_path.is_file():
+    custom = json.loads(custom_path.read_text(encoding="utf-8"))
+    for source_id, entry in (custom.get("sources") or {}).items():
+        if not isinstance(entry, dict) or not entry.get("path"):
+            raise SystemExit(f"Custom artifact provenance is missing for {source_id}")
+        supplemental[str(source_id)] = entry
+        try:
+            validate_artifact_entry(
+                str(source_id), entry, base_dir=artifacts_path.parent
+            )
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
+    if set(custom.get("sources") or {}) != {"vbb", "rnv"}:
+        raise SystemExit("Custom GTFS provenance must contain exactly vbb and rnv")
+austria_path = artifacts_path.parent / "austrian-artifacts.json"
+if austria_path.is_file():
+    austria = json.loads(austria_path.read_text(encoding="utf-8"))
+    expected_austria = {
+        "vor", "steiermark", "salzburg", "kaernten",
+        "ooevv", "tirol", "vorarlberg", "linz-ag",
+    }
+    actual_austria = {}
+    for entry in austria.get("sources", []):
+        source_id = str(entry.get("source", ""))
+        if source_id in expected_austria:
+            if not entry.get("sha256") or not isinstance(entry.get("size"), int):
+                raise SystemExit(f"Austrian provenance is incomplete for {source_id}")
+            try:
+                validate_artifact_entry(
+                    source_id, entry, base_dir=artifacts_path.parent
+                )
+            except ValueError as error:
+                raise SystemExit(str(error)) from error
+            actual_austria[source_id] = entry
+    if set(actual_austria) != expected_austria:
+        raise SystemExit("Austrian provenance does not contain all eight configured sources")
+    supplemental.update(actual_austria)
+input_path = artifacts_path.parent / "stop-data" / "provenance" / "input-artifacts.json"
+if input_path.is_file():
+    inputs = json.loads(input_path.read_text(encoding="utf-8"))
+    for source_id, entry in (inputs.get("sources") or {}).items():
+        if (
+            not isinstance(entry, dict)
+            or not entry.get("sha256")
+            or not isinstance(entry.get("size"), int)
+        ):
+            raise SystemExit(f"Input provenance is incomplete for {source_id}")
+        supplemental[str(source_id)] = entry
+systems_path = artifacts_path.parent / "stop-data" / "transit" / "kyiv-systems.json"
+if systems_path.is_file():
+    systems = json.loads(systems_path.read_text(encoding="utf-8"))
+    systems_source = systems.get("source") or {}
+    if systems_source.get("contentDigest") and isinstance(systems_source.get("contentSize"), int):
+        supplemental["kyiv-systems"] = {
+            "sourceID": "kyiv-systems",
+            "path": "transit/kyiv-systems.json",
+            "sha256": systems_source["contentDigest"],
+            "size": systems_source["contentSize"],
+            "origin": "Kyiv Open Data Portal systems resources",
+            "status": systems_source.get("provenanceStatus", "used"),
+        }
+    else:
+        raise SystemExit("Kyiv systems provenance is incomplete")
+artifacts["supplemental"] = supplemental
+artifacts_path.write_text(
+    json.dumps(artifacts, ensure_ascii=False, indent=2), encoding="utf-8"
+)
+old_root = (
+    previous_release_link.resolve()
+    if previous_release_link.is_symlink()
+    else previous_release_link
+)
+old_artifacts_path = old_root / "gtfs-artifacts.json"
+if old_artifacts_path.is_file():
+    old_artifacts = json.loads(old_artifacts_path.read_text(encoding="utf-8"))
+    old_ids = {
+        str(source_id)
+        for group in ("sources", "external")
+        for source_id, entry in (old_artifacts.get(group) or {}).items()
+        if isinstance(entry, dict) and entry.get("path")
+    }
+    try:
+        validate_previous_release_sources(old_ids, set(source_artifacts))
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    missing_old = sorted(
+        source_id for source_id in old_ids if source_id not in source_artifacts
+    )
+    if missing_old:
+        raise SystemExit(
+            "Candidate lost sources from active release: " + ", ".join(missing_old)
+        )
+old_manifest_path = old_root / "stop-data" / "manifest.json"
+if old_manifest_path.is_file():
+    old_manifest = json.loads(old_manifest_path.read_text(encoding="utf-8"))
+    old_city_ids = {
+        str(city.get("id"))
+        for city in old_manifest.get("cities", [])
+        if isinstance(city, dict) and city.get("id")
+    }
+    missing_old_cities = sorted(old_city_ids - manifest_city_ids)
+    try:
+        validate_previous_release_cities(old_city_ids, manifest_city_ids)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    if missing_old_cities:
+        raise SystemExit(
+            "Candidate lost cities from active release: " + ", ".join(missing_old_cities)
+        )
 manifest["sourceArtifacts"] = source_artifacts
-manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-metadata_path.write_text(json.dumps({"releaseID": release_id, "buildFingerprint": build_fingerprint, "stopManifestVersion": manifest.get("version"), "sourceArtifacts": source_artifacts}, indent=2), encoding="utf-8")
+manifest["inputProvenance"] = supplemental
+manifest_path.write_text(
+    json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+)
+metadata_path.write_text(
+    json.dumps(
+        {
+            "releaseID": release_id,
+            "buildFingerprint": build_fingerprint,
+            "stopManifestVersion": manifest.get("version"),
+            "sourceArtifacts": source_artifacts,
+            "inputProvenance": supplemental,
+        },
+        indent=2,
+    ),
+    encoding="utf-8",
+)
 PY
 echo "[StopData] release=$RELEASE_ID stage=validation duration=$(elapsed_seconds "$VALIDATION_STARTED")"
 

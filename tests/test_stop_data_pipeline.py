@@ -37,8 +37,72 @@ exit 0
 set -euo pipefail
 
 case \"${1:-}\" in
+  *prepare_gtfs_artifacts.py)
+    output=\"\"
+    while [ \"$#\" -gt 0 ]; do
+      if [ \"$1\" = \"--output\" ]; then
+        output=\"$2\"
+        break
+      fi
+      shift
+    done
+    mkdir -p \"$(dirname \"$output\")\"
+    \"$REAL_PYTHON\" - \"$output\" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+output = Path(sys.argv[1])
+root = output.parent
+def artifact(source_id):
+    path = root / f\"{source_id}.zip\"
+    path.write_bytes(source_id.encode(\"utf-8\"))
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return {\"path\": str(path), \"sha256\": digest, \"size\": path.stat().st_size}
+source_ids = [\"sweden\", \"norway\", \"ireland\", \"translink\", \"ttc-surface\", \"ttc-subway\", \"511-bay-area\", \"cta-chicago\", \"king-county-metro\", \"mta-ny-subway\", \"mta-ny-nyct-bus\", \"mta-ny-mta-bus\", \"mbta-boston\", \"wmata-bus\", \"wmata-rail\", \"kyiv\"]
+sources = {\"germany\": artifact(\"germany\"), \"swiss\": artifact(\"swiss\")}
+external = {source_id: artifact(source_id) for source_id in source_ids}
+output.write_text(json.dumps({\"sources\": sources, \"external\": external, \"nlFailure\": None}), encoding=\"utf-8\")
+PY
+    exit 0
+    ;;
   *build_fingerprint.py)
     printf 'test-build-fingerprint\\n'
+    ;;
+  *build_stop_packages.py)
+    printf 'build\\n' >> \"$BUILD_CALLS_LOG\"
+    if [ \"${BUILD_FAIL:-0}\" = \"1\" ]; then
+      exit 1
+    fi
+    if [ -n \"${BUILD_ARGS_LOG:-}\" ]; then
+      printf '%s\\n' \"$*\" > \"$BUILD_ARGS_LOG\"
+    fi
+    output=\"\"
+    while [ \"$#\" -gt 0 ]; do
+      if [ \"$1\" = \"--output\" ]; then
+        output=\"$2\"
+        break
+      fi
+      shift
+    done
+    mkdir -p \"$output/swiss-static\"
+    mkdir -p "$output/provenance"
+    printf '{"sources":{}}' > "$output/provenance/input-artifacts.json"
+    \"$REAL_PYTHON\" - \"$output\" \"${BUILD_INVALID:-0}\" <<'PY'
+import json
+import sys
+from pathlib import Path
+output = Path(sys.argv[1])
+invalid = sys.argv[2] == \"1\"
+cities = [{\"id\": \"test-city\", \"name\": \"Test City\", \"url\": \"stops/test-city.json\"}]
+if not invalid:
+    cities.extend({\"id\": city_id, \"name\": city_id, \"url\": f\"stops/{city_id}.json\"} for city_id in (\"san-francisco\", \"oakland\", \"berkeley\", \"san-jose\"))
+(output / \"manifest.json\").write_text(json.dumps({\"version\": \"2026-07-30\", \"cities\": cities}), encoding=\"utf-8\")
+if not invalid:
+    (output / \"transit-radar-cities.json\").touch()
+PY
+    printf 'new' > \"$output/release-marker\"
+    exit 0
     ;;
   *prepare_gtfs_artifacts.py)
     output=\"\"
@@ -51,6 +115,45 @@ case \"${1:-}\" in
     done
     mkdir -p \"$(dirname \"$output\")\"
     printf '{\"sources\":{\"germany\":{\"path\":\"/tmp/germany.zip\",\"sha256\":\"germany\",\"size\":10},\"swiss\":{\"path\":\"/tmp/swiss.zip\",\"sha256\":\"swiss\",\"size\":10}},\"external\":{},\"nlFailure\":null}' > \"$output\"
+    ;;
+  *prepare_custom_gtfs_artifacts.py)
+    output=\"\"
+    while [ \"$#\" -gt 0 ]; do
+      if [ \"$1\" = \"--output\" ]; then
+        output=\"$2\"
+        break
+      fi
+      shift
+    done
+    mkdir -p \"$(dirname \"$output\")\"
+    \"$REAL_PYTHON\" - \"$output\" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+output = Path(sys.argv[1])
+root = output.parent
+sources = {}
+for source_id in (\"vbb\", \"rnv\"):
+    path = root / f\"{source_id}.zip\"
+    path.write_bytes(source_id.encode(\"utf-8\"))
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    sources[source_id] = {\"sourceID\": source_id, \"path\": str(path), \"sha256\": digest, \"size\": path.stat().st_size}
+output.write_text(json.dumps({\"sources\": sources}), encoding=\"utf-8\")
+PY
+    exit 0
+    ;;
+  *prepare_custom_gtfs_artifacts.py)
+    output=\"\"
+    while [ \"$#\" -gt 0 ]; do
+      if [ \"$1\" = \"--output\" ]; then
+        output=\"$2\"
+        break
+      fi
+      shift
+    done
+    mkdir -p \"$(dirname \"$output\")\"
+    printf '{\"sources\":{\"vbb\":{\"sourceID\":\"vbb\",\"path\":\"/tmp/vbb.zip\",\"sha256\":\"vbb\",\"size\":10},\"rnv\":{\"sourceID\":\"rnv\",\"path\":\"/tmp/rnv.zip\",\"sha256\":\"rnv\",\"size\":10}}}' > \"$output\"
     ;;
   *build_stop_packages.py)
     printf 'build\\n' >> "$BUILD_CALLS_LOG"
@@ -216,7 +319,7 @@ printf 'releaseID=%s\\n' "$RELEASE_ID" > "$NEXT_DATABASE_PATH"
             f"--external-gtfs-sources {REPOSITORY_ROOT / 'config' / 'external-gtfs-sources.json'}",
             build_args,
         )
-        self.assertNotIn("norway=", build_args)
+        self.assertIn("511-bay-area=", build_args)
         self.assertEqual(
             (self.data_root / "current" / "release-marker").read_text(encoding="utf-8"),
             "new",

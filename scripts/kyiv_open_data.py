@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 try:
+    from .artifact_provenance import canonical_content_provenance
+except ImportError:
+    from artifact_provenance import canonical_content_provenance
+
+try:
     import certifi
 except ImportError:  # pragma: no cover - the production image bundles certifi
     certifi = None
@@ -423,6 +428,17 @@ def build_kyiv_systems_artifact(
         name: load_json_resource(spec, opener=opener)
         for name, spec in resources.items()
     }
+    provenance_payload = {
+        name: {
+            "resourceID": str(spec["resourceID"]),
+            "payload": loaded[name],
+        }
+        for name, spec in sorted(resources.items())
+    }
+    content_digest, content_size = canonical_content_provenance(
+        provenance_payload,
+        identity="kyiv-systems-resources-v1",
+    )
     metro_stations = normalize_station_features(loaded["metroStations"], system="metro")
     funicular_stations = normalize_station_features(loaded["funicularStations"], system="funicular")
     express_stations = normalize_station_features(loaded["expressStations"], system="cityExpress")
@@ -449,6 +465,10 @@ def build_kyiv_systems_artifact(
                 name: str(spec["resourceID"])
                 for name, spec in resources.items()
             },
+            "contentDigest": content_digest,
+            "contentSize": content_size,
+            "provenanceStatus": "used",
+            "provenanceIdentity": "kyiv-systems-resources-v1",
         },
         "systems": {
             "metro": {

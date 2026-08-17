@@ -1484,15 +1484,19 @@ class ExternalStopAndDepartureTests(unittest.TestCase):
                 )
             compressed = __import__("gzip").compress(zip_buffer.getvalue())
             class FakeResponse:
+                def __init__(self, body):
+                    self.body = body
+
                 def read(self):
-                    return compressed
+                    body, self.body = self.body, b""
+                    return body
                 def __enter__(self):
                     return self
                 def __exit__(self, *args):
                     return False
             with mock.patch(
                 "build_stop_packages.urllib.request.urlopen",
-                return_value=FakeResponse(),
+                return_value=FakeResponse(compressed),
             ):
                 archive = load_gtfs_archive(
                     "https://example.test/sweden.gtfs",

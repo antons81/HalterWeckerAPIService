@@ -115,17 +115,25 @@ enabled = {
 
 if artifact_path:
     payload = json.loads(Path(artifact_path).read_text(encoding="utf-8"))
-    for source_id, entry in sorted(payload.get("external", {}).items()):
-        if source_id in enabled and isinstance(entry, dict) and entry.get("path"):
-            print(f"{source_id}={entry['path']}")
+    external = payload.get("external", {})
+    for source_id in sorted(enabled):
+        entry = external.get(source_id)
+        if not isinstance(entry, dict) or not entry.get("path"):
+            raise SystemExit(
+                f"Static-enabled source is missing from release import plan: {source_id}"
+            )
+        print(f"{source_id}={entry['path']}")
 else:
     for source in sources:
         source_id = str(source.get("id", ""))
         if source_id not in enabled:
             continue
-        value = str(source.get("localPath") or source.get("url") or "").strip()
-        if value:
-            print(f"{source_id}={value}")
+        value = str(
+            source.get("localPath") or source.get("url") or source.get("scopedURL") or ""
+        ).strip()
+        if not value:
+            raise SystemExit(f"Static-enabled source has no configured input: {source_id}")
+        print(f"{source_id}={value}")
 PY
 )
 if [[ ${#EXTERNAL_GTFS_IMPORT_ARGS[@]} -gt 0 ]]; then

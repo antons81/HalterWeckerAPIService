@@ -53,6 +53,19 @@ try:
 except ImportError:
     from kyiv_open_data import load_json_resource
 
+try:
+    from .artifact_provenance import (
+        artifact_provenance,
+        canonical_content_provenance,
+        provenance_record,
+    )
+except ImportError:
+    from artifact_provenance import (
+        artifact_provenance,
+        canonical_content_provenance,
+        provenance_record,
+    )
+
 
 # Auth is resolved at runtime from environment variables. Secrets never appear
 # in config JSON. Future sources can register here without touching GTFS parsers.
@@ -95,6 +108,27 @@ EXTERNAL_SOURCE_AUTH: dict[str, dict[str, object]] = {
     },
 }
 
+VALID_SOURCE_CLASSIFICATIONS = {"required", "optional", "conditional"}
+
+
+def source_classification(source: dict[str, object]) -> str:
+    value = str(source.get("classification", "required")).strip().lower()
+    if value not in VALID_SOURCE_CLASSIFICATIONS:
+        raise ValueError(
+            f"External GTFS source {source.get('id', '<unknown>')} has invalid "
+            f"classification {value!r}."
+        )
+    return value
+
+
+def configured_external_url(source: dict[str, object]) -> str:
+    """Resolve the canonical feed URL; url wins over scopedURL."""
+    for key in ("url", "scopedURL"):
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
 
 def load_external_gtfs_sources(path: Path) -> list[dict[str, object]]:
     if not path.exists():
@@ -133,12 +167,20 @@ def validate_external_gtfs_source(
             f"External GTFS source {source_id} city file does not exist: {cities_path}"
         )
 
-    configured_url = source.get("url")
-    if configured_url is not None and (
-        not isinstance(configured_url, str) or not configured_url.strip()
+    classification = source_classification(source)
+    for url_key in ("url", "scopedURL"):
+        configured_url = source.get(url_key)
+        if configured_url is not None and (
+            not isinstance(configured_url, str) or not configured_url.strip()
+        ):
+            raise ValueError(
+                f"External GTFS source {source_id} has an invalid {url_key}."
+            )
+    local_path = source.get("localPath")
+    if local_path is not None and (
+        not isinstance(local_path, str) or not local_path.strip()
     ):
-        raise ValueError(f"External GTFS source {source_id} has an invalid URL.")
-
+        raise ValueError(f"External GTFS source {source_id} has an invalid localPath.")
     preflight = source.get("preflight", "head")
     if preflight not in {"head", "download"}:
         raise ValueError(
@@ -214,6 +256,12 @@ def validate_external_gtfs_source(
         value = source.get(flag, flag != "buildRadarTopology")
         if not isinstance(value, bool):
             raise ValueError(f"External GTFS source {source_id} has invalid {flag}.")
+
+    import_static = source.get("importIntoStaticDepartures", False)
+    if not isinstance(import_static, bool):
+        raise ValueError(
+            f"External GTFS source {source_id} has invalid importIntoStaticDepartures."
+        )
 
     publish_passenger_stop_ids = source.get("publishPassengerStopIDs", False)
     if not isinstance(publish_passenger_stop_ids, bool):
@@ -1807,6 +1855,8 @@ def process_external_gtfs_sources(
     lines_by_stop_id: dict[str, dict[str, dict[str, object]]] = {}
     external_city_sources: dict[str, dict[str, object]] = {}
     namespaced_records: dict[str, list[dict[str, object]]] = {}
+    input_provenance: dict[str, dict[str, object]] = {}
+    skipped_sources: dict[str, dict[str, object]] = {}
     namespace_root = output / ".external-namespaces"
 
     for source in sources:
@@ -1828,18 +1878,49 @@ def process_external_gtfs_sources(
         if namespace:
             known_namespaces.add(namespace)
 
-        configured_url = source.get("url")
+        configured_url = configured_external_url(source)
+        if not configured_url:
+            configured_url = str(source.get("localPath") or "").strip()
         url = url_by_provider.get(
             source_id,
-            configured_url if isinstance(configured_url, str) else "",
+            configured_url,
         ).strip()
+        classification = source_classification(source)
         if not url:
-            # Source is configured but not activated for this run.
+            reason = f"no URL configured for {source_id}"
+            if classification == "required":
+                raise ValueError(
+                    f"Required external GTFS source {source_id} cannot be skipped: {reason}."
+                )
+            skipped_sources[source_id] = {
+                "sourceID": source_id,
+                "classification": classification,
+                "status": "skipped",
+                "reason": reason,
+            }
             print(
-                f"[ExternalGTFS] skipping source {source_id}: "
-                f"no URL configured for {source_id}"
+                f"[ExternalGTFS] source={source_id} status=skipped "
+                f"classification={classification} reason={reason}"
             )
             continue
+
+        if Path(url).is_file() or Path(url).is_dir():
+            digest, size = artifact_provenance(Path(url))
+            input_provenance[source_id] = provenance_record(
+                source_id=source_id,
+                path=str(Path(url)),
+                digest=digest,
+                size=size,
+                origin="external-gtfs",
+            )
+        else:
+            input_provenance[source_id] = {
+                "sourceID": source_id,
+                "path": url,
+                "origin": "external-gtfs",
+                "status": "used",
+                "resourceIdentity": url,
+            }
 
         cities = load_external_cities(source, repository_root)
         for city in cities:
@@ -1883,6 +1964,21 @@ def process_external_gtfs_sources(
                 catalog_loader = load_stop_catalog or load_json_resource
                 supplemental_stop_catalog = catalog_loader(
                     supplemental_catalog_configuration
+                )
+                catalog_identity = ":".join(
+                    str(supplemental_catalog_configuration.get(key, ""))
+                    for key in ("resourceID", "downloadURL")
+                )
+                digest, size = canonical_content_provenance(
+                    supplemental_stop_catalog,
+                    identity=catalog_identity,
+                )
+                input_provenance[f"{source_id}:supplemental-stop-catalog"] = provenance_record(
+                    source_id=f"{source_id}:supplemental-stop-catalog",
+                    path=catalog_identity,
+                    digest=digest,
+                    size=size,
+                    origin="Kyiv supplemental stop catalog",
                 )
         except Exception:
             archive.close()
@@ -2123,6 +2219,17 @@ def process_external_gtfs_sources(
             "_source": f"External GTFS namespaces: {source_ids}",
         })
         package_stops_by_city_id[city_id] = merged_stops
+
+    provenance_directory = output / "provenance"
+    provenance_directory.mkdir(parents=True, exist_ok=True)
+    (provenance_directory / "input-artifacts.json").write_text(
+        json.dumps(
+            {"sources": input_provenance, "skipped": skipped_sources},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
     shutil.rmtree(namespace_root, ignore_errors=True)
     return (

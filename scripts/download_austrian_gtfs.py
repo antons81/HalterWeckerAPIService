@@ -17,6 +17,7 @@ from pathlib import Path
 
 from austrian_sources import DEFAULT_REGISTRY, load_austrian_sources
 from gtfs_source_cache import DEFAULT_CACHE_ROOT, GTFSArtifactCache
+from artifact_provenance import artifact_provenance, immutable_file_path
 
 
 DEFAULT_ENV_FILE = Path("/srv/haltewecker/data/austria/.env")
@@ -115,14 +116,23 @@ def download_source(
     target_dir.mkdir(parents=True, exist_ok=True)
     temporary_link = target.with_name(f".{target.name}.next")
     temporary_link.unlink(missing_ok=True)
-    temporary_link.symlink_to(result.path)
+    digest = str((result.state or {}).get("sha256") or "")
+    if not digest:
+        digest, _size = artifact_provenance(result.path)
+    immutable_path = immutable_file_path(result.path, digest)
+    temporary_link.symlink_to(immutable_path)
     os.replace(temporary_link, target)
+    artifact_size = (result.state or {}).get("size")
+    if not isinstance(artifact_size, int) or artifact_size <= 0:
+        artifact_size = immutable_path.stat().st_size
     return {
         "source": source["id"],
         "datasetId": source["datasetId"],
         "year": year,
         "originalName": original_name,
-        "size": result.state.get("size") if result.state else expected_size,
+        "size": artifact_size,
+        "sha256": digest,
+        "immutablePath": str(immutable_path),
         "path": str(target),
         "status": result.status,
         "reason": result.reason,
@@ -135,6 +145,7 @@ def main() -> None:
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
     parser.add_argument("--output", type=Path, default=Path("/srv/haltewecker/data/austria"))
     parser.add_argument("--cache-root", type=Path, default=Path(os.environ.get("GTFS_CACHE_ROOT", str(DEFAULT_CACHE_ROOT))))
+    parser.add_argument("--output-json", type=Path, default=None)
     args = parser.parse_args()
     env = read_env(args.env_file)
     required = ("MVO_USERNAME", "MVO_PASSWORD", "MVO_TOKEN_URL", "MVO_API_BASE")
@@ -153,7 +164,14 @@ def main() -> None:
         result = download_source(source, [item for item in catalog if isinstance(item, dict)], access_token, args.output, env, cache)
         results.append(result)
         print(f"[GTFSCache] source=austria:{source['id']} stage=artifact status={result['status']} duration={time.monotonic() - started:.2f}s")
-    print(json.dumps({"sources": results}, ensure_ascii=False, separators=(",", ":")))
+    payload = {"sources": results}
+    if args.output_json is not None:
+        args.output_json.parent.mkdir(parents=True, exist_ok=True)
+        args.output_json.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
 
 if __name__ == "__main__":

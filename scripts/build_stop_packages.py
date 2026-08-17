@@ -26,6 +26,11 @@ from typing import Iterable
 import resource
 
 try:
+    from .artifact_provenance import artifact_provenance, provenance_record
+except ImportError:
+    from artifact_provenance import artifact_provenance, provenance_record
+
+try:
     import certifi
 except ImportError:  # pragma: no cover - production images use system CA roots
     certifi = None
@@ -184,6 +189,43 @@ class TemporaryZipArchive(zipfile.ZipFile):
             super().close()
         finally:
             self._temporary_path.unlink(missing_ok=True)
+
+
+def record_input_provenance(
+    output: Path,
+    source_id: str,
+    origin: str,
+    archive: zipfile.ZipFile | DirectoryGTFSArchive,
+) -> None:
+    if isinstance(archive, DirectoryGTFSArchive):
+        source_path = archive.root
+    elif isinstance(archive, TemporaryZipArchive):
+        source_path = archive._temporary_path
+    else:
+        filename = getattr(archive, "filename", None)
+        source_path = Path(filename) if filename else None
+    if source_path is None or not source_path.exists():
+        return
+    digest, size = artifact_provenance(source_path)
+    provenance_directory = output / "provenance"
+    provenance_directory.mkdir(parents=True, exist_ok=True)
+    provenance_path = provenance_directory / "input-artifacts.json"
+    try:
+        payload = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        payload = {"sources": {}}
+    sources = payload.setdefault("sources", {})
+    sources[source_id] = provenance_record(
+        source_id=source_id,
+        path=str(source_path) if not isinstance(archive, TemporaryZipArchive) else origin,
+        digest=digest,
+        size=size,
+        origin=origin,
+    )
+    provenance_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def _download_to_tempfile(url: str, headers: dict[str, str]) -> Path:
@@ -2894,6 +2936,7 @@ def main(argv: list[str] | None = None) -> None:
             "rnv", "download", lambda: load_gtfs_archive(args.rnv_gtfs_url)
         )
         try:
+            record_input_provenance(output, "rnv", args.rnv_gtfs_url, rnv_archive)
             rnv_cities, rnv_city_ids = timed_stage(
                 "rnv", "assets", lambda: build_rnv_assets(
                     archive=rnv_archive,
@@ -3016,7 +3059,16 @@ def main(argv: list[str] | None = None) -> None:
         additional_city_ids=rnv_city_ids | external_city_id_set
     )
     if not args.skip_german:
-        timed_stage("vbb", "indexes", lambda: build_vbb_network_indexes(load_gtfs_archive(args.vbb_gtfs_url), output, cities))
+        vbb_archive = load_gtfs_archive(args.vbb_gtfs_url)
+        try:
+            record_input_provenance(output, "vbb", args.vbb_gtfs_url, vbb_archive)
+            timed_stage(
+                "vbb",
+                "indexes",
+                lambda: build_vbb_network_indexes(vbb_archive, output, cities),
+            )
+        finally:
+            vbb_archive.close()
         print(
             f"Built {len(manifest)} city packages from {german_stop_count} canonical stops; "
             f"skipped {skipped_stop_count} stops outside German municipalities."

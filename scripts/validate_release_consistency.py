@@ -30,6 +30,8 @@ def validate_release(release_dir: Path) -> None:
         problems.append("stopManifestVersion does not match manifest.version")
     if metadata.get("sourceArtifacts") != manifest.get("sourceArtifacts"):
         problems.append("sourceArtifacts do not match between release metadata and manifest")
+    if metadata.get("inputProvenance") != manifest.get("inputProvenance"):
+        problems.append("inputProvenance does not match between release metadata and manifest")
 
     database_path = release_dir / "departures.sqlite"
     try:

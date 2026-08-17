@@ -4,57 +4,29 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import time
 import zipfile
 from pathlib import Path
 
+from artifact_provenance import artifact_provenance, immutable_file_path
 from external_gtfs import (
     authenticated_external_request,
+    configured_external_url,
     load_external_gtfs_sources,
     parse_external_gtfs_url_args,
+    source_classification,
 )
 from gtfs_source_cache import DEFAULT_CACHE_ROOT, ArtifactResult, GTFSArtifactCache
-
-
-def directory_artifact_provenance(path: Path) -> tuple[str, int]:
-    digest_builder = hashlib.sha256()
-    total_size = 0
-    files = sorted(item for item in path.rglob("*") if item.is_file())
-    if not files:
-        raise ValueError(f"GTFS directory artifact is empty: {path}")
-    for file_path in files:
-        relative_path = file_path.relative_to(path).as_posix().encode("utf-8")
-        digest_builder.update(len(relative_path).to_bytes(8, "big"))
-        digest_builder.update(relative_path)
-        file_size = file_path.stat().st_size
-        total_size += file_size
-        digest_builder.update(file_size.to_bytes(8, "big"))
-        with file_path.open("rb") as source:
-            for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                digest_builder.update(chunk)
-    return digest_builder.hexdigest(), total_size
-
-
-def file_artifact_provenance(path: Path) -> tuple[str, int]:
-    digest_builder = hashlib.sha256()
-    total_size = path.stat().st_size
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest_builder.update(chunk)
-    return digest_builder.hexdigest(), total_size
 
 
 def artifact_payload(result: ArtifactResult) -> dict[str, object]:
     state = result.state or {}
     digest = state.get("sha256")
     size = state.get("size")
-    if result.path.is_dir():
-        digest, size = directory_artifact_provenance(result.path)
-    elif result.path.is_file() and (not isinstance(digest, str) or not digest):
-        digest, size = file_artifact_provenance(result.path)
+    if result.path.is_dir() or not isinstance(digest, str) or not digest:
+        digest, size = artifact_provenance(result.path)
     if not isinstance(digest, str) or not digest:
         raise ValueError(
             f"GTFS artifact {result.source_id} has no validated SHA-256 provenance."
@@ -63,8 +35,9 @@ def artifact_payload(result: ArtifactResult) -> dict[str, object]:
         raise ValueError(
             f"GTFS artifact {result.source_id} has no validated size provenance."
         )
+    published_path = immutable_file_path(result.path, digest)
     return {
-        "path": str(result.path),
+        "path": str(published_path),
         "status": result.status,
         "sha256": digest,
         "size": size,
@@ -180,29 +153,46 @@ def main() -> None:
     external_urls = parse_external_gtfs_url_args(args.external_gtfs_url)
     for source in load_external_gtfs_sources(Path(args.external_sources)):
         source_id = str(source["id"])
-        configured = source.get("url")
+        classification = source_classification(source)
         local_path = str(source.get("localPath") or "").strip()
         if local_path and source_id not in external_urls:
             path = Path(local_path)
             local_kind = validate_local_gtfs_path(source_id, path)
-            result["external"][source_id] = {
-                "path": str(path),
-                "status": "local",
-            }
+            result["external"][source_id] = artifact_payload(
+                ArtifactResult(
+                    source_id,
+                    path,
+                    "local",
+                    f"local path ({local_kind})",
+                )
+            )
             print(
                 f"[GTFSCache] source={source_id} stage=resolve "
                 f"status=local path={local_kind}"
             )
             continue
-        url = external_urls.get(source_id, str(configured or "")).strip()
+        url = external_urls.get(source_id, configured_external_url(source))
         if not url:
+            reason = f"no URL or localPath configured for {source_id}"
+            if classification == "required":
+                raise ValueError(f"Required external GTFS source {source_id} has {reason}.")
+            result["external"][source_id] = {
+                "path": "",
+                "status": "skipped",
+                "classification": classification,
+                "reason": reason,
+            }
+            print(
+                f"[GTFSCache] source={source_id} stage=resolve status=skipped "
+                f"classification={classification} reason={reason}"
+            )
             continue
         try:
             request_url, headers = authenticated_external_request(
                 source_id, url, environ=os.environ
             )
         except ValueError:
-            if not bool(source.get("allowStale", True)):
+            if classification == "required" or not bool(source.get("allowStale", True)):
                 raise
             cached_path = Path(args.cache_root) / source_id / "current.zip"
             artifact = cache.resolve(
