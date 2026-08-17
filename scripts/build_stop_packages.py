@@ -9,8 +9,12 @@ import gzip
 import io
 import json
 import math
+import os
 import re
+import shutil
+import sqlite3
 import ssl
+import tempfile
 import time as monotonic_clock
 import unicodedata
 import urllib.request
@@ -19,6 +23,7 @@ import zipfile
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Iterable
+import resource
 
 try:
     import certifi
@@ -150,6 +155,76 @@ class DirectoryGTFSArchive:
         return None
 
 
+def _rss_kib() -> int:
+    """Return current RSS in KiB on Linux, or zero when unavailable."""
+    try:
+        with Path("/proc/self/status").open(encoding="ascii") as status_file:
+            for line in status_file:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        return _peak_rss_kib()
+    return _peak_rss_kib()
+
+
+def _peak_rss_kib() -> int:
+    value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return int(value if value < 10_000_000 else value / 1024)
+
+
+class TemporaryZipArchive(zipfile.ZipFile):
+    """ZipFile backed by a temporary path that is removed on close."""
+
+    def __init__(self, path: Path) -> None:
+        self._temporary_path = path
+        super().__init__(path)
+
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            self._temporary_path.unlink(missing_ok=True)
+
+
+def _download_to_tempfile(url: str, headers: dict[str, str]) -> Path:
+    request = urllib.request.Request(url, headers=headers)
+    raw_fd, raw_name = tempfile.mkstemp(prefix="haltewecker-gtfs-", suffix=".download")
+    os.close(raw_fd)
+    raw_path = Path(raw_name)
+    try:
+        with urlopen_with_tls(request, timeout=180) as response, raw_path.open("wb") as output:
+            while True:
+                try:
+                    chunk = response.read(1024 * 1024)
+                except TypeError:  # Small test doubles may expose read() only.
+                    chunk = response.read()
+                if not chunk:
+                    break
+                output.write(chunk)
+
+        with raw_path.open("rb") as input_file:
+            is_gzip = input_file.read(2) == b"\x1f\x8b"
+        if not is_gzip:
+            return raw_path
+
+        decompressed_fd, decompressed_name = tempfile.mkstemp(
+            prefix="haltewecker-gtfs-", suffix=".zip"
+        )
+        os.close(decompressed_fd)
+        decompressed_path = Path(decompressed_name)
+        try:
+            with raw_path.open("rb") as input_file, gzip.GzipFile(fileobj=input_file) as compressed, decompressed_path.open("wb") as output:
+                shutil.copyfileobj(compressed, output, length=1024 * 1024)
+        except Exception:
+            decompressed_path.unlink(missing_ok=True)
+            raise
+        raw_path.unlink(missing_ok=True)
+        return decompressed_path
+    except Exception:
+        raw_path.unlink(missing_ok=True)
+        raise
+
+
 def load_gtfs_archive(
     url: str,
     headers: dict[str, str] | None = None,
@@ -170,18 +245,22 @@ def load_gtfs_archive(
     request_headers = {"User-Agent": "HalteWeckerStopPipeline/1.0"}
     if headers:
         request_headers.update(headers)
-    request = urllib.request.Request(url, headers=request_headers)
-    with urlopen_with_tls(request, timeout=180) as response:
-        payload = response.read()
-    if payload.startswith(b"\x1f\x8b"):
-        payload = gzip.decompress(payload)
-    return zipfile.ZipFile(io.BytesIO(payload))
+    temporary_path = _download_to_tempfile(url, request_headers)
+    try:
+        return TemporaryZipArchive(temporary_path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def timed_stage(source: str, stage: str, callback):
     started = monotonic_clock.monotonic()
     result = callback()
-    print(f"[StopData] source={source} stage={stage} duration={monotonic_clock.monotonic() - started:.2f}s")
+    print(
+        f"[StopData] source={source} stage={stage} "
+        f"duration={monotonic_clock.monotonic() - started:.2f}s "
+        f"rss_kib={_rss_kib()} peak_rss_kib={_peak_rss_kib()}"
+    )
     return result
 
 
@@ -1573,6 +1652,182 @@ def build_vbb_network_indexes(
             )
 
 
+def _stage_rnv_stops(archive: zipfile.ZipFile, connection: sqlite3.Connection) -> None:
+    rows = (
+        (
+            sequence,
+            row.get("stop_id", ""),
+            row.get("parent_station", ""),
+            row.get("stop_name", ""),
+            row.get("stop_lat", ""),
+            row.get("stop_lon", "")
+        )
+        for sequence, row in enumerate(iter_table(archive, "stops.txt"), start=1)
+        if row.get("stop_id")
+    )
+    connection.executemany(
+        "INSERT INTO stops VALUES (?, ?, ?, ?, ?, ?)",
+        rows
+    )
+    connection.commit()
+
+
+def _stage_rnv_routes(archive: zipfile.ZipFile, connection: sqlite3.Connection) -> None:
+    rows = []
+    for sequence, route in enumerate(iter_table(archive, "routes.txt"), start=1):
+        route_id = route.get("route_id", "").strip()
+        if not route_id:
+            continue
+        try:
+            route_type = int(route.get("route_type", "3"))
+        except ValueError:
+            route_type = 3
+        rows.append((
+            sequence,
+            route_id,
+            route.get("route_short_name", "").strip(),
+            route.get("route_long_name", "").strip(),
+            route_type
+        ))
+        if len(rows) >= 2_000:
+            connection.executemany("INSERT INTO routes VALUES (?, ?, ?, ?, ?)", rows)
+            rows.clear()
+    if rows:
+        connection.executemany("INSERT INTO routes VALUES (?, ?, ?, ?, ?)", rows)
+    connection.commit()
+
+
+def _stage_rnv_trips(archive: zipfile.ZipFile, connection: sqlite3.Connection) -> None:
+    rows = []
+    for sequence, trip in enumerate(iter_table(archive, "trips.txt"), start=1):
+        trip_id = trip.get("trip_id", "").strip()
+        route_id = trip.get("route_id", "").strip()
+        if not trip_id or not route_id:
+            continue
+        rows.append((
+            sequence,
+            trip_id,
+            route_id,
+            trip.get("trip_headsign", "").strip()
+        ))
+        if len(rows) >= 2_000:
+            connection.executemany("INSERT INTO trips VALUES (?, ?, ?, ?)", rows)
+            rows.clear()
+    if rows:
+        connection.executemany("INSERT INTO trips VALUES (?, ?, ?, ?)", rows)
+    connection.commit()
+
+
+def _canonicalize_rnv_stops(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE latest_stops AS
+        SELECT stops.*, latest.first_seq
+        FROM stops
+        JOIN (
+            SELECT stop_id, MAX(seq) AS seq, MIN(seq) AS first_seq
+            FROM stops
+            GROUP BY stop_id
+        ) latest ON latest.stop_id = stops.stop_id AND latest.seq = stops.seq;
+        CREATE INDEX latest_stops_by_id ON latest_stops(stop_id);
+        CREATE TABLE canonical_stops (
+            stop_id TEXT NOT NULL,
+            stop_name TEXT NOT NULL,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
+            search_name TEXT NOT NULL,
+            latitude_key INTEGER NOT NULL,
+            longitude_key INTEGER NOT NULL,
+            UNIQUE(search_name, latitude_key, longitude_key)
+        );
+        CREATE TABLE city_coordinates (
+            seq INTEGER PRIMARY KEY,
+            city_id TEXT NOT NULL,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL
+        );
+        CREATE INDEX city_coordinates_by_city ON city_coordinates(city_id, seq);
+        """
+    )
+    rows = []
+    for row in connection.execute(
+        """
+        SELECT child.stop_id,
+               CASE WHEN parent.stop_id IS NOT NULL THEN parent.stop_name ELSE child.stop_name END,
+               CASE WHEN parent.stop_id IS NOT NULL THEN parent.stop_lat ELSE child.stop_lat END,
+               CASE WHEN parent.stop_id IS NOT NULL THEN parent.stop_lon ELSE child.stop_lon END
+        FROM latest_stops child
+        LEFT JOIN latest_stops parent ON parent.stop_id = child.parent_station
+        ORDER BY child.first_seq
+        """
+    ):
+        try:
+            latitude, longitude = float(row[2]), float(row[3])
+        except (TypeError, ValueError):
+            continue
+        name = str(row[1]).strip()
+        if not name:
+            continue
+        rows.append((
+            row[0],
+            name,
+            latitude,
+            longitude,
+            normalized(name),
+            round(latitude * 10_000),
+            round(longitude * 10_000)
+        ))
+        if len(rows) >= 2_000:
+            connection.executemany(
+                "INSERT OR IGNORE INTO canonical_stops VALUES (?, ?, ?, ?, ?, ?, ?)",
+                rows
+            )
+            rows.clear()
+    if rows:
+        connection.executemany(
+            "INSERT OR IGNORE INTO canonical_stops VALUES (?, ?, ?, ?, ?, ?, ?)",
+            rows
+        )
+    connection.commit()
+
+
+def _write_rnv_network(connection: sqlite3.Connection, output: Path) -> None:
+    rnv_directory = output / "transit" / "rnv"
+    rnv_directory.mkdir(parents=True, exist_ok=True)
+    network_path = rnv_directory / "network.json"
+    with network_path.open("w", encoding="utf-8") as network_file:
+        network_file.write('{"version":')
+        network_file.write(json.dumps(date.today().isoformat(), ensure_ascii=False))
+        network_file.write(',"routes":[')
+        first = True
+        for route in connection.execute(
+            "SELECT route_id, short_name, long_name, route_type FROM routes ORDER BY seq"
+        ):
+            if not first:
+                network_file.write(",")
+            first = False
+            network_file.write(json.dumps({
+                "id": route[0],
+                "shortName": route[1],
+                "longName": route[2],
+                "routeType": route[3]
+            }, ensure_ascii=False, separators=(",", ":")))
+        network_file.write('],"trips":[')
+        first = True
+        for trip in connection.execute(
+            "SELECT trip_id, route_id, headsign FROM trips ORDER BY seq"
+        ):
+            if not first:
+                network_file.write(",")
+            first = False
+            network_file.write(json.dumps({
+                "id": trip[0],
+                "routeID": trip[1],
+                "directionName": trip[2]
+            }, ensure_ascii=False, separators=(",", ":")))
+        network_file.write("]}")
+
+
 def build_rnv_assets(
     archive: zipfile.ZipFile,
     output: Path,
@@ -1581,86 +1836,140 @@ def build_rnv_assets(
     municipalities: list[dict[str, object]],
     gateway_url: str
 ) -> tuple[list[dict[str, object]], set[str]]:
-    """Build one regional route index and availability entries for every served municipality."""
-    stop_rows = load_table(archive, "stops.txt")
-    rnv_stops = canonicalize(stop_rows)
-    routes = []
-    for route in load_table(archive, "routes.txt"):
-        route_id = route.get("route_id", "").strip()
-        if not route_id:
-            continue
+    """Build RNV assets using disk-backed staging for large GTFS tables."""
+    with tempfile.TemporaryDirectory(prefix="haltewecker-rnv-") as staging_directory:
+        connection = sqlite3.connect(Path(staging_directory) / "rnv.sqlite3")
         try:
-            route_type = int(route.get("route_type", "3"))
-        except ValueError:
-            route_type = 3
-        routes.append({
-            "id": route_id,
-            "shortName": route.get("route_short_name", "").strip(),
-            "longName": route.get("route_long_name", "").strip(),
-            "routeType": route_type
-        })
+            connection.executescript(
+                """
+                PRAGMA journal_mode = OFF;
+                PRAGMA synchronous = OFF;
+                CREATE TABLE stops (
+                    seq INTEGER PRIMARY KEY,
+                    stop_id TEXT NOT NULL,
+                    parent_station TEXT NOT NULL,
+                    stop_name TEXT NOT NULL,
+                    stop_lat TEXT NOT NULL,
+                    stop_lon TEXT NOT NULL
+                );
+                CREATE INDEX stops_by_id ON stops(stop_id);
+                CREATE TABLE routes (
+                    seq INTEGER PRIMARY KEY,
+                    route_id TEXT NOT NULL,
+                    short_name TEXT NOT NULL,
+                    long_name TEXT NOT NULL,
+                    route_type INTEGER NOT NULL
+                );
+                CREATE TABLE trips (
+                    seq INTEGER PRIMARY KEY,
+                    trip_id TEXT NOT NULL,
+                    route_id TEXT NOT NULL,
+                    headsign TEXT NOT NULL
+                );
+                """
+            )
+            timed_stage("rnv", "stops", lambda: _stage_rnv_stops(archive, connection))
+            timed_stage("rnv", "routes", lambda: _stage_rnv_routes(archive, connection))
+            timed_stage("rnv", "trips", lambda: _stage_rnv_trips(archive, connection))
+            timed_stage("rnv", "assembly", lambda: _canonicalize_rnv_stops(connection))
+            timed_stage("rnv", "write", lambda: _write_rnv_network(connection, output))
 
-    trips = []
-    for trip in load_table(archive, "trips.txt"):
-        trip_id = trip.get("trip_id", "").strip()
-        route_id = trip.get("route_id", "").strip()
-        if not trip_id or not route_id:
-            continue
-        trips.append({
-            "id": trip_id,
-            "routeID": route_id,
-            "directionName": trip.get("trip_headsign", "").strip()
-        })
+            spatial_index = municipality_spatial_index(municipalities)
+            configured_codes = configured_municipality_codes(
+                cities, municipalities, spatial_index
+            )
+            city_ids_in_manifest = {str(city["id"]) for city in manifest}
+            city_id_by_code = dict(configured_codes)
+            for municipality in municipalities:
+                code = str(municipality["code"])
+                automatic_city_id = (
+                    f'{identifier_component(str(municipality["name"]))}-{code.lower()}'
+                )
+                if automatic_city_id in city_ids_in_manifest:
+                    city_id_by_code[code] = automatic_city_id
 
-    rnv_directory = output / "transit" / "rnv"
-    rnv_directory.mkdir(parents=True, exist_ok=True)
-    (rnv_directory / "network.json").write_text(
-        json.dumps(
-            {
-                "version": date.today().isoformat(),
-                "routes": routes,
-                "trips": trips
-            },
-            ensure_ascii=False,
-            separators=(",", ":")
-        ),
-        encoding="utf-8"
-    )
+            coordinate_bounds: dict[str, list[float | int]] = {}
+            coordinate_rows = []
+            for sequence, stop in enumerate(connection.execute(
+                "SELECT latitude, longitude FROM canonical_stops ORDER BY rowid"
+            ), start=1):
+                latitude, longitude = float(stop[0]), float(stop[1])
+                municipality = municipality_for_coordinate(
+                    latitude, longitude, municipalities, spatial_index
+                )
+                if municipality is None:
+                    continue
+                city_id = city_id_by_code.get(str(municipality["code"]))
+                if city_id is None or city_id not in city_ids_in_manifest:
+                    continue
+                coordinate_rows.append((sequence, city_id, latitude, longitude))
+                if len(coordinate_rows) >= 2_000:
+                    connection.executemany(
+                        "INSERT INTO city_coordinates VALUES (?, ?, ?, ?)",
+                        coordinate_rows
+                    )
+                    coordinate_rows.clear()
+                aggregate = coordinate_bounds.setdefault(
+                    city_id, [latitude, longitude, latitude, longitude, 0]
+                )
+                if aggregate[0] > latitude:
+                    aggregate[0] = latitude
+                if aggregate[1] > longitude:
+                    aggregate[1] = longitude
+                if aggregate[2] < latitude:
+                    aggregate[2] = latitude
+                if aggregate[3] < longitude:
+                    aggregate[3] = longitude
+                aggregate[4] += 1
+            if coordinate_rows:
+                connection.executemany(
+                    "INSERT INTO city_coordinates VALUES (?, ?, ?, ?)",
+                    coordinate_rows
+                )
+            connection.commit()
 
-    spatial_index = municipality_spatial_index(municipalities)
-    configured_codes = configured_municipality_codes(
-        cities,
-        municipalities,
-        spatial_index
-    )
-    city_ids_in_manifest = {str(city["id"]) for city in manifest}
-    city_id_by_code = dict(configured_codes)
-    for municipality in municipalities:
-        code = str(municipality["code"])
-        automatic_city_id = (
-            f'{identifier_component(str(municipality["name"]))}-{code.lower()}'
-        )
-        if automatic_city_id in city_ids_in_manifest:
-            city_id_by_code[code] = automatic_city_id
-
-    coordinates_by_city_id: dict[str, list[tuple[float, float]]] = {}
-    for stop in rnv_stops:
-        latitude = float(stop["latitude"])
-        longitude = float(stop["longitude"])
-        municipality = municipality_for_coordinate(
-            latitude,
-            longitude,
-            municipalities,
-            spatial_index
-        )
-        if municipality is None:
-            continue
-        city_id = city_id_by_code.get(str(municipality["code"]))
-        if city_id is None or city_id not in city_ids_in_manifest:
-            continue
-        coordinates_by_city_id.setdefault(city_id, []).append((latitude, longitude))
-
-    manifest_by_id = {str(city["id"]): city for city in manifest}
+            manifest_by_id = {str(city["id"]): city for city in manifest}
+            availability_cities = []
+            for city_id, aggregate in sorted(coordinate_bounds.items()):
+                city = manifest_by_id[city_id]
+                padding = 0.015
+                latitudes = connection.execute(
+                    "SELECT latitude FROM city_coordinates WHERE city_id = ? ORDER BY seq",
+                    (city_id,)
+                )
+                longitudes = connection.execute(
+                    "SELECT longitude FROM city_coordinates WHERE city_id = ? ORDER BY seq",
+                    (city_id,)
+                )
+                provider = {
+                    "providerID": f"rnv-{city_id}",
+                    "adapter": "rnv",
+                    "isEnabled": bool(gateway_url),
+                    "isExperimental": True,
+                    "features": ["liveVehicles", "realtimeDelay"],
+                    "statusMessage": f'Live-Radar für {city["name"]}',
+                    "region": {
+                        "minimumLongitude": aggregate[1] - padding,
+                        "minimumLatitude": aggregate[0] - padding,
+                        "maximumLongitude": aggregate[3] + padding,
+                        "maximumLatitude": aggregate[2] + padding
+                    }
+                }
+                if gateway_url:
+                    provider["gatewayURL"] = gateway_url
+                availability_cities.append({
+                    "cityID": f"{city_id}-de",
+                    "appCityID": city_id,
+                    "name": city["name"],
+                    "center": {
+                        "latitude": sum(row[0] for row in latitudes) / aggregate[4],
+                        "longitude": sum(row[0] for row in longitudes) / aggregate[4]
+                    },
+                    "providers": [provider]
+                })
+            return availability_cities, set(coordinate_bounds)
+        finally:
+            connection.close()
     availability_cities = []
     for city_id, coordinates in sorted(coordinates_by_city_id.items()):
         city = manifest_by_id[city_id]
@@ -2581,16 +2890,22 @@ def main(argv: list[str] | None = None) -> None:
 
     if not args.skip_german:
         assert german_archive is not None
-        rnv_cities, rnv_city_ids = timed_stage(
-            "rnv", "assets", lambda: build_rnv_assets(
-                archive=load_gtfs_archive(args.rnv_gtfs_url),
-                output=output,
-                manifest=manifest,
-                cities=cities,
-                municipalities=municipalities,
-                gateway_url=args.rnv_gateway_url.strip()
-            )
+        rnv_archive = timed_stage(
+            "rnv", "download", lambda: load_gtfs_archive(args.rnv_gtfs_url)
         )
+        try:
+            rnv_cities, rnv_city_ids = timed_stage(
+                "rnv", "assets", lambda: build_rnv_assets(
+                    archive=rnv_archive,
+                    output=output,
+                    manifest=manifest,
+                    cities=cities,
+                    municipalities=municipalities,
+                    gateway_url=args.rnv_gateway_url.strip()
+                )
+            )
+        finally:
+            rnv_archive.close()
 
     if not manifest:
         raise ValueError(

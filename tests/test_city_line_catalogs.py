@@ -7,6 +7,7 @@ import unittest
 import zipfile
 from pathlib import Path
 import sys
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
@@ -445,6 +446,62 @@ class CityLineCatalogTests(unittest.TestCase):
         self.assertNotIn("gatewayURL", availability[0]["providers"][0])
         self.assertEqual(network["routes"][0]["shortName"], "5")
         self.assertEqual(network["trips"][0]["routeID"], "route-5")
+
+    def test_rnv_assets_stage_large_tables_and_report_each_phase(self) -> None:
+        row_count = 5_000
+        archive_data = io.BytesIO()
+        with zipfile.ZipFile(archive_data, "w") as archive:
+            archive.writestr(
+                "stops.txt",
+                "stop_id,stop_name,stop_lat,stop_lon\n" + "".join(
+                    f"stop-{index},Stop {index},49.4,{8.4 + index / 100_000}\n"
+                    for index in range(row_count)
+                )
+            )
+            archive.writestr(
+                "routes.txt",
+                "route_id,route_short_name,route_long_name,route_type\n" + "".join(
+                    f"route-{index},{index},Route {index},3\n"
+                    for index in range(row_count)
+                )
+            )
+            archive.writestr(
+                "trips.txt",
+                "route_id,service_id,trip_id,trip_headsign\n" + "".join(
+                    f"route-{index},weekday,trip-{index},Destination {index}\n"
+                    for index in range(row_count)
+                )
+            )
+        archive_data.seek(0)
+
+        with tempfile.TemporaryDirectory() as temporary_directory, mock.patch(
+            "builtins.print"
+        ) as print_mock:
+            build_rnv_assets(
+                archive=zipfile.ZipFile(archive_data),
+                output=Path(temporary_directory),
+                manifest=[{"id": "mannheim-08222000", "name": "Mannheim", "aliases": []}],
+                cities=[],
+                municipalities=[municipality(
+                    code="08222000",
+                    name="Mannheim",
+                    minimum_longitude=8.3,
+                    minimum_latitude=49.3,
+                    maximum_longitude=8.7,
+                    maximum_latitude=49.7
+                )],
+                gateway_url=""
+            )
+            network = json.loads(
+                (Path(temporary_directory) / "transit" / "rnv" / "network.json")
+                .read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(len(network["routes"]), row_count)
+        self.assertEqual(len(network["trips"]), row_count)
+        logged = "\n".join(str(call.args[0]) for call in print_mock.call_args_list)
+        for phase in ("stops", "routes", "trips", "assembly", "write"):
+            self.assertIn(f"source=rnv stage={phase}", logged)
 
     def test_configured_city_line_scope_uses_municipality_not_search_radius(self) -> None:
         municipalities = [
