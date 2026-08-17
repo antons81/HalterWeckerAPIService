@@ -13,6 +13,7 @@ CURRENT="$DATA_ROOT/current"
 PREVIOUS="$DATA_ROOT/previous/stop-data"
 ROLLBACK="$DATA_ROOT/temp/current-rollback/$RELEASE_ID"
 CURRENT_RELEASE="$DATA_ROOT/current-release"
+STATIC_DEPARTURES_RELEASE="$DATA_ROOT/static-departures-release"
 DEPARTURES_CURRENT="$DATA_ROOT/departures-current.sqlite"
 STOP_DATA_LOCK="${STOP_DATA_LOCK:-/run/lock/haltewecker-stop-data.lock}"
 STATIC_DEPARTURES_LOCK="${STATIC_DEPARTURES_LOCK:-/run/lock/haltewecker-static-departures.lock}"
@@ -49,6 +50,11 @@ if ! "$FLOCK_BIN" -n 10; then
   echo "[StopData] static-departures lock is held by another job" >&2
   exit 1
 fi
+
+# Invalidate the standalone static-departures handoff before starting a new
+# stop-data build. A failed build must never leave the previous release eligible
+# for the downstream nightly static-departures timer.
+rm -f "$STATIC_DEPARTURES_RELEASE"
 
 run_systemctl() {
   "$SUDO_BIN" -n "$SYSTEMCTL_BIN" "$@"
@@ -376,6 +382,10 @@ if ! activate_runtime; then
   fi
   exit 1
 fi
+
+# Publish the handoff only after the release has passed runtime readiness and
+# all canonical release pointers have been activated.
+replace_link "$STATIC_DEPARTURES_RELEASE" "releases/$RELEASE_ID"
 
 if [[ -n "$OLD_RELEASE_TARGET" ]]; then
   mkdir -p "$(dirname "$PREVIOUS")"

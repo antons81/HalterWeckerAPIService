@@ -32,8 +32,13 @@ AUSTRIAN_GTFS_DIR="${AUSTRIAN_GTFS_DIR:-$DATA_ROOT/austria}"
 LOG_PREFIX="[StaticDepartures]"
 CONTAINER_NAME="${STATIC_DEPARTURES_CONTAINER_NAME:-static-departures-api}"
 ACTIVE_RELEASE_DIR=""
-if [[ -z "$RELEASE_ID" && -L "$DATA_ROOT/current-release" ]]; then
-  ACTIVE_RELEASE_DIR="$DATA_ROOT/current-release"
+STATIC_DEPARTURES_RELEASE="${STATIC_DEPARTURES_RELEASE:-$DATA_ROOT/static-departures-release}"
+if [[ -z "$RELEASE_ID" ]]; then
+  if [[ ! -L "$STATIC_DEPARTURES_RELEASE" ]]; then
+    echo "$LOG_PREFIX ERROR: no successful stop-data handoff for standalone release-scoped import" >&2
+    exit 1
+  fi
+  ACTIVE_RELEASE_DIR="$STATIC_DEPARTURES_RELEASE"
   RELEASE_ID="$(python3 - "$ACTIVE_RELEASE_DIR/release-metadata.json" <<'PY'
 import json
 import sys
@@ -42,6 +47,15 @@ PY
 )"
   STOP_DATA_PATH="$ACTIVE_RELEASE_DIR/stop-data"
   NEXT_DATABASE_PATH="$ACTIVE_RELEASE_DIR/departures-next.sqlite"
+fi
+
+# Standalone nightly runs derive provenance only from the active release that
+# supplied STOP_DATA_PATH. Do not search for or reuse artifacts from another release.
+if [[ -n "$RELEASE_ID" && -z "${EXTERNAL_GTFS_ARTIFACTS_JSON:-}" ]]; then
+  if [[ -z "$ACTIVE_RELEASE_DIR" ]]; then
+    ACTIVE_RELEASE_DIR="$DATA_ROOT/releases/$RELEASE_ID"
+  fi
+  EXTERNAL_GTFS_ARTIFACTS_JSON="$ACTIVE_RELEASE_DIR/gtfs-artifacts.json"
 fi
 
 if [[ "${READINESS_ONLY:-0}" == "1" ]]; then
@@ -114,7 +128,9 @@ else:
             print(f"{source_id}={value}")
 PY
 )
-IMPORT_ARGS+=("${EXTERNAL_GTFS_IMPORT_ARGS[@]}")
+if [[ ${#EXTERNAL_GTFS_IMPORT_ARGS[@]} -gt 0 ]]; then
+  IMPORT_ARGS+=("${EXTERNAL_GTFS_IMPORT_ARGS[@]}")
+fi
 
 # Restore the operator secret immediately before the importer so intermediate
 # environment setup cannot replace the credential inherited by the child.
