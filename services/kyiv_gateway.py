@@ -100,6 +100,12 @@ def _parse_trip_descriptor(data: bytes) -> tuple[str, str, str | None]:
     return trip_id, route_id, direction_id
 
 
+def _normalised_bearing(value: float | None) -> float | None:
+    if value is None or not math.isfinite(value):
+        return None
+    return value % 360.0
+
+
 def _positive_finite(value: float | None) -> float | None:
     if value is None or not math.isfinite(value) or value <= 0:
         return None
@@ -143,7 +149,7 @@ def _parse_vehicle_position(
         stop_sequence=stop_sequence,
         latitude=latitude,
         longitude=longitude,
-        bearing=_positive_finite(bearing),
+        bearing=_normalised_bearing(bearing),
         speed=_positive_finite(speed),
         timestamp=timestamp,
     )
@@ -287,6 +293,10 @@ class KyivVehiclePositionsGateway:
                     timestamp=vehicle.timestamp,
                     latitude=vehicle.latitude,
                     longitude=vehicle.longitude,
+                    trip_id=vehicle.trip_id,
+                    stop_id=vehicle.stop_id,
+                    stop_sequence=vehicle.stop_sequence,
+                    bearing=vehicle.bearing,
                 ),
             )
             result.append({

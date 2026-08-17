@@ -59,15 +59,25 @@ def vehicle_entity(
     longitude: float,
     timestamp: int = 1_000,
     trip_id: str | None = None,
+    direction_id: str | None = None,
+    bearing: float | None = None,
+    stop_id: str | None = None,
+    stop_sequence: int | None = None,
 ) -> bytes:
     trip = bytes_field(5, route_id.encode())
     if trip_id is not None:
-        trip = bytes_field(1, trip_id) + trip
+        trip = bytes_field(1, trip_id.encode()) + trip
+    if direction_id is not None:
+        trip += bytes_field(6, direction_id.encode())
     position = fixed32_field(1, latitude) + fixed32_field(2, longitude)
+    if bearing is not None:
+        position += fixed32_field(3, bearing)
     vehicle = (
         bytes_field(1, trip)
         + bytes_field(2, position)
+        + (varint_field(3, stop_sequence) if stop_sequence is not None else b"")
         + varint_field(5, timestamp)
+        + (bytes_field(7, stop_id.encode()) if stop_id is not None else b"")
         + bytes_field(8, bytes_field(1, vehicle_id.encode()))
     )
     return bytes_field(1, entity_id.encode()) + bytes_field(4, vehicle)
@@ -184,6 +194,45 @@ class KyivGatewayTests(unittest.TestCase):
 
         self.assertEqual(response.status, 200)
         self.assertEqual(response.payload["vehicleCount"], 0)
+
+    def test_parser_preserves_realtime_metadata_and_normalises_zero_bearing(self) -> None:
+        feed = bytes_field(
+            2,
+            vehicle_entity(
+                entity_id="entity-metadata",
+                vehicle_id="vehicle-metadata",
+                route_id="3_6",
+                latitude=50.4501,
+                longitude=30.5234,
+                trip_id="trip-1",
+                direction_id="1",
+                bearing=0.0,
+                stop_id="stop-1",
+                stop_sequence=17,
+            ),
+        )
+        _, _, vehicles = parse_kyiv_vehicle_positions(feed)
+        vehicle = vehicles[0]
+        self.assertEqual(vehicle.trip_id, "trip-1")
+        self.assertEqual(vehicle.direction_id, "1")
+        self.assertEqual(vehicle.stop_id, "stop-1")
+        self.assertEqual(vehicle.stop_sequence, 17)
+        self.assertEqual(vehicle.bearing, 0.0)
+
+    def test_parser_drops_invalid_bearing(self) -> None:
+        feed = bytes_field(
+            2,
+            vehicle_entity(
+                entity_id="entity-invalid-bearing",
+                vehicle_id="vehicle-invalid-bearing",
+                route_id="3_6",
+                latitude=50.4501,
+                longitude=30.5234,
+                bearing=float("nan"),
+            ),
+        )
+        _, _, vehicles = parse_kyiv_vehicle_positions(feed)
+        self.assertIsNone(vehicles[0].bearing)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,9 @@ MIN_PROGRESS_DELTA_METERS = 25.0
 MAX_SAMPLE_GAP_SECONDS = 300
 MAX_SPEED_METERS_PER_SECOND = 45.0
 MAX_SHAPE_DISTANCE_METERS = 1_000.0
+MAX_CONFIDENT_SHAPE_DISTANCE_METERS = 100.0
+MIN_DISTANCE_MARGIN_METERS = 20.0
+MAX_BEARING_DEVIATION_DEGREES = 35.0
 SHAPE_DISTANCE_SCALE_METERS = 500.0
 HISTORY_TTL_SECONDS = 600.0
 HYSTERESIS_RETENTION_SECONDS = 180.0
@@ -119,8 +122,13 @@ class KyivRadarShape:
 
 @dataclass(frozen=True)
 class KyivRadarCandidate:
+    variant_id: str
     direction_id: str
     destination: str | None
+    terminal_stop_id: str | None
+    trip_ids: frozenset[str]
+    stop_ids: tuple[str, ...]
+    stop_sequences: tuple[int, ...]
     shapes: tuple[KyivRadarShape, ...]
 
 
@@ -163,7 +171,36 @@ class KyivRadarTopology:
                 if not shapes:
                     continue
                 destination = str(raw_direction.get("destination", "")).strip() or None
-                candidates.append(KyivRadarCandidate(direction_id, destination, shapes))
+                raw_trip_ids = raw_direction.get("tripIDs")
+                trip_ids = frozenset(
+                    str(item).strip() for item in raw_trip_ids if str(item).strip()
+                ) if isinstance(raw_trip_ids, list) else frozenset()
+                raw_stop_ids = raw_direction.get("stopIDs")
+                stop_ids = tuple(
+                    str(item).strip() for item in raw_stop_ids if str(item).strip()
+                ) if isinstance(raw_stop_ids, list) else ()
+                raw_stop_sequences = raw_direction.get("stopSequences")
+                stop_sequences = tuple(
+                    int(item) for item in raw_stop_sequences
+                    if isinstance(item, (int, float, str)) and str(item).strip()
+                ) if isinstance(raw_stop_sequences, list) else ()
+                terminal_stop_id = str(raw_direction.get("terminalStopID", "")).strip() or None
+                shape_ids = ",".join(shape.shape_id for shape in shapes)
+                variant_id = str(raw_direction.get("variantID", "")).strip() or (
+                    f"{raw_route_id}:{direction_id}:{shape_ids}:{destination or ''}"
+                )
+                candidates.append(
+                    KyivRadarCandidate(
+                        variant_id,
+                        direction_id,
+                        destination,
+                        terminal_stop_id,
+                        trip_ids,
+                        stop_ids,
+                        stop_sequences,
+                        shapes,
+                    )
+                )
             if candidates:
                 routes[str(raw_route_id)] = tuple(candidates)
         return cls(routes)
@@ -190,6 +227,10 @@ class KyivVehicleSample:
     timestamp: int
     latitude: float
     longitude: float
+    trip_id: str | None = None
+    stop_id: str | None = None
+    stop_sequence: int | None = None
+    bearing: float | None = None
 
 
 @dataclass(frozen=True)
@@ -199,12 +240,15 @@ class KyivDirectionDecision:
     confidence: float | None
     margin: float | None
     reason: str
+    variant_id: str | None = None
+    evidence_source: str = "unknown"
 
 
 @dataclass(frozen=True)
 class _Projection:
     distance_meters: float
     progress_meters: float
+    bearing_degrees: float | None = None
 
 
 @dataclass(frozen=True)
@@ -214,6 +258,26 @@ class _CandidateScore:
     support: float
     contrary: float
     usable_shapes: int
+    best_distance_meters: float
+
+
+@dataclass(frozen=True)
+class KyivDestinationFamily:
+    route_id: str
+    terminal_stop_id: str | None
+    destination: str | None
+    variants: tuple[KyivRadarCandidate, ...]
+
+    @property
+    def family_id(self) -> str:
+        identity = self.terminal_stop_id or self.destination or "unknown"
+        return f"{self.route_id}:{identity}"
+
+
+@dataclass(frozen=True)
+class _FamilyScore:
+    family: KyivDestinationFamily
+    best_variant: _CandidateScore
 
 
 @dataclass
@@ -223,10 +287,14 @@ class _VehicleState:
         default_factory=lambda: deque(maxlen=MAX_SAMPLES_PER_VEHICLE)
     )
     confirmed_direction_id: str | None = None
+    confirmed_variant_id: str | None = None
+    confirmed_family_id: str | None = None
     confirmed_destination: str | None = None
     confirmed_confidence: float | None = None
     last_confident_at: float | None = None
     pending_direction_id: str | None = None
+    pending_variant_id: str | None = None
+    pending_family_id: str | None = None
     pending_destination: str | None = None
     pending_count: int = 0
     last_seen_at: float = 0.0
@@ -264,6 +332,27 @@ class KyivDirectionInference:
                 state = _VehicleState(route_id=route_id, last_seen_at=now)
                 self._states[vehicle_id] = state
             state.last_seen_at = now
+
+            identity_candidates = self._identity_candidates(state.route_id, sample)
+            if len(identity_candidates) == 1:
+                candidate = identity_candidates[0]
+                family_id = self._family_id(state.route_id, candidate)
+                state.samples.append(sample)
+                state.confirmed_direction_id = candidate.direction_id
+                state.confirmed_variant_id = candidate.variant_id
+                state.confirmed_family_id = family_id
+                state.confirmed_destination = candidate.destination
+                state.confirmed_confidence = 1.0
+                state.last_confident_at = now
+                return KyivDirectionDecision(
+                    candidate.direction_id,
+                    candidate.destination,
+                    1.0,
+                    1.0,
+                    "identity",
+                    candidate.variant_id,
+                    "trip-id" if sample.trip_id and sample.trip_id in candidate.trip_ids else "stop-id",
+                )
 
             previous = state.samples[-1] if state.samples else None
             if previous is None:
@@ -308,10 +397,22 @@ class KyivDirectionInference:
     @staticmethod
     def _reset_direction(state: _VehicleState) -> None:
         state.confirmed_direction_id = None
+        state.confirmed_variant_id = None
+        state.confirmed_family_id = None
         state.confirmed_destination = None
         state.confirmed_confidence = None
         state.last_confident_at = None
         state.pending_direction_id = None
+        state.pending_variant_id = None
+        state.pending_family_id = None
+        state.pending_destination = None
+        state.pending_count = 0
+
+    @staticmethod
+    def _reset_pending(state: _VehicleState) -> None:
+        state.pending_direction_id = None
+        state.pending_variant_id = None
+        state.pending_family_id = None
         state.pending_destination = None
         state.pending_count = 0
 
@@ -323,7 +424,33 @@ class KyivDirectionInference:
             state.confirmed_confidence,
             None,
             reason,
+            state.confirmed_variant_id,
+            "history" if state.confirmed_variant_id else reason,
         )
+
+    def _identity_candidates(
+        self,
+        route_id: str,
+        sample: KyivVehicleSample,
+    ) -> tuple[KyivRadarCandidate, ...]:
+        candidates = self._topology.candidates(route_id)
+        if sample.trip_id:
+            matched = tuple(candidate for candidate in candidates if sample.trip_id in candidate.trip_ids)
+            if matched:
+                return matched
+        if sample.stop_id:
+            matched = tuple(
+                candidate for candidate in candidates
+                if sample.stop_id in candidate.stop_ids
+                and (
+                    sample.stop_sequence is None
+                    or not candidate.stop_sequences
+                    or sample.stop_sequence in candidate.stop_sequences
+                )
+            )
+            if matched:
+                return matched
+        return ()
 
     def _retain_or_unknown(
         self,
@@ -331,12 +458,21 @@ class KyivDirectionInference:
         now: float,
         reason: str,
     ) -> KyivDirectionDecision:
+        self._reset_pending(state)
         if (
             state.confirmed_direction_id is not None
             and state.last_confident_at is not None
             and now - state.last_confident_at <= HYSTERESIS_RETENTION_SECONDS
         ):
-            return self._decision_from_state(state, f"retained-{reason}")
+            return KyivDirectionDecision(
+                None,
+                None,
+                state.confirmed_confidence,
+                None,
+                f"retained-{reason}",
+                None,
+                "history",
+            )
         self._reset_direction(state)
         return self._decision_from_state(state, reason)
 
@@ -354,6 +490,7 @@ class KyivDirectionInference:
         for candidate in candidates:
             support = contrary = 0.0
             usable_shapes = 0
+            best_distance = float("inf")
             for shape in candidate.shapes:
                 before = _project(shape, previous.latitude, previous.longitude)
                 after = _project(shape, current.latitude, current.longitude)
@@ -364,14 +501,23 @@ class KyivDirectionInference:
                     continue
                 if abs(delta) / elapsed > MAX_SPEED_METERS_PER_SECOND:
                     continue
+                bearing_conflict = (
+                    current.bearing is not None
+                    and after.bearing_degrees is not None
+                    and _bearing_difference(current.bearing, after.bearing_degrees)
+                    > MAX_BEARING_DEVIATION_DEGREES
+                )
                 weight = math.exp(
                     -((before.distance_meters + after.distance_meters) / 2.0)
                     / SHAPE_DISTANCE_SCALE_METERS
                 )
                 usable_shapes += 1
+                best_distance = min(best_distance, after.distance_meters)
                 if delta > 0:
                     support += weight
                 else:
+                    contrary += weight
+                if bearing_conflict:
                     contrary += weight
             total = support + contrary
             if usable_shapes == 0 or total <= 0:
@@ -383,11 +529,51 @@ class KyivDirectionInference:
                     support=support,
                     contrary=contrary,
                     usable_shapes=usable_shapes,
+                    best_distance_meters=best_distance,
                 )
             )
         if not scored:
             return None
         return tuple(scored)
+
+    def _destination_families(
+        self,
+        route_id: str,
+        scores: tuple[_CandidateScore, ...],
+    ) -> tuple[_FamilyScore, ...]:
+        families: dict[tuple[str | None, str | None], list[_CandidateScore]] = {}
+        candidates_by_identity: dict[
+            tuple[str | None, str | None], list[KyivRadarCandidate]
+        ] = {}
+        for score in scores:
+            identity = (score.candidate.terminal_stop_id, score.candidate.destination)
+            families.setdefault(identity, []).append(score)
+            candidates_by_identity.setdefault(identity, []).append(score.candidate)
+
+        family_scores: list[_FamilyScore] = []
+        for identity, family_scores_for_variants in families.items():
+            best_variant = max(
+                family_scores_for_variants,
+                key=lambda item: (item.score, item.support, -item.best_distance_meters),
+            )
+            terminal_stop_id, destination = identity
+            family_scores.append(
+                _FamilyScore(
+                    KyivDestinationFamily(
+                        route_id,
+                        terminal_stop_id,
+                        destination,
+                        tuple(candidates_by_identity[identity]),
+                    ),
+                    best_variant,
+                )
+            )
+        return tuple(family_scores)
+
+    @staticmethod
+    def _family_id(route_id: str, candidate: KyivRadarCandidate) -> str:
+        identity = candidate.terminal_stop_id or candidate.destination or "unknown"
+        return f"{route_id}:{identity}"
 
     def _apply_scores(
         self,
@@ -395,66 +581,122 @@ class KyivDirectionInference:
         scores: tuple[_CandidateScore, ...],
         now: float,
     ) -> KyivDirectionDecision:
-        candidates = self._topology.candidates(state.route_id)
-        best = max(scores, key=lambda item: (item.score, item.support, item.usable_shapes))
-        direction_scores = {
-            candidate.direction_id: 0.0
-            for candidate in candidates
-        }
-        for score in scores:
-            direction_scores[score.candidate.direction_id] = max(
-                direction_scores.get(score.candidate.direction_id, 0.0),
-                score.score,
+        eligible = tuple(
+            score for score in scores
+            if score.best_distance_meters <= MAX_CONFIDENT_SHAPE_DISTANCE_METERS
+        )
+        if not eligible:
+            return self._retain_or_unknown(state, now, "distance")
+        family_scores = self._destination_families(state.route_id, eligible)
+        ordered = sorted(
+            family_scores,
+            key=lambda item: (
+                -item.best_variant.score,
+                item.best_variant.best_distance_meters,
+            ),
+        )
+        best_family = ordered[0]
+        best = best_family.best_variant
+        second_family = ordered[1] if len(ordered) > 1 else None
+        second = second_family.best_variant if second_family else None
+        margin = best.score - second.score if second else 1.0
+        distance_margin = (
+            second.best_distance_meters - best.best_distance_meters
+            if second else float("inf")
+        )
+        closest_distance_by_family = {
+            family_score.family.family_id: min(
+                item.best_distance_meters
+                for item in eligible
+                if (
+                    item.candidate.terminal_stop_id,
+                    item.candidate.destination,
+                ) == (
+                    family_score.family.terminal_stop_id,
+                    family_score.family.destination,
+                )
             )
-        competing_scores = [
-            score for direction, score in direction_scores.items()
-            if direction != best.candidate.direction_id
-        ]
-        second = max(competing_scores, default=0.0)
-        margin = best.score - second
-        confident = best.score >= MIN_CONFIDENCE and margin >= MIN_MARGIN
+            for family_score in family_scores
+        }
+        closest_family_id = min(
+            closest_distance_by_family,
+            key=closest_distance_by_family.get,
+        )
+        best_is_spatially_dominated = (
+            best.best_distance_meters
+            - closest_distance_by_family[best_family.family.family_id]
+            >= MIN_DISTANCE_MARGIN_METERS
+            and closest_family_id != best_family.family.family_id
+        )
+        same_direction_competition = (
+            second is not None
+            and second.candidate.direction_id == best.candidate.direction_id
+        )
+        confident = (
+            best.score >= MIN_CONFIDENCE
+            and margin >= MIN_MARGIN
+            and (
+                not same_direction_competition
+                or distance_margin >= MIN_DISTANCE_MARGIN_METERS
+            )
+            and not best_is_spatially_dominated
+        )
         if not confident:
             return self._retain_or_unknown(state, now, "low-confidence")
 
         direction_id = best.candidate.direction_id
-        destination = self._unique_destination(candidates, direction_id)
-        if state.confirmed_direction_id is None:
+        destination = best_family.family.destination
+        family_id = best_family.family.family_id
+        public_variant_id = (
+            best.candidate.variant_id
+            if len(best_family.family.variants) == 1
+            else None
+        )
+        if state.confirmed_family_id is None:
             state.confirmed_direction_id = direction_id
+            state.confirmed_variant_id = best.candidate.variant_id
+            state.confirmed_family_id = family_id
             state.confirmed_destination = destination
             state.confirmed_confidence = best.score
             state.last_confident_at = now
-            return KyivDirectionDecision(direction_id, destination, best.score, margin, "confident")
+            return KyivDirectionDecision(direction_id, destination, best.score, margin, "confident", public_variant_id, "geometry")
 
-        if state.confirmed_direction_id == direction_id:
+        if state.confirmed_family_id == family_id:
             state.confirmed_destination = destination
             state.confirmed_confidence = best.score
             state.last_confident_at = now
-            state.pending_direction_id = None
-            state.pending_destination = None
-            state.pending_count = 0
-            return KyivDirectionDecision(direction_id, destination, best.score, margin, "stable")
+            self._reset_pending(state)
+            return KyivDirectionDecision(direction_id, destination, best.score, margin, "stable", public_variant_id, "geometry")
 
         if best.score >= STRONG_SWITCH_CONFIDENCE and margin >= STRONG_SWITCH_MARGIN:
-            if state.pending_direction_id == direction_id:
+            if state.pending_family_id == family_id:
                 state.pending_count += 1
             else:
                 state.pending_direction_id = direction_id
+                state.pending_variant_id = best.candidate.variant_id
+                state.pending_family_id = family_id
                 state.pending_destination = destination
                 state.pending_count = 1
             if state.pending_count >= REQUIRED_SWITCH_SAMPLES:
                 state.confirmed_direction_id = direction_id
+                state.confirmed_variant_id = best.candidate.variant_id
+                state.confirmed_family_id = family_id
                 state.confirmed_destination = destination
                 state.confirmed_confidence = best.score
                 state.last_confident_at = now
-                state.pending_direction_id = None
-                state.pending_destination = None
-                state.pending_count = 0
-                return KyivDirectionDecision(direction_id, destination, best.score, margin, "switched")
-        else:
-            state.pending_direction_id = None
-            state.pending_destination = None
-            state.pending_count = 0
-        return self._decision_from_state(state, "retained-opposite-evidence")
+                self._reset_pending(state)
+                return KyivDirectionDecision(direction_id, destination, best.score, margin, "switched", public_variant_id, "geometry")
+            return KyivDirectionDecision(
+                None,
+                None,
+                best.score,
+                margin,
+                "pending-switch",
+                None,
+                "geometry",
+            )
+        self._reset_pending(state)
+        return self._retain_or_unknown(state, now, "opposite-evidence")
 
     @staticmethod
     def _unique_destination(
@@ -515,7 +757,22 @@ def _project(shape: KyivRadarShape, latitude: float, longitude: float) -> _Proje
         projected_y = first_xy[1] + fraction * dy
         distance = math.hypot(projected_x, projected_y)
         progress = first[2] + fraction * (second[2] - first[2])
-        candidate = _Projection(distance, progress)
+        candidate = _Projection(distance, progress, _segment_bearing(first, second))
         if best is None or candidate.distance_meters < best.distance_meters:
             best = candidate
-    return best or _Projection(float("inf"), 0.0)
+    return best or _Projection(float("inf"), 0.0, None)
+
+
+def _segment_bearing(
+    first: tuple[float, float, float],
+    second: tuple[float, float, float],
+) -> float:
+    latitude = math.radians((first[0] + second[0]) / 2.0)
+    x = math.radians(second[1] - first[1]) * math.cos(latitude)
+    y = math.radians(second[0] - first[0])
+    return (math.degrees(math.atan2(x, y)) + 360.0) % 360.0
+
+
+def _bearing_difference(first: float, second: float) -> float:
+    difference = abs((first - second) % 360.0)
+    return min(difference, 360.0 - difference)

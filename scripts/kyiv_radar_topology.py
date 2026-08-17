@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import zipfile
@@ -49,7 +50,7 @@ def build_radar_topology(
         for row in _rows(archive, "stops.txt")
         if str(row.get("stop_id", "")).strip()
     }
-    terminal_by_trip: dict[str, tuple[int, str]] = {}
+    stops_by_trip: dict[str, list[tuple[int, str]]] = defaultdict(list)
     for row in _rows(archive, "stop_times.txt"):
         trip_id = str(row.get("trip_id", "")).strip()
         if trip_id not in trips:
@@ -61,9 +62,9 @@ def build_radar_topology(
             sequence = int(str(row.get("stop_sequence", "0") or "0"))
         except ValueError:
             sequence = 0
-        previous = terminal_by_trip.get(trip_id)
-        if previous is None or sequence >= previous[0]:
-            terminal_by_trip[trip_id] = (sequence, stop_id)
+        stops_by_trip[trip_id].append((sequence, stop_id))
+    for trip_stops in stops_by_trip.values():
+        trip_stops.sort()
 
     shape_groups: dict[str, list[tuple[float, float, int, float | None]]] = defaultdict(list)
     for row in _rows(archive, "shapes.txt"):
@@ -109,23 +110,28 @@ def build_radar_topology(
             "points": points,
         }
 
-    grouped: dict[tuple[str, str, str], set[str]] = defaultdict(set)
+    grouped: dict[tuple[str, str, str, str, str, tuple[str, ...]], set[str]] = defaultdict(set)
     for trip_id, trip in trips.items():
         shape_id = trip["shape_id"]
         if shape_id not in shape_payloads:
             continue
+        trip_stops = stops_by_trip.get(trip_id, [])
+        if not trip_stops:
+            continue
+        ordered_stop_ids = tuple(stop_id for _sequence, stop_id in trip_stops)
+        ordered_stop_sequences = tuple(sequence for sequence, _stop_id in trip_stops)
+        terminal_stop_id = ordered_stop_ids[-1]
         destination = trip["headsign"]
         if not destination:
-            terminal = terminal_by_trip.get(trip_id)
-            destination = stop_names.get(terminal[1], "") if terminal else ""
-        grouped[(trip["route_id"], trip["direction_id"], destination)].add(shape_id)
+            destination = stop_names.get(terminal_stop_id, "")
+        grouped[(trip["route_id"], trip["direction_id"], shape_id, terminal_stop_id, destination, ordered_stop_ids, ordered_stop_sequences)].add(trip_id)
 
     for city in cities:
         city_id = str(city.get("id", "")).strip()
         if not city_id:
             continue
         city_routes: dict[str, dict[str, object]] = {}
-        for (route_id, direction_id, destination), shape_ids in sorted(grouped.items()):
+        for (route_id, direction_id, shape_id, terminal_stop_id, destination, stop_ids, stop_sequences), trip_ids in sorted(grouped.items()):
             published_route_id = f"{namespace}{route_id}" if namespace else route_id
             direction_rows = city_routes.setdefault(
                 published_route_id,
@@ -133,13 +139,24 @@ def build_radar_topology(
             )["directions"]
             if not isinstance(direction_rows, list):
                 continue
+            signature = "|".join(f"{sequence}:{stop_id}" for sequence, stop_id in zip(stop_sequences, stop_ids))
+            variant_id = hashlib.sha1(
+                f"{route_id}|{direction_id}|{shape_id}|{terminal_stop_id}|{signature}".encode("utf-8")
+            ).hexdigest()[:16]
             direction_rows.append({
+                "variantID": variant_id,
+                "routeID": published_route_id,
                 "directionID": direction_id,
+                "shapeID": shape_id,
+                "terminalStopID": terminal_stop_id,
                 "destination": destination or None,
-                "shapes": [shape_payloads[shape_id] for shape_id in sorted(shape_ids)],
+                "tripIDs": sorted(trip_ids),
+                "stopIDs": list(stop_ids),
+                "stopSequences": list(stop_sequences),
+                "shapes": [shape_payloads[shape_id]],
             })
         artifact = {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "cityID": city_id,
             "routes": dict(sorted(city_routes.items())),
         }
@@ -151,7 +168,7 @@ def build_radar_topology(
         )
 
     return {
-        str(city.get("id")): len({route_id for route_id, _direction, _destination in grouped})
+        str(city.get("id")): len({route_id for route_id, _direction, _shape, _terminal, _destination, _stops, _sequences in grouped})
         for city in cities
         if city.get("id")
     }

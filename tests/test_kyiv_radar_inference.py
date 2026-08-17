@@ -57,13 +57,19 @@ def topology_payload(*, shared_geometry: bool = False) -> dict[str, object]:
             "3_6": {
                 "directions": [
                     {
+                        "variantID": "variant-forward",
                         "directionID": "0",
                         "destination": "Terminal forward",
+                        "tripIDs": ["trip-forward"],
+                        "stopIDs": ["stop-start", "stop-forward"],
                         "shapes": [forward],
                     },
                     {
+                        "variantID": "variant-reverse",
                         "directionID": "1",
                         "destination": "Terminal reverse",
+                        "tripIDs": ["trip-reverse"],
+                        "stopIDs": ["stop-terminal", "stop-start"],
                         "shapes": [reverse],
                     },
                 ],
@@ -73,6 +79,67 @@ def topology_payload(*, shared_geometry: bool = False) -> dict[str, object]:
 
 
 class KyivDirectionInferenceTests(unittest.TestCase):
+    def test_exact_trip_identity_selects_variant_before_geometry(self) -> None:
+        inference = KyivDirectionInference(
+            KyivRadarTopology.from_payload(topology_payload()),
+            clock=lambda: 1000.0,
+        )
+        result = inference.observe(
+            "vehicle-trip",
+            "3_6",
+            KyivVehicleSample(1000, 50.4501, 30.5220, trip_id="trip-forward"),
+        )
+        self.assertEqual(result.variant_id, "variant-forward")
+        self.assertEqual(result.destination, "Terminal forward")
+        self.assertEqual(result.evidence_source, "trip-id")
+
+    def test_stop_identity_selects_depot_terminal_without_filtering_it(self) -> None:
+        payload = topology_payload()
+        payload["routes"]["3_6"]["directions"][0]["destination"] = "ТРЕД"
+        payload["routes"]["3_6"]["directions"][0]["stopIDs"] = ["stop-start", "depot-stop"]
+        inference = KyivDirectionInference(
+            KyivRadarTopology.from_payload(payload),
+            clock=lambda: 1000.0,
+        )
+        result = inference.observe(
+            "vehicle-depot",
+            "3_6",
+            KyivVehicleSample(1000, 50.4501, 30.5220, stop_id="depot-stop"),
+        )
+        self.assertEqual(result.destination, "ТРЕД")
+        self.assertEqual(result.evidence_source, "stop-id")
+
+    def test_bearing_rejects_opposite_shape(self) -> None:
+        inference = KyivDirectionInference(
+            KyivRadarTopology.from_payload(topology_payload()),
+            clock=lambda: 1000.0,
+        )
+        inference.observe("vehicle-bearing", "3_6", KyivVehicleSample(1000, 50.4501, 30.5220))
+        result = inference.observe(
+            "vehicle-bearing",
+            "3_6",
+            KyivVehicleSample(1060, 50.4501, 30.5260, bearing=90.0),
+        )
+        self.assertEqual(result.variant_id, "variant-forward")
+
+    def test_route_change_drops_confirmed_variant(self) -> None:
+        inference = KyivDirectionInference(
+            KyivRadarTopology.from_payload(topology_payload()),
+            clock=lambda: 1000.0,
+        )
+        first = inference.observe(
+            "vehicle-route-change",
+            "3_6",
+            KyivVehicleSample(1000, 50.4501, 30.5220, trip_id="trip-forward"),
+        )
+        changed = inference.observe(
+            "vehicle-route-change",
+            "unknown-route",
+            KyivVehicleSample(1060, 50.4501, 30.5260),
+        )
+        self.assertEqual(first.variant_id, "variant-forward")
+        self.assertIsNone(changed.variant_id)
+        self.assertIsNone(changed.destination)
     def test_first_sample_is_unknown_and_second_moving_sample_is_confident(self) -> None:
         inference = KyivDirectionInference(
             KyivRadarTopology.from_payload(topology_payload()),
@@ -106,6 +173,100 @@ class KyivDirectionInferenceTests(unittest.TestCase):
 
         self.assertIsNone(result.direction_id)
         self.assertIsNone(result.destination)
+
+    def test_same_direction_variants_with_equal_distance_are_ambiguous(self) -> None:
+        payload = topology_payload()
+        duplicate = dict(payload["routes"]["3_6"]["directions"][0])
+        duplicate["variantID"] = "variant-forward-duplicate"
+        duplicate["destination"] = "Another terminal"
+        payload["routes"]["3_6"]["directions"].append(duplicate)
+        inference = KyivDirectionInference(
+            KyivRadarTopology.from_payload(payload),
+            clock=lambda: 1000.0,
+        )
+        inference.observe("vehicle-ambiguous", "3_6", KyivVehicleSample(1000, 50.4501, 30.5220))
+        result = inference.observe("vehicle-ambiguous", "3_6", KyivVehicleSample(1060, 50.4501, 30.5260))
+        self.assertIsNone(result.variant_id)
+        self.assertIsNone(result.destination)
+
+    def test_same_destination_variants_do_not_block_family_decision(self) -> None:
+        payload = topology_payload()
+        forward = payload["routes"]["3_6"]["directions"][0]
+        forward["terminalStopID"] = "terminal-forward"
+        duplicate = dict(forward)
+        duplicate["variantID"] = "variant-forward-duplicate"
+        duplicate["tripIDs"] = ["trip-forward-duplicate"]
+        payload["routes"]["3_6"]["directions"].append(duplicate)
+
+        inference = KyivDirectionInference(
+            KyivRadarTopology.from_payload(payload),
+            clock=lambda: 1000.0,
+        )
+        inference.observe("vehicle-family", "3_6", KyivVehicleSample(1000, 50.4501, 30.5220))
+        result = inference.observe(
+            "vehicle-family",
+            "3_6",
+            KyivVehicleSample(1060, 50.4501, 30.5260),
+        )
+
+        self.assertEqual(result.destination, "Terminal forward")
+        self.assertIsNone(result.variant_id)
+
+    def test_same_display_name_with_different_terminal_ids_remains_ambiguous(self) -> None:
+        payload = topology_payload()
+        forward = payload["routes"]["3_6"]["directions"][0]
+        reverse = payload["routes"]["3_6"]["directions"][1]
+        forward["destination"] = reverse["destination"] = "Same display name"
+        forward["terminalStopID"] = "terminal-forward"
+        reverse["terminalStopID"] = "terminal-reverse"
+        reverse["shapes"] = forward["shapes"]
+
+        inference = KyivDirectionInference(
+            KyivRadarTopology.from_payload(payload),
+            clock=lambda: 1000.0,
+        )
+        inference.observe("vehicle-terminal-name", "3_6", KyivVehicleSample(1000, 50.4501, 30.5220))
+        result = inference.observe(
+            "vehicle-terminal-name",
+            "3_6",
+            KyivVehicleSample(1060, 50.4501, 30.5260),
+        )
+
+        self.assertIsNone(result.destination)
+
+    def test_depot_family_is_not_filtered(self) -> None:
+        payload = topology_payload()
+        forward = payload["routes"]["3_6"]["directions"][0]
+        forward["destination"] = "ТРЕД депо"
+        forward["terminalStopID"] = "tred-terminal"
+        duplicate = dict(forward)
+        duplicate["variantID"] = "variant-tred-duplicate"
+        duplicate["tripIDs"] = ["trip-tred-duplicate"]
+        payload["routes"]["3_6"]["directions"].append(duplicate)
+
+        inference = KyivDirectionInference(
+            KyivRadarTopology.from_payload(payload),
+            clock=lambda: 1000.0,
+        )
+        inference.observe("vehicle-tred", "3_6", KyivVehicleSample(1000, 50.4501, 30.5220))
+        result = inference.observe(
+            "vehicle-tred",
+            "3_6",
+            KyivVehicleSample(1060, 50.4501, 30.5260),
+        )
+
+        self.assertEqual(result.destination, "ТРЕД депо")
+
+    def test_far_position_and_non_monotonic_timestamp_are_unknown(self) -> None:
+        inference = KyivDirectionInference(
+            KyivRadarTopology.from_payload(topology_payload()),
+            clock=lambda: 1000.0,
+        )
+        inference.observe("vehicle-far", "3_6", KyivVehicleSample(1000, 51.0, 31.0))
+        far = inference.observe("vehicle-far", "3_6", KyivVehicleSample(1060, 51.0, 31.01))
+        self.assertIsNone(far.destination)
+        non_monotonic = inference.observe("vehicle-far", "3_6", KyivVehicleSample(1050, 50.4501, 30.5260))
+        self.assertIsNone(non_monotonic.destination)
 
     def test_multiple_shapes_for_direction_are_aggregated(self) -> None:
         payload = topology_payload()
@@ -158,9 +319,99 @@ class KyivDirectionInferenceTests(unittest.TestCase):
         switched = inference.observe("vehicle-sequence", "3_6", KyivVehicleSample(1180, 50.4501, 30.5185))
 
         self.assertEqual(forward.direction_id, "0")
-        self.assertEqual(retained.direction_id, "0")
+        self.assertIsNone(retained.direction_id)
+        self.assertIsNone(retained.destination)
+        self.assertEqual(retained.reason, "pending-switch")
         self.assertEqual(switched.direction_id, "1")
         self.assertEqual(switched.destination, "Terminal reverse")
+
+    def test_weak_sample_resets_alternate_pending_family(self) -> None:
+        inference = KyivDirectionInference(
+            KyivRadarTopology.from_payload(topology_payload()),
+            clock=lambda: 1000.0,
+        )
+        inference.observe("vehicle-pending-reset", "3_6", KyivVehicleSample(1000, 50.4501, 30.5220))
+        inference.observe("vehicle-pending-reset", "3_6", KyivVehicleSample(1060, 50.4501, 30.5260))
+        first_alternate = inference.observe(
+            "vehicle-pending-reset",
+            "3_6",
+            KyivVehicleSample(1120, 50.4501, 30.5220),
+        )
+        weak = inference.observe(
+            "vehicle-pending-reset",
+            "3_6",
+            KyivVehicleSample(1180, 50.4501, 30.5221),
+        )
+        second_alternate = inference.observe(
+            "vehicle-pending-reset",
+            "3_6",
+            KyivVehicleSample(1240, 50.4501, 30.5185),
+        )
+
+        self.assertEqual(first_alternate.reason, "pending-switch")
+        self.assertIsNone(first_alternate.destination)
+        self.assertIsNone(weak.destination)
+        self.assertEqual(second_alternate.reason, "pending-switch")
+        self.assertIsNone(second_alternate.destination)
+        self.assertEqual(
+            inference._states["vehicle-pending-reset"].pending_count,
+            1,
+        )
+
+    def test_stationary_sample_resets_alternate_pending_family(self) -> None:
+        inference = KyivDirectionInference(
+            KyivRadarTopology.from_payload(topology_payload()),
+            clock=lambda: 1000.0,
+        )
+        inference.observe("vehicle-stationary-reset", "3_6", KyivVehicleSample(1000, 50.4501, 30.5220))
+        inference.observe("vehicle-stationary-reset", "3_6", KyivVehicleSample(1060, 50.4501, 30.5260))
+        first_alternate = inference.observe(
+            "vehicle-stationary-reset",
+            "3_6",
+            KyivVehicleSample(1120, 50.4501, 30.5220),
+        )
+        stationary = inference.observe(
+            "vehicle-stationary-reset",
+            "3_6",
+            KyivVehicleSample(1180, 50.4501, 30.5220),
+        )
+        second_alternate = inference.observe(
+            "vehicle-stationary-reset",
+            "3_6",
+            KyivVehicleSample(1240, 50.4501, 30.5185),
+        )
+
+        self.assertEqual(first_alternate.reason, "pending-switch")
+        self.assertIsNone(stationary.destination)
+        self.assertEqual(second_alternate.reason, "pending-switch")
+        self.assertIsNone(second_alternate.destination)
+        self.assertEqual(
+            inference._states["vehicle-stationary-reset"].pending_count,
+            1,
+        )
+
+    def test_confirmed_family_clears_pending_alternate(self) -> None:
+        inference = KyivDirectionInference(
+            KyivRadarTopology.from_payload(topology_payload()),
+            clock=lambda: 1000.0,
+        )
+        inference.observe("vehicle-return", "3_6", KyivVehicleSample(1000, 50.4501, 30.5220))
+        inference.observe("vehicle-return", "3_6", KyivVehicleSample(1060, 50.4501, 30.5260))
+        alternate = inference.observe(
+            "vehicle-return",
+            "3_6",
+            KyivVehicleSample(1120, 50.4501, 30.5220),
+        )
+        confirmed = inference.observe(
+            "vehicle-return",
+            "3_6",
+            KyivVehicleSample(1180, 50.4501, 30.5260),
+        )
+
+        self.assertEqual(alternate.reason, "pending-switch")
+        self.assertEqual(confirmed.destination, "Terminal forward")
+        self.assertEqual(confirmed.reason, "stable")
+        self.assertEqual(inference._states["vehicle-return"].pending_count, 0)
 
     def test_ttl_removes_history_and_requires_new_first_sample(self) -> None:
         now = [1000.0]
@@ -176,6 +427,31 @@ class KyivDirectionInferenceTests(unittest.TestCase):
 
         self.assertIsNone(result.direction_id)
         self.assertEqual(inference.history_size(), 1)
+
+    def test_stale_confirmed_family_is_not_exposed_without_fresh_evidence(self) -> None:
+        inference = KyivDirectionInference(
+            KyivRadarTopology.from_payload(topology_payload()),
+            clock=lambda: 1000.0,
+        )
+        inference.observe(
+            "vehicle-stale",
+            "3_6",
+            KyivVehicleSample(1000, 50.4501, 30.5220),
+        )
+        confident = inference.observe(
+            "vehicle-stale",
+            "3_6",
+            KyivVehicleSample(1060, 50.4501, 30.5260),
+        )
+        stale = inference.observe(
+            "vehicle-stale",
+            "3_6",
+            KyivVehicleSample(1120, 51.0, 31.0),
+        )
+
+        self.assertEqual(confident.destination, "Terminal forward")
+        self.assertIsNone(stale.destination)
+        self.assertIsNone(stale.variant_id)
 
 
 class KyivTopologyBuildTests(unittest.TestCase):
@@ -219,12 +495,22 @@ class KyivTopologyBuildTests(unittest.TestCase):
                 build_radar_topology(archive, [{"id": "kyiv"}], output)
 
             artifact = json.loads((output / "radar/kyiv.json").read_text())
+            self.assertEqual(artifact["schemaVersion"], 2)
             directions = artifact["routes"]["3_6"]["directions"]
             self.assertEqual(len(artifact["routes"]), 1)
             self.assertEqual({item["directionID"] for item in directions}, {"0", "1"})
             self.assertEqual(
                 {item["destination"] for item in directions},
                 {"Terminal A", "Terminal B"},
+            )
+            self.assertTrue(all(item["variantID"] for item in directions))
+            self.assertEqual(
+                {item["tripIDs"][0] for item in directions},
+                {"t0", "t1"},
+            )
+            self.assertEqual(
+                {item["terminalStopID"] for item in directions},
+                {"b", "d"},
             )
             self.assertGreater(directions[0]["shapes"][0]["points"][-1][2], 0)
 
