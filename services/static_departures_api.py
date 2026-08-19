@@ -47,6 +47,7 @@ from mta_ny_gateway import (
     api_key_from_environment,
 )
 from kyiv_gateway import KyivVehiclePositionsGateway, KYIV_VEHICLE_POSITIONS_PATH
+from apple_store_notifications import AppleStoreNotificationVerificationError, default_verifier
 
 
 DEFAULT_TIMEZONE = "Europe/Berlin"
@@ -476,6 +477,8 @@ def bounded_limit(raw: str | None) -> int:
 
 
 class Handler(BaseHTTPRequestHandler):
+    apple_store_notification_verifier = None
+
     def version_string(self) -> str:
         return "HalteWecker"
 
@@ -700,10 +703,21 @@ class Handler(BaseHTTPRequestHandler):
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError, OSError):
                 return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request body"})
 
+            try:
+                verifier = self.apple_store_notification_verifier or default_verifier()
+                verified_notification = verifier.verify(signed_payload)
+            except AppleStoreNotificationVerificationError:
+                return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid signedPayload"})
+
             LOGGER.warning(
-                "timestamp=%s event=apple_store_notification_received signedPayloadLength=%d",
-                datetime.now().astimezone().isoformat(timespec="seconds"),
-                len(signed_payload),
+                "event=apple_store_notification_verified notificationUUID=%s notificationType=%s "
+                "subtype=%s bundleId=%s environment=%s signedDate=%s",
+                verified_notification.notification_uuid,
+                verified_notification.notification_type,
+                verified_notification.subtype,
+                verified_notification.bundle_id,
+                verified_notification.environment,
+                verified_notification.signed_date,
             )
             return self.send_json(HTTPStatus.OK, {"ok": True})
 

@@ -1,0 +1,16 @@
+{
+  "apps": [
+    {
+      "name": "haltewecker",
+      "bundleId": "com.aSoft.HalteWecker",
+      "appAppleId": 6789654959,
+      "environments": ["PRODUCTION", "SANDBOX"]
+    },
+    {
+      "name": "pasty",
+      "bundleId": "com.aSoft.Pasty",
+      "appAppleId": 6766716767,
+      "environments": ["PRODUCTION", "SANDBOX"]
+    }
+  ]
+}

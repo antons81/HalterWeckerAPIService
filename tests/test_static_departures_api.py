@@ -337,7 +337,7 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                     HTTPStatus.BAD_REQUEST,
                 )
 
-    def test_apple_store_notification_with_signed_payload_returns_ok(self) -> None:
+    def test_apple_store_notification_with_arbitrary_signed_payload_returns_bad_request(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "current.sqlite"
             write_database(path, "apple-notification")
@@ -347,7 +347,7 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                         "/api/apple/store-notifications",
                         b'{"signedPayload":"test"}',
                     ),
-                    HTTPStatus.OK,
+                    HTTPStatus.BAD_REQUEST,
                 )
 
     def test_apple_store_notification_with_invalid_json_returns_bad_request(self) -> None:
