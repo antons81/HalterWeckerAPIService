@@ -2088,13 +2088,15 @@ def process_external_gtfs_sources(
                 ),
             )
             archive = load_gtfs_archive(str(result.path))
-            input_provenance[source_id] = {
-                "sourceID": source_id,
-                "path": str(result.path),
-                "origin": "external-gtfs-cache",
-                "status": result.status,
-                "resourceIdentity": url,
-            }
+            digest, size = artifact_provenance(result.path)
+            input_provenance[source_id] = provenance_record(
+                source_id=source_id,
+                path=str(result.path),
+                digest=digest,
+                size=size,
+                origin="external-gtfs-cache",
+                status=result.status,
+            ) | {"resourceIdentity": url}
         else:
             archive = load_gtfs_archive(request_url, headers=headers)
         archive = agency_scoped_archive(archive, source.get("agencyID"))
