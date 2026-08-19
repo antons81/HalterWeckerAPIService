@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from appstoreserverlibrary.models.Environment import Environment
+from appstoreserverlibrary.models.JWSRenewalInfoDecodedPayload import JWSRenewalInfoDecodedPayload
+from appstoreserverlibrary.models.JWSTransactionDecodedPayload import JWSTransactionDecodedPayload
 from appstoreserverlibrary.signed_data_verifier import SignedDataVerifier
 
 
@@ -34,6 +36,8 @@ class VerifiedAppleNotification:
     bundle_id: str
     environment: str
     signed_date: int | None
+    transaction_info: JWSTransactionDecodedPayload | None = None
+    renewal_info: JWSRenewalInfoDecodedPayload | None = None
 
 
 def _configured_path(environment_name: str, relative_path: str) -> Path:
@@ -153,13 +157,19 @@ class AppleStoreNotificationVerifier:
             try:
                 notification = candidate.verifier.verify_and_decode_notification(signed_payload)
                 data = _notification_data(notification)
+                transaction_info = None
+                renewal_info = None
                 if data is not None:
                     signed_transaction_info = getattr(data, "signedTransactionInfo", None)
                     if signed_transaction_info:
-                        candidate.verifier.verify_and_decode_signed_transaction(signed_transaction_info)
+                        transaction_info = candidate.verifier.verify_and_decode_signed_transaction(
+                            signed_transaction_info
+                        )
                     signed_renewal_info = getattr(data, "signedRenewalInfo", None)
                     if signed_renewal_info:
-                        candidate.verifier.verify_and_decode_renewal_info(signed_renewal_info)
+                        renewal_info = candidate.verifier.verify_and_decode_renewal_info(
+                            signed_renewal_info
+                        )
 
                 environment = getattr(candidate.environment, "value", candidate.environment)
                 return VerifiedAppleNotification(
@@ -169,6 +179,8 @@ class AppleStoreNotificationVerifier:
                     bundle_id=candidate.bundle_id,
                     environment=str(environment),
                     signed_date=getattr(notification, "signedDate", None),
+                    transaction_info=transaction_info,
+                    renewal_info=renewal_info,
                 )
             except Exception as error:
                 last_error = error

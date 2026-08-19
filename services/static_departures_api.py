@@ -47,6 +47,11 @@ from mta_ny_gateway import (
     api_key_from_environment,
 )
 from kyiv_gateway import KyivVehiclePositionsGateway, KYIV_VEHICLE_POSITIONS_PATH
+from apple_store_business_events import normalize_notification
+from apple_store_notification_store import (
+    AppleStoreNotificationStore,
+    AppleStoreNotificationStoreError,
+)
 from apple_store_notifications import AppleStoreNotificationVerificationError, default_verifier
 
 
@@ -65,6 +70,7 @@ STATIC_DATA_PATH_PREFIXES = (
 IRELAND_REALTIME_ROOT = Path(
     os.environ.get("IRELAND_REALTIME_ROOT", "/data/ireland/realtime")
 )
+DEFAULT_APPLE_NOTIFICATION_STORE_PATH = "/data/apple-store-notifications/events.sqlite3"
 
 
 class Database:
@@ -478,6 +484,7 @@ def bounded_limit(raw: str | None) -> int:
 
 class Handler(BaseHTTPRequestHandler):
     apple_store_notification_verifier = None
+    apple_store_notification_store: AppleStoreNotificationStore | None = None
 
     def version_string(self) -> str:
         return "HalteWecker"
@@ -709,16 +716,51 @@ class Handler(BaseHTTPRequestHandler):
             except AppleStoreNotificationVerificationError:
                 return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid signedPayload"})
 
-            LOGGER.warning(
-                "event=apple_store_notification_verified notificationUUID=%s notificationType=%s "
-                "subtype=%s bundleId=%s environment=%s signedDate=%s",
-                verified_notification.notification_uuid,
-                verified_notification.notification_type,
-                verified_notification.subtype,
-                verified_notification.bundle_id,
-                verified_notification.environment,
-                verified_notification.signed_date,
-            )
+            try:
+                event = normalize_notification(verified_notification)
+                store = self.apple_store_notification_store
+                if store is None:
+                    raise AppleStoreNotificationStoreError("Apple notification store is not configured")
+                inserted = store.insert_once(event)
+            except (AppleStoreNotificationStoreError, ValueError):
+                LOGGER.exception(
+                    "event=apple_store_notification_persistence_failed notificationUUID=%s",
+                    verified_notification.notification_uuid,
+                )
+                return self.send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": "notification persistence unavailable"},
+                )
+
+            if not inserted:
+                LOGGER.info(
+                    "event=apple_store_notification_duplicate notificationUUID=%s",
+                    event.notification_uuid,
+                )
+                return self.send_json(HTTPStatus.OK, {"ok": True})
+
+            if event.is_handled:
+                LOGGER.info(
+                    "event=apple_store_business_event app=%s notificationType=%s "
+                    "purchaseKind=%s productId=%s environment=%s notificationUUID=%s",
+                    event.app,
+                    event.notification_type,
+                    event.purchase_kind,
+                    event.product_id,
+                    event.environment,
+                    event.notification_uuid,
+                )
+            else:
+                LOGGER.info(
+                    "event=apple_store_notification_unhandled app=%s notificationType=%s "
+                    "purchaseKind=%s productId=%s environment=%s notificationUUID=%s",
+                    event.app,
+                    event.notification_type,
+                    event.purchase_kind,
+                    event.product_id,
+                    event.environment,
+                    event.notification_uuid,
+                )
             return self.send_json(HTTPStatus.OK, {"ok": True})
 
         if not parsed.path.startswith("/geofox/"):
@@ -739,6 +781,12 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     database = Database(os.environ.get("DEPARTURES_DATABASE", "/data/departures-current.sqlite"))
     Handler.database = database
+    Handler.apple_store_notification_store = AppleStoreNotificationStore(
+        os.environ.get(
+            "APPLE_NOTIFICATION_STORE_PATH",
+            DEFAULT_APPLE_NOTIFICATION_STORE_PATH,
+        )
+    )
     Handler.geofox_gateway = GeofoxProxy.from_environment()
     Handler.tfl_gateway = TfLProxy.from_environment()
     Handler.translink_gateway = TransLinkProxy.from_environment()

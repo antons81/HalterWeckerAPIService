@@ -1,0 +1,28 @@
+{
+  "products": {
+    "com.aSoft.HalteWecker": {
+      "com.asoft.haltewecker.monthly": {
+        "app": "haltewecker",
+        "purchaseKind": "monthly"
+      },
+      "com.asoft.haltewecker.yearly": {
+        "app": "haltewecker",
+        "purchaseKind": "yearly"
+      },
+      "com.asoft.haltewecker.unlimited.new": {
+        "app": "haltewecker",
+        "purchaseKind": "lifetime_current"
+      },
+      "com.asoft.haltewecker.unlimited": {
+        "app": "haltewecker",
+        "purchaseKind": "lifetime_legacy"
+      }
+    },
+    "com.aSoft.Pasty": {
+      "com.aSoft.Pasty.pro.lifetime": {
+        "app": "pasty",
+        "purchaseKind": "lifetime"
+      }
+    }
+  }
+}

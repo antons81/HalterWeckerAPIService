@@ -11,6 +11,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))
 
 import static_departures_api
 from appstoreserverlibrary.models.Environment import Environment
+from apple_store_notification_store import (
+    AppleStoreNotificationStore,
+    AppleStoreNotificationStoreError,
+)
 from apple_store_notifications import (
     AppleStoreNotificationVerificationError,
     AppleStoreNotificationVerifier,
@@ -102,6 +106,8 @@ class AppleStoreNotificationVerifierTests(unittest.TestCase):
         self.assertEqual(result.bundle_id, "com.aSoft.HalteWecker")
         self.assertEqual(fake.transaction_calls, ["nested-transaction"])
         self.assertEqual(fake.renewal_calls, ["nested-renewal"])
+        self.assertIsNotNone(result.transaction_info)
+        self.assertIsNotNone(result.renewal_info)
 
     def test_invalid_nested_jws_fails_verification(self) -> None:
         fake = FakeSignedDataVerifier(
@@ -156,14 +162,95 @@ class AppleStoreNotificationEndpointStubTests(unittest.TestCase):
         with patch.object(static_departures_api, "default_verifier", return_value=FailingVerifier()):
             self.assertEqual(self._post_notification(), 400)
 
+    def test_test_notification_without_transaction_data_is_persisted(self) -> None:
+        notification = VerifiedAppleNotification(
+            "test-notification-uuid",
+            "TEST",
+            None,
+            "com.aSoft.HalteWecker",
+            "Production",
+            1_700_000_000_000,
+        )
+
+        with tempfile.TemporaryDirectory() as temp:
+            store = AppleStoreNotificationStore(Path(temp) / "events.sqlite3")
+            try:
+                with patch.object(
+                    static_departures_api,
+                    "default_verifier",
+                    return_value=type("StubVerifier", (), {"verify": lambda _self, _payload: notification})(),
+                ):
+                    self.assertEqual(self._post_notification(store), 200)
+                self.assertEqual(self._stored_event_count(store), 1)
+            finally:
+                store.close()
+
+    def test_duplicate_notification_returns_200_and_is_stored_once(self) -> None:
+        notification = VerifiedAppleNotification(
+            "duplicate-notification-uuid",
+            "ONE_TIME_CHARGE",
+            None,
+            "com.aSoft.Pasty",
+            "Production",
+            1_700_000_000_000,
+        )
+
+        class StubVerifier:
+            def verify(self, _payload: str) -> VerifiedAppleNotification:
+                return notification
+
+        with tempfile.TemporaryDirectory() as temp:
+            store = AppleStoreNotificationStore(Path(temp) / "events.sqlite3")
+            try:
+                with patch.object(static_departures_api, "default_verifier", return_value=StubVerifier()):
+                    self.assertEqual(self._post_notification(store), 200)
+                    self.assertEqual(self._post_notification(store), 200)
+                self.assertEqual(self._stored_event_count(store), 1)
+            finally:
+                store.close()
+
+    def test_persistence_failure_returns_server_error(self) -> None:
+        class StubVerifier:
+            def verify(self, _payload: str) -> VerifiedAppleNotification:
+                return VerifiedAppleNotification(
+                    "persistence-failure-uuid",
+                    "TEST",
+                    None,
+                    "com.aSoft.HalteWecker",
+                    "Production",
+                    1_700_000_000_000,
+                )
+
+        class FailingStore:
+            def insert_once(self, _event) -> bool:
+                raise AppleStoreNotificationStoreError("disk full")
+
+        with patch.object(static_departures_api, "default_verifier", return_value=StubVerifier()):
+            self.assertEqual(self._post_notification(FailingStore()), 500)
+
     @staticmethod
-    def _post_notification() -> int:
+    def _stored_event_count(store: AppleStoreNotificationStore) -> int:
+        cursor = store._connection.execute(
+            "SELECT COUNT(*) FROM apple_store_notification_events"
+        )
+        return int(cursor.fetchone()[0])
+
+    @staticmethod
+    def _post_notification(store: object | None = None) -> int:
         from http.server import ThreadingHTTPServer
         from urllib.error import HTTPError
         from urllib.request import Request, urlopen
 
+        if store is None:
+            with tempfile.TemporaryDirectory() as temp:
+                temporary_store = AppleStoreNotificationStore(Path(temp) / "events.sqlite3")
+                try:
+                    return AppleStoreNotificationEndpointStubTests._post_notification(temporary_store)
+                finally:
+                    temporary_store.close()
+
         class EndpointHandler(static_departures_api.Handler):
-            pass
+            apple_store_notification_store = store
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), EndpointHandler)
         thread = __import__("threading").Thread(target=server.serve_forever, daemon=True)

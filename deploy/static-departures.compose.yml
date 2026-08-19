@@ -15,6 +15,7 @@ services:
       DEPARTURES_DATABASE: ${DEPARTURES_DATABASE:-/data/current-release/departures.sqlite}
       STATIC_DATA_ROOT: ${STATIC_DATA_ROOT:-/data/current-release/stop-data}
       IRELAND_REALTIME_ROOT: ${IRELAND_REALTIME_ROOT:-/data/ireland/realtime}
+      APPLE_NOTIFICATION_STORE_PATH: ${APPLE_NOTIFICATION_STORE_PATH:-/data/apple-store-notifications/events.sqlite3}
       PORT: "8080"
     volumes:
       - /srv/haltewecker/data/releases:/data/releases:ro
@@ -22,6 +23,7 @@ services:
       - /srv/haltewecker/data/current-release:/data/current-release:ro
       - /srv/haltewecker/data/departures-current.sqlite:/data/departures-current.sqlite:ro
       - /srv/haltewecker/data/ireland/realtime:/data/ireland/realtime:ro
+      - /srv/haltewecker/data/apple-store-notifications:/data/apple-store-notifications:rw
     restart: unless-stopped
     read_only: true
     tmpfs:

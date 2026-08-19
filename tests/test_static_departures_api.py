@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import static_departures_api
 from import_static_departures_database import populate_german_city_memberships
 from static_departures_api import Database, Handler
+from apple_store_notification_store import AppleStoreNotificationStore
 from swap_static_departures_database import activate_database
 
 
@@ -112,7 +113,17 @@ def write_database(path: Path, version: str, valid: bool = True) -> None:
 class StaticDeparturesHTTPServer:
     def __init__(self, database_path: Path, ttl: float = 0.0) -> None:
         self.database = Database(str(database_path), ttl=ttl)
-        handler = type("StaticDeparturesTestHandler", (Handler,), {"database": self.database})
+        self.notification_store = AppleStoreNotificationStore(
+            database_path.with_name("apple-store-notifications.sqlite3")
+        )
+        handler = type(
+            "StaticDeparturesTestHandler",
+            (Handler,),
+            {
+                "database": self.database,
+                "apple_store_notification_store": self.notification_store,
+            },
+        )
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
@@ -126,6 +137,7 @@ class StaticDeparturesHTTPServer:
         self.thread.join(timeout=5)
         self.server.server_close()
         self.database.close()
+        self.notification_store.close()
 
     def get(self, path: str) -> dict[str, object]:
         with urlopen(f"{self.base_url}{path}", timeout=5) as response:
