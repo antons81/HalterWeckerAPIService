@@ -302,6 +302,13 @@
     "importIntoStaticDepartures": true,
     "preflight": "download",
     "allowStale": false,
+    "resilientFetch": {
+      "enabled": true,
+      "allowStale": true,
+      "retryAttempts": 3,
+      "metadataProbe": false,
+      "requireDataRows": true
+    },
     "staticIdentifierPrefix": "kyiv:",
     "staticStopIDPrefix": "",
     "supplementalStopCatalog": {

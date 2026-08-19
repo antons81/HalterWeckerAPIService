@@ -4,8 +4,15 @@
 from __future__ import annotations
 
 import json
+import errno
+import os
+import shutil
+import socket
 import ssl
+import tempfile
+import time
 import urllib.parse
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +38,10 @@ KYIV_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36"
 )
+KYIV_REQUEST_TIMEOUT_SECONDS = 45
+KYIV_MAX_ATTEMPTS = 3
+KYIV_RETRY_BACKOFF_SECONDS = (0.5, 1.0)
+DEFAULT_KYIV_CACHE_ROOT = Path("/srv/haltewecker/cache/kyiv-open-data")
 TLS_CONTEXT = ssl.create_default_context(
     cafile=certifi.where() if certifi is not None else None
 )
@@ -38,6 +49,12 @@ TLS_CONTEXT = ssl.create_default_context(
 
 class KyivOpenDataError(ValueError):
     """Raised when an official Kyiv resource is unavailable or malformed."""
+
+
+class _KyivHTTPError(KyivOpenDataError):
+    def __init__(self, status: int) -> None:
+        self.status = status
+        super().__init__(f"HTTP {status}")
 
 
 def request_headers(*, accept: str = "application/json,application/geo+json;q=0.9,*/*;q=0.8") -> dict[str, str]:
@@ -48,36 +65,99 @@ def request_headers(*, accept: str = "application/json,application/geo+json;q=0.
     }
 
 
+def _is_transient_error(error: BaseException) -> bool:
+    if isinstance(error, _KyivHTTPError):
+        return error.status == 429 or 500 <= error.status <= 504
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code == 429 or 500 <= error.code <= 504
+    if isinstance(error, urllib.error.URLError):
+        reason = error.reason
+        if isinstance(reason, BaseException):
+            return _is_transient_error(reason)
+        return False
+    if isinstance(error, (TimeoutError, socket.timeout, ConnectionError)):
+        return True
+    if isinstance(error, OSError):
+        return getattr(error, "errno", None) in {
+            errno.ECONNABORTED,
+            errno.ECONNREFUSED,
+            errno.ECONNRESET,
+            errno.EHOSTUNREACH,
+            errno.ENETUNREACH,
+            errno.ETIMEDOUT,
+            getattr(errno, "EAI_AGAIN", -1),
+        }
+    return False
+
+
+def _error_summary(error: BaseException) -> str:
+    if isinstance(error, (_KyivHTTPError, urllib.error.HTTPError)):
+        status = getattr(error, "status", None) or getattr(error, "code", None)
+        return f"HTTP {status}"
+    if isinstance(error, (TimeoutError, socket.timeout)):
+        return "timeout"
+    if isinstance(error, urllib.error.URLError):
+        reason = error.reason
+        if isinstance(reason, BaseException):
+            return _error_summary(reason)
+        return "temporary connection failure" if _is_transient_error(error) else "URL error"
+    if isinstance(error, ConnectionError) or (
+        isinstance(error, OSError)
+        and getattr(error, "errno", None)
+        in {
+            errno.ECONNABORTED,
+            errno.ECONNREFUSED,
+            errno.ECONNRESET,
+            errno.EHOSTUNREACH,
+            errno.ENETUNREACH,
+            errno.ETIMEDOUT,
+        }
+    ):
+        return "temporary connection failure"
+    return type(error).__name__
+
+
 def _read_url(
     url: str,
     *,
     opener: Callable[..., Any] | None = None,
     accept: str = "application/json,application/geo+json;q=0.9,*/*;q=0.8",
+    source_name: str = "resource",
+    sleep: Callable[[float], None] | None = None,
 ) -> tuple[bytes, str]:
     parsed = urllib.parse.urlparse(url)
     if parsed.hostname != KYIV_DATA_HOST:
-        raise KyivOpenDataError(f"Kyiv source must use {KYIV_DATA_HOST}: {url}")
+        raise KyivOpenDataError(f"Kyiv source must use {KYIV_DATA_HOST}")
     request = urllib.request.Request(url, headers=request_headers(accept=accept))
-    try:
-        if opener is None:
-            response_context = urllib.request.urlopen(
-                request,
-                timeout=45,
-                context=TLS_CONTEXT,
-            )
-        else:
-            response_context = opener(request, timeout=45)
-        with response_context as response:
-            status = int(getattr(response, "status", 200))
-            body = response.read()
-            content_type = str(response.headers.get("Content-Type", ""))
-    except Exception as error:
-        raise KyivOpenDataError(f"Kyiv source request failed: {url}: {error}") from error
-    if status < 200 or status >= 300:
-        raise KyivOpenDataError(f"Kyiv source returned HTTP {status}: {url}")
-    if not body or body.lstrip().startswith((b"<", b"<!DOCTYPE")):
-        raise KyivOpenDataError(f"Kyiv source returned HTML or empty body: {url}")
-    return body, content_type
+    sleeper = sleep or time.sleep
+    for attempt in range(1, KYIV_MAX_ATTEMPTS + 1):
+        try:
+            if opener is None:
+                response_context = urllib.request.urlopen(
+                    request,
+                    timeout=KYIV_REQUEST_TIMEOUT_SECONDS,
+                    context=TLS_CONTEXT,
+                )
+            else:
+                response_context = opener(request, timeout=KYIV_REQUEST_TIMEOUT_SECONDS)
+            with response_context as response:
+                status = int(getattr(response, "status", 200))
+                body = response.read()
+                content_type = str(response.headers.get("Content-Type", ""))
+            if status < 200 or status >= 300:
+                raise _KyivHTTPError(status)
+            if not body or body.lstrip().startswith((b"<", b"<!DOCTYPE")):
+                raise KyivOpenDataError("Kyiv source returned HTML or empty body")
+            return body, content_type
+        except Exception as error:
+            summary = _error_summary(error)
+            print(f"[Kyiv] source={source_name} attempt={attempt} failed: {summary}")
+            if attempt >= KYIV_MAX_ATTEMPTS or not _is_transient_error(error):
+                raise KyivOpenDataError(
+                    f"Kyiv source request failed source={source_name}: {summary}"
+                ) from error
+            sleeper(KYIV_RETRY_BACKOFF_SECONDS[attempt - 1])
+    raise AssertionError("Kyiv retry loop did not return or raise")
 
 
 def datastore_page(
@@ -86,13 +166,20 @@ def datastore_page(
     limit: int = 100,
     offset: int = 0,
     opener: Callable[..., Any] | None = None,
+    source_name: str | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> dict[str, Any]:
     if limit <= 0 or offset < 0:
         raise KyivOpenDataError("DataStore pagination values are invalid")
     query = urllib.parse.urlencode(
         {"resource_id": resource_id, "limit": limit, "offset": offset}
     )
-    body, _ = _read_url(f"{CKAN_DATASTORE_URL}?{query}", opener=opener)
+    body, _ = _read_url(
+        f"{CKAN_DATASTORE_URL}?{query}",
+        opener=opener,
+        source_name=source_name or resource_id,
+        sleep=sleep,
+    )
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as error:
@@ -107,6 +194,8 @@ def load_datastore_records(
     *,
     page_size: int = 100,
     opener: Callable[..., Any] | None = None,
+    source_name: str | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Read every DataStore record, honoring result.total and pagination."""
     records: list[dict[str, Any]] = []
@@ -118,6 +207,8 @@ def load_datastore_records(
             limit=page_size,
             offset=offset,
             opener=opener,
+            source_name=source_name,
+            sleep=sleep,
         )
         raw_total = result.get("total")
         if isinstance(raw_total, int):
@@ -149,8 +240,9 @@ def resolve_datastore_download_url(
     resource_id: str,
     *,
     opener: Callable[..., Any] | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> str:
-    records, total = load_datastore_records(resource_id, opener=opener)
+    records, total = load_datastore_records(resource_id, opener=opener, sleep=sleep)
     if total == 0 or not records:
         raise KyivOpenDataError(f"DataStore has no public URL for {resource_id}")
     urls = [str(record.get("resource_url", "")).strip() for record in records]
@@ -161,7 +253,7 @@ def resolve_datastore_download_url(
     parsed = urllib.parse.urlparse(url)
     if parsed.hostname != KYIV_DATA_HOST or "/data/download" not in parsed.path:
         raise KyivOpenDataError(
-            f"DataStore resolved a non-public download URL for {resource_id}: {url}"
+            f"DataStore resolved a non-public download URL for {resource_id}"
         )
     return url
 
@@ -170,10 +262,17 @@ def load_json_resource(
     spec: dict[str, Any],
     *,
     opener: Callable[..., Any] | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> Any:
     """Load a file resource or an is_api resource via CKAN DataStore metadata."""
+    source_name = str(spec.get("name") or spec.get("resourceID") or "resource")
     if bool(spec.get("isAPI")):
-        records, _ = load_datastore_records(str(spec["resourceID"]), opener=opener)
+        records, _ = load_datastore_records(
+            str(spec["resourceID"]),
+            opener=opener,
+            source_name=source_name,
+            sleep=sleep,
+        )
         resource_urls = [
             str(record.get("resource_url", "")).strip()
             for record in records
@@ -185,7 +284,7 @@ def load_json_resource(
             parsed = urllib.parse.urlparse(url)
             if parsed.hostname != KYIV_DATA_HOST or "/data/download" not in parsed.path:
                 raise KyivOpenDataError(
-                    f"DataStore resolved a non-public download URL for {spec['resourceID']}: {url}"
+                    f"DataStore resolved a non-public download URL for {source_name}"
                 )
         elif records and all(isinstance(record, dict) for record in records):
             return datastore_records_to_geojson(records, name=str(spec.get("name", "resource")))
@@ -194,14 +293,98 @@ def load_json_resource(
     else:
         url = str(spec.get("downloadURL", "")).strip()
     if not url:
-        raise KyivOpenDataError(f"Kyiv resource has no public download URL: {spec}")
-    body, _ = _read_url(url, opener=opener)
+        raise KyivOpenDataError(f"Kyiv resource {source_name} has no public download URL")
+    body, _ = _read_url(url, opener=opener, source_name=source_name, sleep=sleep)
     try:
         return json.loads(body)
     except json.JSONDecodeError as error:
         raise KyivOpenDataError(
             f"Kyiv resource {spec.get('name', spec.get('resourceID'))} is not JSON"
         ) from error
+
+
+def _resource_cache_key(spec: dict[str, Any]) -> str:
+    resource_id = str(spec.get("resourceID") or spec.get("name") or "").strip()
+    if not resource_id or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for character in resource_id):
+        raise KyivOpenDataError("Kyiv resource cache key is invalid")
+    return resource_id
+
+
+class KyivResourceCache:
+    """Atomic last-known-good cache for validated Kyiv JSON resources."""
+
+    def __init__(self, root: Path | str = DEFAULT_KYIV_CACHE_ROOT) -> None:
+        self.root = Path(root)
+
+    def path_for(self, spec: dict[str, Any]) -> Path:
+        return self.root / f"{_resource_cache_key(spec)}.json"
+
+    def load(self, spec: dict[str, Any]) -> tuple[Any, datetime] | None:
+        path = self.path_for(spec)
+        try:
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(envelope, dict) or envelope.get("schemaVersion") != 1:
+                return None
+            if str(envelope.get("resourceID", "")) != str(spec.get("resourceID", "")):
+                return None
+            payload = envelope.get("payload")
+            modified_at = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+            return payload, modified_at
+        except (OSError, TypeError, ValueError):
+            return None
+
+    def store(self, spec: dict[str, Any], payload: Any) -> Path:
+        path = self.path_for(spec)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "schemaVersion": 1,
+                        "resourceID": str(spec.get("resourceID", "")),
+                        "name": str(spec.get("name", "")),
+                        "fetchedAt": datetime.now(timezone.utc).isoformat(),
+                        "payload": payload,
+                    },
+                    handle,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            self._fsync_directory(path.parent)
+            return path
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _fsync_directory(directory: Path) -> None:
+        try:
+            descriptor = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _cache_age_text(modified_at: datetime) -> str:
+    seconds = max(0, int((datetime.now(timezone.utc) - modified_at).total_seconds()))
+    days, remainder = divmod(seconds, 24 * 60 * 60)
+    hours, remainder = divmod(remainder, 60 * 60)
+    minutes = remainder // 60
+    if days:
+        return f"{days}d{hours}h{minutes:02d}m"
+    return f"{hours}h{minutes:02d}m"
 
 
 def datastore_records_to_geojson(
@@ -412,22 +595,197 @@ def normalize_city_express_stop_times(payload: Any) -> list[dict[str, Any]]:
     return result
 
 
+def validate_kyiv_resource_payload(
+    name: str,
+    payload: Any,
+    config: dict[str, Any],
+) -> None:
+    """Validate one resource before it is allowed into the local cache."""
+    if name == "metroStations":
+        stations = normalize_station_features(payload, system="metro")
+        if len(stations) != int(config["expectedCounts"]["metroStations"]):
+            raise KyivOpenDataError(f"Kyiv metro station count changed: {len(stations)}")
+    elif name == "funicularStations":
+        stations = normalize_station_features(payload, system="funicular")
+        if len(stations) != int(config["expectedCounts"]["funicularStations"]):
+            raise KyivOpenDataError(
+                f"Kyiv funicular station count changed: {len(stations)}"
+            )
+        expected_ids = set(
+            config.get("expectedIDs", {}).get("funicularStations", ["fn01", "fn02"])
+        )
+        if {station["id"] for station in stations} != expected_ids:
+            raise KyivOpenDataError("Kyiv funicular station IDs are not fn01/fn02")
+    elif name == "expressStations":
+        stations = normalize_station_features(payload, system="cityExpress")
+        if len(stations) != int(config["expectedCounts"]["expressPlatforms"]):
+            raise KyivOpenDataError(
+                f"Kyiv City Express platform count changed: {len(stations)}"
+            )
+    elif name == "metroTopology":
+        normalize_topology(payload, system="metro")
+    elif name == "funicularTopology":
+        normalize_topology(payload, system="funicular")
+    elif name == "expressTopology":
+        normalize_topology(payload, system="cityExpress")
+    elif name in {"metroStopTimes", "funicularStopTimes"}:
+        normalize_stop_times(payload, system=name.removesuffix("StopTimes"))
+    elif name == "expressStopTimes":
+        stop_times = normalize_city_express_stop_times(payload)
+        if len(stop_times) != int(config["expectedCounts"]["expressStopTimes"]):
+            raise KyivOpenDataError(
+                f"Kyiv City Express stop time count changed: {len(stop_times)}"
+            )
+    elif name in {"metroPeriods", "funicularPeriods"}:
+        normalize_periods(payload, system=name.removesuffix("Periods"))
+    elif name in {"metroCalendar", "funicularCalendar"}:
+        normalize_calendar(payload, system=name.removesuffix("Calendar"))
+    elif name in {"metroInterchanges", "funicularInterchanges", "expressInterchanges"}:
+        normalize_interchanges(payload, system=name.removesuffix("Interchanges"))
+    else:
+        raise KyivOpenDataError(f"Kyiv resource {name} has no validation rule")
+
+
+def validate_kyiv_systems_artifact(path: Path) -> dict[str, Any]:
+    try:
+        artifact = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise KyivOpenDataError("Previous Kyiv systems artifact is not valid JSON") from error
+    if not isinstance(artifact, dict):
+        raise KyivOpenDataError("Previous Kyiv systems artifact is not an object")
+    if artifact.get("schemaVersion") != 1 or artifact.get("cityID") != "kyiv":
+        raise KyivOpenDataError("Previous Kyiv systems artifact has an invalid identity")
+    source = artifact.get("source")
+    systems = artifact.get("systems")
+    if (
+        not isinstance(source, dict)
+        or not isinstance(source.get("contentDigest"), str)
+        or not source["contentDigest"]
+        or not isinstance(source.get("contentSize"), int)
+        or source["contentSize"] <= 0
+        or not isinstance(systems, dict)
+    ):
+        raise KyivOpenDataError("Previous Kyiv systems artifact provenance is incomplete")
+    required_systems = {
+        "metro": {"stations", "topology", "stopTimes", "periods", "calendar", "interchanges"},
+        "funicular": {"stations", "topology", "stopTimes", "periods", "calendar", "interchanges"},
+        "cityExpress": {"platforms", "topology", "stopTimes", "interchanges"},
+    }
+    for system_name, required_keys in required_systems.items():
+        system = systems.get(system_name)
+        if not isinstance(system, dict) or not required_keys.issubset(system):
+            raise KyivOpenDataError(
+                f"Previous Kyiv systems artifact is missing {system_name} data"
+            )
+        if any(not isinstance(system[key], list) for key in required_keys):
+            raise KyivOpenDataError(
+                f"Previous Kyiv systems artifact has invalid {system_name} data"
+            )
+
+        primary_key = "platforms" if system_name == "cityExpress" else "stations"
+        if not system[primary_key]:
+            raise KyivOpenDataError(
+                f"Previous Kyiv systems artifact has no {system_name} {primary_key}"
+            )
+        for item in system[primary_key]:
+            if not isinstance(item, dict):
+                raise KyivOpenDataError(
+                    f"Previous Kyiv systems artifact has invalid {system_name} {primary_key}"
+                )
+            if not all(str(item.get(field, "")).strip() for field in ("id", "name")):
+                raise KyivOpenDataError(
+                    f"Previous Kyiv systems artifact has incomplete {system_name} {primary_key}"
+                )
+            try:
+                latitude = float(item["latitude"])
+                longitude = float(item["longitude"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise KyivOpenDataError(
+                    f"Previous Kyiv systems artifact has invalid {system_name} coordinates"
+                ) from error
+            if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+                raise KyivOpenDataError(
+                    f"Previous Kyiv systems artifact has invalid {system_name} coordinates"
+                )
+
+        if not system["stopTimes"]:
+            raise KyivOpenDataError(
+                f"Previous Kyiv systems artifact has no {system_name} stop times"
+            )
+        for item in system["stopTimes"]:
+            if not isinstance(item, dict) or not str(item.get("stationID", "")).strip():
+                raise KyivOpenDataError(
+                    f"Previous Kyiv systems artifact has invalid {system_name} stop times"
+                )
+            if system_name == "cityExpress" and not str(item.get("trainID", "")).strip():
+                raise KyivOpenDataError(
+                    "Previous Kyiv systems artifact has invalid cityExpress trains"
+                )
+    return artifact
+
+
+def copy_validated_kyiv_systems_artifact(source: Path, output: Path) -> Path:
+    """Copy a previous artifact into staging without exposing a partial file."""
+    validate_kyiv_systems_artifact(source)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.",
+        suffix=".tmp",
+        dir=output.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as destination, source.open("rb") as origin:
+            shutil.copyfileobj(origin, destination)
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.replace(temporary, output)
+        KyivResourceCache._fsync_directory(output.parent)
+        return output
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def build_kyiv_systems_artifact(
     *,
     repository_root: Path,
     output: Path,
     sources_path: Path | None = None,
     opener: Callable[..., Any] | None = None,
+    cache_root: Path | str | None = DEFAULT_KYIV_CACHE_ROOT,
+    sleep: Callable[[float], None] | None = None,
 ) -> Path:
     config_path = sources_path or repository_root / "config" / "kyiv-systems-resources.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     if not isinstance(config, dict) or not isinstance(config.get("resources"), dict):
         raise KyivOpenDataError("Kyiv systems resource config is invalid")
     resources = config["resources"]
-    loaded = {
-        name: load_json_resource(spec, opener=opener)
-        for name, spec in resources.items()
-    }
+    cache = KyivResourceCache(cache_root) if cache_root is not None else None
+    loaded: dict[str, Any] = {}
+    for name, spec in resources.items():
+        try:
+            payload = load_json_resource(spec, opener=opener, sleep=sleep)
+            validate_kyiv_resource_payload(name, payload, config)
+            if cache is not None:
+                try:
+                    cache.store(spec, payload)
+                except OSError as error:
+                    print(f"[Kyiv] source={name} cache update failed: {type(error).__name__}")
+            loaded[name] = payload
+        except KyivOpenDataError as error:
+            cached = cache.load(spec) if cache is not None else None
+            if cached is None:
+                raise
+            cached_payload, modified_at = cached
+            try:
+                validate_kyiv_resource_payload(name, cached_payload, config)
+            except KyivOpenDataError:
+                raise error
+            print(
+                f"[Kyiv] source={name} using cached resource "
+                f"age={_cache_age_text(modified_at)}"
+            )
+            loaded[name] = cached_payload
     provenance_payload = {
         name: {
             "resourceID": str(spec["resourceID"]),
@@ -501,10 +859,22 @@ def build_kyiv_systems_artifact(
             f"Kyiv City Express stop time count changed: {len(city_express['stopTimes'])}"
         )
     output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(f".{output.name}.tmp")
-    temporary.unlink(missing_ok=True)
-    temporary.write_text(json.dumps(artifact, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(output)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.",
+        suffix=".tmp",
+        dir=output.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(artifact, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, output)
+        KyivResourceCache._fsync_directory(output.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
     return output
 
 

@@ -18,6 +18,11 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 try:
+    from .gtfs_source_cache import GTFSArtifactCache, REQUIRED_GTFS_FILES
+except ImportError:
+    from gtfs_source_cache import GTFSArtifactCache, REQUIRED_GTFS_FILES
+
+try:
     from .external_staging import ExternalDepartureStage, ExternalMergeStage, iter_departure_payload, iter_json_array, iter_json_object
 except ImportError:
     from external_staging import ExternalDepartureStage, ExternalMergeStage, iter_departure_payload, iter_json_array, iter_json_object
@@ -49,9 +54,9 @@ except ImportError:
     )
 
 try:
-    from .kyiv_open_data import load_json_resource
+    from .kyiv_open_data import KyivResourceCache, _cache_age_text, load_json_resource
 except ImportError:
-    from kyiv_open_data import load_json_resource
+    from kyiv_open_data import KyivResourceCache, _cache_age_text, load_json_resource
 
 try:
     from .artifact_provenance import (
@@ -144,6 +149,51 @@ def load_external_gtfs_sources(path: Path) -> list[dict[str, object]]:
     return sources
 
 
+def external_gtfs_resilience_policy(
+    source: dict[str, object],
+) -> dict[str, object] | None:
+    raw_policy = source.get("resilientFetch")
+    if raw_policy is None:
+        return None
+    if not isinstance(raw_policy, dict) or raw_policy.get("enabled") is not True:
+        raise ValueError(
+            f"External GTFS source {source.get('id', '<unknown>')} has invalid resilientFetch."
+        )
+    allow_stale = raw_policy.get("allowStale")
+    retry_attempts = raw_policy.get("retryAttempts")
+    metadata_probe = raw_policy.get("metadataProbe", False)
+    require_data_rows = raw_policy.get("requireDataRows", True)
+    if not isinstance(allow_stale, bool):
+        raise ValueError("resilientFetch.allowStale must be a boolean")
+    if not isinstance(retry_attempts, int) or not 1 <= retry_attempts <= 5:
+        raise ValueError("resilientFetch.retryAttempts must be between 1 and 5")
+    if not isinstance(metadata_probe, bool) or not isinstance(require_data_rows, bool):
+        raise ValueError("resilientFetch boolean options are invalid")
+    return {
+        "allowStale": allow_stale,
+        "retryAttempts": retry_attempts,
+        "metadataProbe": metadata_probe,
+        "requireDataRows": require_data_rows,
+    }
+
+
+def validate_kyiv_gtfs_archive(path: Path) -> None:
+    """Require the core Kyiv feed tables to contain headers and data rows."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            for name in REQUIRED_GTFS_FILES:
+                with archive.open(name) as stream:
+                    rows = [
+                        line.decode("utf-8-sig").strip()
+                        for line in stream
+                        if line.strip()
+                    ]
+                if len(rows) < 2:
+                    raise ValueError(f"Kyiv GTFS {name} has no data rows")
+    except (OSError, UnicodeDecodeError, zipfile.BadZipFile) as error:
+        raise ValueError("Kyiv GTFS archive is unreadable") from error
+
+
 def validate_external_gtfs_source(
     source: dict[str, object],
     repository_root: Path,
@@ -190,6 +240,7 @@ def validate_external_gtfs_source(
     allow_stale = source.get("allowStale", True)
     if not isinstance(allow_stale, bool):
         raise ValueError(f"External GTFS source {source_id} has invalid allowStale.")
+    external_gtfs_resilience_policy(source)
 
     agency_id = source.get("agencyID")
     if agency_id is not None and (
@@ -639,6 +690,74 @@ def _supplemental_stop_records(payload: object) -> list[dict[str, object]]:
     raise ValueError(
         "Supplemental stop catalog must contain a non-empty array of records."
     )
+
+
+def validate_kyiv_supplemental_catalog(
+    payload: object,
+    configuration: dict[str, object],
+) -> None:
+    records = _supplemental_stop_records(payload)
+    fields = {
+        key: str(configuration[key])
+        for key in ("idField", "nameField", "latitudeField", "longitudeField")
+    }
+    allowed_types = {
+        int(value)
+        for value in configuration.get("allowedTypes", [0])
+        if isinstance(value, (int, str)) and str(value).strip().lstrip("-").isdigit()
+    }
+    valid_records = 0
+    for record in records:
+        if not str(record.get(fields["idField"], "") or "").strip():
+            continue
+        if not str(record.get(fields["nameField"], "") or "").strip():
+            continue
+        try:
+            latitude = float(record[fields["latitudeField"]])
+            longitude = float(record[fields["longitudeField"]])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not math.isfinite(latitude) or not math.isfinite(longitude):
+            continue
+        if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+            continue
+        type_field = str(configuration.get("typeField", "type"))
+        if allowed_types:
+            raw_type = record.get(type_field, 0)
+            try:
+                if int(raw_type) not in allowed_types:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        valid_records += 1
+    if valid_records == 0:
+        raise ValueError("Kyiv supplemental stop catalog has no valid stop records")
+
+
+def load_kyiv_supplemental_catalog(
+    configuration: dict[str, object],
+    *,
+    cache: KyivResourceCache | None,
+) -> object:
+    try:
+        payload = load_json_resource(configuration)
+        validate_kyiv_supplemental_catalog(payload, configuration)
+        if cache is not None:
+            cache.store(configuration, payload)
+        return payload
+    except Exception as error:
+        if cache is None:
+            raise
+        cached = cache.load(configuration)
+        if cached is None:
+            raise
+        payload, modified_at = cached
+        validate_kyiv_supplemental_catalog(payload, configuration)
+        print(
+            "[Kyiv] source=supplemental-stop-catalog "
+            f"using cached resource age={_cache_age_text(modified_at)}"
+        )
+        return payload
 
 
 def _build_supplemental_stop_entries(
@@ -1829,6 +1948,8 @@ def process_external_gtfs_sources(
     occupied_city_ids: set[str] | None = None,
     selected_source_ids: set[str] | None = None,
     load_stop_catalog: Callable[[dict[str, object]], object] | None = None,
+    gtfs_cache: GTFSArtifactCache | None = None,
+    kyiv_resource_cache: KyivResourceCache | None = None,
 ) -> tuple[
     list[dict[str, object]],
     list[dict[str, object]],
@@ -1950,7 +2071,32 @@ def process_external_gtfs_sources(
             source_id, url, environ=environ
         )
         source_started = time.monotonic()
-        archive = load_gtfs_archive(request_url, headers=headers)
+        resilience_policy = external_gtfs_resilience_policy(source)
+        if resilience_policy is not None and gtfs_cache is not None:
+            result = gtfs_cache.resolve(
+                source_id,
+                request_url,
+                headers=headers,
+                allow_stale=bool(resilience_policy["allowStale"]),
+                state_url=url,
+                metadata_probe=bool(resilience_policy["metadataProbe"]),
+                retry_attempts=int(resilience_policy["retryAttempts"]),
+                validator=(
+                    validate_kyiv_gtfs_archive
+                    if bool(resilience_policy["requireDataRows"])
+                    else None
+                ),
+            )
+            archive = load_gtfs_archive(str(result.path))
+            input_provenance[source_id] = {
+                "sourceID": source_id,
+                "path": str(result.path),
+                "origin": "external-gtfs-cache",
+                "status": result.status,
+                "resourceIdentity": url,
+            }
+        else:
+            archive = load_gtfs_archive(request_url, headers=headers)
         archive = agency_scoped_archive(archive, source.get("agencyID"))
         supplemental_catalog_configuration = source.get("supplementalStopCatalog")
         supplemental_stop_catalog: object | None = None
@@ -1961,10 +2107,16 @@ def process_external_gtfs_sources(
                         f"External GTFS source {source_id} has an invalid "
                         "supplementalStopCatalog."
                     )
-                catalog_loader = load_stop_catalog or load_json_resource
-                supplemental_stop_catalog = catalog_loader(
-                    supplemental_catalog_configuration
-                )
+                if source_id == "kyiv" and kyiv_resource_cache is not None:
+                    supplemental_stop_catalog = load_kyiv_supplemental_catalog(
+                        supplemental_catalog_configuration,
+                        cache=kyiv_resource_cache,
+                    )
+                else:
+                    catalog_loader = load_stop_catalog or load_json_resource
+                    supplemental_stop_catalog = catalog_loader(
+                        supplemental_catalog_configuration
+                    )
                 catalog_identity = ":".join(
                     str(supplemental_catalog_configuration.get(key, ""))
                     for key in ("resourceID", "downloadURL")

@@ -31,6 +31,16 @@ except ImportError:
     from artifact_provenance import artifact_provenance, provenance_record
 
 try:
+    from .gtfs_source_cache import DEFAULT_CACHE_ROOT, GTFSArtifactCache
+except ImportError:
+    from gtfs_source_cache import DEFAULT_CACHE_ROOT, GTFSArtifactCache
+
+try:
+    from .kyiv_open_data import KyivResourceCache
+except ImportError:
+    from kyiv_open_data import KyivResourceCache
+
+try:
     import certifi
 except ImportError:  # pragma: no cover - production images use system CA roots
     certifi = None
@@ -2727,6 +2737,21 @@ def parse_build_stop_packages_args(argv: list[str] | None = None) -> argparse.Na
         default=[],
         help="Repeatable providerID=URL mapping for external GTFS sources.",
     )
+    parser.add_argument(
+        "--kyiv-cache-root",
+        default=os.environ.get("KYIV_OPEN_DATA_CACHE_ROOT", "/srv/haltewecker/cache/kyiv-open-data"),
+        help="Persistent cache directory for validated Kyiv Open Data resources.",
+    )
+    parser.add_argument(
+        "--previous-stop-data",
+        default="",
+        help="Previously published stop-data directory used for a validated Kyiv artifact fallback.",
+    )
+    parser.add_argument(
+        "--gtfs-cache-root",
+        default=os.environ.get("GTFS_CACHE_ROOT", str(DEFAULT_CACHE_ROOT)),
+        help="Persistent cache directory for validated raw GTFS artifacts.",
+    )
     args = parser.parse_args(argv)
 
     has_german = bool(args.gtfs_url.strip()) and not args.skip_german
@@ -2795,6 +2820,7 @@ def main(argv: list[str] | None = None) -> None:
     german_archive: zipfile.ZipFile | None = None
     german_stop_rows: list[dict[str, str]] = []
     municipalities: list[dict[str, object]] = []
+    kyiv_build_error: Exception | None = None
 
     if not args.skip_german:
         german_archive = load_gtfs_archive(args.gtfs_url)
@@ -2895,6 +2921,8 @@ def main(argv: list[str] | None = None) -> None:
             output=output,
             load_gtfs_archive=load_gtfs_archive,
             occupied_city_ids=set(manifest_sources),
+            gtfs_cache=GTFSArtifactCache(Path(args.gtfs_cache_root)),
+            kyiv_resource_cache=KyivResourceCache(Path(args.kyiv_cache_root)),
         ),
     )
     if external_manifest_entries:
@@ -2919,16 +2947,51 @@ def main(argv: list[str] | None = None) -> None:
         manifest.sort(key=lambda city: (normalized(str(city["name"])), str(city["id"])))
         if any(str(city.get("id")) == "kyiv" for city in external_cities):
             try:
-                from .kyiv_open_data import build_kyiv_systems_artifact
+                from .kyiv_open_data import (
+                    KyivOpenDataError,
+                    build_kyiv_systems_artifact,
+                    copy_validated_kyiv_systems_artifact,
+                )
             except ImportError:
-                from kyiv_open_data import build_kyiv_systems_artifact
-            timed_stage(
-                "kyiv", "systems",
-                lambda: build_kyiv_systems_artifact(
-                    repository_root=repository_root,
-                    output=output / "transit" / "kyiv-systems.json",
-                ),
-            )
+                from kyiv_open_data import (
+                    KyivOpenDataError,
+                    build_kyiv_systems_artifact,
+                    copy_validated_kyiv_systems_artifact,
+                )
+            try:
+                timed_stage(
+                    "kyiv", "systems",
+                    lambda: build_kyiv_systems_artifact(
+                        repository_root=repository_root,
+                        output=output / "transit" / "kyiv-systems.json",
+                        cache_root=Path(args.kyiv_cache_root),
+                    ),
+                )
+            except KyivOpenDataError as error:
+                previous_artifact = (
+                    Path(args.previous_stop_data) / "transit" / "kyiv-systems.json"
+                    if args.previous_stop_data.strip()
+                    else None
+                )
+                if previous_artifact is not None and previous_artifact.is_file():
+                    try:
+                        copy_validated_kyiv_systems_artifact(
+                            previous_artifact,
+                            output / "transit" / "kyiv-systems.json",
+                        )
+                        print(
+                            "[Kyiv] using previous published systems artifact "
+                            f"path={previous_artifact.name}"
+                        )
+                    except KyivOpenDataError as fallback_error:
+                        print(
+                            "[Kyiv] previous systems artifact is invalid; "
+                            f"no validated fallback: {fallback_error}"
+                        )
+                        kyiv_build_error = error
+                else:
+                    print("[Kyiv] no validated cache or previous systems artifact available")
+                    kyiv_build_error = error
 
     if not args.skip_german:
         assert german_archive is not None
@@ -3078,6 +3141,11 @@ def main(argv: list[str] | None = None) -> None:
             f"Built {len(manifest)} city packages in --skip-german mode "
             f"(no German GTFS branch)."
         )
+    if kyiv_build_error is not None:
+        raise KyivOpenDataError(
+            "Kyiv systems artifact could not be refreshed and no validated fallback "
+            "was available; the candidate release was not published."
+        ) from kyiv_build_error
 
 
 if __name__ == "__main__":

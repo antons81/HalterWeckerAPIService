@@ -12,6 +12,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from gtfs_source_cache import GTFSArtifactCache
 from gtfs_source_cache import ArtifactResult
+from external_gtfs import validate_kyiv_gtfs_archive
 from download_austrian_gtfs import download_source
 
 
@@ -19,6 +20,17 @@ def write_gtfs(path: Path, marker: str = "1") -> None:
     with zipfile.ZipFile(path, "w") as archive:
         for name in ("stops.txt", "routes.txt", "trips.txt", "stop_times.txt"):
             archive.writestr(name, f"marker,{marker}\n")
+
+
+def write_kyiv_gtfs(path: Path, marker: str = "1") -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("stops.txt", f"stop_id,stop_name\nstop-{marker},Main\n")
+        archive.writestr("routes.txt", f"route_id,route_name\nroute-{marker},Route\n")
+        archive.writestr("trips.txt", f"route_id,trip_id\nroute-{marker},trip-{marker}\n")
+        archive.writestr(
+            "stop_times.txt",
+            f"trip_id,stop_id,stop_sequence\ntrip-{marker},stop-{marker},1\n",
+        )
 
 
 class FakeResponse:
@@ -42,6 +54,138 @@ class FakeResponse:
 
 
 class GTFSArtifactCacheTests(unittest.TestCase):
+    def test_kyiv_timeout_retries_then_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "kyiv.zip"
+            write_kyiv_gtfs(source)
+            calls = []
+
+            def fake_urlopen(request, timeout=0):
+                calls.append(request.get_method())
+                if len(calls) < 3:
+                    raise TimeoutError("simulated timeout")
+                return FakeResponse(body=source.read_bytes())
+
+            with patch("gtfs_source_cache.urllib.request.urlopen", side_effect=fake_urlopen):
+                result = GTFSArtifactCache(root / "cache").resolve(
+                    "kyiv",
+                    "https://data.kyivcity.gov.ua/gtfs.zip",
+                    allow_stale=True,
+                    metadata_probe=False,
+                    retry_attempts=3,
+                    validator=validate_kyiv_gtfs_archive,
+                )
+
+            self.assertEqual(result.status, "updated")
+            self.assertEqual(calls, ["GET", "GET", "GET"])
+
+    def test_kyiv_http_503_retries_then_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "kyiv.zip"
+            write_kyiv_gtfs(source)
+            calls = []
+
+            def fake_urlopen(request, timeout=0):
+                calls.append(request.get_method())
+                if len(calls) < 3:
+                    return FakeResponse(status=503)
+                return FakeResponse(body=source.read_bytes())
+
+            with patch("gtfs_source_cache.urllib.request.urlopen", side_effect=fake_urlopen):
+                result = GTFSArtifactCache(root / "cache").resolve(
+                    "kyiv",
+                    "https://data.kyivcity.gov.ua/gtfs.zip",
+                    allow_stale=True,
+                    metadata_probe=False,
+                    retry_attempts=3,
+                    validator=validate_kyiv_gtfs_archive,
+                )
+
+            self.assertEqual(result.status, "updated")
+            self.assertEqual(calls, ["GET", "GET", "GET"])
+
+    def test_kyiv_retry_exhaustion_uses_valid_stale_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "kyiv.zip"
+            write_kyiv_gtfs(source, "old")
+            cache = GTFSArtifactCache(root / "cache")
+            first = cache.resolve(
+                "kyiv",
+                str(source),
+                validator=validate_kyiv_gtfs_archive,
+            )
+            calls = []
+
+            def fake_urlopen(request, timeout=0):
+                calls.append(request.get_method())
+                raise TimeoutError("simulated timeout")
+
+            with patch("gtfs_source_cache.urllib.request.urlopen", side_effect=fake_urlopen):
+                result = cache.resolve(
+                    "kyiv",
+                    "https://data.kyivcity.gov.ua/gtfs.zip",
+                    allow_stale=True,
+                    metadata_probe=False,
+                    retry_attempts=3,
+                    validator=validate_kyiv_gtfs_archive,
+                )
+
+            self.assertEqual(result.status, "preserved-stale")
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(result.state["sha256"], first.state["sha256"])
+            self.assertEqual((root / "cache" / "kyiv" / "current.zip").read_bytes(), source.read_bytes())
+
+    def test_kyiv_corrupt_download_does_not_replace_valid_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "kyiv.zip"
+            write_kyiv_gtfs(source, "old")
+            cache = GTFSArtifactCache(root / "cache")
+            first = cache.resolve("kyiv", str(source), validator=validate_kyiv_gtfs_archive)
+
+            def fake_urlopen(request, timeout=0):
+                return FakeResponse(body=b"partial-not-a-zip")
+
+            with patch("gtfs_source_cache.urllib.request.urlopen", side_effect=fake_urlopen):
+                result = cache.resolve(
+                    "kyiv",
+                    "https://data.kyivcity.gov.ua/gtfs.zip",
+                    allow_stale=True,
+                    metadata_probe=False,
+                    retry_attempts=3,
+                    validator=validate_kyiv_gtfs_archive,
+                )
+
+            self.assertEqual(result.status, "preserved-stale")
+            self.assertEqual(result.state["sha256"], first.state["sha256"])
+            self.assertEqual((root / "cache" / "kyiv" / "current.zip").read_bytes(), source.read_bytes())
+
+    def test_kyiv_permanent_404_is_not_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            calls = []
+
+            def fake_urlopen(request, timeout=0):
+                calls.append(request.get_method())
+                raise urllib.error.HTTPError(
+                    request.full_url, 404, "not found", {}, io.BytesIO()
+                )
+
+            with patch("gtfs_source_cache.urllib.request.urlopen", side_effect=fake_urlopen):
+                with self.assertRaises(urllib.error.HTTPError):
+                    GTFSArtifactCache(Path(temp) / "cache").resolve(
+                        "kyiv",
+                        "https://data.kyivcity.gov.ua/gtfs.zip",
+                        allow_stale=False,
+                        metadata_probe=False,
+                        retry_attempts=3,
+                        validator=validate_kyiv_gtfs_archive,
+                    )
+
+            self.assertEqual(calls, ["GET"])
+
     def test_germany_request_preserves_exact_url_and_legacy_user_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

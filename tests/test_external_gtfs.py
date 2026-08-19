@@ -3,6 +3,7 @@ import json
 import sys
 import tempfile
 import unittest
+import urllib.error
 import zipfile
 from datetime import date
 from pathlib import Path
@@ -32,8 +33,11 @@ from external_gtfs import (  # noqa: E402
     process_external_gtfs_sources,
     validate_external_stop_packages,
     validate_external_gtfs_source,
+    external_gtfs_resilience_policy,
+    validate_kyiv_gtfs_archive,
 )
 from external_staging import ExternalMergeStage, iter_departure_payload  # noqa: E402
+from gtfs_source_cache import GTFSArtifactCache  # noqa: E402
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -70,6 +74,46 @@ def _gtfs_zip(
 
 
 class ExternalGTFSRegistryTests(unittest.TestCase):
+    def test_kyiv_gtfs_outage_without_cache_fails_closed_after_limited_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = next(
+                item
+                for item in load_external_gtfs_sources(
+                    REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
+                )
+                if item["id"] == "kyiv"
+            )
+            source["supplementalStopCatalog"] = None
+            source["buildStops"] = False
+            source["buildRoutes"] = False
+            source["buildDepartures"] = False
+            source["buildTripIndex"] = False
+            source["buildRadarTopology"] = False
+            sources_path = root / "sources.json"
+            sources_path.write_text(json.dumps([source]), encoding="utf-8")
+            calls = []
+
+            def unavailable(request, timeout=0):
+                calls.append(request.get_method())
+                raise urllib.error.URLError(TimeoutError("simulated outage"))
+
+            with mock.patch(
+                "gtfs_source_cache.urllib.request.urlopen",
+                side_effect=unavailable,
+            ):
+                with self.assertRaises(urllib.error.URLError):
+                    process_external_gtfs_sources(
+                        repository_root=REPOSITORY_ROOT,
+                        sources_path=sources_path,
+                        url_by_provider={"kyiv": "https://data.kyivcity.gov.ua/gtfs.zip"},
+                        output=root / "out",
+                        load_gtfs_archive=load_gtfs_archive,
+                        gtfs_cache=GTFSArtifactCache(root / "gtfs-cache"),
+                    )
+
+            self.assertEqual(calls, ["GET", "GET", "GET"])
+
     def test_streaming_merge_stages_large_departure_json_on_disk(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -618,6 +662,23 @@ class ExternalStopAndDepartureTests(unittest.TestCase):
         )
         self.assertEqual(source["preflight"], "download")
         self.assertFalse(source["allowStale"])
+        self.assertEqual(
+            external_gtfs_resilience_policy(source),
+            {
+                "allowStale": True,
+                "retryAttempts": 3,
+                "metadataProbe": False,
+                "requireDataRows": True,
+            },
+        )
+        sweden = next(
+            item
+            for item in load_external_gtfs_sources(
+                REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
+            )
+            if item["id"] == "sweden"
+        )
+        self.assertIsNone(external_gtfs_resilience_policy(sweden))
         catalog = source["supplementalStopCatalog"]
         self.assertEqual(catalog["resourceID"], "269ffb2e-dac0-4978-9552-10d29a30724b")
         self.assertEqual(catalog["idPrefix"], "kyiv-catalog:")

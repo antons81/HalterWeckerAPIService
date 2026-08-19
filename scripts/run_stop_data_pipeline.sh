@@ -229,6 +229,9 @@ run_build_stop_packages() {
   fi
   cmd+=(--vbb-gtfs-url "$VBB_GTFS_ARTIFACT")
   cmd+=(--rnv-gtfs-url "$RNV_GTFS_ARTIFACT")
+  cmd+=(--kyiv-cache-root "${KYIV_OPEN_DATA_CACHE_ROOT:-$DATA_ROOT/kyiv-open-data-cache}")
+  cmd+=(--gtfs-cache-root "${GTFS_CACHE_ROOT:-/srv/haltewecker/cache/gtfs}")
+  cmd+=(--previous-stop-data "$CURRENT")
   if [ -n "$nl_url" ]; then
     cmd+=(--nl-gtfs-url "$nl_url")
   fi

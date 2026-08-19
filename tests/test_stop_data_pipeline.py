@@ -4,6 +4,13 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+
+import json
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import build_stop_packages as stop_package_builder
+from kyiv_open_data import KyivOpenDataError
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -319,6 +326,9 @@ printf 'releaseID=%s\\n' "$RELEASE_ID" > "$NEXT_DATABASE_PATH"
             f"--external-gtfs-sources {REPOSITORY_ROOT / 'config' / 'external-gtfs-sources.json'}",
             build_args,
         )
+        self.assertIn(f"--kyiv-cache-root {self.data_root / 'kyiv-open-data-cache'}", build_args)
+        self.assertIn("--gtfs-cache-root /srv/haltewecker/cache/gtfs", build_args)
+        self.assertIn(f"--previous-stop-data {self.data_root / 'current'}", build_args)
         self.assertIn("511-bay-area=", build_args)
         self.assertEqual(
             (self.data_root / "current" / "release-marker").read_text(encoding="utf-8"),
@@ -340,6 +350,57 @@ printf 'releaseID=%s\\n' "$RELEASE_ID" > "$NEXT_DATABASE_PATH"
         self.assertEqual(self.systemctl_calls(), [])
         self.assertEqual((self.root / "build-calls.log").read_text().splitlines(), ["build"])
         self.assertNotIn("Dutch", result.stdout)
+
+    def test_kyiv_without_any_fallback_fails_candidate_after_other_stages(self) -> None:
+        output = self.root / "candidate"
+        kyiv_city = json.loads(
+            (REPOSITORY_ROOT / "config" / "kyiv-cities.json").read_text(encoding="utf-8")
+        )[0]
+        manifest_entry = {
+            "id": "kyiv",
+            "name": "Kyiv",
+            "aliases": [],
+            "stopCount": 1,
+            "url": "stops/kyiv.json",
+            "country": "UA",
+            "_source": "test external source",
+        }
+
+        def fake_external_sources(**_kwargs):
+            return [manifest_entry], [kyiv_city], {"kyiv": []}, {}
+
+        with mock.patch(
+            "external_gtfs.process_external_gtfs_sources",
+            side_effect=fake_external_sources,
+        ), mock.patch(
+            "external_gtfs.validate_external_stop_packages",
+        ), mock.patch(
+            "kyiv_open_data.build_kyiv_systems_artifact",
+            side_effect=KyivOpenDataError("simulated Kyiv outage"),
+        ):
+            with self.assertRaises(KyivOpenDataError):
+                stop_package_builder.main([
+                    "--skip-german",
+                    "--external-gtfs-url",
+                    "kyiv=https://data.kyivcity.gov.ua/gtfs.zip",
+                    "--external-gtfs-sources",
+                    str(REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"),
+                    "--output",
+                    str(output),
+                    "--kyiv-cache-root",
+                    str(self.root / "missing-kyiv-cache"),
+                    "--gtfs-cache-root",
+                    str(self.root / "missing-gtfs-cache"),
+                    "--previous-stop-data",
+                    str(self.data_root / "current"),
+                ])
+
+        self.assertEqual(
+            (self.data_root / "current" / "release-marker").read_text(encoding="utf-8"),
+            "old",
+        )
+        self.assertIn("kyiv", json.loads((output / "manifest.json").read_text())["cities"][0]["id"])
+        self.assertTrue((output / "transit" / "city-lines" / "kyiv.json").is_file())
 
     def test_validation_failure_does_not_trigger_static_departures(self) -> None:
         result = self.run_pipeline(BUILD_INVALID="1")

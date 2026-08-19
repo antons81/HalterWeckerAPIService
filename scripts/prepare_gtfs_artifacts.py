@@ -14,11 +14,22 @@ from artifact_provenance import artifact_provenance, immutable_file_path
 from external_gtfs import (
     authenticated_external_request,
     configured_external_url,
+    external_gtfs_resilience_policy,
     load_external_gtfs_sources,
     parse_external_gtfs_url_args,
     source_classification,
+    validate_kyiv_gtfs_archive,
 )
 from gtfs_source_cache import DEFAULT_CACHE_ROOT, ArtifactResult, GTFSArtifactCache
+
+
+def safe_error_reason(error: BaseException) -> str:
+    code = getattr(error, "code", None)
+    if isinstance(code, int):
+        return f"HTTP {code}"
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    return type(error).__name__
 
 
 def artifact_payload(result: ArtifactResult) -> dict[str, object]:
@@ -54,6 +65,8 @@ def resolve_one(
     source_version: dict[str, object] | None = None,
     state_url: str | None = None,
     metadata_probe: bool = True,
+    retry_attempts: int = 1,
+    validator=None,
 ) -> ArtifactResult:
     started = time.monotonic()
     try:
@@ -65,12 +78,14 @@ def resolve_one(
             allow_stale=allow_stale,
             state_url=state_url,
             metadata_probe=metadata_probe,
+            retry_attempts=retry_attempts,
+            validator=validator,
         )
     except Exception as error:
         duration = time.monotonic() - started
         print(
             f"[GTFSCache] source={source_id} stage=resolve "
-            f"status=failed duration={duration:.2f}s reason={error}"
+            f"status=failed duration={duration:.2f}s reason={safe_error_reason(error)}"
         )
         print(
             f"[GTFSCache] source={source_id} stage=download "
@@ -210,14 +225,34 @@ def main() -> None:
             }
             continue
         preflight = str(source.get("preflight", "head"))
+        resilience_policy = external_gtfs_resilience_policy(source)
         artifact = resolve_one(
             cache,
             source_id,
             request_url,
             headers=headers,
-            allow_stale=bool(source.get("allowStale", True)),
+            allow_stale=(
+                bool(resilience_policy["allowStale"])
+                if resilience_policy is not None
+                else bool(source.get("allowStale", True))
+            ),
             state_url=url,
-            metadata_probe=preflight == "head",
+            metadata_probe=(
+                bool(resilience_policy["metadataProbe"])
+                if resilience_policy is not None
+                else preflight == "head"
+            ),
+            retry_attempts=(
+                int(resilience_policy["retryAttempts"])
+                if resilience_policy is not None
+                else 1
+            ),
+            validator=(
+                validate_kyiv_gtfs_archive
+                if resilience_policy is not None
+                and bool(resilience_policy["requireDataRows"])
+                else None
+            ),
         )
         result["external"][source_id] = artifact_payload(artifact)
 

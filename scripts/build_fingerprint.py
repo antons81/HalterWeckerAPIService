@@ -16,6 +16,7 @@ DEFAULT_INPUTS = (
     "config/ireland-cities.json",
     "config/city-id-aliases.json",
     "scripts/build_stop_packages.py",
+    "scripts/kyiv_open_data.py",
     "scripts/external_gtfs.py",
     "scripts/build_swiss_departure_index.py",
     "scripts/build_german_departure_index.py",
