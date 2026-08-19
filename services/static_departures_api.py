@@ -687,6 +687,26 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/apple/store-notifications":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > 1_000_000:
+                    return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request body"})
+                body = self.rfile.read(length)
+                payload = json.loads(body.decode("utf-8"))
+                signed_payload = payload.get("signedPayload") if isinstance(payload, dict) else None
+                if not isinstance(signed_payload, str) or not signed_payload:
+                    return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "signedPayload is required"})
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, OSError):
+                return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request body"})
+
+            LOGGER.warning(
+                "timestamp=%s event=apple_store_notification_received signedPayloadLength=%d",
+                datetime.now().astimezone().isoformat(timespec="seconds"),
+                len(signed_payload),
+            )
+            return self.send_json(HTTPStatus.OK, {"ok": True})
+
         if not parsed.path.startswith("/geofox/"):
             return self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
         if self.geofox_gateway is None:

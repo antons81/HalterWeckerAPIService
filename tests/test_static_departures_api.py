@@ -6,10 +6,11 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from http import HTTPStatus
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -129,6 +130,19 @@ class StaticDeparturesHTTPServer:
     def get(self, path: str) -> dict[str, object]:
         with urlopen(f"{self.base_url}{path}", timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))
+
+    def post(self, path: str, body: bytes) -> int:
+        request = Request(
+            f"{self.base_url}{path}",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status
+        except HTTPError as error:
+            return error.code
 
 
 class StaticDeparturesDatabaseTests(unittest.TestCase):
@@ -286,6 +300,65 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                 self.assertEqual(aliased["cityID"], "koln")
                 self.assertEqual(aliased["requestedCityID"], "koeln")
                 self.assertEqual(aliased["lines"][0]["line"], "7")
+
+    def test_apple_store_notification_without_signed_payload_returns_bad_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "current.sqlite"
+            write_database(path, "apple-notification")
+            with StaticDeparturesHTTPServer(path) as server:
+                self.assertEqual(
+                    server.post("/api/apple/store-notifications", b"{}"),
+                    HTTPStatus.BAD_REQUEST,
+                )
+
+    def test_apple_store_notification_with_null_signed_payload_returns_bad_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "current.sqlite"
+            write_database(path, "apple-notification")
+            with StaticDeparturesHTTPServer(path) as server:
+                self.assertEqual(
+                    server.post(
+                        "/api/apple/store-notifications",
+                        b'{"signedPayload":null}',
+                    ),
+                    HTTPStatus.BAD_REQUEST,
+                )
+
+    def test_apple_store_notification_with_empty_signed_payload_returns_bad_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "current.sqlite"
+            write_database(path, "apple-notification")
+            with StaticDeparturesHTTPServer(path) as server:
+                self.assertEqual(
+                    server.post(
+                        "/api/apple/store-notifications",
+                        b'{"signedPayload":""}',
+                    ),
+                    HTTPStatus.BAD_REQUEST,
+                )
+
+    def test_apple_store_notification_with_signed_payload_returns_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "current.sqlite"
+            write_database(path, "apple-notification")
+            with StaticDeparturesHTTPServer(path) as server:
+                self.assertEqual(
+                    server.post(
+                        "/api/apple/store-notifications",
+                        b'{"signedPayload":"test"}',
+                    ),
+                    HTTPStatus.OK,
+                )
+
+    def test_apple_store_notification_with_invalid_json_returns_bad_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "current.sqlite"
+            write_database(path, "apple-notification")
+            with StaticDeparturesHTTPServer(path) as server:
+                self.assertEqual(
+                    server.post("/api/apple/store-notifications", b"not-json"),
+                    HTTPStatus.BAD_REQUEST,
+                )
 
     def test_toronto_namespaced_board_is_stop_scoped_and_isolated(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
