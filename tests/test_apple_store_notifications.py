@@ -23,6 +23,7 @@ from apple_store_notifications import (
     build_verifier_candidates,
     load_root_certificates,
 )
+from telegram_sales_notifier import TelegramSalesNotifier
 
 
 class FakeSignedDataVerifier:
@@ -174,6 +175,88 @@ class AppleStoreNotificationEndpointStubTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp:
             store = AppleStoreNotificationStore(Path(temp) / "events.sqlite3")
+            notifier = RecordingTelegramNotifier()
+            try:
+                with patch.object(
+                    static_departures_api,
+                    "default_verifier",
+                    return_value=type("StubVerifier", (), {"verify": lambda _self, _payload: notification})(),
+                ):
+                    self.assertEqual(self._post_notification(store, notifier), 200)
+                self.assertEqual(self._stored_event_count(store), 1)
+                self.assertEqual(notifier.sent, [])
+            finally:
+                store.close()
+
+    def test_handled_subscription_sends_after_persistence(self) -> None:
+        notification = VerifiedAppleNotification(
+            "subscription-notification-uuid",
+            "SUBSCRIBED",
+            None,
+            "com.aSoft.HalteWecker",
+            "Production",
+            1_700_000_000_000,
+            transaction_info=SimpleNamespace(
+                productId="com.asoft.haltewecker.monthly",
+                transactionId="transaction-id",
+            ),
+        )
+        notifier = RecordingTelegramNotifier()
+
+        with tempfile.TemporaryDirectory() as temp:
+            store = AppleStoreNotificationStore(Path(temp) / "events.sqlite3")
+            try:
+                with patch.object(
+                    static_departures_api,
+                    "default_verifier",
+                    return_value=type("StubVerifier", (), {"verify": lambda _self, _payload: notification})(),
+                ):
+                    self.assertEqual(self._post_notification(store, notifier), 200)
+                self.assertEqual(self._stored_event_count(store), 1)
+                self.assertEqual(len(notifier.sent), 1)
+                self.assertEqual(notifier.sent[0].product_id, "com.asoft.haltewecker.monthly")
+            finally:
+                store.close()
+
+    def test_unknown_notification_type_is_not_sent(self) -> None:
+        notification = VerifiedAppleNotification(
+            "unknown-type-uuid",
+            "UNKNOWN_TYPE",
+            None,
+            "com.aSoft.HalteWecker",
+            "Production",
+            1_700_000_000_000,
+            transaction_info=SimpleNamespace(productId="com.asoft.haltewecker.monthly"),
+        )
+        notifier = RecordingTelegramNotifier()
+
+        with tempfile.TemporaryDirectory() as temp:
+            store = AppleStoreNotificationStore(Path(temp) / "events.sqlite3")
+            try:
+                with patch.object(
+                    static_departures_api,
+                    "default_verifier",
+                    return_value=type("StubVerifier", (), {"verify": lambda _self, _payload: notification})(),
+                ):
+                    self.assertEqual(self._post_notification(store, notifier), 200)
+                self.assertEqual(self._stored_event_count(store), 1)
+                self.assertEqual(notifier.sent, [])
+            finally:
+                store.close()
+
+    def test_missing_telegram_configuration_still_persists_and_returns_ok(self) -> None:
+        notification = VerifiedAppleNotification(
+            "missing-telegram-config-uuid",
+            "SUBSCRIBED",
+            None,
+            "com.aSoft.HalteWecker",
+            "Production",
+            1_700_000_000_000,
+            transaction_info=SimpleNamespace(productId="com.asoft.haltewecker.monthly"),
+        )
+
+        with tempfile.TemporaryDirectory() as temp:
+            store = AppleStoreNotificationStore(Path(temp) / "events.sqlite3")
             try:
                 with patch.object(
                     static_departures_api,
@@ -185,6 +268,43 @@ class AppleStoreNotificationEndpointStubTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_telegram_failure_still_persists_and_returns_ok_without_token_log(self) -> None:
+        notification = VerifiedAppleNotification(
+            "telegram-failure-uuid",
+            "SUBSCRIBED",
+            None,
+            "com.aSoft.HalteWecker",
+            "Production",
+            1_700_000_000_000,
+            transaction_info=SimpleNamespace(productId="com.asoft.haltewecker.monthly"),
+        )
+
+        failing_notifier = TelegramSalesNotifier(
+            "private-bot-token",
+            "private-chat",
+            transport=lambda *_args: 503,
+        )
+
+        with tempfile.TemporaryDirectory() as temp:
+            store = AppleStoreNotificationStore(Path(temp) / "events.sqlite3")
+            try:
+                with patch.object(
+                    static_departures_api,
+                    "default_verifier",
+                    return_value=type("StubVerifier", (), {"verify": lambda _self, _payload: notification})(),
+                ), self.assertLogs(static_departures_api.LOGGER, level="WARNING") as captured:
+                    self.assertEqual(
+                        self._post_notification(store, failing_notifier),
+                        200,
+                    )
+                self.assertEqual(self._stored_event_count(store), 1)
+                output = "\n".join(captured.output)
+                self.assertIn("event=telegram_sales_notification_failed", output)
+                self.assertNotIn("private-bot-token", output)
+                self.assertNotIn("private-chat", output)
+            finally:
+                store.close()
+
     def test_duplicate_notification_returns_200_and_is_stored_once(self) -> None:
         notification = VerifiedAppleNotification(
             "duplicate-notification-uuid",
@@ -193,7 +313,9 @@ class AppleStoreNotificationEndpointStubTests(unittest.TestCase):
             "com.aSoft.Pasty",
             "Production",
             1_700_000_000_000,
+            transaction_info=SimpleNamespace(productId="com.aSoft.Pasty.pro.lifetime"),
         )
+        notifier = RecordingTelegramNotifier()
 
         class StubVerifier:
             def verify(self, _payload: str) -> VerifiedAppleNotification:
@@ -203,9 +325,10 @@ class AppleStoreNotificationEndpointStubTests(unittest.TestCase):
             store = AppleStoreNotificationStore(Path(temp) / "events.sqlite3")
             try:
                 with patch.object(static_departures_api, "default_verifier", return_value=StubVerifier()):
-                    self.assertEqual(self._post_notification(store), 200)
-                    self.assertEqual(self._post_notification(store), 200)
+                    self.assertEqual(self._post_notification(store, notifier), 200)
+                    self.assertEqual(self._post_notification(store, notifier), 200)
                 self.assertEqual(self._stored_event_count(store), 1)
+                self.assertEqual(len(notifier.sent), 1)
             finally:
                 store.close()
 
@@ -236,7 +359,10 @@ class AppleStoreNotificationEndpointStubTests(unittest.TestCase):
         return int(cursor.fetchone()[0])
 
     @staticmethod
-    def _post_notification(store: object | None = None) -> int:
+    def _post_notification(
+        store: object | None = None,
+        notifier: object | None = None,
+    ) -> int:
         from http.server import ThreadingHTTPServer
         from urllib.error import HTTPError
         from urllib.request import Request, urlopen
@@ -245,12 +371,16 @@ class AppleStoreNotificationEndpointStubTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as temp:
                 temporary_store = AppleStoreNotificationStore(Path(temp) / "events.sqlite3")
                 try:
-                    return AppleStoreNotificationEndpointStubTests._post_notification(temporary_store)
+                    return AppleStoreNotificationEndpointStubTests._post_notification(
+                        temporary_store,
+                        notifier,
+                    )
                 finally:
                     temporary_store.close()
 
         class EndpointHandler(static_departures_api.Handler):
             apple_store_notification_store = store
+            telegram_sales_notifier = notifier
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), EndpointHandler)
         thread = __import__("threading").Thread(target=server.serve_forever, daemon=True)
@@ -271,6 +401,16 @@ class AppleStoreNotificationEndpointStubTests(unittest.TestCase):
             server.shutdown()
             thread.join(timeout=5)
             server.server_close()
+
+
+class RecordingTelegramNotifier:
+    notify_sandbox = False
+
+    def __init__(self) -> None:
+        self.sent: list[object] = []
+
+    def send(self, event) -> None:
+        self.sent.append(event)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ COPY services/static_departures_api.py /app/static_departures_api.py
 COPY services/apple_store_notifications.py /app/apple_store_notifications.py
 COPY services/apple_store_business_events.py /app/apple_store_business_events.py
 COPY services/apple_store_notification_store.py /app/apple_store_notification_store.py
+COPY services/telegram_sales_notifier.py /app/telegram_sales_notifier.py
 COPY services/tfl_gateway.py /app/tfl_gateway.py
 COPY services/translink_gateway.py /app/translink_gateway.py
 COPY services/gtfsrt_gateway.py /app/gtfsrt_gateway.py

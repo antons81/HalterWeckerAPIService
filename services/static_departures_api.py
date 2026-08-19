@@ -53,6 +53,7 @@ from apple_store_notification_store import (
     AppleStoreNotificationStoreError,
 )
 from apple_store_notifications import AppleStoreNotificationVerificationError, default_verifier
+from telegram_sales_notifier import TelegramSalesNotificationError, TelegramSalesNotifier
 
 
 DEFAULT_TIMEZONE = "Europe/Berlin"
@@ -485,6 +486,7 @@ def bounded_limit(raw: str | None) -> int:
 class Handler(BaseHTTPRequestHandler):
     apple_store_notification_verifier = None
     apple_store_notification_store: AppleStoreNotificationStore | None = None
+    telegram_sales_notifier: TelegramSalesNotifier | None = None
 
     def version_string(self) -> str:
         return "HalteWecker"
@@ -739,6 +741,38 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return self.send_json(HTTPStatus.OK, {"ok": True})
 
+            notifier = self.telegram_sales_notifier
+            if event.is_handled and notifier is not None:
+                try:
+                    notifier.send(event)
+                except TelegramSalesNotificationError as error:
+                    LOGGER.warning(
+                        "event=telegram_sales_notification_failed app=%s "
+                        "notificationType=%s reason=%s",
+                        event.app,
+                        event.notification_type,
+                        error.reason,
+                    )
+                except Exception as error:
+                    LOGGER.warning(
+                        "event=telegram_sales_notification_failed app=%s "
+                        "notificationType=%s reason=%s",
+                        event.app,
+                        event.notification_type,
+                        type(error).__name__,
+                    )
+                else:
+                    if not (
+                        event.environment.casefold() == "sandbox"
+                        and not notifier.notify_sandbox
+                    ):
+                        LOGGER.info(
+                            "event=telegram_sales_notification_sent app=%s "
+                            "notificationType=%s",
+                            event.app,
+                            event.notification_type,
+                        )
+
             if event.is_handled:
                 LOGGER.info(
                     "event=apple_store_business_event app=%s notificationType=%s "
@@ -787,6 +821,7 @@ if __name__ == "__main__":
             DEFAULT_APPLE_NOTIFICATION_STORE_PATH,
         )
     )
+    Handler.telegram_sales_notifier = TelegramSalesNotifier.from_environment()
     Handler.geofox_gateway = GeofoxProxy.from_environment()
     Handler.tfl_gateway = TfLProxy.from_environment()
     Handler.translink_gateway = TransLinkProxy.from_environment()
