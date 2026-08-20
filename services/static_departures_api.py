@@ -54,13 +54,26 @@ from apple_store_notification_store import (
 )
 from apple_store_notifications import AppleStoreNotificationVerificationError, default_verifier
 from telegram_sales_notifier import TelegramSalesNotificationError, TelegramSalesNotifier
+from stm_gateway import (
+    STMRealtimeGateway,
+    STMRealtimePoller,
+    STM_ALERTS_PATH,
+    STM_TRIP_UPDATES_PATH,
+    STM_VEHICLE_POSITIONS_PATH,
+    STM_NAMESPACE,
+)
 
 
 DEFAULT_TIMEZONE = "Europe/Berlin"
 MBTA_NAMESPACE = "mbta-boston:"
+STM_PROVIDER_ID = "stm-montreal"
+STM_CITY_ID = "montreal"
 
 def _native_id(value: str) -> str:
     return value[len(MBTA_NAMESPACE):] if value.startswith(MBTA_NAMESPACE) else value
+
+def _native(value: str, namespace: str) -> str:
+    return value[len(namespace):] if namespace and value.startswith(namespace) else value
 LOGGER = logging.getLogger("haltewecker.static_departures_api")
 
 STATIC_DATA_ROOT = os.environ.get("STATIC_DATA_ROOT", "")
@@ -203,6 +216,76 @@ class Database:
             if route_id is not None and route_type is not None
         }
 
+    def provider_route_metadata(self, provider_id: str) -> dict[str, tuple[str, str]]:
+        """Return provider-owned route labels and GTFS route types."""
+        with self.lock:
+            try:
+                rows = self._connection().execute(
+                    """
+                    SELECT owned.key_1, routes.short_name, routes.route_type
+                    FROM provider_entities AS owned
+                    JOIN routes ON routes.route_id = owned.key_1
+                    WHERE owned.entity_type='routes' AND owned.provider_id=?
+                    """,
+                    (provider_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return {}
+        return {
+            str(route_id): (str(short_name or ""), str(route_type or ""))
+            for route_id, short_name, route_type in rows
+            if route_id is not None
+        }
+
+    def city_stop_registry(self, city_id: str) -> set[str]:
+        with self.lock:
+            try:
+                rows = self._connection().execute(
+                    "SELECT stop_id FROM city_stops WHERE city_id=?",
+                    (city_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return set()
+        return {str(row[0]) for row in rows if row[0] is not None}
+
+    def city_child_stop_ids(
+        self,
+        city_id: str,
+        stop_ids: set[str],
+        namespace: str,
+        provider_id: str,
+    ) -> set[str]:
+        """Expand requested public parent stations to public child platforms."""
+        public_ids = self.city_stop_registry(city_id)
+        selected = {str(stop_id) for stop_id in stop_ids if str(stop_id) in public_ids}
+        if not selected:
+            return selected
+        parent_ids = tuple(f"{namespace}{stop_id}" for stop_id in selected)
+        placeholders = ",".join("?" for _ in parent_ids)
+        with self.lock:
+            try:
+                rows = self._connection().execute(
+                    f"""
+                    SELECT raw.stop_id
+                    FROM raw_stops AS raw
+                    JOIN provider_entities AS owned
+                      ON owned.entity_type='raw_stops' AND owned.key_1=raw.stop_id
+                    WHERE owned.provider_id=?
+                      AND raw.parent_station IN ({placeholders})
+                    """,
+                    (provider_id, *parent_ids),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return selected
+        selected.update(
+            str(row[0])[len(namespace):]
+            for row in rows
+            if row[0] is not None
+            and str(row[0]).startswith(namespace)
+            and str(row[0])[len(namespace):] in public_ids
+        )
+        return selected
+
     def provider_trip_stop_registry(self, provider_id: str, trip_ids: set[str]) -> dict[tuple[str, int], str]:
         if not trip_ids:
             return {}
@@ -326,23 +409,24 @@ class Database:
         mode, _, stop_id_prefix, _ = self.city_departure_mode(city_id)
         if mode != "exact-stop-with-parent-fallback":
             return f"{stop_id_prefix}{stop_id}"
+        internal_stop_id = f"{stop_id_prefix}{stop_id}" if stop_id_prefix else stop_id
         with self.lock:
             cursor = self._connection().execute(
-                "SELECT 1 FROM stop_times WHERE raw_stop_id=? LIMIT 1", (stop_id,)
+                "SELECT 1 FROM stop_times WHERE raw_stop_id=? LIMIT 1", (internal_stop_id,)
             )
             try:
                 if cursor.fetchone() is not None:
-                    return stop_id
+                    return internal_stop_id
             finally:
                 cursor.close()
             cursor = self._connection().execute(
-                "SELECT parent_station FROM raw_stops WHERE stop_id=?", (stop_id,)
+                "SELECT parent_station FROM raw_stops WHERE stop_id=?", (internal_stop_id,)
             )
             try:
                 row = cursor.fetchone()
             finally:
                 cursor.close()
-        return str(row[0]) if row and row[0] else stop_id
+        return str(row[0]) if row and row[0] else internal_stop_id
 
     def lines(self, city_id: str, stop_id: str) -> list[dict[str, str | None]]:
         mode, _, stop_id_prefix, identifier_prefix = self.city_departure_mode(city_id)
@@ -509,6 +593,7 @@ class Handler(BaseHTTPRequestHandler):
     wmata_alerts_gateway: WMATAAlertsGateway | None = None
     geofox_gateway: GeofoxProxy | None = None
     kyiv_vehicle_positions_gateway: KyivVehiclePositionsGateway | None = None
+    stm_gateway: STMRealtimeGateway | None = None
 
     def send_json(
         self,
@@ -648,6 +733,11 @@ class Handler(BaseHTTPRequestHandler):
                 if gateway is None:
                     return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "WMATA provider unavailable"})
                 response = gateway.handle(parsed.path, query)
+                return self.send_json(response.status, response.payload, response.cache_control)
+            if parsed.path in {STM_TRIP_UPDATES_PATH, STM_VEHICLE_POSITIONS_PATH, STM_ALERTS_PATH}:
+                if self.stm_gateway is None:
+                    return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "STM provider unavailable"})
+                response = self.stm_gateway.handle(parsed.path, query)
                 return self.send_json(response.status, response.payload, response.cache_control)
             if parsed.path == KYIV_VEHICLE_POSITIONS_PATH:
                 if self.kyiv_vehicle_positions_gateway is None:
@@ -933,6 +1023,73 @@ if __name__ == "__main__":
             valid_registry=lambda: (*wmata_native_trip_registry(), lambda value: value),
         )
         Handler.wmata_alerts_gateway = WMATAAlertsGateway(api_key=wmata_api_key)
+    stm_api_key = os.environ.get("STM_API_KEY", "").strip()
+    if stm_api_key:
+        def stm_native_trip_registry():
+            trips, routes, route_by_trip = database.provider_realtime_registry(STM_PROVIDER_ID)
+            route_metadata = database.provider_route_metadata(STM_PROVIDER_ID)
+            native_trips = {_native(value, STM_NAMESPACE) for value in trips}
+            native_routes = {_native(value, STM_NAMESPACE) for value in routes}
+            native_routes_by_trip = {
+                _native(trip_id, STM_NAMESPACE): _native(route_id, STM_NAMESPACE)
+                for trip_id, route_id in route_by_trip.items()
+            }
+            route_types = {
+                _native(route_id, STM_NAMESPACE): route_type
+                for route_id, (_short_name, route_type) in route_metadata.items()
+            }
+            return native_trips, native_routes, native_routes_by_trip, route_types
+
+        def stm_native_stop_registry():
+            return {
+                _native(value, STM_NAMESPACE)
+                for value in database.provider_stop_registry(STM_PROVIDER_ID)
+            }
+
+        def stm_public_stop_registry():
+            return database.city_stop_registry(STM_CITY_ID)
+
+        def stm_stop_selector(stop_ids):
+            return database.city_child_stop_ids(
+                STM_CITY_ID,
+                stop_ids,
+                STM_NAMESPACE,
+                STM_PROVIDER_ID,
+            )
+
+        def stm_route_short_registry():
+            result = {}
+            for route_id, (short_name, _route_type) in database.provider_route_metadata(STM_PROVIDER_ID).items():
+                if short_name:
+                    result.setdefault(short_name, set()).add(_native(route_id, STM_NAMESPACE))
+            return result
+
+        def stm_stop_code_registry():
+            path = Path(STATIC_DATA_ROOT) / "stops" / f"{STM_CITY_ID}.json"
+            try:
+                records = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                return {}
+            result = {}
+            for record in records if isinstance(records, list) else []:
+                if not isinstance(record, dict):
+                    continue
+                stop_code = str(record.get("stopCode") or "").strip()
+                stop_id = str(record.get("id") or "").strip()
+                if stop_code and stop_id:
+                    result.setdefault(stop_code, set()).add(stop_id)
+            return result
+
+        stm_poller = STMRealtimePoller(stm_api_key, start=True)
+        Handler.stm_gateway = STMRealtimeGateway(
+            poller=stm_poller,
+            valid_registry=stm_native_trip_registry,
+            valid_stop_registry=stm_native_stop_registry,
+            public_stop_registry=stm_public_stop_registry,
+            stop_selector=stm_stop_selector,
+            route_short_registry=stm_route_short_registry,
+            stop_code_registry=stm_stop_code_registry,
+        )
     Handler.kyiv_vehicle_positions_gateway = KyivVehiclePositionsGateway(
         valid_route_registry=lambda: database.provider_route_type_registry("kyiv"),
         topology_path=(

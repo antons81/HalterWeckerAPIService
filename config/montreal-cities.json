@@ -1,0 +1,40 @@
+[
+  {
+    "id": "montreal",
+    "name": "Montréal",
+    "aliases": ["Montreal", "Montréal, QC"],
+    "latitude": 45.5019,
+    "longitude": -73.5674,
+    "radiusMeters": 38000,
+    "timezone": "America/Toronto",
+    "packageMode": "external",
+    "externalGTFSProvider": "stm-montreal",
+    "staticDepartures": true,
+    "transitRadar": {
+      "providerID": "stm-montreal",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "vehiclePositions",
+        "stopSequence",
+        "alerts"
+      ],
+      "staticModes": ["bus", "metro"],
+      "realtimeDepartureModes": ["bus"],
+      "vehiclePositionModes": ["bus"],
+      "alertModes": ["bus", "metro"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/stm-montreal/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/stm-montreal/realtime/trip-updates",
+      "alertsURL": "https://api.asoftlabs.app/stm-montreal/realtime/alerts",
+      "statusMessage": "STM Bus Live-Radar und Live-Abfahrten; Métro statische Abfahrten"
+    }
+  }
+]

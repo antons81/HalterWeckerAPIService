@@ -728,12 +728,20 @@ def add_external_gtfs(
         source = sources_by_id[source_id]
         for city in load_external_cities(source, repository_root):
             source_ids_by_city.setdefault(str(city["id"]), []).append(source_id)
+
+    def departure_mode(source: dict[str, object]) -> str:
+        mode = str(source.get("staticDepartureMode", "canonical")).strip() or "canonical"
+        if mode not in {"canonical", "exact-stop-with-parent-fallback"}:
+            raise ValueError(f"Unsupported staticDepartureMode for {source.get('id')}: {mode}")
+        return mode
+
     def register_modes() -> int:
         connection.executemany(
-            "INSERT OR IGNORE INTO city_departure_modes(city_id, mode, timezone, stop_id_prefix, identifier_prefix) VALUES (?, 'canonical', ?, ?, ?)",
+            "INSERT OR IGNORE INTO city_departure_modes(city_id, mode, timezone, stop_id_prefix, identifier_prefix) VALUES (?, ?, ?, ?, ?)",
             (
                 (
                     city_id,
+                    departure_mode(sources_by_id[source_ids_by_city[city_id][0]]),
                     str(sources_by_id[source_ids_by_city[city_id][0]]["timezone"]),
                     (
                         str(sources_by_id[source_ids_by_city[city_id][0]].get("staticStopIDPrefix", (
@@ -761,7 +769,7 @@ def add_external_gtfs(
                     connection,
                     source_id,
                     city_id,
-                    "canonical",
+                    departure_mode(source),
                     str(source["timezone"]),
                     (
                         str(source.get("staticStopIDPrefix", (

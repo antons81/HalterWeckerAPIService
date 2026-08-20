@@ -117,6 +117,7 @@ SUPPORTED_TRANSIT_RADAR_FEATURES = {
     "vehiclePositions",
     "vehicleBearing",
     "stopSequence",
+    "alerts",
 }
 STATIC_TRANSIT_RADAR_PROVIDERS = {
     "rheinbahn-duesseldorf": {
@@ -128,7 +129,15 @@ STATIC_TRANSIT_RADAR_PROVIDERS = {
     "wsw-wuppertal": {
         "cityID": "wuppertal",
         "features": {"liveVehicles", "realtimeDelay"}
-    }
+    },
+    "stm-montreal": {
+        "cityID": "montreal",
+        "features": {
+            "liveVehicles", "realtimeDepartures", "firstDepartures",
+            "stopLookup", "realtimeDelay", "tripUpdates", "vehiclePositions",
+            "stopSequence", "alerts"
+        }
+    },
 }
 
 
@@ -1455,10 +1464,14 @@ def transit_radar_manifest(
             static_only = provider_configuration.get("staticOnly")
             if isinstance(static_only, bool):
                 provider["staticOnly"] = static_only
-            for url_key in ("staticBaseURL", "boardURL", "realtimeURL", "tripUpdatesURL"):
+            for url_key in ("staticBaseURL", "boardURL", "realtimeURL", "tripUpdatesURL", "alertsURL"):
                 configured_url = provider_configuration.get(url_key)
                 if isinstance(configured_url, str) and configured_url.strip():
                     provider[url_key] = configured_url.strip()
+            for mode_key in ("staticModes", "realtimeDepartureModes", "vehiclePositionModes", "alertModes"):
+                configured_modes = provider_configuration.get(mode_key)
+                if isinstance(configured_modes, list) and all(isinstance(value, str) for value in configured_modes):
+                    provider[mode_key] = configured_modes
             providers.append(provider)
 
         if any(p.get("adapter") == "netherlands" for p in providers):

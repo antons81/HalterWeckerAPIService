@@ -542,7 +542,17 @@ def build_external_static_assets(
         encoding="utf-8",
     )
 
-    radar_path = stop_data / "transit-radar-cities.json"
+    radar_path = next(
+        (
+            candidate
+            for candidate in (
+                stop_data / "transit-radar-cities.json",
+                stop_data / "manifest" / "transit-radar-cities.json",
+            )
+            if candidate.is_file()
+        ),
+        stop_data / "transit-radar-cities.json",
+    )
     if radar_path.is_file():
         radar_payload = json.loads(radar_path.read_text(encoding="utf-8"))
         radar_cities = radar_payload.get("cities")
@@ -568,6 +578,12 @@ def build_external_static_assets(
             json.dumps(radar_payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        nested_radar_path = stop_data / "manifest" / "transit-radar-cities.json"
+        if radar_path != nested_radar_path and nested_radar_path.is_file():
+            nested_radar_path.write_text(
+                radar_path.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
 
     attributions_path = stop_data / "attributions.json"
     if attributions_path.is_file():

@@ -40,6 +40,12 @@ if [[ -f "$WMATA_SECRET_FILE" ]]; then
   set +a
 fi
 
+STM_SECRET_FILE="${STM_SECRET_FILE:-/srv/haltewecker/secrets/stm-montreal/.env}"
+if [[ -f "$STM_SECRET_FILE" ]]; then
+  STM_API_KEY="$(sed -n 's/^STM_API_KEY=//p' "$STM_SECRET_FILE" | head -n 1)"
+  export STM_API_KEY
+fi
+
 mkdir -p "$(dirname "$LOCK_PATH")"
 exec 9>"$LOCK_PATH"
 if ! "$FLOCK_BIN" -n 9; then

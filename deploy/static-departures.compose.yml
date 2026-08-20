@@ -19,6 +19,7 @@ services:
       TELEGRAM_SALES_BOT_TOKEN: ${TELEGRAM_SALES_BOT_TOKEN:-}
       TELEGRAM_SALES_CHAT_ID: ${TELEGRAM_SALES_CHAT_ID:-}
       TELEGRAM_SALES_NOTIFY_SANDBOX: ${TELEGRAM_SALES_NOTIFY_SANDBOX:-false}
+      STM_API_KEY: ${STM_API_KEY:-}
       PORT: "8080"
     volumes:
       - /srv/haltewecker/data/releases:/data/releases:ro

@@ -19,6 +19,7 @@ COPY services/wmata_gateway.py /app/wmata_gateway.py
 COPY services/geofox_gateway.py /app/geofox_gateway.py
 COPY services/kyiv_gateway.py /app/kyiv_gateway.py
 COPY services/kyiv_radar_inference.py /app/kyiv_radar_inference.py
+COPY services/stm_gateway.py /app/stm_gateway.py
 COPY config/apple /app/config/apple
 EXPOSE 8080
 HEALTHCHECK --interval=15s --timeout=3s --retries=3 CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/static-departures/health', timeout=2)"

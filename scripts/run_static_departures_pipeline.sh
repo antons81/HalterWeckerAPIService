@@ -22,6 +22,11 @@ fi
 : "${WMATA_API_KEY:?WMATA_API_KEY is required after loading WMATA secret}"
 WMATA_OPERATOR_API_KEY="$WMATA_API_KEY"
 export WMATA_OPERATOR_API_KEY
+STM_SECRET_FILE="${STM_SECRET_FILE:-/srv/haltewecker/secrets/stm-montreal/.env}"
+if [[ -f "$STM_SECRET_FILE" ]]; then
+  STM_API_KEY="$(sed -n 's/^STM_API_KEY=//p' "$STM_SECRET_FILE" | head -n 1)"
+  export STM_API_KEY
+fi
 DATA_ROOT="${DATA_ROOT:-/srv/haltewecker/data}"
 GTFS_URL="${GTFS_URL:?GTFS_URL is required}"
 STOP_DATA_PATH="${STOP_DATA_PATH:-$DATA_ROOT/current}"
