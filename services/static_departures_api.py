@@ -47,6 +47,13 @@ from mta_ny_gateway import (
     api_key_from_environment,
 )
 from kyiv_gateway import KyivVehiclePositionsGateway, KYIV_VEHICLE_POSITIONS_PATH
+from fintraffic_gateway import (
+    FINTRAFFIC_TRIP_UPDATES_PATH,
+    FINTRAFFIC_VEHICLE_POSITIONS_PATH,
+    FintrafficProviderContext,
+    FintrafficTripUpdatesGateway,
+    FintrafficVehiclePositionsGateway,
+)
 from apple_store_business_events import normalize_notification
 from apple_store_notification_store import (
     AppleStoreNotificationStore,
@@ -311,6 +318,39 @@ class Database:
             except sqlite3.OperationalError:
                 return set()
         return {str(row[0]) for row in rows}
+
+    def fintraffic_provider_contexts(self, city_id: str) -> tuple[FintrafficProviderContext, ...]:
+        """Return Finnish provider ownership used to join one shared RT feed."""
+        with self.lock:
+            try:
+                rows = self._connection().execute(
+                    """
+                    SELECT provider_id, stop_id_prefix, identifier_prefix
+                    FROM provider_city_modes
+                    WHERE city_id=? AND provider_id LIKE 'finland-%'
+                    ORDER BY provider_id
+                    """,
+                    (city_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return ()
+
+        contexts: list[FintrafficProviderContext] = []
+        for provider_id, stop_id_prefix, identifier_prefix in rows:
+            provider = str(provider_id)
+            trips, routes, route_by_trip = self.provider_realtime_registry(provider)
+            contexts.append(
+                FintrafficProviderContext(
+                    provider_id=provider,
+                    identifier_prefix=str(identifier_prefix or ""),
+                    stop_id_prefix=str(stop_id_prefix or ""),
+                    trips=frozenset(trips),
+                    routes=frozenset(routes),
+                    route_by_trip=dict(route_by_trip),
+                    stops=frozenset(self.provider_stop_registry(provider)),
+                )
+            )
+        return tuple(contexts)
 
     def city_departure_mode(self, city_id: str) -> tuple[str, str, str, str]:
         with self.lock:
@@ -593,6 +633,8 @@ class Handler(BaseHTTPRequestHandler):
     wmata_alerts_gateway: WMATAAlertsGateway | None = None
     geofox_gateway: GeofoxProxy | None = None
     kyiv_vehicle_positions_gateway: KyivVehiclePositionsGateway | None = None
+    fintraffic_trip_updates_gateway: FintrafficTripUpdatesGateway | None = None
+    fintraffic_vehicle_positions_gateway: FintrafficVehiclePositionsGateway | None = None
     stm_gateway: STMRealtimeGateway | None = None
 
     def send_json(
@@ -743,6 +785,16 @@ class Handler(BaseHTTPRequestHandler):
                 if self.kyiv_vehicle_positions_gateway is None:
                     return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Kyiv provider unavailable"})
                 response = self.kyiv_vehicle_positions_gateway.handle(parsed.path, query)
+                return self.send_json(response.status, response.payload, response.cache_control)
+            if parsed.path in {FINTRAFFIC_TRIP_UPDATES_PATH, FINTRAFFIC_VEHICLE_POSITIONS_PATH}:
+                gateway = (
+                    self.fintraffic_trip_updates_gateway
+                    if parsed.path == FINTRAFFIC_TRIP_UPDATES_PATH
+                    else self.fintraffic_vehicle_positions_gateway
+                )
+                if gateway is None:
+                    return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Fintraffic provider unavailable"})
+                response = gateway.handle(parsed.path, query)
                 return self.send_json(response.status, response.payload, response.cache_control)
             for prefix in STATIC_DATA_PATH_PREFIXES:
                 if parsed.path.startswith(prefix):
@@ -1097,5 +1149,55 @@ if __name__ == "__main__":
             if STATIC_DATA_ROOT
             else None
         ),
+    )
+    def fintraffic_city_configuration() -> tuple[set[str], dict[str, dict[str, object]]]:
+        candidates = [
+            Path(STATIC_DATA_ROOT) / "transit-radar-cities.json",
+            Path(__file__).resolve().parents[1] / "config" / "finland-cities.json",
+            Path("/app/config/finland-cities.json"),
+        ]
+        payload = None
+        for candidate in candidates:
+            try:
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+                break
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+        city_ids: set[str] = set()
+        regions: dict[str, dict[str, object]] = {}
+        if isinstance(payload, list):
+            payload = {"cities": payload}
+        for city in (payload or {}).get("cities", []) if isinstance(payload, dict) else []:
+            if not isinstance(city, dict):
+                continue
+            if "appCityID" in city:
+                city_id = str(city.get("appCityID", ""))
+                providers = city.get("providers", [])
+                for provider in providers if isinstance(providers, list) else []:
+                    if isinstance(provider, dict) and provider.get("adapter") == "fintraffic":
+                        city_ids.add(city_id)
+                        region = provider.get("region")
+                        if isinstance(region, dict):
+                            regions[city_id] = region
+                        break
+            elif isinstance(city.get("id"), str):
+                radar = city.get("transitRadar")
+                if isinstance(radar, dict) and radar.get("adapter") == "fintraffic":
+                    city_id = str(city["id"])
+                    city_ids.add(city_id)
+                    region = radar.get("region")
+                    if isinstance(region, dict):
+                        regions[city_id] = region
+        return city_ids, regions
+
+    fintraffic_city_ids, fintraffic_city_regions = fintraffic_city_configuration()
+    Handler.fintraffic_trip_updates_gateway = FintrafficTripUpdatesGateway.from_environment(
+        city_ids=fintraffic_city_ids,
+        context_registry=lambda city_id: database.fintraffic_provider_contexts(city_id),
+    )
+    Handler.fintraffic_vehicle_positions_gateway = FintrafficVehiclePositionsGateway.from_environment(
+        city_ids=fintraffic_city_ids,
+        city_regions=fintraffic_city_regions,
+        context_registry=lambda city_id: database.fintraffic_provider_contexts(city_id),
     )
     ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Handler).serve_forever()

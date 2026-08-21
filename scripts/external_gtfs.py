@@ -113,6 +113,8 @@ EXTERNAL_SOURCE_AUTH: dict[str, dict[str, object]] = {
     },
 }
 
+FINLAND_SOURCE_PREFIX = "finland-"
+
 VALID_SOURCE_CLASSIFICATIONS = {"required", "optional", "conditional"}
 
 
@@ -296,6 +298,12 @@ def validate_external_gtfs_source(
     if not isinstance(country, str) or not country.strip():
         raise ValueError(f"External GTFS source {source_id} is missing country.")
 
+    filter_by_provider = source.get("filterCitiesByProvider", False)
+    if not isinstance(filter_by_provider, bool):
+        raise ValueError(
+            f"External GTFS source {source_id} has invalid filterCitiesByProvider."
+        )
+
     stop_id_mode = source.get("stopIDMode", "exact")
     if stop_id_mode != "exact":
         raise ValueError(
@@ -386,6 +394,17 @@ def load_external_cities(
     cities_rel = str(source["cities"])
     cities = load_cities(repository_root / cities_rel)
     source_id = str(source["id"])
+    filter_by_provider = bool(source.get("filterCitiesByProvider", False))
+    if filter_by_provider:
+        cities = [
+            city
+            for city in cities
+            if source_id in {
+                str(provider).strip()
+                for provider in (city.get("externalGTFSProviders") or [])
+                if str(provider).strip()
+            }
+        ]
     if not cities:
         raise ValueError(f"External GTFS source {source_id} has no cities.")
     for city in cities:
@@ -458,6 +477,12 @@ def authenticated_external_request(
     """Return (url, headers) for an external source without logging secrets."""
     env = environ if environ is not None else os.environ
     auth = EXTERNAL_SOURCE_AUTH.get(source_id, {})
+    if not auth and source_id.startswith(FINLAND_SOURCE_PREFIX):
+        auth = {
+            "api_key_env": "DIGITRANSIT_KEY",
+            "header_name": "digitransit-subscription-key",
+            "headers": {"Accept-Encoding": "gzip"},
+        }
     headers = {
         str(key): str(value)
         for key, value in dict(auth.get("headers") or {}).items()

@@ -37,6 +37,13 @@ if [[ -f "$API_511_ENV_FILE" ]]; then
   set +a
 fi
 
+FINLAND_ENV_FILE="${FINLAND_ENV_FILE:-/srv/haltewecker/secrets/finland/.env}"
+if [[ -f "$FINLAND_ENV_FILE" ]]; then
+  set -a
+  source "$FINLAND_ENV_FILE"
+  set +a
+fi
+
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 SUDO_BIN="${SUDO_BIN:-sudo}"
 STATIC_DEPARTURES_SERVICE="${STATIC_DEPARTURES_SERVICE:-haltewecker-static-departures.service}"

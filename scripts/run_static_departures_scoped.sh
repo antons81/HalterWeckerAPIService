@@ -46,6 +46,13 @@ if [[ -f "$STM_SECRET_FILE" ]]; then
   export STM_API_KEY
 fi
 
+FINLAND_ENV_FILE="${FINLAND_ENV_FILE:-/srv/haltewecker/secrets/finland/.env}"
+if [[ -f "$FINLAND_ENV_FILE" ]]; then
+  set -a
+  source "$FINLAND_ENV_FILE"
+  set +a
+fi
+
 mkdir -p "$(dirname "$LOCK_PATH")"
 exec 9>"$LOCK_PATH"
 if ! "$FLOCK_BIN" -n 9; then

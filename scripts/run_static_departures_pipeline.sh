@@ -27,6 +27,12 @@ if [[ -f "$STM_SECRET_FILE" ]]; then
   STM_API_KEY="$(sed -n 's/^STM_API_KEY=//p' "$STM_SECRET_FILE" | head -n 1)"
   export STM_API_KEY
 fi
+FINLAND_ENV_FILE="${FINLAND_ENV_FILE:-/srv/haltewecker/secrets/finland/.env}"
+if [[ -f "$FINLAND_ENV_FILE" ]]; then
+  set -a
+  source "$FINLAND_ENV_FILE"
+  set +a
+fi
 DATA_ROOT="${DATA_ROOT:-/srv/haltewecker/data}"
 GTFS_URL="${GTFS_URL:?GTFS_URL is required}"
 STOP_DATA_PATH="${STOP_DATA_PATH:-$DATA_ROOT/current}"

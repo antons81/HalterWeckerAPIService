@@ -106,6 +106,7 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "mbta",
     "wmata",
     "kyiv",
+    "fintraffic",
 }
 SUPPORTED_TRANSIT_RADAR_FEATURES = {
     "liveVehicles",
@@ -878,6 +879,19 @@ def validate_transit_radar_provider(
     if adapter == "netherlands":
         return
 
+    if adapter == "fintraffic":
+        if not isinstance(region, dict):
+            raise ValueError(f"Fintraffic requires a geographic region for {city_id}")
+        features = configuration.get("features")
+        required = {"liveVehicles", "realtimeDepartures", "tripUpdates", "vehiclePositions"}
+        if not isinstance(features, list) or not required.issubset(features):
+            raise ValueError(f"Fintraffic features are invalid for {city_id}")
+        for key in ("realtimeURL", "tripUpdatesURL"):
+            value = configuration.get(key)
+            if not isinstance(value, str) or not value.startswith("https://"):
+                raise ValueError(f"Fintraffic requires an HTTPS {key} for {city_id}")
+        return
+
     if adapter == "kyiv":
         if city_id != "kyiv":
             raise ValueError(f"Invalid Kyiv configuration for {city_id}")
@@ -1374,6 +1388,8 @@ def transit_radar_manifest(
                 provider_id = "wmata"
             elif adapter == "kyiv":
                 provider_id = "kyiv"
+            elif adapter == "fintraffic":
+                provider_id = "fintraffic"
             elif adapter == "bwTrias":
                 provider_id = "bw-trias"
             else:
@@ -1392,7 +1408,7 @@ def transit_radar_manifest(
                 supports_departures = bool(
                     provider_configuration.get(
                         "supportsDepartures",
-                        adapter in {"bwTrias", "vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "avvHafas", "oebb", "netherlands", "sweden", "ireland", "entur", "translink", "ttc", "kingCounty", "mtaNY", "wmata", "kyiv"}
+                        adapter in {"bwTrias", "vrrEFA", "kvvEFA", "hvvEFA", "vvsEFA", "mvvEFA", "vvo", "vrs", "rmvHafas", "avvHafas", "oebb", "netherlands", "sweden", "ireland", "entur", "translink", "ttc", "kingCounty", "mtaNY", "wmata", "kyiv", "fintraffic"}
                     )
                 )
                 supports_live_vehicles = bool(
@@ -1494,6 +1510,8 @@ def transit_radar_manifest(
             country_suffix = "us"
         elif any(p.get("adapter") == "kyiv" for p in providers):
             country_suffix = "ua"
+        elif any(p.get("adapter") == "fintraffic" for p in providers):
+            country_suffix = "fi"
         else:
             country_suffix = "de"
         radar_cities.append({
