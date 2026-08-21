@@ -49,6 +49,30 @@ def _native_id(value: str, prefix: str) -> str:
     return value[len(prefix):] if prefix and value.startswith(prefix) else value
 
 
+def _context_identifier_prefix(context: FintrafficProviderContext) -> str:
+    """Resolve the static namespace when older release metadata omitted it."""
+    if context.identifier_prefix:
+        return context.identifier_prefix
+    if context.provider_id.startswith("finland-"):
+        return f"fi-{context.provider_id.removeprefix('finland-')}:"
+    return ""
+
+
+def _context_stop_prefix(context: FintrafficProviderContext) -> str:
+    return context.stop_id_prefix or _context_identifier_prefix(context)
+
+
+def _trip_candidates_for_raw_id(
+    trip_candidates: dict[str, list[tuple[FintrafficProviderContext, str, str]]],
+    raw_trip_id: str,
+) -> list[tuple[FintrafficProviderContext, str, str]]:
+    candidates = trip_candidates.get(raw_trip_id, [])
+    if candidates or "_" not in raw_trip_id:
+        return candidates
+    # Fintraffic may prepend an operator/source identifier to a static trip ID.
+    return trip_candidates.get(raw_trip_id.split("_", 1)[1], [])
+
+
 def _normalised_bearing(value: float | None) -> float | None:
     if value is None or not math.isfinite(value):
         return None
@@ -244,12 +268,13 @@ def _candidate_contexts(
     trips: dict[str, list[tuple[FintrafficProviderContext, str, str]]] = {}
     routes: dict[str, list[tuple[FintrafficProviderContext, str]]] = {}
     for context in contexts:
+        identifier_prefix = _context_identifier_prefix(context)
         for internal_trip in context.trips:
-            raw_trip = _native_id(internal_trip, context.identifier_prefix)
+            raw_trip = _native_id(internal_trip, identifier_prefix)
             internal_route = context.route_by_trip.get(internal_trip, "")
             trips.setdefault(raw_trip, []).append((context, internal_trip, internal_route))
         for internal_route in context.routes:
-            raw_route = _native_id(internal_route, context.identifier_prefix)
+            raw_route = _native_id(internal_route, identifier_prefix)
             routes.setdefault(raw_route, []).append((context, internal_route))
     return trips, routes
 
@@ -365,12 +390,14 @@ class FintrafficVehiclePositionsGateway:
             published_trip = vehicle.trip_id
             published_route = vehicle.route_id
             if vehicle.trip_id:
-                candidates = trip_candidates.get(vehicle.trip_id, [])
+                candidates = _trip_candidates_for_raw_id(trip_candidates, vehicle.trip_id)
                 if vehicle.route_id:
                     candidates = [
                         candidate
                         for candidate in candidates
-                        if _native_id(candidate[2], candidate[0].identifier_prefix) == vehicle.route_id
+                        if _native_id(
+                            candidate[2], _context_identifier_prefix(candidate[0])
+                        ) == vehicle.route_id
                     ] or candidates
                 if candidates:
                     context, published_trip, expected_route = candidates[0]
@@ -382,7 +409,7 @@ class FintrafficVehiclePositionsGateway:
 
             published_stop = vehicle.stop_id
             if context is not None and vehicle.stop_id:
-                candidate_stop = f"{context.stop_id_prefix}{vehicle.stop_id}"
+                candidate_stop = f"{_context_stop_prefix(context)}{vehicle.stop_id}"
                 if candidate_stop in context.stops:
                     published_stop = candidate_stop
 
@@ -487,24 +514,26 @@ class FintrafficTripUpdatesGateway(GTFSRealtimeGateway):
         contexts = tuple(self._context_registry(city_id))
         trip_candidates, _ = _candidate_contexts(contexts)
         for update in updates:
-            candidates = trip_candidates.get(update.trip_id, [])
+            candidates = _trip_candidates_for_raw_id(trip_candidates, update.trip_id)
             if update.route_id:
                 candidates = [
                     candidate
                     for candidate in candidates
-                    if _native_id(candidate[2], candidate[0].identifier_prefix) == update.route_id
+                    if _native_id(
+                        candidate[2], _context_identifier_prefix(candidate[0])
+                    ) == update.route_id
                 ] or candidates
             if not candidates:
                 continue
             context, internal_trip, internal_route = candidates[0]
-            internal_stop = f"{context.stop_id_prefix}{update.stop_id}"
+            internal_stop = f"{_context_stop_prefix(context)}{update.stop_id}"
             if internal_stop not in context.stops:
                 continue
             if internal_stop not in requested_stop_ids and update.stop_id not in requested_stop_ids:
                 continue
             result.append({
                 "tripID": internal_trip,
-                "routeID": internal_route or f"{context.identifier_prefix}{update.route_id}",
+                "routeID": internal_route or f"{_context_identifier_prefix(context)}{update.route_id}",
                 "directionID": update.direction_id,
                 "stopID": internal_stop,
                 "stopSequence": update.stop_sequence,

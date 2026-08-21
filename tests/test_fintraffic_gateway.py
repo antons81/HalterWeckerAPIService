@@ -58,14 +58,19 @@ def vehicle_feed() -> bytes:
     return bytes_field(1, header) + bytes_field(2, entity) + bytes_field(2, alert_entity)
 
 
-def trip_update_feed() -> bytes:
+def trip_update_feed(
+    *,
+    trip_id: bytes = b"trip-1",
+    route_id: bytes = b"route-1",
+    stop_id: bytes = b"stop-1",
+) -> bytes:
     header = varint_field(3, 900)
-    trip = bytes_field(1, b"trip-1") + bytes_field(5, b"route-1") + bytes_field(6, b"0")
+    trip = bytes_field(1, trip_id) + bytes_field(5, route_id) + bytes_field(6, b"0")
     event = varint_field(2, 950) + varint_field(1, 30)
     stop_update = (
         bytes_field(1, event)
         + varint_field(3, 4)
-        + bytes_field(4, b"stop-1")
+        + bytes_field(4, stop_id)
     )
     trip_update = bytes_field(1, trip) + bytes_field(2, stop_update)
     entity = bytes_field(1, b"trip-entity-1") + bytes_field(3, trip_update)
@@ -85,6 +90,38 @@ def context() -> FintrafficProviderContext:
 
 
 class FintrafficGatewayTests(unittest.TestCase):
+    def test_runtime_provider_context_infers_finland_namespace(self) -> None:
+        runtime_context = FintrafficProviderContext(
+            provider_id="finland-foli",
+            identifier_prefix="",
+            stop_id_prefix="",
+            trips=frozenset({"fi-foli:trip-1"}),
+            routes=frozenset({"fi-foli:route-1"}),
+            route_by_trip={"fi-foli:trip-1": "fi-foli:route-1"},
+            stops=frozenset({"fi-foli:stop-1"}),
+        )
+        gateway = FintrafficVehiclePositionsGateway(
+            city_ids={"turku"},
+            city_regions={"turku": {
+                "minimumLatitude": 60.0,
+                "maximumLatitude": 61.0,
+                "minimumLongitude": 21.0,
+                "maximumLongitude": 23.0,
+            }},
+            context_registry=lambda _city_id: (runtime_context,),
+            transport=lambda _url: vehicle_feed(),
+            clock=lambda: 1000.0,
+        )
+
+        response = gateway.handle(
+            FINTRAFFIC_VEHICLE_POSITIONS_PATH,
+            {"cityID": ["turku"]},
+        )
+
+        vehicle = response.payload["vehicles"][0]
+        self.assertEqual(vehicle["tripID"], "fi-foli:trip-1")
+        self.assertEqual(vehicle["routeID"], "fi-foli:route-1")
+
     def test_vehicle_parser_keeps_position_and_ignores_alert_entity(self) -> None:
         timestamp, entity_count, vehicles = parse_vehicle_positions(vehicle_feed())
 
@@ -162,6 +199,22 @@ class FintrafficGatewayTests(unittest.TestCase):
         self.assertEqual(response.payload["updates"][0]["tripID"], "fi-foli:trip-1")
         self.assertEqual(response.payload["updates"][0]["routeID"], "fi-foli:route-1")
         self.assertEqual(response.payload["updates"][0]["stopID"], "fi-foli:stop-1")
+
+    def test_trip_updates_accept_fintraffic_source_prefix_on_trip_id(self) -> None:
+        gateway = FintrafficTripUpdatesGateway(
+            city_ids={"turku"},
+            context_registry=lambda _city_id: (context(),),
+            transport=lambda _url: trip_update_feed(trip_id=b"12578_trip-1"),
+            clock=lambda: 1000.0,
+        )
+
+        response = gateway.handle(
+            FINTRAFFIC_TRIP_UPDATES_PATH,
+            {"cityID": ["turku"], "stopIDs": ["fi-foli:stop-1"]},
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.payload["updates"][0]["tripID"], "fi-foli:trip-1")
 
 
 if __name__ == "__main__":
