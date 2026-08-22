@@ -17,9 +17,6 @@ services:
       STATIC_DATA_ROOT: ${STATIC_DATA_ROOT:-/data/current-release/stop-data}
       IRELAND_REALTIME_ROOT: ${IRELAND_REALTIME_ROOT:-/data/ireland/realtime}
       APPLE_NOTIFICATION_STORE_PATH: ${APPLE_NOTIFICATION_STORE_PATH:-/data/apple-store-notifications/events.sqlite3}
-      TELEGRAM_SALES_BOT_TOKEN: ${TELEGRAM_SALES_BOT_TOKEN:-}
-      TELEGRAM_SALES_CHAT_ID: ${TELEGRAM_SALES_CHAT_ID:-}
-      TELEGRAM_SALES_NOTIFY_SANDBOX: ${TELEGRAM_SALES_NOTIFY_SANDBOX:-false}
       STM_API_KEY: ${STM_API_KEY:-}
       PORT: "8080"
     volumes:
