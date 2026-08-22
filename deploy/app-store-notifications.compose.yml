@@ -1,0 +1,23 @@
+services:
+  app-store-notifications-api:
+    env_file:
+      - /srv/haltewecker/secrets/uk/.env
+    build:
+      context: ..
+      dockerfile: services/app-store-notifications.Dockerfile
+    container_name: app-store-notifications-api
+    environment:
+      APPLE_NOTIFICATION_STORE_PATH: /data/apple-store-notifications/events.sqlite3
+      PORT: "8080"
+    volumes:
+      - /srv/haltewecker/data/apple-store-notifications:/data/apple-store-notifications:rw
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    networks:
+      - haltewecker
+
+networks:
+  haltewecker:
+    external: true
