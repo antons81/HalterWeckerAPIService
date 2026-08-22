@@ -765,6 +765,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed, query = urlparse(self.path), parse_qs(urlparse(self.path).query)
         try:
+            request_path = parsed.path
+            if request_path.startswith("/static-departures/australia/"):
+                request_path = request_path.removeprefix("/static-departures")
             if parsed.path.startswith("/tfl/"):
                 if self.tfl_gateway is None:
                     return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "TfL provider unavailable"})
@@ -856,11 +859,11 @@ class Handler(BaseHTTPRequestHandler):
                 AUSTRALIA_ADELAIDE_TRIP_UPDATES_PATH: self.australia_adelaide_trip_updates_gateway,
                 AUSTRALIA_ADELAIDE_VEHICLE_POSITIONS_PATH: self.australia_adelaide_vehicle_positions_gateway,
             }
-            if parsed.path in australia_gateways:
-                gateway = australia_gateways[parsed.path]
+            if request_path in australia_gateways:
+                gateway = australia_gateways[request_path]
                 if gateway is None:
                     return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Australia GTFS-RT provider unavailable"})
-                response = gateway.handle(parsed.path, query)
+                response = gateway.handle(request_path, query)
                 return self.send_json(response.status, response.payload, response.cache_control)
             for prefix in STATIC_DATA_PATH_PREFIXES:
                 if parsed.path.startswith(prefix):
