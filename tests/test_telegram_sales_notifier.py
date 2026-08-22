@@ -11,6 +11,7 @@ from telegram_sales_notifier import (
     TelegramSalesNotificationError,
     TelegramSalesNotifier,
     format_sales_message,
+    format_test_message,
 )
 
 
@@ -88,6 +89,20 @@ class TelegramSalesNotifierTests(unittest.TestCase):
             ),
         )
 
+    def test_format_test_message(self) -> None:
+        self.assertEqual(
+            format_test_message(
+                make_event(
+                    notification_type="TEST",
+                    product_id=None,
+                    purchase_kind="unknown",
+                    is_handled=False,
+                )
+            ),
+            "🧪 Apple Store TEST\nHalteWecker\nEnvironment: Production",
+        )
+        self.assertIsNone(format_test_message(make_event()))
+
     def test_successful_send_uses_configured_chat_and_timeout(self) -> None:
         calls: list[tuple[str, bytes, dict[str, str], float]] = []
 
@@ -148,6 +163,67 @@ class TelegramSalesNotifierTests(unittest.TestCase):
         notifier.send(make_event(environment="Sandbox"))
 
         self.assertEqual(calls, [True])
+
+    def test_test_notification_is_disabled_by_default(self) -> None:
+        calls: list[object] = []
+        notifier = TelegramSalesNotifier(
+            "token",
+            "chat",
+            transport=lambda *_args: calls.append(True) or 200,
+        )
+
+        notifier.send_test(
+            make_event(
+                notification_type="TEST",
+                product_id=None,
+                purchase_kind="unknown",
+                is_handled=False,
+            )
+        )
+
+        self.assertEqual(calls, [])
+
+    def test_test_notification_can_be_enabled(self) -> None:
+        calls: list[tuple[str, bytes, dict[str, str], float]] = []
+
+        def transport(url: str, body: bytes, headers: dict[str, str], timeout: float) -> int:
+            calls.append((url, body, headers, timeout))
+            return 200
+
+        notifier = TelegramSalesNotifier(
+            "token",
+            "chat",
+            notify_test=True,
+            transport=transport,
+        )
+        notifier.send_test(
+            make_event(
+                notification_type="TEST",
+                product_id=None,
+                purchase_kind="unknown",
+                is_handled=False,
+            )
+        )
+
+        self.assertTrue(notifier.notify_test)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("Apple Store TEST", calls[0][1].decode())
+
+    def test_test_notification_flag_is_read_from_environment(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TELEGRAM_SALES_BOT_TOKEN": "token",
+                "TELEGRAM_SALES_CHAT_ID": "chat",
+                "TELEGRAM_SALES_NOTIFY_TEST": "true",
+            },
+            clear=True,
+        ):
+            notifier = TelegramSalesNotifier.from_environment()
+
+        self.assertIsNotNone(notifier)
+        assert notifier is not None
+        self.assertTrue(notifier.notify_test)
 
     def test_unhandled_event_is_not_sent(self) -> None:
         calls: list[object] = []

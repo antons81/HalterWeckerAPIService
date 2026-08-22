@@ -191,6 +191,33 @@ class AppleStoreNotificationEndpointStubTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_test_notification_sends_only_when_explicitly_enabled(self) -> None:
+        notification = VerifiedAppleNotification(
+            "test-notification-enabled-uuid",
+            "TEST",
+            None,
+            "com.aSoft.HalteWecker",
+            "Production",
+            1_700_000_000_000,
+        )
+
+        with tempfile.TemporaryDirectory() as temp:
+            store = AppleStoreNotificationStore(Path(temp) / "events.sqlite3")
+            notifier = RecordingTelegramNotifier(notify_test=True)
+            try:
+                with patch.object(
+                    app_store_notifications_api,
+                    "default_verifier",
+                    return_value=type("StubVerifier", (), {"verify": lambda _self, _payload: notification})(),
+                ):
+                    self.assertEqual(self._post_notification(store, notifier), 200)
+                self.assertEqual(self._stored_event_count(store), 1)
+                self.assertEqual(notifier.sent, [])
+                self.assertEqual(len(notifier.test_sent), 1)
+                self.assertEqual(notifier.test_sent[0].notification_type, "TEST")
+            finally:
+                store.close()
+
     def test_handled_subscription_sends_after_persistence(self) -> None:
         notification = VerifiedAppleNotification(
             "subscription-notification-uuid",
@@ -436,11 +463,16 @@ class AppleStoreNotificationEndpointStubTests(unittest.TestCase):
 class RecordingTelegramNotifier:
     notify_sandbox = False
 
-    def __init__(self) -> None:
+    def __init__(self, *, notify_test: bool = False) -> None:
+        self.notify_test = notify_test
         self.sent: list[object] = []
+        self.test_sent: list[object] = []
 
     def send(self, event) -> None:
         self.sent.append(event)
+
+    def send_test(self, event) -> None:
+        self.test_sent.append(event)
 
 
 if __name__ == "__main__":

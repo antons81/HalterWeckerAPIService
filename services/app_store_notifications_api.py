@@ -103,9 +103,16 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         notifier = self.telegram_sales_notifier
-        if event.is_handled and notifier is not None:
+        should_send_business_event = event.is_handled
+        should_send_test = event.notification_type == "TEST" and bool(
+            notifier and notifier.notify_test
+        )
+        if notifier is not None and (should_send_business_event or should_send_test):
             try:
-                notifier.send(event)
+                if should_send_business_event:
+                    notifier.send(event)
+                else:
+                    notifier.send_test(event)
             except TelegramSalesNotificationError as error:
                 LOGGER.warning(
                     "event=telegram_sales_notification_failed app=%s "

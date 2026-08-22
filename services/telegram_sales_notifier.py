@@ -104,7 +104,22 @@ def format_sales_message(event: NormalizedAppleStoreEvent) -> str | None:
     return "\n".join(lines)
 
 
-def _sandbox_enabled(raw_value: str | None) -> bool:
+def format_test_message(event: NormalizedAppleStoreEvent) -> str | None:
+    """Return the opt-in Telegram text for a verified Apple TEST event."""
+    if event.notification_type != "TEST":
+        return None
+
+    app_name = "HalteWecker" if event.app == "haltewecker" else "Pasty"
+    return "\n".join(
+        [
+            "🧪 Apple Store TEST",
+            app_name,
+            f"Environment: {_environment_label(event.environment)}",
+        ]
+    )
+
+
+def _notifications_enabled(raw_value: str | None) -> bool:
     return (raw_value or "").strip().casefold() in {"1", "true", "yes", "on"}
 
 
@@ -117,12 +132,14 @@ class TelegramSalesNotifier:
         chat_id: str,
         *,
         notify_sandbox: bool = False,
+        notify_test: bool = False,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         transport: Transport = _default_transport,
     ) -> None:
         if not token or not chat_id:
             raise ValueError("Telegram token and chat ID are required")
         self.notify_sandbox = notify_sandbox
+        self.notify_test = notify_test
         self._token = token
         self._chat_id = chat_id
         self._timeout = timeout
@@ -137,13 +154,29 @@ class TelegramSalesNotifier:
         return cls(
             token,
             chat_id,
-            notify_sandbox=_sandbox_enabled(
+            notify_sandbox=_notifications_enabled(
                 os.environ.get("TELEGRAM_SALES_NOTIFY_SANDBOX")
+            ),
+            notify_test=_notifications_enabled(
+                os.environ.get("TELEGRAM_SALES_NOTIFY_TEST")
             ),
         )
 
     def send(self, event: NormalizedAppleStoreEvent) -> None:
         message = format_sales_message(event)
+        self._send_message(event, message)
+
+    def send_test(self, event: NormalizedAppleStoreEvent) -> None:
+        if not self.notify_test:
+            return
+        message = format_test_message(event)
+        self._send_message(event, message)
+
+    def _send_message(
+        self,
+        event: NormalizedAppleStoreEvent,
+        message: str | None,
+    ) -> None:
         if message is None:
             return
         if event.environment.casefold() == "sandbox" and not self.notify_sandbox:

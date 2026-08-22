@@ -1,6 +1,7 @@
 services:
   app-store-notifications-api:
     env_file:
+      - ./app-store-notifications.defaults.env
       - /srv/haltewecker/secrets/uk/.env
     build:
       context: ..
