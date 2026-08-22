@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import os
@@ -100,6 +101,22 @@ EXTERNAL_SOURCE_AUTH: dict[str, dict[str, object]] = {
         "api_key_env": "WMATA_API_KEY",
         "header_name": "api_key",
         "headers": {"Accept-Encoding": "gzip"},
+    },
+    "australia-transport-nsw": {
+        "api_key_env": "NSW_API_TOKEN",
+        "header_name": "Authorization",
+        "header_prefix": "apikey ",
+        "headers": {
+            "Accept-Encoding": "gzip",
+            "User-Agent": "HalteWeckerStopPipeline/1.0",
+        },
+    },
+    "australia-transport-canberra": {
+        "basic_auth_env": ("CANBERRA_CLIENT_ID", "CANBERRA_CLIENT_SECRET"),
+        "headers": {
+            "Accept-Encoding": "gzip",
+            "User-Agent": "HalteWeckerStopPipeline/1.0",
+        },
     },
     "kyiv": {
         "headers": {
@@ -304,6 +321,12 @@ def validate_external_gtfs_source(
             f"External GTFS source {source_id} has invalid filterCitiesByProvider."
         )
 
+    exclusive_city_partition = source.get("exclusiveCityPartition", False)
+    if not isinstance(exclusive_city_partition, bool):
+        raise ValueError(
+            f"External GTFS source {source_id} has invalid exclusiveCityPartition."
+        )
+
     stop_id_mode = source.get("stopIDMode", "exact")
     if stop_id_mode != "exact":
         raise ValueError(
@@ -502,7 +525,8 @@ def authenticated_external_request(
             )
         header_name = str(auth.get("header_name") or "").strip()
         if header_name:
-            headers[header_name] = api_key
+            header_prefix = str(auth.get("header_prefix") or "")
+            headers[header_name] = f"{header_prefix}{api_key}"
         else:
             query_parameter = str(auth.get("query_parameter") or "key")
             query = dict(parse_qsl(parts.query, keep_blank_values=True))
@@ -510,6 +534,19 @@ def authenticated_external_request(
             url = urlunsplit(
                 (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
             )
+    basic_auth_env = auth.get("basic_auth_env")
+    if is_remote and isinstance(basic_auth_env, (tuple, list)) and len(basic_auth_env) == 2:
+        client_id_env, client_secret_env = (str(value) for value in basic_auth_env)
+        client_id = env.get(client_id_env, "").strip()
+        client_secret = env.get(client_secret_env, "").strip()
+        if not client_id or not client_secret:
+            missing = client_id_env if not client_id else client_secret_env
+            raise ValueError(
+                f"Missing required environment variable {missing} "
+                f"for external GTFS source {source_id}."
+            )
+        credentials = f"{client_id}:{client_secret}".encode("utf-8")
+        headers["Authorization"] = "Basic " + base64.b64encode(credentials).decode("ascii")
     return url, headers
 
 
@@ -878,6 +915,7 @@ def build_external_stop_packages(
     publish_passenger_stop_ids: bool = False,
     supplemental_stop_catalog: object | None = None,
     supplemental_catalog_configuration: dict[str, object] | None = None,
+    exclusive_city_partition: bool = False,
 ) -> tuple[list[dict[str, object]], dict[str, list[dict[str, object]]]]:
     if stop_id_mode != "exact":
         raise ValueError(f"Unsupported stopIDMode: {stop_id_mode!r}")
@@ -910,14 +948,32 @@ def build_external_stop_packages(
             "parent_station": str(row.get("parent_station", "") or "").strip(),
             "platform_code": str(row.get("platform_code", "") or "").strip(),
         }
-        for city in cities:
+        if exclusive_city_partition:
+            nearest_city = min(
+                cities,
+                key=lambda city: distance_meters(
+                    latitude,
+                    longitude,
+                    float(city["latitude"]),
+                    float(city["longitude"]),
+                ),
+            )
             if distance_meters(
                 latitude,
                 longitude,
-                float(city["latitude"]),
-                float(city["longitude"]),
-            ) <= float(city["radiusMeters"]):
-                raw_by_city_id[str(city["id"])].append(record)
+                float(nearest_city["latitude"]),
+                float(nearest_city["longitude"]),
+            ) <= float(nearest_city["radiusMeters"]):
+                raw_by_city_id[str(nearest_city["id"])].append(record)
+        else:
+            for city in cities:
+                if distance_meters(
+                    latitude,
+                    longitude,
+                    float(city["latitude"]),
+                    float(city["longitude"]),
+                ) <= float(city["radiusMeters"]):
+                    raw_by_city_id[str(city["id"])].append(record)
 
     packages_directory = output / "stops"
     packages_directory.mkdir(parents=True, exist_ok=True)
@@ -2184,6 +2240,9 @@ def process_external_gtfs_sources(
                         supplemental_catalog_configuration
                         if isinstance(supplemental_catalog_configuration, dict)
                         else None
+                    ),
+                    exclusive_city_partition=bool(
+                        source.get("exclusiveCityPartition", False)
                     ),
                 )
                 if namespace or str(source.get("mergeGroup", "")).strip():

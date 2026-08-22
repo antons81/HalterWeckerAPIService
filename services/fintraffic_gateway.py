@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import gzip
 import math
 import os
@@ -19,6 +20,8 @@ from gtfsrt_gateway import (
     GTFSRealtimeGateway,
     GTFSRealtimeGatewayError,
     RealtimeUpdate,
+    decode_gtfs_realtime_body,
+    infer_identifier_prefix,
     _iter_fields,
     _text,
 )
@@ -53,6 +56,11 @@ def _context_identifier_prefix(context: FintrafficProviderContext) -> str:
     """Resolve the static namespace when older release metadata omitted it."""
     if context.identifier_prefix:
         return context.identifier_prefix
+    inferred_prefix = infer_identifier_prefix(
+        (*context.trips, *context.routes, *context.stops)
+    )
+    if inferred_prefix:
+        return inferred_prefix
     if context.provider_id.startswith("finland-"):
         return f"fi-{context.provider_id.removeprefix('finland-')}:"
     return ""
@@ -105,28 +113,73 @@ class _FintrafficHTTPTransport:
                 body = response.read()
                 if response.headers.get("Content-Encoding", "").lower() == "gzip":
                     body = gzip.decompress(body)
-                return body
+                return decode_gtfs_realtime_body(
+                    body,
+                    content_type=response.headers.get("Content-Type", ""),
+                )
         except (HTTPError, URLError, TimeoutError, OSError) as error:
             raise GTFSRealtimeGatewayError("upstream unavailable") from error
 
 
 class PublicGTFSRealtimeHTTPTransport:
-    """Fetch a public GTFS-Realtime protobuf feed without credentials."""
+    """Fetch a GTFS-Realtime protobuf feed with optional runtime headers."""
 
-    def __init__(self, user_agent: str) -> None:
+    def __init__(self, user_agent: str, headers: dict[str, str] | None = None) -> None:
         self._user_agent = user_agent
+        self._headers = dict(headers or {})
+
+    @classmethod
+    def from_environment(
+        cls,
+        user_agent: str,
+        *,
+        api_key_env: str,
+        header_name: str = "Authorization",
+        header_prefix: str = "",
+    ) -> "PublicGTFSRealtimeHTTPTransport | None":
+        api_key = os.environ.get(api_key_env, "").strip()
+        if not api_key:
+            return None
+        return cls(
+            user_agent,
+            headers={header_name: f"{header_prefix}{api_key}"},
+        )
+
+    @classmethod
+    def from_basic_auth_environment(
+        cls,
+        user_agent: str,
+        *,
+        client_id_env: str,
+        client_secret_env: str,
+    ) -> "PublicGTFSRealtimeHTTPTransport | None":
+        client_id = os.environ.get(client_id_env, "").strip()
+        client_secret = os.environ.get(client_secret_env, "").strip()
+        if not client_id or not client_secret:
+            return None
+        credentials = f"{client_id}:{client_secret}".encode("utf-8")
+        authorization = "Basic " + base64.b64encode(credentials).decode("ascii")
+        return cls(user_agent, headers={"Authorization": authorization})
 
     def __call__(self, url: str) -> bytes:
+        headers = {
+            "Accept": "application/octet-stream, application/protobuf",
+            "User-Agent": self._user_agent,
+            **self._headers,
+        }
         request = Request(
             url,
-            headers={
-                "Accept": "application/octet-stream, application/protobuf",
-                "User-Agent": self._user_agent,
-            },
+            headers=headers,
         )
         try:
             with urlopen(request, timeout=15) as response:
-                return response.read()
+                body = response.read()
+                if response.headers.get("Content-Encoding", "").lower() == "gzip":
+                    body = gzip.decompress(body)
+                return decode_gtfs_realtime_body(
+                    body,
+                    content_type=response.headers.get("Content-Type", ""),
+                )
         except (HTTPError, URLError, TimeoutError, OSError) as error:
             raise GTFSRealtimeGatewayError("upstream unavailable") from error
 

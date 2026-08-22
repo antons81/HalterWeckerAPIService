@@ -250,6 +250,16 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
                 "finland-digitraffic",
                 "australia-translink-seq",
                 "australia-adelaide",
+                "australia-translink-cairns",
+                "australia-translink-bowen",
+                "australia-translink-innisfail",
+                "australia-translink-fraser-coast",
+                "australia-transperth",
+                "australia-tasmania",
+                "australia-nt-darwin",
+                "australia-nt-alice-springs",
+                "australia-transport-nsw",
+                "australia-transport-canberra",
             },
         )
         sweden = next(source for source in sources if source["id"] == "sweden")
@@ -430,6 +440,36 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
                 environ={},
             )
         self.assertNotIn("api_key=", str(raised.exception))
+
+    def test_nsw_auth_uses_authorization_prefix_without_exposing_secret(self) -> None:
+        url, headers = authenticated_external_request(
+            "australia-transport-nsw",
+            "https://api.transport.nsw.gov.au/v1/gtfs/schedule/buses",
+            environ={"NSW_API_TOKEN": "test-token"},
+        )
+        self.assertEqual(url, "https://api.transport.nsw.gov.au/v1/gtfs/schedule/buses")
+        self.assertEqual(headers["Authorization"], "apikey test-token")
+        with self.assertRaisesRegex(ValueError, "NSW_API_TOKEN"):
+            authenticated_external_request(
+                "australia-transport-nsw",
+                url,
+                environ={},
+            )
+
+    def test_canberra_auth_uses_basic_auth_without_exposing_credentials(self) -> None:
+        url, headers = authenticated_external_request(
+            "australia-transport-canberra",
+            "https://transport.api.act.gov.au/gtfs/data/gtfs/v2/google_transit.zip",
+            environ={"CANBERRA_CLIENT_ID": "client", "CANBERRA_CLIENT_SECRET": "secret"},
+        )
+        self.assertEqual(url, "https://transport.api.act.gov.au/gtfs/data/gtfs/v2/google_transit.zip")
+        self.assertEqual(headers["Authorization"], "Basic Y2xpZW50OnNlY3JldA==")
+        with self.assertRaisesRegex(ValueError, "CANBERRA_CLIENT_SECRET"):
+            authenticated_external_request(
+                "australia-transport-canberra",
+                url,
+                environ={"CANBERRA_CLIENT_ID": "client"},
+            )
 
     def test_canadian_timers_use_local_night_and_shared_service(self) -> None:
         vancouver_timer = (

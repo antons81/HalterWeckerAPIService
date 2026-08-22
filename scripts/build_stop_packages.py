@@ -108,7 +108,9 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "kyiv",
     "fintraffic",
     "translinkSEQ",
+    "translinkQueensland",
     "adelaideMetro",
+    "externalGTFS",
 }
 SUPPORTED_TRANSIT_RADAR_FEATURES = {
     "liveVehicles",
@@ -912,14 +914,76 @@ def validate_transit_radar_provider(
                 raise ValueError(f"Fintraffic requires an HTTPS {key} for {city_id}")
         return
 
-    if adapter in {"translinkSEQ", "adelaideMetro"}:
+    if adapter == "externalGTFS":
+        provider_id = configuration.get("providerID")
+        features = configuration.get("features")
+        if configuration.get("staticOnly") is not True:
+            required = {
+                "liveVehicles",
+                "realtimeDepartures",
+                "realtimeDelay",
+                "tripUpdates",
+                "vehiclePositions",
+            }
+            valid_realtime_city = (
+                provider_id == "australia-transport-nsw"
+                and city_id in {"sydney", "newcastle", "wollongong", "central-coast"}
+            ) or (
+                provider_id == "australia-transport-canberra"
+                and city_id == "canberra"
+            )
+            if (
+                not valid_realtime_city
+                or not isinstance(configuration.get("region"), dict)
+                or not isinstance(features, list)
+                or not required.issubset(features)
+                or any(
+                    not isinstance(configuration.get(key), str)
+                    or not str(configuration[key]).startswith("https://")
+                    for key in ("staticBaseURL", "boardURL", "realtimeURL", "tripUpdatesURL")
+                )
+            ):
+                raise ValueError(f"Invalid Australian external GTFS configuration for {city_id}")
+            return
+        if (
+            not isinstance(provider_id, str)
+            or not provider_id.startswith("australia-")
+            or configuration.get("staticOnly") is not True
+            or not isinstance(features, list)
+            or not {"firstDepartures", "stopLookup"}.issubset(features)
+            or configuration.get("region") is not None
+            or any(
+                feature in features
+                for feature in (
+                    "liveVehicles",
+                    "realtimeDepartures",
+                    "realtimeDelay",
+                    "tripUpdates",
+                    "vehiclePositions",
+                )
+            )
+        ):
+            raise ValueError(f"Invalid static-only external GTFS configuration for {city_id}")
+        for key in ("staticBaseURL", "boardURL"):
+            value = configuration.get(key)
+            if not isinstance(value, str) or not value.startswith("https://"):
+                raise ValueError(f"Static-only external GTFS requires an HTTPS {key} for {city_id}")
+        return
+
+    if adapter in {"translinkSEQ", "translinkQueensland", "adelaideMetro"}:
         expected_city_ids = (
             {"brisbane", "gold-coast", "sunshine-coast"}
             if adapter == "translinkSEQ"
+            else {"cairns", "bowen", "innisfail", "fraser-coast"}
+            if adapter == "translinkQueensland"
             else {"adelaide"}
         )
         if city_id not in expected_city_ids or not isinstance(region, dict):
             raise ValueError(f"Invalid Australia GTFS-RT configuration for {city_id}")
+        if adapter == "translinkQueensland":
+            provider_id = configuration.get("providerID")
+            if not isinstance(provider_id, str) or not provider_id.startswith("australia-translink-"):
+                raise ValueError(f"Australia Queensland GTFS-RT requires providerID for {city_id}")
         features = configuration.get("features")
         required = {"liveVehicles", "realtimeDepartures", "tripUpdates", "vehiclePositions"}
         if not isinstance(features, list) or not required.issubset(features):
@@ -1428,8 +1492,12 @@ def transit_radar_manifest(
                 provider_id = "kyiv"
             elif adapter == "fintraffic":
                 provider_id = "fintraffic"
+            elif adapter == "externalGTFS":
+                provider_id = str(provider_configuration["providerID"])
             elif adapter == "translinkSEQ":
                 provider_id = f"australia-translink-seq-{city_id}"
+            elif adapter == "translinkQueensland":
+                provider_id = str(provider_configuration["providerID"])
             elif adapter == "adelaideMetro":
                 provider_id = "australia-adelaide"
             elif adapter == "bwTrias":
@@ -1565,7 +1633,7 @@ def transit_radar_manifest(
             country_suffix = "ua"
         elif any(p.get("adapter") == "fintraffic" for p in providers):
             country_suffix = "fi"
-        elif any(p.get("adapter") in {"translinkSEQ", "adelaideMetro"} for p in providers):
+        elif any(p.get("adapter") in {"translinkSEQ", "translinkQueensland", "adelaideMetro", "externalGTFS"} for p in providers):
             country_suffix = "au"
         else:
             country_suffix = "de"

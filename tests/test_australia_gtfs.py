@@ -1,10 +1,12 @@
 import json
+import os
 import struct
 import sys
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))
@@ -20,6 +22,7 @@ from fintraffic_gateway import (  # noqa: E402
     GTFSRealtimeProviderContext,
     GTFSRealtimeTripUpdatesGateway,
     GTFSRealtimeVehiclePositionsGateway,
+    PublicGTFSRealtimeHTTPTransport,
 )
 
 
@@ -97,6 +100,20 @@ def context(city_id: str) -> GTFSRealtimeProviderContext:
 
 
 class AustraliaGTFSConfigurationTests(unittest.TestCase):
+    def test_canberra_realtime_transport_uses_basic_auth_environment(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"CANBERRA_CLIENT_ID": "client", "CANBERRA_CLIENT_SECRET": "secret"},
+            clear=False,
+        ):
+            transport = PublicGTFSRealtimeHTTPTransport.from_basic_auth_environment(
+                "HalteWecker-TransportCanberra-GTFSRT/1.0",
+                client_id_env="CANBERRA_CLIENT_ID",
+                client_secret_env="CANBERRA_CLIENT_SECRET",
+            )
+        self.assertIsNotNone(transport)
+        self.assertEqual(transport._headers["Authorization"], "Basic Y2xpZW50OnNlY3JldA==")
+
     def test_registry_and_manifest_keep_australian_providers_distinct(self) -> None:
         sources = {
             str(source["id"]): source
@@ -105,7 +122,20 @@ class AustraliaGTFSConfigurationTests(unittest.TestCase):
             )
         }
         self.assertEqual(
-            {"australia-translink-seq", "australia-adelaide"},
+            {
+                "australia-translink-seq",
+                "australia-adelaide",
+                "australia-translink-cairns",
+                "australia-translink-bowen",
+                "australia-translink-innisfail",
+                "australia-translink-fraser-coast",
+                "australia-transperth",
+                "australia-tasmania",
+                "australia-nt-darwin",
+                "australia-nt-alice-springs",
+                "australia-transport-nsw",
+                "australia-transport-canberra",
+            },
             {source_id for source_id in sources if source_id.startswith("australia-")},
         )
         self.assertEqual(
@@ -115,6 +145,14 @@ class AustraliaGTFSConfigurationTests(unittest.TestCase):
         self.assertEqual(
             [city["id"] for city in load_external_cities(sources["australia-adelaide"], REPOSITORY_ROOT)],
             ["adelaide"],
+        )
+        self.assertEqual(
+            [city["id"] for city in load_external_cities(sources["australia-transport-nsw"], REPOSITORY_ROOT)],
+            ["sydney", "newcastle", "wollongong", "central-coast"],
+        )
+        self.assertEqual(
+            [city["id"] for city in load_external_cities(sources["australia-transport-canberra"], REPOSITORY_ROOT)],
+            ["canberra"],
         )
 
         manifest = transit_radar_manifest(
@@ -132,6 +170,26 @@ class AustraliaGTFSConfigurationTests(unittest.TestCase):
             by_city["adelaide"]["providers"][0]["providerID"],
             "australia-adelaide",
         )
+        static_only = {
+            city_id: by_city[city_id]["providers"][0]
+            for city_id in ("perth", "hobart", "launceston", "burnie", "darwin", "alice-springs")
+        }
+        self.assertTrue(all(provider["staticOnly"] for provider in static_only.values()))
+        self.assertTrue(all("realtimeDepartures" not in provider["features"] for provider in static_only.values()))
+        self.assertEqual(by_city["cairns"]["providers"][0]["adapter"], "translinkQueensland")
+        for city_id in ("sydney", "newcastle", "wollongong", "central-coast"):
+            provider = by_city[city_id]["providers"][0]
+            self.assertEqual(provider["providerID"], "australia-transport-nsw")
+            self.assertEqual(provider["adapter"], "externalGTFS")
+            self.assertEqual(by_city[city_id]["timeZoneIdentifier"], "Australia/Sydney")
+            self.assertIn("realtimeDepartures", provider["features"])
+            self.assertIn("vehiclePositions", provider["features"])
+        canberra = by_city["canberra"]["providers"][0]
+        self.assertEqual(canberra["providerID"], "australia-transport-canberra")
+        self.assertEqual(canberra["adapter"], "externalGTFS")
+        self.assertEqual(by_city["canberra"]["timeZoneIdentifier"], "Australia/Sydney")
+        self.assertIn("realtimeDepartures", canberra["features"])
+        self.assertIn("vehiclePositions", canberra["features"])
 
     def test_city_stop_sets_are_disjoint_and_shared_route_is_preserved(self) -> None:
         cities = [
@@ -182,8 +240,115 @@ class AustraliaGTFSConfigurationTests(unittest.TestCase):
             for city_id in ("brisbane", "gold-coast", "sunshine-coast"):
                 self.assertIn("au-seq:shared", lines[f"au-seq:{city_id[0]}"])
 
+    def test_nsw_exclusive_partition_keeps_overlapping_radii_disjoint(self) -> None:
+        cities = [
+            {"id": "sydney", "name": "Sydney", "latitude": -33.8688, "longitude": 151.2093, "radiusMeters": 40_000},
+            {"id": "central-coast", "name": "Central Coast", "latitude": -33.4269, "longitude": 151.3419, "radiusMeters": 40_000},
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive_path = root / "nsw.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr(
+                    "stops.txt",
+                    "stop_id,stop_name,stop_lat,stop_lon\n"
+                    "s,Sydney,-33.8688,151.2093\n"
+                    "c,Central Coast,-33.4269,151.3419\n"
+                    "m,Midpoint,-33.64,151.28\n",
+                )
+                archive.writestr("routes.txt", "route_id,route_short_name,route_long_name,route_type\nR,1,Shared,3\n")
+                archive.writestr("trips.txt", "route_id,service_id,trip_id,trip_headsign,direction_id\nR,S,T,Shared,0\n")
+                archive.writestr(
+                    "stop_times.txt",
+                    "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+                    "T,08:00:00,08:00:00,s,1\nT,08:10:00,08:10:00,m,2\nT,08:20:00,08:20:00,c,3\n",
+                )
+            with zipfile.ZipFile(archive_path) as archive:
+                _entries, packages = build_external_stop_packages(
+                    archive,
+                    cities,
+                    root / "out",
+                    namespace="au-nsw:",
+                    exclusive_city_partition=True,
+                )
+            stop_sets = [
+                {str(stop["id"]) for stop in packages[city_id]}
+                for city_id in ("sydney", "central-coast")
+            ]
+            self.assertTrue(stop_sets[0].isdisjoint(stop_sets[1]))
+            self.assertEqual(stop_sets[0] | stop_sets[1], {"au-nsw:s", "au-nsw:c", "au-nsw:m"})
+
 
 class AustraliaGTFSRealtimeGatewayTests(unittest.TestCase):
+    def test_strict_join_infers_legacy_static_namespace(self) -> None:
+        legacy_context = GTFSRealtimeProviderContext(
+            provider_id="australia-translink-seq",
+            identifier_prefix="",
+            stop_id_prefix="",
+            trips=frozenset({"au-seq:trip-b"}),
+            routes=frozenset({"au-seq:route-b"}),
+            route_by_trip={"au-seq:trip-b": "au-seq:route-b"},
+            stops=frozenset({"au-seq:stop-b"}),
+        )
+        gateway = GTFSRealtimeVehiclePositionsGateway(
+            provider_id="australia-translink-seq",
+            city_ids={"brisbane"},
+            city_regions={
+                "brisbane": {
+                    "minimumLatitude": -27.8,
+                    "maximumLatitude": -27.1,
+                    "minimumLongitude": 152.5,
+                    "maximumLongitude": 153.5,
+                }
+            },
+            context_registry=lambda _city_id: (legacy_context,),
+            transport=lambda _url: vehicle_feed(),
+            upstream_url="https://example.invalid/seq/vehicles",
+            path="/australia/seq/realtime/vehicle-positions",
+            clock=lambda: 900,
+            strict_static_join=True,
+        )
+
+        response = gateway.handle(
+            "/australia/seq/realtime/vehicle-positions",
+            {"cityID": ["brisbane"]},
+        )
+
+        self.assertEqual(response.payload["vehicleCount"], 1)
+        self.assertEqual(response.payload["vehicles"][0]["tripID"], "au-seq:trip-b")
+        self.assertEqual(response.payload["vehicles"][0]["routeID"], "au-seq:route-b")
+        self.assertEqual(response.payload["vehicles"][0]["stopID"], "au-seq:stop-b")
+
+    def test_trip_updates_infer_legacy_static_namespace(self) -> None:
+        legacy_context = GTFSRealtimeProviderContext(
+            provider_id="australia-translink-seq",
+            identifier_prefix="",
+            stop_id_prefix="",
+            trips=frozenset({"au-seq:trip-b"}),
+            routes=frozenset({"au-seq:route-b"}),
+            route_by_trip={"au-seq:trip-b": "au-seq:route-b"},
+            stops=frozenset({"au-seq:stop-b"}),
+        )
+        gateway = GTFSRealtimeTripUpdatesGateway(
+            provider_id="australia-translink-seq",
+            city_ids={"brisbane"},
+            context_registry=lambda _city_id: (legacy_context,),
+            transport=lambda _url: trip_update_feed(),
+            upstream_url="https://example.invalid/seq/trip-updates",
+            path="/australia/seq/realtime/trip-updates",
+            clock=lambda: 900,
+            strict_static_join=True,
+        )
+
+        response = gateway.handle(
+            "/australia/seq/realtime/trip-updates",
+            {"cityID": ["brisbane"], "stopIDs": ["au-seq:stop-b"]},
+        )
+
+        self.assertEqual(response.payload["updates"][0]["tripID"], "au-seq:trip-b")
+        self.assertEqual(response.payload["updates"][0]["routeID"], "au-seq:route-b")
+        self.assertEqual(response.payload["updates"][0]["stopID"], "au-seq:stop-b")
+
     def test_shared_seq_cache_filters_city_and_rejects_unjoined_vehicles(self) -> None:
         calls = []
         gateway = GTFSRealtimeVehiclePositionsGateway(

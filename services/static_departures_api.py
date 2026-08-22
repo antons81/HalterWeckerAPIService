@@ -85,10 +85,42 @@ AUSTRALIA_SEQ_TRIP_UPDATES_PATH = "/australia/seq/realtime/trip-updates"
 AUSTRALIA_SEQ_VEHICLE_POSITIONS_PATH = "/australia/seq/realtime/vehicle-positions"
 AUSTRALIA_ADELAIDE_TRIP_UPDATES_PATH = "/australia/adelaide/realtime/trip-updates"
 AUSTRALIA_ADELAIDE_VEHICLE_POSITIONS_PATH = "/australia/adelaide/realtime/vehicle-positions"
+AUSTRALIA_NSW_PROVIDER_ID = "australia-transport-nsw"
+AUSTRALIA_NSW_TRIP_UPDATES_PATH = "/australia/nsw/realtime/trip-updates"
+AUSTRALIA_NSW_VEHICLE_POSITIONS_PATH = "/australia/nsw/realtime/vehicle-positions"
+AUSTRALIA_CANBERRA_PROVIDER_ID = "australia-transport-canberra"
+AUSTRALIA_CANBERRA_TRIP_UPDATES_PATH = "/australia/canberra/realtime/trip-updates"
+AUSTRALIA_CANBERRA_VEHICLE_POSITIONS_PATH = "/australia/canberra/realtime/vehicle-positions"
 AUSTRALIA_SEQ_TRIP_UPDATES_UPSTREAM = "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/TripUpdates"
 AUSTRALIA_SEQ_VEHICLE_POSITIONS_UPSTREAM = "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/VehiclePositions"
 AUSTRALIA_ADELAIDE_TRIP_UPDATES_UPSTREAM = "https://gtfs.adelaidemetro.com.au/v1/realtime/trip_updates"
 AUSTRALIA_ADELAIDE_VEHICLE_POSITIONS_UPSTREAM = "https://gtfs.adelaidemetro.com.au/v1/realtime/vehicle_positions"
+AUSTRALIA_NSW_TRIP_UPDATES_UPSTREAM = "https://api.transport.nsw.gov.au/v1/gtfs/realtime/buses"
+AUSTRALIA_NSW_VEHICLE_POSITIONS_UPSTREAM = "https://api.transport.nsw.gov.au/v1/gtfs/vehiclepos/buses"
+AUSTRALIA_CANBERRA_TRIP_UPDATES_UPSTREAM = "https://transport.api.act.gov.au/gtfs/data/gtfs/v2/trip-updates.pb"
+AUSTRALIA_CANBERRA_VEHICLE_POSITIONS_UPSTREAM = "https://transport.api.act.gov.au/gtfs/data/gtfs/v2/vehicle-positions-mywayplus.pb"
+AUSTRALIA_QUEENSLAND_REALTIME = {
+    "australia-translink-cairns": {
+        "path_prefix": "/australia/cairns/realtime",
+        "trip_updates": "https://gtfsrt.api.translink.com.au/api/realtime/CNS/TripUpdates",
+        "vehicle_positions": "https://gtfsrt.api.translink.com.au/api/realtime/CNS/VehiclePositions",
+    },
+    "australia-translink-bowen": {
+        "path_prefix": "/australia/bowen/realtime",
+        "trip_updates": "https://gtfsrt.api.translink.com.au/api/realtime/BOW/TripUpdates",
+        "vehicle_positions": "https://gtfsrt.api.translink.com.au/api/realtime/BOW/VehiclePositions",
+    },
+    "australia-translink-innisfail": {
+        "path_prefix": "/australia/innisfail/realtime",
+        "trip_updates": "https://gtfsrt.api.translink.com.au/api/realtime/INN/TripUpdates",
+        "vehicle_positions": "https://gtfsrt.api.translink.com.au/api/realtime/INN/VehiclePositions",
+    },
+    "australia-translink-fraser-coast": {
+        "path_prefix": "/australia/fraser-coast/realtime",
+        "trip_updates": "https://gtfsrt.api.translink.com.au/api/realtime/MHB/TripUpdates",
+        "vehicle_positions": "https://gtfsrt.api.translink.com.au/api/realtime/MHB/VehiclePositions",
+    },
+}
 
 def _native_id(value: str) -> str:
     return value[len(MBTA_NAMESPACE):] if value.startswith(MBTA_NAMESPACE) else value
@@ -689,6 +721,12 @@ class Handler(BaseHTTPRequestHandler):
     australia_seq_vehicle_positions_gateway: GTFSRealtimeVehiclePositionsGateway | None = None
     australia_adelaide_trip_updates_gateway: GTFSRealtimeTripUpdatesGateway | None = None
     australia_adelaide_vehicle_positions_gateway: GTFSRealtimeVehiclePositionsGateway | None = None
+    australia_nsw_trip_updates_gateway: GTFSRealtimeTripUpdatesGateway | None = None
+    australia_nsw_vehicle_positions_gateway: GTFSRealtimeVehiclePositionsGateway | None = None
+    australia_canberra_trip_updates_gateway: GTFSRealtimeTripUpdatesGateway | None = None
+    australia_canberra_vehicle_positions_gateway: GTFSRealtimeVehiclePositionsGateway | None = None
+    australia_queensland_trip_updates_gateways: dict[str, GTFSRealtimeTripUpdatesGateway] = {}
+    australia_queensland_vehicle_positions_gateways: dict[str, GTFSRealtimeVehiclePositionsGateway] = {}
     stm_gateway: STMRealtimeGateway | None = None
 
     def send_json(
@@ -855,12 +893,31 @@ class Handler(BaseHTTPRequestHandler):
                 AUSTRALIA_SEQ_VEHICLE_POSITIONS_PATH: self.australia_seq_vehicle_positions_gateway,
                 AUSTRALIA_ADELAIDE_TRIP_UPDATES_PATH: self.australia_adelaide_trip_updates_gateway,
                 AUSTRALIA_ADELAIDE_VEHICLE_POSITIONS_PATH: self.australia_adelaide_vehicle_positions_gateway,
+                AUSTRALIA_NSW_TRIP_UPDATES_PATH: self.australia_nsw_trip_updates_gateway,
+                AUSTRALIA_NSW_VEHICLE_POSITIONS_PATH: self.australia_nsw_vehicle_positions_gateway,
+                AUSTRALIA_CANBERRA_TRIP_UPDATES_PATH: self.australia_canberra_trip_updates_gateway,
+                AUSTRALIA_CANBERRA_VEHICLE_POSITIONS_PATH: self.australia_canberra_vehicle_positions_gateway,
             }
             if parsed.path in australia_gateways:
                 gateway = australia_gateways[parsed.path]
                 if gateway is None:
                     return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Australia GTFS-RT provider unavailable"})
                 response = gateway.handle(parsed.path, query)
+                return self.send_json(response.status, response.payload, response.cache_control)
+            queensland_gateways = {
+                **{
+                    f"{configuration['path_prefix']}/trip-updates": gateway
+                    for provider_id, gateway in self.australia_queensland_trip_updates_gateways.items()
+                    if (configuration := AUSTRALIA_QUEENSLAND_REALTIME.get(provider_id)) is not None
+                },
+                **{
+                    f"{configuration['path_prefix']}/vehicle-positions": gateway
+                    for provider_id, gateway in self.australia_queensland_vehicle_positions_gateways.items()
+                    if (configuration := AUSTRALIA_QUEENSLAND_REALTIME.get(provider_id)) is not None
+                },
+            }
+            if parsed.path in queensland_gateways:
+                response = queensland_gateways[parsed.path].handle(parsed.path, query)
                 return self.send_json(response.status, response.payload, response.cache_control)
             for prefix in STATIC_DATA_PATH_PREFIXES:
                 if parsed.path.startswith(prefix):
@@ -1269,6 +1326,7 @@ if __name__ == "__main__":
 
     def australia_city_configuration(
         adapter: str,
+        provider_id: str | None = None,
     ) -> tuple[set[str], dict[str, dict[str, object]]]:
         candidates = [
             Path(STATIC_DATA_ROOT) / "transit-radar-cities.json",
@@ -1291,6 +1349,8 @@ if __name__ == "__main__":
             providers = city.get("providers", [])
             for provider in providers if isinstance(providers, list) else []:
                 if not isinstance(provider, dict) or provider.get("adapter") != adapter:
+                    continue
+                if provider_id is not None and str(provider.get("providerID", "")) != provider_id:
                     continue
                 region = provider.get("region")
                 if city_id and isinstance(region, dict):
@@ -1364,6 +1424,152 @@ if __name__ == "__main__":
             transport=adelaide_vehicle_transport,
             upstream_url=AUSTRALIA_ADELAIDE_VEHICLE_POSITIONS_UPSTREAM,
             path=AUSTRALIA_ADELAIDE_VEHICLE_POSITIONS_PATH,
+            strict_static_join=True,
+        )
+
+    nsw_city_ids, nsw_city_regions = australia_city_configuration(
+        "externalGTFS",
+        provider_id=AUSTRALIA_NSW_PROVIDER_ID,
+    )
+    if nsw_city_ids:
+        nsw_trip_transport = PublicGTFSRealtimeHTTPTransport.from_environment(
+            "HalteWecker-TransportNSW-GTFSRT/1.0",
+            api_key_env="NSW_API_TOKEN",
+            header_name="Authorization",
+            header_prefix="apikey ",
+        )
+        nsw_vehicle_transport = PublicGTFSRealtimeHTTPTransport.from_environment(
+            "HalteWecker-TransportNSW-GTFSRT/1.0",
+            api_key_env="NSW_API_TOKEN",
+            header_name="Authorization",
+            header_prefix="apikey ",
+        )
+        if nsw_trip_transport is not None and nsw_vehicle_transport is not None:
+            Handler.australia_nsw_trip_updates_gateway = GTFSRealtimeTripUpdatesGateway(
+                provider_id=AUSTRALIA_NSW_PROVIDER_ID,
+                city_ids=nsw_city_ids,
+                context_registry=lambda city_id: database.external_gtfs_provider_contexts(
+                    city_id,
+                    AUSTRALIA_NSW_PROVIDER_ID,
+                ),
+                transport=nsw_trip_transport,
+                upstream_url=AUSTRALIA_NSW_TRIP_UPDATES_UPSTREAM,
+                path=AUSTRALIA_NSW_TRIP_UPDATES_PATH,
+                strict_static_join=True,
+            )
+            Handler.australia_nsw_vehicle_positions_gateway = GTFSRealtimeVehiclePositionsGateway(
+                provider_id=AUSTRALIA_NSW_PROVIDER_ID,
+                city_ids=nsw_city_ids,
+                city_regions=nsw_city_regions,
+                context_registry=lambda city_id: database.external_gtfs_provider_contexts(
+                    city_id,
+                    AUSTRALIA_NSW_PROVIDER_ID,
+                ),
+                transport=nsw_vehicle_transport,
+                upstream_url=AUSTRALIA_NSW_VEHICLE_POSITIONS_UPSTREAM,
+                path=AUSTRALIA_NSW_VEHICLE_POSITIONS_PATH,
+                strict_static_join=True,
+            )
+    canberra_city_ids, canberra_city_regions = australia_city_configuration(
+        "externalGTFS",
+        provider_id=AUSTRALIA_CANBERRA_PROVIDER_ID,
+    )
+    if canberra_city_ids:
+        canberra_trip_transport = PublicGTFSRealtimeHTTPTransport.from_basic_auth_environment(
+            "HalteWecker-TransportCanberra-GTFSRT/1.0",
+            client_id_env="CANBERRA_CLIENT_ID",
+            client_secret_env="CANBERRA_CLIENT_SECRET",
+        )
+        canberra_vehicle_transport = PublicGTFSRealtimeHTTPTransport.from_basic_auth_environment(
+            "HalteWecker-TransportCanberra-GTFSRT/1.0",
+            client_id_env="CANBERRA_CLIENT_ID",
+            client_secret_env="CANBERRA_CLIENT_SECRET",
+        )
+        if canberra_trip_transport is not None and canberra_vehicle_transport is not None:
+            Handler.australia_canberra_trip_updates_gateway = GTFSRealtimeTripUpdatesGateway(
+                provider_id=AUSTRALIA_CANBERRA_PROVIDER_ID,
+                city_ids=canberra_city_ids,
+                context_registry=lambda city_id: database.external_gtfs_provider_contexts(
+                    city_id,
+                    AUSTRALIA_CANBERRA_PROVIDER_ID,
+                ),
+                transport=canberra_trip_transport,
+                upstream_url=AUSTRALIA_CANBERRA_TRIP_UPDATES_UPSTREAM,
+                path=AUSTRALIA_CANBERRA_TRIP_UPDATES_PATH,
+                strict_static_join=True,
+            )
+            Handler.australia_canberra_vehicle_positions_gateway = GTFSRealtimeVehiclePositionsGateway(
+                provider_id=AUSTRALIA_CANBERRA_PROVIDER_ID,
+                city_ids=canberra_city_ids,
+                city_regions=canberra_city_regions,
+                context_registry=lambda city_id: database.external_gtfs_provider_contexts(
+                    city_id,
+                    AUSTRALIA_CANBERRA_PROVIDER_ID,
+                ),
+                transport=canberra_vehicle_transport,
+                upstream_url=AUSTRALIA_CANBERRA_VEHICLE_POSITIONS_UPSTREAM,
+                path=AUSTRALIA_CANBERRA_VEHICLE_POSITIONS_PATH,
+                strict_static_join=True,
+            )
+    queensland_manifest_payload: object = None
+    for candidate in (
+        Path(STATIC_DATA_ROOT) / "transit-radar-cities.json",
+        Path("/data/current/transit-radar-cities.json"),
+    ):
+        try:
+            queensland_manifest_payload = json.loads(candidate.read_text(encoding="utf-8"))
+            break
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+    queensland_city_configuration: dict[str, tuple[set[str], dict[str, dict[str, object]]]] = {}
+    for city in (queensland_manifest_payload or {}).get("cities", []) if isinstance(queensland_manifest_payload, dict) else []:
+        if not isinstance(city, dict):
+            continue
+        city_id = str(city.get("appCityID", "")).strip()
+        providers = city.get("providers", [])
+        for provider in providers if isinstance(providers, list) else []:
+            if not isinstance(provider, dict) or provider.get("adapter") != "translinkQueensland":
+                continue
+            provider_id = str(provider.get("providerID", "")).strip()
+            if not city_id or provider_id not in AUSTRALIA_QUEENSLAND_REALTIME:
+                continue
+            city_ids, regions = queensland_city_configuration.setdefault(
+                provider_id, (set(), {})
+            )
+            city_ids.add(city_id)
+            region = provider.get("region")
+            if isinstance(region, dict):
+                regions[city_id] = region
+            break
+
+    for provider_id, (city_ids, city_regions) in queensland_city_configuration.items():
+        feed = AUSTRALIA_QUEENSLAND_REALTIME[provider_id]
+        trip_path = f"{feed['path_prefix']}/trip-updates"
+        vehicle_path = f"{feed['path_prefix']}/vehicle-positions"
+        user_agent = f"HalteWecker-{provider_id}-GTFSRT/1.0"
+        Handler.australia_queensland_trip_updates_gateways[provider_id] = GTFSRealtimeTripUpdatesGateway(
+            provider_id=provider_id,
+            city_ids=city_ids,
+            context_registry=lambda city_id, provider_id=provider_id: database.external_gtfs_provider_contexts(
+                city_id,
+                provider_id,
+            ),
+            transport=PublicGTFSRealtimeHTTPTransport(user_agent),
+            upstream_url=str(feed["trip_updates"]),
+            path=trip_path,
+            strict_static_join=True,
+        )
+        Handler.australia_queensland_vehicle_positions_gateways[provider_id] = GTFSRealtimeVehiclePositionsGateway(
+            provider_id=provider_id,
+            city_ids=city_ids,
+            city_regions=city_regions,
+            context_registry=lambda city_id, provider_id=provider_id: database.external_gtfs_provider_contexts(
+                city_id,
+                provider_id,
+            ),
+            transport=PublicGTFSRealtimeHTTPTransport(user_agent),
+            upstream_url=str(feed["vehicle_positions"]),
+            path=vehicle_path,
             strict_static_join=True,
         )
     ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Handler).serve_forever()

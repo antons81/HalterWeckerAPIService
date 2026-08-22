@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import gzip
 import threading
 import time
@@ -45,6 +47,23 @@ class _Snapshot:
 
 class GTFSRealtimeGatewayError(Exception):
     """An upstream or payload error safe to expose as a generic status."""
+
+
+def infer_identifier_prefix(values: object) -> str:
+    """Infer one unambiguous static namespace from provider-owned IDs.
+
+    This is only a compatibility path for releases whose ownership metadata
+    predates the identifier-prefix column. Ambiguous or mixed IDs return an
+    empty prefix so strict realtime joins continue to fail closed.
+    """
+    try:
+        identifiers = [str(value) for value in values if str(value)]
+    except TypeError:
+        return ""
+    if not identifiers or any(":" not in value for value in identifiers):
+        return ""
+    prefixes = {value[: value.index(":") + 1] for value in identifiers}
+    return next(iter(prefixes)) if len(prefixes) == 1 else ""
 
 
 def _read_varint(data: bytes, offset: int) -> tuple[int, int]:
@@ -95,6 +114,34 @@ def _text(value: bytes) -> str:
         return value.decode("utf-8")
     except UnicodeDecodeError as error:
         raise GTFSRealtimeGatewayError("invalid protobuf text") from error
+
+
+def _validate_gtfs_realtime_payload(data: bytes) -> None:
+    """Validate the GTFS-RT envelope without accepting arbitrary JSON/bytes."""
+    if not data:
+        raise GTFSRealtimeGatewayError("empty realtime payload")
+    has_feed_header_or_entity = False
+    for field, wire_type, _value in _iter_fields(data):
+        if field in (1, 2) and wire_type == 2:
+            has_feed_header_or_entity = True
+    if not has_feed_header_or_entity:
+        raise GTFSRealtimeGatewayError("invalid GTFS-Realtime protobuf")
+
+
+def decode_gtfs_realtime_body(body: bytes, *, content_type: str = "") -> bytes:
+    """Return raw GTFS-RT protobuf from a raw or strictly Base64-wrapped body."""
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    if media_type in {"application/json", "text/json", "text/plain"}:
+        try:
+            encoded = body.strip().decode("ascii")
+            decoded = base64.b64decode(encoded, validate=True)
+        except (UnicodeDecodeError, binascii.Error, ValueError) as error:
+            raise GTFSRealtimeGatewayError("invalid Base64 realtime payload") from error
+        _validate_gtfs_realtime_payload(decoded)
+        return decoded
+
+    _validate_gtfs_realtime_payload(body)
+    return body
 
 
 def _signed_int32(value: int) -> int:
@@ -223,7 +270,10 @@ class _HTTPTransport:
                 body = response.read()
                 if response.headers.get("Content-Encoding", "").lower() == "gzip":
                     body = gzip.decompress(body)
-                return body
+                return decode_gtfs_realtime_body(
+                    body,
+                    content_type=response.headers.get("Content-Type", ""),
+                )
         except (HTTPError, URLError, TimeoutError, OSError) as error:
             raise GTFSRealtimeGatewayError("upstream unavailable") from error
 

@@ -235,6 +235,28 @@ class StaticDepartureScopeTests(unittest.TestCase):
             ],
         )
 
+    def test_australia_scope_resolves_only_australian_sources(self) -> None:
+        _label, providers = scoped.resolve_scope(REPOSITORY_ROOT, country="AU")
+        self.assertTrue(providers)
+        self.assertTrue(all(provider.country == "AU" for provider in providers))
+        self.assertEqual(
+            {provider.provider_id for provider in providers},
+            {
+                "australia-translink-seq",
+                "australia-adelaide",
+                "australia-translink-cairns",
+                "australia-translink-bowen",
+                "australia-translink-innisfail",
+                "australia-translink-fraser-coast",
+                "australia-transperth",
+                "australia-tasmania",
+                "australia-nt-darwin",
+                "australia-nt-alice-springs",
+                "australia-transport-nsw",
+                "australia-transport-canberra",
+            },
+        )
+
     def test_scoped_cta_rebuild_publishes_native_membership_and_board(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
