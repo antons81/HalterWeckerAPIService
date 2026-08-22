@@ -7,6 +7,7 @@ on:
     paths:
       - "config/cities.json"
       - "config/external-gtfs-sources.json"
+      - "config/australia-cities.json"
       - "config/ireland-cities.json"
       - ".github/workflows/update-transit-radar-manifest.yml"
 
@@ -36,6 +37,7 @@ jobs:
           import json, pathlib
 
           cities = load_cities(pathlib.Path("config/cities.json"))
+          cities.extend(load_cities(pathlib.Path("config/australia-cities.json")))
           manifest = transit_radar_manifest(cities, skip_auto_radar_stops=True)
           pathlib.Path("docs/data/transit-radar-cities.json").write_text(
               json.dumps(manifest, indent=2, ensure_ascii=False)

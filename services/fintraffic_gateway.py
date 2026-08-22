@@ -1,4 +1,4 @@
-"""Fintraffic GTFS-Realtime gateways for Finland vehicle positions and TripUpdates."""
+"""Reusable GTFS-Realtime gateways with Fintraffic compatibility defaults."""
 
 from __future__ import annotations
 
@@ -106,6 +106,27 @@ class _FintrafficHTTPTransport:
                 if response.headers.get("Content-Encoding", "").lower() == "gzip":
                     body = gzip.decompress(body)
                 return body
+        except (HTTPError, URLError, TimeoutError, OSError) as error:
+            raise GTFSRealtimeGatewayError("upstream unavailable") from error
+
+
+class PublicGTFSRealtimeHTTPTransport:
+    """Fetch a public GTFS-Realtime protobuf feed without credentials."""
+
+    def __init__(self, user_agent: str) -> None:
+        self._user_agent = user_agent
+
+    def __call__(self, url: str) -> bytes:
+        request = Request(
+            url,
+            headers={
+                "Accept": "application/octet-stream, application/protobuf",
+                "User-Agent": self._user_agent,
+            },
+        )
+        try:
+            with urlopen(request, timeout=15) as response:
+                return response.read()
         except (HTTPError, URLError, TimeoutError, OSError) as error:
             raise GTFSRealtimeGatewayError("upstream unavailable") from error
 
@@ -279,27 +300,37 @@ def _candidate_contexts(
     return trips, routes
 
 
-class FintrafficVehiclePositionsGateway:
+class GTFSRealtimeVehiclePositionsGateway:
+    """Shared protobuf VehiclePositions cache with static ownership joins."""
+
     def __init__(
         self,
         *,
         city_ids: set[str],
         city_regions: dict[str, dict[str, object]],
         context_registry: Callable[[str], Iterable[FintrafficProviderContext]],
-        transport: Callable[[str], bytes],
+        transport: Callable[[str], bytes] | None = None,
         upstream_url: str = FINTRAFFIC_UPSTREAM_URL,
         clock: Callable[[], float] = time.time,
         cache_ttl: float = FINTRAFFIC_CACHE_TTL_SECONDS,
         max_stale: float = FINTRAFFIC_MAX_STALE_SECONDS,
+        provider_id: str = FINTRAFFIC_PROVIDER_ID,
+        path: str = FINTRAFFIC_VEHICLE_POSITIONS_PATH,
+        strict_static_join: bool = False,
     ) -> None:
         self._city_ids = frozenset(city_ids)
         self._city_regions = city_regions
         self._context_registry = context_registry
-        self._transport = transport
+        self._transport = transport or PublicGTFSRealtimeHTTPTransport(
+            "HalteWecker-GTFSRT/1.0"
+        )
         self._upstream_url = upstream_url
         self._clock = clock
         self._cache_ttl = cache_ttl
         self._max_stale = max_stale
+        self._provider_id = provider_id
+        self._path = path
+        self._strict_static_join = strict_static_join
         self._snapshot: _VehicleSnapshot | None = None
         self._lock = threading.Lock()
         self._refresh_lock = threading.Lock()
@@ -311,7 +342,7 @@ class FintrafficVehiclePositionsGateway:
         city_ids: set[str],
         city_regions: dict[str, dict[str, object]],
         context_registry: Callable[[str], Iterable[FintrafficProviderContext]],
-    ) -> "FintrafficVehiclePositionsGateway | None":
+    ) -> "GTFSRealtimeVehiclePositionsGateway | None":
         api_key = os.environ.get("FINTRAFFIC_API_KEY", "").strip()
         if not api_key:
             return None
@@ -392,13 +423,17 @@ class FintrafficVehiclePositionsGateway:
             if vehicle.trip_id:
                 candidates = _trip_candidates_for_raw_id(trip_candidates, vehicle.trip_id)
                 if vehicle.route_id:
-                    candidates = [
+                    route_candidates_for_trip = [
                         candidate
                         for candidate in candidates
                         if _native_id(
                             candidate[2], _context_identifier_prefix(candidate[0])
                         ) == vehicle.route_id
-                    ] or candidates
+                    ]
+                    if route_candidates_for_trip:
+                        candidates = route_candidates_for_trip
+                    elif self._strict_static_join:
+                        continue
                 if candidates:
                     context, published_trip, expected_route = candidates[0]
                     published_route = expected_route or published_route
@@ -406,6 +441,9 @@ class FintrafficVehiclePositionsGateway:
                 candidates = route_candidates.get(vehicle.route_id, [])
                 if candidates:
                     context, published_route = candidates[0]
+
+            if context is None and self._strict_static_join:
+                continue
 
             published_stop = vehicle.stop_id
             if context is not None and vehicle.stop_id:
@@ -430,7 +468,7 @@ class FintrafficVehiclePositionsGateway:
         return result
 
     def handle(self, path: str, query: dict[str, list[str]]) -> GatewayResponse:
-        if path != FINTRAFFIC_VEHICLE_POSITIONS_PATH:
+        if path != self._path:
             return GatewayResponse(HTTPStatus.NOT_FOUND, {"error": "not found"})
         city_id = query.get("cityID", [None])[0]
         if city_id not in self._city_ids:
@@ -447,7 +485,7 @@ class FintrafficVehiclePositionsGateway:
             HTTPStatus.OK,
             {
                 "schemaVersion": 1,
-                "providerID": FINTRAFFIC_PROVIDER_ID,
+                "providerID": self._provider_id,
                 "cityID": city_id,
                 "feedTimestamp": self._iso_time(snapshot.feed_timestamp),
                 "retrievedAt": self._iso_time(int(snapshot.retrieved_at)),
@@ -459,8 +497,8 @@ class FintrafficVehiclePositionsGateway:
         )
 
 
-class FintrafficTripUpdatesGateway(GTFSRealtimeGateway):
-    """Use the shared TripUpdates parser/cache with Finland-specific ID mapping."""
+class GTFSRealtimeTripUpdatesGateway(GTFSRealtimeGateway):
+    """Shared TripUpdates parser/cache with static ownership joins."""
 
     def __init__(
         self,
@@ -472,14 +510,18 @@ class FintrafficTripUpdatesGateway(GTFSRealtimeGateway):
         clock: Callable[[], float] = time.time,
         cache_ttl: float = FINTRAFFIC_CACHE_TTL_SECONDS,
         max_stale: float = FINTRAFFIC_MAX_STALE_SECONDS,
+        provider_id: str = FINTRAFFIC_PROVIDER_ID,
+        path: str = FINTRAFFIC_TRIP_UPDATES_PATH,
+        strict_static_join: bool = False,
     ) -> None:
         first_city = next(iter(city_ids), "helsinki")
         self._context_registry = context_registry
+        self._strict_static_join = strict_static_join
         super().__init__(
-            provider_id=FINTRAFFIC_PROVIDER_ID,
+            provider_id=provider_id,
             city_id=first_city,
             city_ids=city_ids,
-            path=FINTRAFFIC_TRIP_UPDATES_PATH,
+            path=path,
             upstream_url=upstream_url,
             transport=transport,
             clock=clock,
@@ -494,7 +536,7 @@ class FintrafficTripUpdatesGateway(GTFSRealtimeGateway):
         *,
         city_ids: set[str],
         context_registry: Callable[[str], Iterable[FintrafficProviderContext]],
-    ) -> "FintrafficTripUpdatesGateway | None":
+    ) -> "GTFSRealtimeTripUpdatesGateway | None":
         api_key = os.environ.get("FINTRAFFIC_API_KEY", "").strip()
         if not api_key:
             return None
@@ -516,13 +558,17 @@ class FintrafficTripUpdatesGateway(GTFSRealtimeGateway):
         for update in updates:
             candidates = _trip_candidates_for_raw_id(trip_candidates, update.trip_id)
             if update.route_id:
-                candidates = [
+                route_candidates_for_trip = [
                     candidate
                     for candidate in candidates
                     if _native_id(
                         candidate[2], _context_identifier_prefix(candidate[0])
                     ) == update.route_id
-                ] or candidates
+                ]
+                if route_candidates_for_trip:
+                    candidates = route_candidates_for_trip
+                elif self._strict_static_join:
+                    continue
             if not candidates:
                 continue
             context, internal_trip, internal_route = candidates[0]
@@ -549,7 +595,7 @@ class FintrafficTripUpdatesGateway(GTFSRealtimeGateway):
         return result
 
     def handle(self, path: str, query: dict[str, list[str]]) -> GatewayResponse:
-        if path != FINTRAFFIC_TRIP_UPDATES_PATH:
+        if path != self._path:
             return GatewayResponse(HTTPStatus.NOT_FOUND, {"error": "not found"})
         requested_city_id = query.get("cityID", [None])[0]
         if requested_city_id not in self._city_ids:
@@ -578,7 +624,7 @@ class FintrafficTripUpdatesGateway(GTFSRealtimeGateway):
             HTTPStatus.OK,
             {
                 "schemaVersion": 1,
-                "providerID": FINTRAFFIC_PROVIDER_ID,
+                "providerID": self._provider_id,
                 "cityID": requested_city_id,
                 "stopIDs": requested_stop_ids,
                 "feedTimestamp": self._iso_time(snapshot.feed_timestamp),
@@ -589,3 +635,10 @@ class FintrafficTripUpdatesGateway(GTFSRealtimeGateway):
                 "updates": updates,
             },
         )
+
+
+# Fintraffic imports remain stable while other public GTFS-RT sources use the
+# neutral gateway names above.
+FintrafficVehiclePositionsGateway = GTFSRealtimeVehiclePositionsGateway
+FintrafficTripUpdatesGateway = GTFSRealtimeTripUpdatesGateway
+GTFSRealtimeProviderContext = FintrafficProviderContext

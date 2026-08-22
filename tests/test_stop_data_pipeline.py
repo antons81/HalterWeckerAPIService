@@ -57,6 +57,7 @@ case \"${1:-}\" in
     \"$REAL_PYTHON\" - \"$output\" <<'PY'
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 output = Path(sys.argv[1])
@@ -66,7 +67,16 @@ def artifact(source_id):
     path.write_bytes(source_id.encode(\"utf-8\"))
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     return {\"path\": str(path), \"sha256\": digest, \"size\": path.stat().st_size}
-source_ids = [\"sweden\", \"norway\", \"ireland\", \"translink\", \"ttc-surface\", \"ttc-subway\", \"511-bay-area\", \"cta-chicago\", \"king-county-metro\", \"mta-ny-subway\", \"mta-ny-nyct-bus\", \"mta-ny-mta-bus\", \"mbta-boston\", \"wmata-bus\", \"wmata-rail\", \"kyiv\"]
+registry = json.loads(
+    (Path(os.environ[\"REPO\"]) / \"config\" / \"external-gtfs-sources.json\").read_text(
+        encoding=\"utf-8\"
+    )
+)
+source_ids = [
+    str(source[\"id\"])
+    for source in registry
+    if str(source.get(\"classification\", \"required\")) == \"required\"
+]
 sources = {\"germany\": artifact(\"germany\"), \"swiss\": artifact(\"swiss\")}
 external = {source_id: artifact(source_id) for source_id in source_ids}
 output.write_text(json.dumps({\"sources\": sources, \"external\": external, \"nlFailure\": None}), encoding=\"utf-8\")

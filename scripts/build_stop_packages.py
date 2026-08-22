@@ -107,6 +107,8 @@ SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "wmata",
     "kyiv",
     "fintraffic",
+    "translinkSEQ",
+    "adelaideMetro",
 }
 SUPPORTED_TRANSIT_RADAR_FEATURES = {
     "liveVehicles",
@@ -910,6 +912,24 @@ def validate_transit_radar_provider(
                 raise ValueError(f"Fintraffic requires an HTTPS {key} for {city_id}")
         return
 
+    if adapter in {"translinkSEQ", "adelaideMetro"}:
+        expected_city_ids = (
+            {"brisbane", "gold-coast", "sunshine-coast"}
+            if adapter == "translinkSEQ"
+            else {"adelaide"}
+        )
+        if city_id not in expected_city_ids or not isinstance(region, dict):
+            raise ValueError(f"Invalid Australia GTFS-RT configuration for {city_id}")
+        features = configuration.get("features")
+        required = {"liveVehicles", "realtimeDepartures", "tripUpdates", "vehiclePositions"}
+        if not isinstance(features, list) or not required.issubset(features):
+            raise ValueError(f"Australia GTFS-RT features are invalid for {city_id}")
+        for key in ("staticBaseURL", "boardURL", "realtimeURL", "tripUpdatesURL"):
+            value = configuration.get(key)
+            if not isinstance(value, str) or not value.startswith("https://"):
+                raise ValueError(f"Australia GTFS-RT requires an HTTPS {key} for {city_id}")
+        return
+
     if adapter == "kyiv":
         if city_id != "kyiv":
             raise ValueError(f"Invalid Kyiv configuration for {city_id}")
@@ -1408,6 +1428,10 @@ def transit_radar_manifest(
                 provider_id = "kyiv"
             elif adapter == "fintraffic":
                 provider_id = "fintraffic"
+            elif adapter == "translinkSEQ":
+                provider_id = f"australia-translink-seq-{city_id}"
+            elif adapter == "adelaideMetro":
+                provider_id = "australia-adelaide"
             elif adapter == "bwTrias":
                 provider_id = "bw-trias"
             else:
@@ -1541,6 +1565,8 @@ def transit_radar_manifest(
             country_suffix = "ua"
         elif any(p.get("adapter") == "fintraffic" for p in providers):
             country_suffix = "fi"
+        elif any(p.get("adapter") in {"translinkSEQ", "adelaideMetro"} for p in providers):
+            country_suffix = "au"
         else:
             country_suffix = "de"
         radar_cities.append({
