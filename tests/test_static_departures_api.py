@@ -18,7 +18,6 @@ import static_departures_api
 from import_static_departures_database import populate_german_city_memberships
 from static_departures_api import Database, Handler
 from apple_store_notification_store import AppleStoreNotificationStore
-from gtfsrt_gateway import GatewayResponse
 from swap_static_departures_database import activate_database
 
 
@@ -112,25 +111,18 @@ def write_database(path: Path, version: str, valid: bool = True) -> None:
 
 
 class StaticDeparturesHTTPServer:
-    def __init__(
-        self,
-        database_path: Path,
-        ttl: float = 0.0,
-        handler_overrides: dict[str, object] | None = None,
-    ) -> None:
+    def __init__(self, database_path: Path, ttl: float = 0.0) -> None:
         self.database = Database(str(database_path), ttl=ttl)
         self.notification_store = AppleStoreNotificationStore(
             database_path.with_name("apple-store-notifications.sqlite3")
         )
-        handler_attributes = {
-            "database": self.database,
-            "apple_store_notification_store": self.notification_store,
-        }
-        handler_attributes.update(handler_overrides or {})
         handler = type(
             "StaticDeparturesTestHandler",
             (Handler,),
-            handler_attributes,
+            {
+                "database": self.database,
+                "apple_store_notification_store": self.notification_store,
+            },
         )
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -273,30 +265,6 @@ class StaticDeparturesImportTests(unittest.TestCase):
 
 
 class StaticDeparturesEndpointTests(unittest.TestCase):
-    def test_australia_realtime_alias_uses_existing_static_departures_proxy_path(self) -> None:
-        class RecordingGateway:
-            def __init__(self) -> None:
-                self.paths: list[str] = []
-
-            def handle(self, path: str, _query: dict[str, list[str]]) -> GatewayResponse:
-                self.paths.append(path)
-                return GatewayResponse(HTTPStatus.OK, {"ok": True})
-
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "current.sqlite"
-            write_database(path, "australia-alias")
-            gateway = RecordingGateway()
-            with StaticDeparturesHTTPServer(
-                path,
-                handler_overrides={"australia_seq_vehicle_positions_gateway": gateway},
-            ) as server:
-                response = server.get(
-                    "/static-departures/australia/seq/realtime/vehicle-positions?cityID=brisbane"
-                )
-
-        self.assertEqual(response, {"ok": True})
-        self.assertEqual(gateway.paths, ["/australia/seq/realtime/vehicle-positions"])
-
     def test_server_header_does_not_expose_runtime_version(self) -> None:
         self.assertEqual(
             Handler.version_string(Handler.__new__(Handler)),

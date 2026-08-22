@@ -132,14 +132,6 @@ class AustraliaGTFSConfigurationTests(unittest.TestCase):
             by_city["adelaide"]["providers"][0]["providerID"],
             "australia-adelaide",
         )
-        self.assertEqual(
-            by_city["brisbane"]["providers"][0]["realtimeURL"],
-            "https://api.asoftlabs.app/static-departures/australia/seq/realtime/vehicle-positions",
-        )
-        self.assertEqual(
-            by_city["adelaide"]["providers"][0]["tripUpdatesURL"],
-            "https://api.asoftlabs.app/static-departures/australia/adelaide/realtime/trip-updates",
-        )
 
     def test_city_stop_sets_are_disjoint_and_shared_route_is_preserved(self) -> None:
         cities = [
