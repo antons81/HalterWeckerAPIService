@@ -837,6 +837,24 @@ def validate_transit_radar_provider(
     if not isinstance(is_enabled, bool):
         raise ValueError(f"Invalid transit radar availability for {city_id}")
 
+    service_scope_points = configuration.get("serviceScopePoints")
+    if service_scope_points is not None:
+        if not isinstance(service_scope_points, list):
+            raise ValueError(f"Invalid service scope points for {city_id}")
+        for point in service_scope_points:
+            if not isinstance(point, dict):
+                raise ValueError(f"Invalid service scope point for {city_id}")
+            if not isinstance(point.get("id"), str) or not point["id"].strip():
+                raise ValueError(f"Invalid service scope point ID for {city_id}")
+            if not isinstance(point.get("name"), str) or not point["name"].strip():
+                raise ValueError(f"Invalid service scope point name for {city_id}")
+            for coordinate_key in ("latitude", "longitude", "radiusMeters"):
+                coordinate = point.get(coordinate_key)
+                if not isinstance(coordinate, (int, float)) or not math.isfinite(coordinate):
+                    raise ValueError(f"Invalid service scope point {coordinate_key} for {city_id}")
+            if point["radiusMeters"] <= 0:
+                raise ValueError(f"Invalid service scope point radius for {city_id}")
+
     if adapter == "bwTrias":
         if region is not None:
             raise ValueError(f"bwTrias does not use a radar region for {city_id}")
@@ -1472,6 +1490,17 @@ def transit_radar_manifest(
             allowed_vehicle_modes = provider_configuration.get("allowedVehicleModes")
             if isinstance(allowed_vehicle_modes, list):
                 provider["allowedVehicleModes"] = allowed_vehicle_modes
+            service_scope_region = provider_configuration.get("serviceScopeRegion")
+            if isinstance(service_scope_region, dict):
+                provider["serviceScopeRegion"] = service_scope_region
+            service_scope_route_ids = provider_configuration.get("serviceScopeRouteIDs")
+            if isinstance(service_scope_route_ids, list) and all(
+                isinstance(value, str) for value in service_scope_route_ids
+            ):
+                provider["serviceScopeRouteIDs"] = service_scope_route_ids
+            service_scope_points = provider_configuration.get("serviceScopePoints")
+            if isinstance(service_scope_points, list):
+                provider["serviceScopePoints"] = service_scope_points
             gateway_url = provider_configuration.get("gatewayURL")
             if adapter == "vagPuls" and vag_gateway_url:
                 gateway_url = vag_gateway_url

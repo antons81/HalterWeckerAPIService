@@ -315,6 +315,36 @@ class CityLineCatalogTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid EFA radar stops"):
             transit_radar_manifest([city])
 
+    def test_db_regio_manifest_preserves_terminal_service_scope_points(self) -> None:
+        city = {
+            "id": "velbert",
+            "name": "Velbert",
+            "latitude": 51.3406,
+            "longitude": 7.0434,
+            "transitRadar": {
+                "adapter": "dbRegioBusNRW",
+                "region": {
+                    "minimumLongitude": 6.97,
+                    "minimumLatitude": 51.31,
+                    "maximumLongitude": 7.09,
+                    "maximumLatitude": 51.37
+                },
+                "serviceScopePoints": [{
+                    "id": "terminal-steinbrink",
+                    "name": "Steinbrink",
+                    "latitude": 51.371906,
+                    "longitude": 7.133001,
+                    "radiusMeters": 500
+                }]
+            }
+        }
+
+        provider = transit_radar_manifest([city])["cities"][0]["providers"][0]
+
+        self.assertEqual(provider["providerID"], "db-regio-bus-nrw-velbert")
+        self.assertEqual(provider["serviceScopePoints"][0]["id"], "terminal-steinbrink")
+        self.assertEqual(provider["serviceScopePoints"][0]["radiusMeters"], 500)
+
     def test_static_provider_is_published_without_adapter(self) -> None:
         cities = [{
             "id": "wuppertal",
