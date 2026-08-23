@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import gzip
 import io
 import json
@@ -34,6 +33,11 @@ try:
     from .gtfs_source_cache import DEFAULT_CACHE_ROOT, GTFSArtifactCache
 except ImportError:
     from gtfs_source_cache import DEFAULT_CACHE_ROOT, GTFSArtifactCache
+
+try:
+    from .gtfs_csv import normalized_dict_reader
+except ImportError:
+    from gtfs_csv import normalized_dict_reader
 
 try:
     from .kyiv_open_data import KyivResourceCache
@@ -558,7 +562,8 @@ def load_table(archive: zipfile.ZipFile, filename: str) -> list[dict[str, str]]:
     if filename not in archive.namelist():
         return []
     with archive.open(filename) as file:
-        return list(csv.DictReader(io.TextIOWrapper(file, encoding="utf-8-sig")))
+        text = io.TextIOWrapper(file, encoding="utf-8-sig")
+        return list(normalized_dict_reader(text))
 
 
 def iter_table(
@@ -568,7 +573,8 @@ def iter_table(
     if filename not in archive.namelist():
         return
     with archive.open(filename) as file:
-        yield from csv.DictReader(io.TextIOWrapper(file, encoding="utf-8-sig"))
+        text = io.TextIOWrapper(file, encoding="utf-8-sig")
+        yield from normalized_dict_reader(text)
 
 
 def canonicalize(rows: list[dict[str, str]]) -> list[dict[str, object]]:

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import shutil
 import sqlite3
@@ -17,6 +16,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from build_stop_packages import load_gtfs_archive, normalized
+from gtfs_csv import normalized_dict_reader
 from static_departures_ownership import ensure_ownership_schema, register_entities
 
 
@@ -75,7 +75,7 @@ def gtfs_rows(archive: zipfile.ZipFile, name: str) -> Iterable[dict[str, str]]:
     if name not in archive.namelist():
         return []
     with archive.open(name) as raw:
-        yield from csv.DictReader((line.decode("utf-8-sig") for line in raw))
+        yield from normalized_dict_reader((line.decode("utf-8-sig") for line in raw))
 
 
 def parse_gtfs_time(value: str) -> int | None:

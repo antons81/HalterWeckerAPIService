@@ -10,6 +10,11 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
+try:
+    from .gtfs_csv import normalized_dict_reader
+except ImportError:
+    from gtfs_csv import normalized_dict_reader
+
 
 class JSONStream:
     """Incrementally decode generated JSON without reading the whole file."""
@@ -696,9 +701,9 @@ class ExternalDepartureStage:
 
 
 def _iter_table(archive, filename: str) -> Iterator[dict[str, str]]:
-    import csv
-
     if filename not in archive.namelist():
         return
     with archive.open(filename) as raw:
-        yield from csv.DictReader((line.decode("utf-8-sig") for line in raw))
+        yield from normalized_dict_reader(
+            (line.decode("utf-8-sig") for line in raw)
+        )

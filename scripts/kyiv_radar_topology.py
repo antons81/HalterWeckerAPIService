@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import csv
 import hashlib
 import json
 import math
@@ -10,6 +9,11 @@ import zipfile
 from collections import defaultdict
 from collections.abc import Iterable
 from pathlib import Path
+
+try:
+    from .gtfs_csv import normalized_dict_reader
+except ImportError:
+    from gtfs_csv import normalized_dict_reader
 
 KYIV_SURFACE_ROUTE_TYPES = frozenset({"0", "3", "11"})
 EARTH_RADIUS_METERS = 6_371_000.0
@@ -177,7 +181,7 @@ def build_radar_topology(
 def _rows(archive: zipfile.ZipFile, name: str) -> Iterable[dict[str, str]]:
     with archive.open(name) as source:
         text = (line.decode("utf-8-sig") for line in source)
-        yield from csv.DictReader(text)
+        yield from normalized_dict_reader(text)
 
 
 def _distance_meters(

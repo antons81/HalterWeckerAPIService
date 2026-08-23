@@ -9,6 +9,11 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+try:
+    from .gtfs_csv import normalized_dict_reader
+except ImportError:
+    from gtfs_csv import normalized_dict_reader
+
 
 _FILTERED_TABLES = {
     "agency.txt",
@@ -30,7 +35,8 @@ def _rows(archive: zipfile.ZipFile, name: str) -> list[dict[str, str]]:
     if name not in archive.namelist():
         return []
     with archive.open(name) as source:
-        return list(csv.DictReader(io.TextIOWrapper(source, encoding="utf-8-sig")))
+        text = io.TextIOWrapper(source, encoding="utf-8-sig")
+        return list(normalized_dict_reader(text))
 
 
 def _write_rows(archive: zipfile.ZipFile, name: str, rows: list[dict[str, str]]) -> bytes:

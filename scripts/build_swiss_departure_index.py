@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
 import json
 import math
@@ -16,11 +15,12 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from build_stop_packages import load_gtfs_archive
+from gtfs_csv import normalized_dict_reader
 
 
 def rows(archive: zipfile.ZipFile, name: str):
     with archive.open(name) as raw:
-        yield from csv.DictReader((line.decode("utf-8-sig") for line in raw))
+        yield from normalized_dict_reader((line.decode("utf-8-sig") for line in raw))
 
 
 def distance_meters(a_lat, a_lon, b_lat, b_lon):
