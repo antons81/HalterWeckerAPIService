@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import errno
+import gzip
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -114,6 +116,27 @@ def _error_summary(error: BaseException) -> str:
     if isinstance(error, ConnectionError):
         return "connection failure"
     return type(error).__name__
+
+
+def _copy_http_body(response: object, output: object, headers: Mapping[str, str]) -> None:
+    """Persist the decoded HTTP representation, not the wire encoding."""
+    content_encoding = headers.get("content-encoding", "").strip().casefold()
+    if not content_encoding or content_encoding == "identity":
+        shutil.copyfileobj(response, output)
+        return
+
+    encodings = [item.strip().casefold() for item in content_encoding.split(",") if item.strip()]
+    if encodings != ["gzip"]:
+        raise ValueError(
+            "Unsupported HTTP Content-Encoding for GTFS artifact: "
+            f"{content_encoding}"
+        )
+
+    try:
+        with gzip.GzipFile(fileobj=response, mode="rb") as decoded:
+            shutil.copyfileobj(decoded, output)
+    except (EOFError, OSError, zlib.error) as error:
+        raise ValueError("Invalid gzip HTTP Content-Encoding for GTFS artifact") from error
 
 
 def validate_gtfs_archive(
@@ -347,8 +370,8 @@ class GTFSArtifactCache:
                                 )
                             if status == 304 and valid_cache:
                                 return ArtifactResult(source_id, artifact, "unchanged", "HTTP 304", state)
-                            shutil.copyfileobj(response, output)
                             response_headers = _headers(response)
+                            _copy_http_body(response, output, response_headers)
                         output.flush()
                         os.fsync(output.fileno())
                     digest, size = validate_gtfs_archive(candidate, validator=validator)

@@ -1,4 +1,5 @@
 import io
+import gzip
 import json
 import tempfile
 import unittest
@@ -54,6 +55,76 @@ class FakeResponse:
 
 
 class GTFSArtifactCacheTests(unittest.TestCase):
+    def test_gzip_content_encoding_is_decoded_before_cache_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.zip"
+            write_gtfs(source)
+            encoded = gzip.compress(source.read_bytes())
+
+            def fake_urlopen(request, timeout=0):
+                return FakeResponse(
+                    body=encoded,
+                    headers={
+                        "Content-Encoding": "gzip",
+                        "Content-Type": "application/zip",
+                    },
+                )
+
+            with patch("gtfs_source_cache.urllib.request.urlopen", side_effect=fake_urlopen):
+                result = GTFSArtifactCache(root / "cache").resolve(
+                    "australia-transport-nsw",
+                    "https://api.transport.nsw.gov.au/v1/gtfs/schedule/buses",
+                    metadata_probe=False,
+                )
+
+            cached = root / "cache" / "australia-transport-nsw" / "current.zip"
+            self.assertEqual(result.status, "updated")
+            self.assertEqual(cached.read_bytes()[:4], b"PK\x03\x04")
+            self.assertEqual(result.state["size"], source.stat().st_size)
+            with zipfile.ZipFile(cached) as archive:
+                self.assertIn("stops.txt", archive.namelist())
+
+    def test_malformed_gzip_content_encoding_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+
+            def fake_urlopen(request, timeout=0):
+                return FakeResponse(
+                    body=b"not-a-gzip-stream",
+                    headers={"Content-Encoding": "gzip"},
+                )
+
+            with patch("gtfs_source_cache.urllib.request.urlopen", side_effect=fake_urlopen):
+                with self.assertRaisesRegex(ValueError, "Invalid gzip HTTP Content-Encoding"):
+                    GTFSArtifactCache(root / "cache").resolve(
+                        "nsw",
+                        "https://example.test/nsw.zip",
+                        metadata_probe=False,
+                    )
+
+            self.assertFalse((root / "cache" / "nsw" / "current.zip").exists())
+
+    def test_gzip_content_encoding_that_decodes_to_non_zip_fails_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+
+            def fake_urlopen(request, timeout=0):
+                return FakeResponse(
+                    body=gzip.compress(b"not-a-zip"),
+                    headers={"Content-Encoding": "gzip"},
+                )
+
+            with patch("gtfs_source_cache.urllib.request.urlopen", side_effect=fake_urlopen):
+                with self.assertRaises(zipfile.BadZipFile):
+                    GTFSArtifactCache(root / "cache").resolve(
+                        "nonzip",
+                        "https://example.test/nonzip.zip",
+                        metadata_probe=False,
+                    )
+
+            self.assertFalse((root / "cache" / "nonzip" / "current.zip").exists())
+
     def test_kyiv_timeout_retries_then_succeeds(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
