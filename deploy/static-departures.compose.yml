@@ -8,6 +8,7 @@ services:
       - /srv/haltewecker/secrets/wmata/.env
       - /srv/haltewecker/secrets/geofox-hamburg/.env
       - /srv/haltewecker/secrets/finland/.env
+      - /srv/haltewecker/secrets/australia/.env
     build:
       context: ..
       dockerfile: services/static-departures.Dockerfile
