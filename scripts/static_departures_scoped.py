@@ -18,6 +18,7 @@ from pathlib import Path
 
 from build_german_departure_index import (
     DEFAULT_TIMEZONE,
+    TRANSFER_KEY_SEPARATOR,
     populate_gtfs,
     resolve_canonical_stops,
     service_window,
@@ -48,6 +49,29 @@ from austrian_sources import load_austrian_sources
 
 
 STATIC_CONTAINER_DEFAULT = "static-departures-api"
+TRANSFER_OWNERSHIP_COLUMNS = (
+    "from_stop_id",
+    "to_stop_id",
+    "from_trip_id",
+    "to_trip_id",
+    "from_route_id",
+    "to_route_id",
+)
+
+
+def transfer_existence_query(primary_key_index: str) -> str:
+    quoted_index = primary_key_index.replace('"', '""')
+    return f"""
+        SELECT 1
+        FROM transfers INDEXED BY "{quoted_index}"
+        WHERE from_stop_id = ?
+          AND to_stop_id = ?
+          AND from_trip_id = ?
+          AND to_trip_id = ?
+          AND from_route_id = ?
+          AND to_route_id = ?
+        LIMIT 1
+    """
 
 
 @dataclass(frozen=True)
@@ -652,28 +676,77 @@ def validate_scoped_database(
             "to_route_id",
         }
         if required_transfer_columns.issubset(transfer_columns):
-            transfer_identity = (
-                "actual.from_stop_id || char(31) || actual.to_stop_id || char(31) || "
-                "actual.from_trip_id || char(31) || actual.to_trip_id || char(31) || "
-                "actual.from_route_id || char(31) || actual.to_route_id"
-            )
-            orphan_count = connection.execute(
-                f"""
-                SELECT COUNT(*)
-                FROM provider_entities owned
-                WHERE owned.entity_type = 'transfers'
-                  AND owned.provider_id IN ({placeholders})
-                  AND NOT EXISTS (
-                      SELECT 1 FROM transfers actual
-                      WHERE owned.key_1 = {transfer_identity}
-                  )
-                """,
-                tuple(provider_ids),
-            ).fetchone()[0]
+            orphan_count = _validate_transfer_ownership(connection, provider_ids)
             if orphan_count:
                 raise ValueError(
                     f"Provider ownership contains {orphan_count} orphaned transfers rows."
                 )
+
+
+def _parse_transfer_ownership_key(
+    provider_id: object,
+    ownership_key: object,
+) -> tuple[str, ...]:
+    if not isinstance(provider_id, str) or not isinstance(ownership_key, str):
+        raise ValueError(
+            "Provider ownership contains a malformed transfer key: "
+            "transfer ownership values must be text."
+        )
+    components = ownership_key.split(TRANSFER_KEY_SEPARATOR)
+    if len(components) != len(TRANSFER_OWNERSHIP_COLUMNS):
+        raise ValueError(
+            f"Provider ownership contains a malformed transfer key for provider {provider_id}: "
+            f"expected {len(TRANSFER_OWNERSHIP_COLUMNS)} components."
+        )
+    return tuple(components)
+
+
+def _transfer_primary_key_index(connection: sqlite3.Connection) -> str | None:
+    for index_row in connection.execute("PRAGMA index_list(transfers)"):
+        if len(index_row) < 4 or str(index_row[3]) != "pk":
+            continue
+        index_name = str(index_row[1])
+        quoted_index = index_name.replace('"', '""')
+        index_columns = tuple(
+            str(column_row[2])
+            for column_row in connection.execute(
+                f'PRAGMA index_info("{quoted_index}")'
+            )
+        )
+        if index_columns == TRANSFER_OWNERSHIP_COLUMNS:
+            return index_name
+    return None
+
+
+def _validate_transfer_ownership(
+    connection: sqlite3.Connection,
+    provider_ids: list[str],
+) -> int:
+    placeholders = ",".join("?" for _ in provider_ids)
+    owned_rows = connection.execute(
+        f"""
+        SELECT provider_id, key_1
+        FROM provider_entities
+        WHERE entity_type = 'transfers'
+          AND provider_id IN ({placeholders})
+        """,
+        tuple(provider_ids),
+    )
+    transfer_keys = [
+        _parse_transfer_ownership_key(provider_id, ownership_key)
+        for provider_id, ownership_key in owned_rows
+    ]
+    primary_key_index = _transfer_primary_key_index(connection)
+    if primary_key_index is None:
+        raise ValueError(
+            "The transfers table is missing the required composite primary key."
+        )
+    existence_query = transfer_existence_query(primary_key_index)
+    orphan_count = 0
+    for transfer_key in transfer_keys:
+        if connection.execute(existence_query, transfer_key).fetchone() is None:
+            orphan_count += 1
+    return orphan_count
 
 
 def prepare_staging_release(
