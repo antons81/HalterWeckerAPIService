@@ -66,8 +66,22 @@ def _context_identifier_prefix(context: FintrafficProviderContext) -> str:
     return ""
 
 
-def _context_stop_prefix(context: FintrafficProviderContext) -> str:
-    return context.stop_id_prefix or _context_identifier_prefix(context)
+def _context_prefixes(
+    contexts: Iterable[FintrafficProviderContext],
+) -> dict[int, str]:
+    """Resolve each provider namespace once for one request."""
+    return {id(context): _context_identifier_prefix(context) for context in contexts}
+
+
+def _context_stop_prefix(
+    context: FintrafficProviderContext,
+    identifier_prefix: str | None = None,
+) -> str:
+    return context.stop_id_prefix or (
+        _context_identifier_prefix(context)
+        if identifier_prefix is None
+        else identifier_prefix
+    )
 
 
 def _trip_candidates_for_raw_id(
@@ -335,14 +349,17 @@ def _in_region(latitude: float, longitude: float, region: dict[str, object]) -> 
 
 def _candidate_contexts(
     contexts: Iterable[FintrafficProviderContext],
+    identifier_prefixes: dict[int, str] | None = None,
 ) -> tuple[
     dict[str, list[tuple[FintrafficProviderContext, str, str]]],
     dict[str, list[tuple[FintrafficProviderContext, str]]],
 ]:
+    context_list = tuple(contexts)
+    resolved_prefixes = identifier_prefixes or _context_prefixes(context_list)
     trips: dict[str, list[tuple[FintrafficProviderContext, str, str]]] = {}
     routes: dict[str, list[tuple[FintrafficProviderContext, str]]] = {}
-    for context in contexts:
-        identifier_prefix = _context_identifier_prefix(context)
+    for context in context_list:
+        identifier_prefix = resolved_prefixes[id(context)]
         for internal_trip in context.trips:
             raw_trip = _native_id(internal_trip, identifier_prefix)
             internal_route = context.route_by_trip.get(internal_trip, "")
@@ -457,7 +474,11 @@ class GTFSRealtimeVehiclePositionsGateway:
         now: float,
     ) -> list[dict[str, object]]:
         contexts = tuple(self._context_registry(city_id))
-        trip_candidates, route_candidates = _candidate_contexts(contexts)
+        identifier_prefixes = _context_prefixes(contexts)
+        trip_candidates, route_candidates = _candidate_contexts(
+            contexts,
+            identifier_prefixes,
+        )
         region = self._city_regions.get(city_id, {})
         result: list[dict[str, object]] = []
         for vehicle in vehicles:
@@ -480,7 +501,7 @@ class GTFSRealtimeVehiclePositionsGateway:
                         candidate
                         for candidate in candidates
                         if _native_id(
-                            candidate[2], _context_identifier_prefix(candidate[0])
+                            candidate[2], identifier_prefixes[id(candidate[0])]
                         ) == vehicle.route_id
                     ]
                     if route_candidates_for_trip:
@@ -500,7 +521,10 @@ class GTFSRealtimeVehiclePositionsGateway:
 
             published_stop = vehicle.stop_id
             if context is not None and vehicle.stop_id:
-                candidate_stop = f"{_context_stop_prefix(context)}{vehicle.stop_id}"
+                candidate_stop = (
+                    f"{_context_stop_prefix(context, identifier_prefixes[id(context)])}"
+                    f"{vehicle.stop_id}"
+                )
                 if candidate_stop in context.stops:
                     published_stop = candidate_stop
 
@@ -607,7 +631,8 @@ class GTFSRealtimeTripUpdatesGateway(GTFSRealtimeGateway):
     ) -> list[dict[str, object]]:
         result: list[dict[str, object]] = []
         contexts = tuple(self._context_registry(city_id))
-        trip_candidates, _ = _candidate_contexts(contexts)
+        identifier_prefixes = _context_prefixes(contexts)
+        trip_candidates, _ = _candidate_contexts(contexts, identifier_prefixes)
         for update in updates:
             candidates = _trip_candidates_for_raw_id(trip_candidates, update.trip_id)
             if update.route_id:
@@ -615,7 +640,7 @@ class GTFSRealtimeTripUpdatesGateway(GTFSRealtimeGateway):
                     candidate
                     for candidate in candidates
                     if _native_id(
-                        candidate[2], _context_identifier_prefix(candidate[0])
+                        candidate[2], identifier_prefixes[id(candidate[0])]
                     ) == update.route_id
                 ]
                 if route_candidates_for_trip:
@@ -625,14 +650,19 @@ class GTFSRealtimeTripUpdatesGateway(GTFSRealtimeGateway):
             if not candidates:
                 continue
             context, internal_trip, internal_route = candidates[0]
-            internal_stop = f"{_context_stop_prefix(context)}{update.stop_id}"
+            internal_stop = (
+                f"{_context_stop_prefix(context, identifier_prefixes[id(context)])}"
+                f"{update.stop_id}"
+            )
             if internal_stop not in context.stops:
                 continue
             if internal_stop not in requested_stop_ids and update.stop_id not in requested_stop_ids:
                 continue
             result.append({
                 "tripID": internal_trip,
-                "routeID": internal_route or f"{_context_identifier_prefix(context)}{update.route_id}",
+                "routeID": internal_route or (
+                    f"{identifier_prefixes[id(context)]}{update.route_id}"
+                ),
                 "directionID": update.direction_id,
                 "stopID": internal_stop,
                 "stopSequence": update.stop_sequence,

@@ -2,6 +2,7 @@ import struct
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))
 
@@ -10,8 +11,10 @@ from fintraffic_gateway import (  # noqa: E402
     FINTRAFFIC_VEHICLE_POSITIONS_PATH,
     FintrafficProviderContext,
     FintrafficTripUpdatesGateway,
+    FintrafficVehiclePosition,
     FintrafficVehiclePositionsGateway,
     parse_vehicle_positions,
+    _context_identifier_prefix as _context_identifier_prefix_for_test,
 )
 
 
@@ -90,6 +93,128 @@ def context() -> FintrafficProviderContext:
 
 
 class FintrafficGatewayTests(unittest.TestCase):
+    def _vehicle_gateway(
+        self,
+        runtime_context: FintrafficProviderContext,
+    ) -> FintrafficVehiclePositionsGateway:
+        return FintrafficVehiclePositionsGateway(
+            city_ids={"turku"},
+            city_regions={"turku": {
+                "minimumLatitude": 60.0,
+                "maximumLatitude": 61.0,
+                "minimumLongitude": 21.0,
+                "maximumLongitude": 23.0,
+            }},
+            context_registry=lambda _city_id: (runtime_context,),
+            transport=lambda _url: vehicle_feed(),
+            clock=lambda: 1000.0,
+            strict_static_join=True,
+        )
+
+    def test_vehicle_filter_resolves_explicit_inferred_and_empty_prefix_once(self) -> None:
+        cases = (
+            ("explicit", context()),
+            ("inferred", FintrafficProviderContext(
+                provider_id="finland-foli",
+                identifier_prefix="",
+                stop_id_prefix="",
+                trips=frozenset({"fi-foli:trip-1"}),
+                routes=frozenset({"fi-foli:route-1"}),
+                route_by_trip={"fi-foli:trip-1": "fi-foli:route-1"},
+                stops=frozenset({"fi-foli:stop-1"}),
+            )),
+            ("empty", FintrafficProviderContext(
+                provider_id="generic-provider",
+                identifier_prefix="",
+                stop_id_prefix="",
+                trips=frozenset({"trip-1"}),
+                routes=frozenset({"route-1"}),
+                route_by_trip={"trip-1": "route-1"},
+                stops=frozenset({"stop-1"}),
+            )),
+        )
+
+        for name, runtime_context in cases:
+            with self.subTest(name=name), mock.patch(
+                "fintraffic_gateway._context_identifier_prefix",
+                wraps=_context_identifier_prefix_for_test,
+            ) as resolve_prefix:
+                response = self._vehicle_gateway(runtime_context).handle(
+                    FINTRAFFIC_VEHICLE_POSITIONS_PATH,
+                    {"cityID": ["turku"]},
+                )
+
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.payload["vehicleCount"], 1)
+            self.assertEqual(resolve_prefix.call_count, 1)
+
+    def test_vehicle_filter_large_context_does_not_infer_per_vehicle(self) -> None:
+        size = 4000
+        runtime_context = FintrafficProviderContext(
+            provider_id="finland-foli",
+            identifier_prefix="",
+            stop_id_prefix="",
+            trips=frozenset(f"fi-foli:trip-{index}" for index in range(size)),
+            routes=frozenset(f"fi-foli:route-{index}" for index in range(size)),
+            route_by_trip={
+                f"fi-foli:trip-{index}": f"fi-foli:route-{index}"
+                for index in range(size)
+            },
+            stops=frozenset({"fi-foli:stop-1"}),
+        )
+        vehicles = tuple(
+            FintrafficVehiclePosition(
+                vehicle_id=f"vehicle-{index}",
+                trip_id=f"trip-{index}",
+                route_id=f"route-{index}",
+                direction_id=None,
+                stop_id="stop-1",
+                stop_sequence=None,
+                latitude=60.45,
+                longitude=22.26,
+                bearing=None,
+                speed=None,
+                timestamp=1000,
+            )
+            for index in range(128)
+        )
+        gateway = self._vehicle_gateway(runtime_context)
+
+        with mock.patch(
+            "fintraffic_gateway._context_identifier_prefix",
+            wraps=_context_identifier_prefix_for_test,
+        ) as resolve_prefix:
+            result = gateway._filtered_vehicles("turku", vehicles, 1000.0)
+
+        self.assertEqual(len(result), len(vehicles))
+        self.assertEqual(resolve_prefix.call_count, 1)
+
+    def test_strict_filter_rejects_non_matching_vehicle_without_prefix_rescans(self) -> None:
+        runtime_context = context()
+        vehicle = FintrafficVehiclePosition(
+            vehicle_id="unknown-vehicle",
+            trip_id="unknown-trip",
+            route_id="unknown-route",
+            direction_id=None,
+            stop_id="stop-1",
+            stop_sequence=None,
+            latitude=60.45,
+            longitude=22.26,
+            bearing=None,
+            speed=None,
+            timestamp=1000,
+        )
+        gateway = self._vehicle_gateway(runtime_context)
+
+        with mock.patch(
+            "fintraffic_gateway._context_identifier_prefix",
+            wraps=_context_identifier_prefix_for_test,
+        ) as resolve_prefix:
+            result = gateway._filtered_vehicles("turku", (vehicle,), 1000.0)
+
+        self.assertEqual(result, [])
+        self.assertEqual(resolve_prefix.call_count, 1)
+
     def test_runtime_provider_context_infers_finland_namespace(self) -> None:
         runtime_context = FintrafficProviderContext(
             provider_id="finland-foli",
