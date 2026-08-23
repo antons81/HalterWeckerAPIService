@@ -9,7 +9,7 @@ import os
 import struct
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Callable, Iterable
 from urllib.error import HTTPError, URLError
@@ -46,6 +46,7 @@ class FintrafficProviderContext:
     routes: frozenset[str]
     route_by_trip: dict[str, str]
     stops: frozenset[str]
+    trip_headsign_by_trip: dict[str, str] = field(default_factory=dict)
 
 
 def _native_id(value: str, prefix: str) -> str:
@@ -494,6 +495,7 @@ class GTFSRealtimeVehiclePositionsGateway:
             context: FintrafficProviderContext | None = None
             published_trip = vehicle.trip_id
             published_route = vehicle.route_id
+            destination: str | None = None
             if vehicle.trip_id:
                 candidates = _trip_candidates_for_raw_id(trip_candidates, vehicle.trip_id)
                 if vehicle.route_id:
@@ -511,6 +513,8 @@ class GTFSRealtimeVehiclePositionsGateway:
                 if candidates:
                     context, published_trip, expected_route = candidates[0]
                     published_route = expected_route or published_route
+                    static_headsign = context.trip_headsign_by_trip.get(published_trip, "").strip()
+                    destination = static_headsign or None
             if context is None and vehicle.route_id:
                 candidates = route_candidates.get(vehicle.route_id, [])
                 if candidates:
@@ -533,6 +537,7 @@ class GTFSRealtimeVehiclePositionsGateway:
                 "tripID": published_trip,
                 "routeID": published_route,
                 "directionID": vehicle.direction_id,
+                "destination": destination,
                 "stopID": published_stop,
                 "stopSequence": vehicle.stop_sequence,
                 "latitude": vehicle.latitude,

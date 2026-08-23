@@ -96,6 +96,7 @@ def context(city_id: str) -> GTFSRealtimeProviderContext:
         routes=frozenset({f"au-seq:route-{suffix}"}),
         route_by_trip={f"au-seq:trip-{suffix}": f"au-seq:route-{suffix}"},
         stops=frozenset({f"au-seq:stop-{suffix}"}),
+        trip_headsign_by_trip={f"au-seq:trip-{suffix}": "Brisbane terminal"},
     )
 
 
@@ -289,6 +290,7 @@ class AustraliaGTFSRealtimeGatewayTests(unittest.TestCase):
             routes=frozenset({"au-seq:route-b"}),
             route_by_trip={"au-seq:trip-b": "au-seq:route-b"},
             stops=frozenset({"au-seq:stop-b"}),
+            trip_headsign_by_trip={"au-seq:trip-b": "Brisbane terminal"},
         )
         gateway = GTFSRealtimeVehiclePositionsGateway(
             provider_id="australia-translink-seq",
@@ -318,6 +320,7 @@ class AustraliaGTFSRealtimeGatewayTests(unittest.TestCase):
         self.assertEqual(response.payload["vehicles"][0]["tripID"], "au-seq:trip-b")
         self.assertEqual(response.payload["vehicles"][0]["routeID"], "au-seq:route-b")
         self.assertEqual(response.payload["vehicles"][0]["stopID"], "au-seq:stop-b")
+        self.assertEqual(response.payload["vehicles"][0]["destination"], "Brisbane terminal")
 
     def test_trip_updates_infer_legacy_static_namespace(self) -> None:
         legacy_context = GTFSRealtimeProviderContext(

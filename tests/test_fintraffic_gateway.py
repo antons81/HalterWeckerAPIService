@@ -1,6 +1,7 @@
 import struct
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -89,6 +90,7 @@ def context() -> FintrafficProviderContext:
         routes=frozenset({"fi-foli:route-1"}),
         route_by_trip={"fi-foli:trip-1": "fi-foli:route-1"},
         stops=frozenset({"fi-foli:stop-1"}),
+        trip_headsign_by_trip={"fi-foli:trip-1": "Turku Centre"},
     )
 
 
@@ -246,6 +248,39 @@ class FintrafficGatewayTests(unittest.TestCase):
         vehicle = response.payload["vehicles"][0]
         self.assertEqual(vehicle["tripID"], "fi-foli:trip-1")
         self.assertEqual(vehicle["routeID"], "fi-foli:route-1")
+
+    def test_vehicle_enriches_destination_from_static_trip_headsign(self) -> None:
+        response = self._vehicle_gateway(context()).handle(
+            FINTRAFFIC_VEHICLE_POSITIONS_PATH,
+            {"cityID": ["turku"]},
+        )
+
+        vehicle = response.payload["vehicles"][0]
+        self.assertEqual(vehicle["tripID"], "fi-foli:trip-1")
+        self.assertEqual(vehicle["destination"], "Turku Centre")
+
+    def test_direction_id_is_preserved_without_becoming_destination(self) -> None:
+        runtime_context = replace(context(), trip_headsign_by_trip={"fi-foli:trip-1": ""})
+        response = self._vehicle_gateway(runtime_context).handle(
+            FINTRAFFIC_VEHICLE_POSITIONS_PATH,
+            {"cityID": ["turku"]},
+        )
+
+        vehicle = response.payload["vehicles"][0]
+        self.assertEqual(vehicle["directionID"], "0")
+        self.assertIsNone(vehicle["destination"])
+
+    def test_multiple_vehicles_reuse_static_trip_headsign_map(self) -> None:
+        _timestamp, _entity_count, parsed = parse_vehicle_positions(vehicle_feed())
+        vehicles = (parsed[0], replace(parsed[0], vehicle_id="vehicle-2"))
+        result = self._vehicle_gateway(context())._filtered_vehicles(
+            "turku",
+            vehicles,
+            1000.0,
+        )
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual({item["destination"] for item in result}, {"Turku Centre"})
 
     def test_vehicle_parser_keeps_position_and_ignores_alert_entity(self) -> None:
         timestamp, entity_count, vehicles = parse_vehicle_positions(vehicle_feed())

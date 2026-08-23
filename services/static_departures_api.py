@@ -223,11 +223,19 @@ class Database:
         provider_id: str,
     ) -> tuple[set[str], set[str], dict[str, str]]:
         """Return internal trip/route ownership without exposing it publicly."""
+        trips, routes, route_by_trip, _headsigns = self.provider_realtime_metadata(provider_id)
+        return trips, routes, route_by_trip
+
+    def provider_realtime_metadata(
+        self,
+        provider_id: str,
+    ) -> tuple[set[str], set[str], dict[str, str], dict[str, str]]:
+        """Return owned trips/routes and static trip display metadata."""
         with self.lock:
             try:
                 rows = self._connection().execute(
                     """
-                    SELECT owned.key_1, trips.route_id
+                    SELECT owned.key_1, trips.route_id, trips.headsign
                     FROM provider_entities AS owned
                     JOIN trips ON trips.trip_id = owned.key_1
                     WHERE owned.entity_type='trips' AND owned.provider_id=?
@@ -242,11 +250,16 @@ class Database:
                     (provider_id,),
                 ).fetchall()
             except sqlite3.OperationalError:
-                return set(), set(), {}
+                return set(), set(), {}, {}
         trips = {str(row[0]) for row in rows}
         route_by_trip = {str(row[0]): str(row[1]) for row in rows if row[1]}
+        headsign_by_trip = {
+            str(row[0]): str(row[2] or "")
+            for row in rows
+            if row[0] is not None
+        }
         routes = {str(row[0]) for row in route_rows}
-        return trips, routes, route_by_trip
+        return trips, routes, route_by_trip, headsign_by_trip
 
     def provider_route_type_registry(self, provider_id: str) -> dict[str, str]:
         """Return internal route identities and their static GTFS route types."""
@@ -384,7 +397,7 @@ class Database:
         contexts: list[FintrafficProviderContext] = []
         for provider_id, stop_id_prefix, identifier_prefix in rows:
             provider = str(provider_id)
-            trips, routes, route_by_trip = self.provider_realtime_registry(provider)
+            trips, routes, route_by_trip, headsign_by_trip = self.provider_realtime_metadata(provider)
             contexts.append(
                 FintrafficProviderContext(
                     provider_id=provider,
@@ -394,6 +407,7 @@ class Database:
                     routes=frozenset(routes),
                     route_by_trip=dict(route_by_trip),
                     stops=frozenset(self.provider_stop_registry(provider)),
+                    trip_headsign_by_trip=dict(headsign_by_trip),
                 )
             )
         return tuple(contexts)
@@ -420,7 +434,7 @@ class Database:
         contexts: list[GTFSRealtimeProviderContext] = []
         for row_provider_id, stop_id_prefix, identifier_prefix in rows:
             source_id = str(row_provider_id)
-            trips, routes, route_by_trip = self.provider_realtime_registry(source_id)
+            trips, routes, route_by_trip, headsign_by_trip = self.provider_realtime_metadata(source_id)
             contexts.append(
                 GTFSRealtimeProviderContext(
                     provider_id=source_id,
@@ -430,6 +444,7 @@ class Database:
                     routes=frozenset(routes),
                     route_by_trip=dict(route_by_trip),
                     stops=frozenset(self.provider_stop_registry(source_id)),
+                    trip_headsign_by_trip=dict(headsign_by_trip),
                 )
             )
         return tuple(contexts)
