@@ -33,6 +33,14 @@ if [[ -f "$FINLAND_ENV_FILE" ]]; then
   source "$FINLAND_ENV_FILE"
   set +a
 fi
+
+AUSTRALIA_ENV_FILE="${AUSTRALIA_ENV_FILE:-/srv/haltewecker/secrets/australia/.env}"
+if [[ -f "$AUSTRALIA_ENV_FILE" ]]; then
+  set -a
+  source "$AUSTRALIA_ENV_FILE"
+  set +a
+fi
+
 DATA_ROOT="${DATA_ROOT:-/srv/haltewecker/data}"
 GTFS_URL="${GTFS_URL:?GTFS_URL is required}"
 STOP_DATA_PATH="${STOP_DATA_PATH:-$DATA_ROOT/current}"

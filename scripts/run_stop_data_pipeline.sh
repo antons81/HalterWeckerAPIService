@@ -44,6 +44,13 @@ if [[ -f "$FINLAND_ENV_FILE" ]]; then
   set +a
 fi
 
+AUSTRALIA_ENV_FILE="${AUSTRALIA_ENV_FILE:-/srv/haltewecker/secrets/australia/.env}"
+if [[ -f "$AUSTRALIA_ENV_FILE" ]]; then
+  set -a
+  source "$AUSTRALIA_ENV_FILE"
+  set +a
+fi
+
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 SUDO_BIN="${SUDO_BIN:-sudo}"
 STATIC_DEPARTURES_SERVICE="${STATIC_DEPARTURES_SERVICE:-haltewecker-static-departures.service}"

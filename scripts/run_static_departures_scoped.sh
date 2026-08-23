@@ -53,6 +53,13 @@ if [[ -f "$FINLAND_ENV_FILE" ]]; then
   set +a
 fi
 
+AUSTRALIA_ENV_FILE="${AUSTRALIA_ENV_FILE:-/srv/haltewecker/secrets/australia/.env}"
+if [[ -f "$AUSTRALIA_ENV_FILE" ]]; then
+  set -a
+  source "$AUSTRALIA_ENV_FILE"
+  set +a
+fi
+
 mkdir -p "$(dirname "$LOCK_PATH")"
 exec 9>"$LOCK_PATH"
 if ! "$FLOCK_BIN" -n 9; then
