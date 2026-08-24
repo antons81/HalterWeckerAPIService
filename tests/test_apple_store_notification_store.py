@@ -34,6 +34,19 @@ def make_event(notification_uuid: str = "notification-uuid") -> NormalizedAppleS
         signed_date=1_700_000_000_001,
         received_at=1_700_000_000_002,
         is_handled=True,
+        storefront="DEU",
+        price_milliunits=990,
+        currency="EUR",
+        transaction_reason="RENEWAL",
+        transaction_type="AUTO_RENEWABLE_SUBSCRIPTION",
+        offer_identifier="intro-offer",
+        offer_type="INTRODUCTORY_OFFER",
+        offer_discount_type="FREE_TRIAL",
+        offer_period="P1M",
+        is_upgraded=False,
+        revocation_reason=None,
+        revocation_type=None,
+        revocation_percentage=None,
     )
 
 
@@ -56,10 +69,20 @@ class AppleStoreNotificationStoreTests(unittest.TestCase):
                 "notification_uuid", "notification_type", "subtype", "app", "bundle_id",
                 "environment", "product_id", "purchase_kind", "transaction_id",
                 "original_transaction_id", "purchase_date", "expires_date",
-                "revocation_date", "auto_renew_status", "signed_date", "received_at",
-                "is_handled",
+                    "revocation_date", "auto_renew_status", "signed_date", "received_at",
+                "is_handled", "storefront", "price_milliunits", "currency",
+                "transaction_reason", "transaction_type", "offer_identifier",
+                "offer_type", "offer_discount_type", "offer_period", "is_upgraded",
+                "revocation_reason", "revocation_type", "revocation_percentage",
             })
-            self.assertEqual(row, ("notification-uuid", "com.asoft.haltewecker.monthly", "monthly"))
+            self.assertEqual(
+                row,
+                (
+                    "notification-uuid",
+                    "com.asoft.haltewecker.monthly",
+                    "monthly",
+                ),
+            )
             self.assertNotIn("signed_payload", columns)
             self.assertNotIn("signed_transaction_info", columns)
             self.assertNotIn("signed_renewal_info", columns)

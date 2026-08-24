@@ -10,6 +10,8 @@ COPY services/apple_store_notifications.py /app/apple_store_notifications.py
 COPY services/apple_store_business_events.py /app/apple_store_business_events.py
 COPY services/apple_store_notification_store.py /app/apple_store_notification_store.py
 COPY services/telegram_sales_notifier.py /app/telegram_sales_notifier.py
+COPY services/apple_store_weekly_report.py /app/apple_store_weekly_report.py
+COPY scripts/send_app_store_weekly_report.py /app/send_app_store_weekly_report.py
 COPY config/apple /app/config/apple
 
 ENV PYTHONDONTWRITEBYTECODE=1

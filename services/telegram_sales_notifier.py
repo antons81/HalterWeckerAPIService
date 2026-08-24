@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Callable, Mapping
+from datetime import datetime, timezone
+from decimal import Decimal
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -81,10 +83,86 @@ def _event_title(event: NormalizedAppleStoreEvent) -> tuple[str, str]:
     if notification_type == "GRACE_PERIOD_EXPIRED":
         return "⏳", "Subscription grace period expired"
     if notification_type == "DID_CHANGE_RENEWAL_STATUS":
+        if event.subtype == "AUTO_RENEW_DISABLED":
+            return "🔕", "Auto-renew disabled"
+        if event.subtype == "AUTO_RENEW_ENABLED":
+            return "🔔", "Auto-renew enabled"
         return "🔁", "Renewal status changed"
     if notification_type == "DID_CHANGE_RENEWAL_PREF":
         return "🔁", "Renewal preference changed"
     return "ℹ️", "Apple Store event"
+
+
+def _format_access_until(expires_date: int | None) -> str | None:
+    if expires_date is None:
+        return None
+    return datetime.fromtimestamp(
+        expires_date / 1000,
+        tz=timezone.utc,
+    ).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _renewal_status_lines(event: NormalizedAppleStoreEvent) -> list[str]:
+    if event.notification_type != "DID_CHANGE_RENEWAL_STATUS":
+        return []
+    if event.subtype == "AUTO_RENEW_DISABLED":
+        lines = []
+        if event.storefront:
+            lines.append(f"Storefront: {event.storefront}")
+        lines.append("Auto-renew: OFF")
+        access_until = _format_access_until(event.expires_date)
+        if access_until is not None:
+            lines.append(f"Access until: {access_until}")
+        return lines
+    if event.subtype == "AUTO_RENEW_ENABLED":
+        lines = []
+        if event.storefront:
+            lines.append(f"Storefront: {event.storefront}")
+        lines.append("Auto-renew: ON")
+        return lines
+    return []
+
+
+def _format_price(price_milliunits: int | None, currency: str | None) -> str | None:
+    if price_milliunits is None or not currency:
+        return None
+    amount = Decimal(price_milliunits) / Decimal(1000)
+    return f"{amount:.2f} {currency.upper()}"
+
+
+def _financial_detail_lines(event: NormalizedAppleStoreEvent) -> list[str]:
+    if event.notification_type not in {
+        "SUBSCRIBED",
+        "DID_RENEW",
+        "ONE_TIME_CHARGE",
+        "REFUND",
+        "REFUND_REVERSED",
+    }:
+        return []
+
+    lines: list[str] = []
+    if event.storefront:
+        lines.append(f"Storefront: {event.storefront}")
+    price = _format_price(event.price_milliunits, event.currency)
+    if price is not None:
+        lines.append(f"Price: {price}")
+    if event.transaction_reason:
+        lines.append(f"Transaction: {event.transaction_reason.capitalize()}")
+    if event.offer_type:
+        lines.append(f"Offer: {event.offer_type}")
+    if event.offer_identifier:
+        lines.append(f"Offer ID: {event.offer_identifier}")
+    if event.offer_discount_type == "FREE_TRIAL":
+        lines.append("Trial: Yes")
+    elif event.offer_discount_type:
+        lines.append(f"Offer discount: {event.offer_discount_type}")
+    if event.offer_period:
+        lines.append(f"Offer period: {event.offer_period}")
+    if event.revocation_type:
+        lines.append(f"Refund type: {event.revocation_type}")
+    if event.revocation_type == "REFUND_PRORATED" and event.revocation_percentage is not None:
+        lines.append(f"Refund percentage: {event.revocation_percentage}%")
+    return lines
 
 
 def format_sales_message(event: NormalizedAppleStoreEvent) -> str | None:
@@ -97,8 +175,10 @@ def format_sales_message(event: NormalizedAppleStoreEvent) -> str | None:
     lines = [
         f"{icon} {app_name}",
         title,
-        f"Environment: {_environment_label(event.environment)}",
     ]
+    lines.extend(_renewal_status_lines(event))
+    lines.extend(_financial_detail_lines(event))
+    lines.append(f"Environment: {_environment_label(event.environment)}")
     if event.product_id:
         lines.append(f"Product: {event.product_id}")
     return "\n".join(lines)
@@ -172,6 +252,9 @@ class TelegramSalesNotifier:
         message = format_test_message(event)
         self._send_message(event, message)
 
+    def send_report(self, message: str, *, environment: str = "Production") -> None:
+        self._send_text(environment, message)
+
     def _send_message(
         self,
         event: NormalizedAppleStoreEvent,
@@ -179,7 +262,10 @@ class TelegramSalesNotifier:
     ) -> None:
         if message is None:
             return
-        if event.environment.casefold() == "sandbox" and not self.notify_sandbox:
+        self._send_text(event.environment, message)
+
+    def _send_text(self, environment: str, message: str) -> None:
+        if environment.casefold() == "sandbox" and not self.notify_sandbox:
             return
 
         body = json.dumps(

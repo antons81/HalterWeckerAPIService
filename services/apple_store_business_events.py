@@ -65,6 +65,19 @@ class NormalizedAppleStoreEvent:
     signed_date: int | None
     received_at: int
     is_handled: bool
+    storefront: str | None = None
+    price_milliunits: int | None = None
+    currency: str | None = None
+    transaction_reason: str | None = None
+    transaction_type: str | None = None
+    offer_identifier: str | None = None
+    offer_type: str | None = None
+    offer_discount_type: str | None = None
+    offer_period: str | None = None
+    is_upgraded: bool | None = None
+    revocation_reason: int | None = None
+    revocation_type: str | None = None
+    revocation_percentage: int | None = None
 
 
 def _configured_path() -> Path:
@@ -135,6 +148,21 @@ def _raw_value(value: object, raw_name: str, enum_name: str) -> object:
     return getattr(enum_value, "value", enum_value)
 
 
+def _enum_text(value: object | None, raw_name: str, enum_name: str) -> str | None:
+    if value is None:
+        return None
+    enum_value = getattr(value, enum_name, None)
+    if enum_value is not None:
+        name = getattr(enum_value, "name", None)
+        if name is not None:
+            return str(name)
+        enum_raw_value = getattr(enum_value, "value", None)
+        if enum_raw_value is not None:
+            return str(enum_raw_value)
+    raw_value = getattr(value, raw_name, None)
+    return None if raw_value is None else str(raw_value)
+
+
 def _product_id(notification: VerifiedAppleNotification) -> str | None:
     transaction = notification.transaction_info
     renewal = notification.renewal_info
@@ -171,6 +199,55 @@ def normalize_notification(
     if hasattr(auto_renew_status, "value"):
         auto_renew_status = auto_renew_status.value
 
+    transaction_reason = _enum_text(
+        transaction,
+        "rawTransactionReason",
+        "transactionReason",
+    )
+    if transaction_reason is None:
+        transaction_reason = {
+            "SUBSCRIBED": "PURCHASE",
+            "DID_RENEW": "RENEWAL",
+            "ONE_TIME_CHARGE": "PURCHASE",
+        }.get(notification_type)
+
+    price_milliunits = (
+        getattr(transaction, "price", None)
+        if transaction is not None and getattr(transaction, "price", None) is not None
+        else getattr(renewal, "renewalPrice", None) if renewal else None
+    )
+    currency = (
+        getattr(transaction, "currency", None)
+        if transaction is not None and getattr(transaction, "currency", None) is not None
+        else getattr(renewal, "currency", None) if renewal else None
+    )
+    offer_identifier = (
+        getattr(transaction, "offerIdentifier", None)
+        if transaction is not None and getattr(transaction, "offerIdentifier", None) is not None
+        else getattr(renewal, "offerIdentifier", None) if renewal else None
+    )
+    offer_type = (
+        _enum_text(transaction, "rawOfferType", "offerType")
+        if transaction is not None and getattr(transaction, "offerType", None) is not None
+        else _enum_text(renewal, "rawOfferType", "offerType") if renewal else None
+    )
+    offer_discount_type = _enum_text(
+        transaction,
+        "rawOfferDiscountType",
+        "offerDiscountType",
+    )
+    if offer_discount_type is None and renewal is not None:
+        offer_discount_type = _enum_text(
+            renewal,
+            "rawOfferDiscountType",
+            "offerDiscountType",
+        )
+    offer_period = (
+        getattr(transaction, "offerPeriod", None)
+        if transaction is not None and getattr(transaction, "offerPeriod", None) is not None
+        else getattr(renewal, "offerPeriod", None) if renewal else None
+    )
+
     return NormalizedAppleStoreEvent(
         notification_uuid=notification.notification_uuid,
         notification_type=notification_type,
@@ -192,4 +269,17 @@ def normalize_notification(
         signed_date=notification.signed_date,
         received_at=received_at if received_at is not None else time.time_ns() // 1_000_000,
         is_handled=is_handled,
+        storefront=getattr(transaction, "storefront", None),
+        price_milliunits=price_milliunits,
+        currency=currency,
+        transaction_reason=transaction_reason,
+        transaction_type=_enum_text(transaction, "rawType", "type"),
+        offer_identifier=offer_identifier,
+        offer_type=offer_type,
+        offer_discount_type=offer_discount_type,
+        offer_period=offer_period,
+        is_upgraded=getattr(transaction, "isUpgraded", None),
+        revocation_reason=getattr(transaction, "rawRevocationReason", None),
+        revocation_type=_enum_text(transaction, "rawRevocationType", "revocationType"),
+        revocation_percentage=getattr(transaction, "revocationPercentage", None),
     )

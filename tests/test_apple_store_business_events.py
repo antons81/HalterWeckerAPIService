@@ -22,15 +22,21 @@ def make_notification(
     transaction_id: str | None = "transaction-id",
     original_transaction_id: str | None = "original-transaction-id",
     renewal: bool = False,
+    storefront: str | None = None,
 ) -> VerifiedAppleNotification:
     transaction = (
         SimpleNamespace(
             productId=product_id,
             transactionId=transaction_id,
             originalTransactionId=original_transaction_id,
+            transactionReason=("RENEWAL" if notification_type == "DID_RENEW" else "PURCHASE"),
+            rawTransactionReason=("RENEWAL" if notification_type == "DID_RENEW" else "PURCHASE"),
             purchaseDate=1_700_000_000_001,
             expiresDate=1_800_000_000_001,
             revocationDate=None,
+            price=990,
+            currency="EUR",
+            storefront=storefront,
         )
         if product_id and not renewal
         else None
@@ -42,6 +48,8 @@ def make_notification(
             originalTransactionId=original_transaction_id,
             rawAutoRenewStatus=1,
             autoRenewStatus=1,
+            renewalPrice=990,
+            currency="EUR",
         )
         if renewal
         else None
@@ -102,7 +110,22 @@ class AppleStoreBusinessEventTests(unittest.TestCase):
         self.assertEqual(event.product_id, "com.asoft.haltewecker.monthly")
         self.assertEqual(event.auto_renew_status, 1)
         self.assertEqual(event.original_transaction_id, "original-transaction-id")
+        self.assertEqual(event.transaction_reason, "RENEWAL")
+        self.assertEqual(event.price_milliunits, 990)
+        self.assertEqual(event.currency, "EUR")
         self.assertTrue(event.is_handled)
+
+    def test_storefront_is_preserved_from_transaction(self) -> None:
+        event = normalize_notification(
+            make_notification(
+                "DID_CHANGE_RENEWAL_STATUS",
+                "com.aSoft.HalteWecker",
+                "com.asoft.haltewecker.monthly",
+                storefront="DEU",
+            )
+        )
+
+        self.assertEqual(event.storefront, "DEU")
 
     def test_lifetime_current_legacy_and_pasty_are_non_subscription_events(self) -> None:
         cases = (

@@ -1,0 +1,10 @@
+[Unit]
+Description=Send weekly Apple Store sales report
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=deploy
+Group=deploy
+ExecStart=/usr/bin/docker exec app-store-notifications-api python3 /app/send_app_store_weekly_report.py

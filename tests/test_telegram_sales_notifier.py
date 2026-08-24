@@ -89,6 +89,106 @@ class TelegramSalesNotifierTests(unittest.TestCase):
             ),
         )
 
+    def test_format_auto_renew_disabled_message_with_access_until(self) -> None:
+        message = format_sales_message(
+            make_event(
+                notification_type="DID_CHANGE_RENEWAL_STATUS",
+                subtype="AUTO_RENEW_DISABLED",
+                expires_date=1_800_000_000_000,
+                storefront="DEU",
+            )
+        )
+
+        self.assertEqual(
+            message,
+            "🔕 HalteWecker\n"
+            "Auto-renew disabled\n"
+            "Storefront: DEU\n"
+            "Auto-renew: OFF\n"
+            "Access until: 2027-01-15 08:00 UTC\n"
+            "Environment: Production\n"
+            "Product: com.asoft.haltewecker.monthly",
+        )
+
+    def test_format_auto_renew_enabled_message(self) -> None:
+        message = format_sales_message(
+            make_event(
+                notification_type="DID_CHANGE_RENEWAL_STATUS",
+                subtype="AUTO_RENEW_ENABLED",
+                storefront="USA",
+            )
+        )
+
+        self.assertEqual(
+            message,
+            "🔔 HalteWecker\n"
+            "Auto-renew enabled\n"
+            "Storefront: USA\n"
+            "Auto-renew: ON\n"
+            "Environment: Production\n"
+            "Product: com.asoft.haltewecker.monthly",
+        )
+
+    def test_format_purchase_with_price_transaction_and_trial(self) -> None:
+        message = format_sales_message(
+            make_event(
+                storefront="DEU",
+                price_milliunits=990,
+                currency="EUR",
+                transaction_reason="PURCHASE",
+                offer_type="INTRODUCTORY_OFFER",
+                offer_identifier="intro-offer",
+                offer_discount_type="FREE_TRIAL",
+                offer_period="P1M",
+            )
+        )
+
+        self.assertEqual(
+            message,
+            "💰 HalteWecker\n"
+            "New monthly subscription\n"
+            "Storefront: DEU\n"
+            "Price: 0.99 EUR\n"
+            "Transaction: Purchase\n"
+            "Offer: INTRODUCTORY_OFFER\n"
+            "Offer ID: intro-offer\n"
+            "Trial: Yes\n"
+            "Offer period: P1M\n"
+            "Environment: Production\n"
+            "Product: com.asoft.haltewecker.monthly",
+        )
+
+    def test_format_refund_with_renewal_reason(self) -> None:
+        message = format_sales_message(
+            make_event(
+                notification_type="REFUND",
+                storefront="USA",
+                price_milliunits=4990,
+                currency="USD",
+                transaction_reason="RENEWAL",
+                revocation_type="REFUND_PRORATED",
+                revocation_percentage=50,
+            )
+        )
+
+        self.assertIn("Storefront: USA", message)
+        self.assertIn("Price: 4.99 USD", message)
+        self.assertIn("Transaction: Renewal", message)
+        self.assertIn("Refund type: REFUND_PRORATED", message)
+        self.assertIn("Refund percentage: 50%", message)
+
+    def test_unknown_renewal_status_subtype_keeps_generic_message(self) -> None:
+        message = format_sales_message(
+            make_event(
+                notification_type="DID_CHANGE_RENEWAL_STATUS",
+                subtype="UNKNOWN_SUBTYPE",
+            )
+        )
+
+        self.assertIn("Renewal status changed", message)
+        self.assertNotIn("Auto-renew:", message)
+        self.assertNotIn("Access until:", message)
+
     def test_format_test_message(self) -> None:
         self.assertEqual(
             format_test_message(
@@ -125,6 +225,19 @@ class TelegramSalesNotifierTests(unittest.TestCase):
         self.assertIn("New monthly subscription", body.decode())
         self.assertEqual(headers["Content-Type"], "application/json")
         self.assertEqual(timeout, 3.0)
+
+    def test_successful_report_send_uses_configured_transport(self) -> None:
+        calls: list[tuple[str, bytes, dict[str, str], float]] = []
+
+        def transport(url: str, body: bytes, headers: dict[str, str], timeout: float) -> int:
+            calls.append((url, body, headers, timeout))
+            return 200
+
+        notifier = TelegramSalesNotifier("token", "chat", transport=transport)
+        notifier.send_report("📊 weekly", environment="Production")
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("weekly", calls[0][1].decode())
 
     def test_api_failure_is_reported_without_exposing_token(self) -> None:
         notifier = TelegramSalesNotifier(

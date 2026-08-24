@@ -48,10 +48,48 @@ class AppleStoreNotificationStore:
                     auto_renew_status INTEGER,
                     signed_date INTEGER,
                     received_at INTEGER NOT NULL,
-                    is_handled INTEGER NOT NULL
+                    is_handled INTEGER NOT NULL,
+                    storefront TEXT,
+                    price_milliunits INTEGER,
+                    currency TEXT,
+                    transaction_reason TEXT,
+                    transaction_type TEXT,
+                    offer_identifier TEXT,
+                    offer_type TEXT,
+                    offer_discount_type TEXT,
+                    offer_period TEXT,
+                    is_upgraded INTEGER,
+                    revocation_reason INTEGER,
+                    revocation_type TEXT,
+                    revocation_percentage INTEGER
                 );
                 """
             )
+            existing_columns = {
+                row[1]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(apple_store_notification_events)"
+                )
+            }
+            for column, definition in (
+                ("storefront", "TEXT"),
+                ("price_milliunits", "INTEGER"),
+                ("currency", "TEXT"),
+                ("transaction_reason", "TEXT"),
+                ("transaction_type", "TEXT"),
+                ("offer_identifier", "TEXT"),
+                ("offer_type", "TEXT"),
+                ("offer_discount_type", "TEXT"),
+                ("offer_period", "TEXT"),
+                ("is_upgraded", "INTEGER"),
+                ("revocation_reason", "INTEGER"),
+                ("revocation_type", "TEXT"),
+                ("revocation_percentage", "INTEGER"),
+            ):
+                if column not in existing_columns:
+                    self._connection.execute(
+                        f"ALTER TABLE apple_store_notification_events ADD COLUMN {column} {definition}"
+                    )
 
     def insert_once(self, event: NormalizedAppleStoreEvent) -> bool:
         values = (
@@ -72,6 +110,19 @@ class AppleStoreNotificationStore:
             event.signed_date,
             event.received_at,
             int(event.is_handled),
+            event.storefront,
+            event.price_milliunits,
+            event.currency,
+            event.transaction_reason,
+            event.transaction_type,
+            event.offer_identifier,
+            event.offer_type,
+            event.offer_discount_type,
+            event.offer_period,
+            None if event.is_upgraded is None else int(event.is_upgraded),
+            event.revocation_reason,
+            event.revocation_type,
+            event.revocation_percentage,
         )
         with self._lock:
             try:
@@ -83,8 +134,15 @@ class AppleStoreNotificationStore:
                         environment, product_id, purchase_kind, transaction_id,
                         original_transaction_id, purchase_date, expires_date,
                         revocation_date, auto_renew_status, signed_date, received_at,
-                        is_handled
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        is_handled, storefront, price_milliunits, currency,
+                        transaction_reason, transaction_type, offer_identifier,
+                        offer_type, offer_discount_type, offer_period, is_upgraded,
+                        revocation_reason, revocation_type, revocation_percentage
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
                     ON CONFLICT(notification_uuid) DO NOTHING
                     """,
                     values,

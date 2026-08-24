@@ -1,0 +1,10 @@
+[Unit]
+Description=Run weekly Apple Store sales report every Sunday at 18:00 Europe/Berlin
+
+[Timer]
+OnCalendar=Sun *-*-* 18:00:00 Europe/Berlin
+Persistent=true
+Unit=app-store-weekly-report.service
+
+[Install]
+WantedBy=timers.target
