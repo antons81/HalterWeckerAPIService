@@ -7,14 +7,15 @@ import base64
 import json
 import math
 import os
-import sqlite3
 import shutil
+import sqlite3
 import tempfile
 import time
 import zipfile
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
-from typing import Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
@@ -70,6 +71,29 @@ except ImportError:
         artifact_provenance,
         canonical_content_provenance,
         provenance_record,
+    )
+
+try:
+    from .external_build_cache import (
+        CACHEABLE_PROVIDER_CITY_IDS,
+        CTA_PROVIDER_ID,
+        CacheKey,
+        CacheKeyUnavailable,
+        ExternalBuildCache,
+        cache_enabled,
+        cache_provider_allowed,
+        cache_key,
+    )
+except ImportError:
+    from external_build_cache import (
+        CACHEABLE_PROVIDER_CITY_IDS,
+        CTA_PROVIDER_ID,
+        CacheKey,
+        CacheKeyUnavailable,
+        ExternalBuildCache,
+        cache_enabled,
+        cache_provider_allowed,
+        cache_key,
     )
 
 
@@ -1960,6 +1984,80 @@ def build_external_trip_index_bounded(
 build_external_trip_index = build_external_trip_index_bounded
 
 
+def _timed_external_stage(
+    source_id: str,
+    stage: str,
+    operation: Callable[[], object],
+) -> object:
+    started = time.monotonic()
+    try:
+        result = operation()
+    except Exception:
+        print(
+            f"[StopData] source={source_id} stage={stage} status=failed "
+            f"duration={time.monotonic() - started:.2f}s",
+            flush=True,
+        )
+        raise
+    print(
+        f"[StopData] source={source_id} stage={stage} status=completed "
+        f"duration={time.monotonic() - started:.2f}s",
+        flush=True,
+    )
+    return result
+
+
+def _external_cache_is_eligible(
+    source: dict[str, object],
+    cities: list[dict[str, object]],
+) -> tuple[bool, str, str | None]:
+    provider_id = str(source.get("id"))
+    expected_city_id = CACHEABLE_PROVIDER_CITY_IDS.get(provider_id)
+    if expected_city_id is None:
+        return False, "provider-not-in-class-a", None
+    if len(cities) != 1 or str(cities[0].get("id")) != expected_city_id:
+        return False, "class-a-requires-single-configured-city", None
+    if str(source.get("namespace", "")):
+        return False, "namespaced-source-not-supported", None
+    if str(source.get("mergeGroup", "")).strip():
+        return False, "merged-source-not-supported", None
+    if source.get("supplementalStopCatalog") is not None:
+        return False, "supplemental-stop-catalog-not-supported", None
+    if source.get("agencyID") is not None:
+        return False, "agency-scoped-source-not-supported", None
+    if source.get("localPath") is not None:
+        return False, "local-staged-source-not-supported", None
+    if source.get("filterCitiesByProvider", False):
+        return False, "provider-filtered-city-set-not-supported", None
+    if source.get("buildStops", True) is not True:
+        return False, "stop-builder-disabled", None
+    if source.get("buildRoutes", True) is not True:
+        return False, "route-builder-disabled", None
+    if source.get("buildDepartures", True) is not True:
+        return False, "departure-builder-disabled", None
+    if source.get("buildRadarTopology", False) is not False:
+        return False, "radar-topology-not-supported", None
+    if str(source.get("stopIDMode", "exact")) != "exact":
+        return False, "stop-id-mode-not-supported", None
+    if source.get("exclusiveCityPartition", False) is not False:
+        return False, "exclusive-city-partition-not-supported", None
+    return True, "eligible", expected_city_id
+
+
+def _cached_external_manifest_entry(
+    city: dict[str, object],
+    stop_count: int,
+) -> dict[str, object]:
+    return {
+        "id": city["id"],
+        "name": city["name"],
+        "aliases": city.get("aliases", []),
+        "stopCount": stop_count,
+        "url": f"stops/{city['id']}.json",
+        **({"catalogOnly": True} if city.get("catalogOnly") is True else {}),
+    }
+
+
 def _merge_namespaced_city_records_bounded(
     city_id: str,
     records: list[dict[str, object]],
@@ -1968,8 +2066,10 @@ def _merge_namespaced_city_records_bounded(
     package_stops_by_city_id: dict[str, list[dict[str, object]]],
 ) -> None:
     """Merge namespaced assets via SQLite and stream every output JSON."""
+    total_started = time.monotonic()
     stage = ExternalMergeStage()
     try:
+        input_started = time.monotonic()
         for record in records:
             source_output = Path(record["output"])
             source_id = str(record["sourceID"])
@@ -1985,19 +2085,37 @@ def _merge_namespaced_city_records_bounded(
                 stage.add_departures(departure_path)
             if trip_path.exists():
                 stage.add_object_file(trip_path, "trips", source_id)
+        print(
+            f"[ExternalGTFS] city={city_id} stage=merge-input-read "
+            f"duration={time.monotonic() - input_started:.2f}s",
+            flush=True,
+        )
 
         if len(stage.timezones) > 1:
             raise ValueError(
                 f"Merged external city {city_id} has conflicting timezones: "
                 f"{sorted(stage.timezones)}"
             )
+        staging_started = time.monotonic()
+        stage.commit()
+        print(
+            f"[ExternalGTFS] city={city_id} stage=merge-sqlite-staging "
+            f"duration={time.monotonic() - staging_started:.2f}s",
+            flush=True,
+        )
         departure_count = stage.connection.execute(
             "SELECT count(*) FROM departures"
         ).fetchone()[0]
         if not departure_count:
             raise ValueError(f"Merged external city {city_id} has incomplete assets.")
 
+        output_started = time.monotonic()
         stop_count, _metadata = stage.write_outputs(output, city_id)
+        print(
+            f"[ExternalGTFS] city={city_id} stage=merge-output-assembly-write "
+            f"duration={time.monotonic() - output_started:.2f}s",
+            flush=True,
+        )
         merged_stops = [
             item for item in iter_json_array(output / "stops" / f"{city_id}.json")
             if isinstance(item, dict)
@@ -2015,7 +2133,18 @@ def _merge_namespaced_city_records_bounded(
             "_source": f"External GTFS namespaces: {source_ids}",
         })
     finally:
+        cleanup_started = time.monotonic()
         stage.close()
+        print(
+            f"[ExternalGTFS] city={city_id} stage=merge-cleanup "
+            f"duration={time.monotonic() - cleanup_started:.2f}s",
+            flush=True,
+        )
+        print(
+            f"[ExternalGTFS] city={city_id} stage=merge-total "
+            f"duration={time.monotonic() - total_started:.2f}s",
+            flush=True,
+        )
 
 
 def process_external_gtfs_sources(
@@ -2106,13 +2235,15 @@ def process_external_gtfs_sources(
             )
             continue
 
+        raw_artifact_digest: str | None = None
+        raw_artifact_size: int | None = None
         if Path(url).is_file() or Path(url).is_dir():
-            digest, size = artifact_provenance(Path(url))
+            raw_artifact_digest, raw_artifact_size = artifact_provenance(Path(url))
             input_provenance[source_id] = provenance_record(
                 source_id=source_id,
                 path=str(Path(url)),
-                digest=digest,
-                size=size,
+                digest=raw_artifact_digest,
+                size=raw_artifact_size,
                 origin="external-gtfs",
             )
         else:
@@ -2148,6 +2279,76 @@ def process_external_gtfs_sources(
                 }
                 external_cities_by_id[city_id] = city
 
+        build_cache: ExternalBuildCache | None = None
+        build_cache_key: CacheKey | None = None
+        build_cache_lookup = None
+        build_cache_hit = False
+        cache_city_id: str | None = None
+        if source_id in CACHEABLE_PROVIDER_CITY_IDS:
+            eligible, eligibility_reason, cache_city_id = _external_cache_is_eligible(
+                source, cities
+            )
+            if not cache_enabled(environ):
+                print(
+                    f"[StopData] source={source_id} stage=build-cache status=DISABLED "
+                    "reason=feature-gate-off"
+                )
+            elif not cache_provider_allowed(source_id, environ):
+                print(
+                    f"[StopData] source={source_id} stage=build-cache status=DISABLED "
+                    "reason=provider-not-allowlisted"
+                )
+            elif not eligible or cache_city_id is None:
+                print(
+                    f"[StopData] source={source_id} stage=build-cache status=DISABLED "
+                    f"reason={eligibility_reason}"
+                )
+            elif raw_artifact_digest is None:
+                print(
+                    f"[StopData] source={source_id} stage=build-cache status=MISS "
+                    "reason=raw-sha-unavailable rawSHA=n/a "
+                    "providerConfig=n/a builder=n/a"
+                )
+            elif gtfs_cache is None:
+                print(
+                    f"[StopData] source={source_id} stage=build-cache status=MISS "
+                    "reason=cache-root-unavailable rawSHA="
+                    f"{raw_artifact_digest[:12]} providerConfig=n/a builder=n/a"
+                )
+            else:
+                try:
+                    build_cache_key = cache_key(
+                        repository_root=repository_root,
+                        provider_id=source_id,
+                        raw_sha256=raw_artifact_digest,
+                        source=source,
+                        city_id=cache_city_id,
+                    )
+                    build_cache = ExternalBuildCache(
+                        Path(gtfs_cache.root) / "external-build",
+                        provider_id=source_id,
+                        city_id=cache_city_id,
+                    )
+                    lookup_started = time.monotonic()
+                    build_cache_lookup = build_cache.lookup(build_cache_key)
+                    build_cache_hit = build_cache_lookup.status == "HIT"
+                    print(
+                        f"[StopData] source={source_id} stage=build-cache "
+                        f"status={build_cache_lookup.status} reason={build_cache_lookup.reason} "
+                        f"duration={time.monotonic() - lookup_started:.2f}s "
+                        f"key={build_cache_key.value[:12]} rawSHA={raw_artifact_digest[:12]} "
+                        f"providerConfig={build_cache_key.provider_config_fingerprint[:12]} "
+                        f"builder={build_cache_key.builder_fingerprint[:12]}"
+                    )
+                except (CacheKeyUnavailable, OSError, ValueError) as error:
+                    build_cache = None
+                    build_cache_key = None
+                    print(
+                        f"[StopData] source={source_id} stage=build-cache status=MISS "
+                        f"reason=fingerprint-unavailable:{type(error).__name__} "
+                        f"rawSHA={raw_artifact_digest[:12]} providerConfig=n/a builder=n/a"
+                    )
+
         request_url, headers = authenticated_external_request(
             source_id, url, environ=environ
         )
@@ -2169,12 +2370,12 @@ def process_external_gtfs_sources(
                 ),
             )
             archive = load_gtfs_archive(str(result.path))
-            digest, size = artifact_provenance(result.path)
+            raw_artifact_digest, raw_artifact_size = artifact_provenance(result.path)
             input_provenance[source_id] = provenance_record(
                 source_id=source_id,
                 path=str(result.path),
-                digest=digest,
-                size=size,
+                digest=raw_artifact_digest,
+                size=raw_artifact_size,
                 origin="external-gtfs-cache",
                 status=result.status,
             ) | {"resourceIdentity": url}
@@ -2225,26 +2426,72 @@ def process_external_gtfs_sources(
             source_output.mkdir(parents=True, exist_ok=True)
         try:
             package_stops: dict[str, list[dict[str, object]]] = {}
+            entries: list[dict[str, object]] = []
+            provider_lines: dict[str, dict[str, dict[str, object]]] = {}
+            if (
+                build_cache_hit
+                and build_cache is not None
+                and build_cache_lookup is not None
+                and cache_city_id is not None
+            ):
+                restore_started = time.monotonic()
+                try:
+                    restored = build_cache.restore(build_cache_lookup, source_output)
+                    package_stops = {cache_city_id: restored.stops}
+                    provider_lines = restored.lines_by_stop_id
+                    entries = [
+                        _cached_external_manifest_entry(
+                            cities[0], len(restored.stops)
+                        )
+                    ]
+                    print(
+                        f"[StopData] source={source_id} stage=cache-restore "
+                        "status=completed "
+                        f"duration={time.monotonic() - restore_started:.2f}s "
+                        "mode=copy artifacts=stops,routes,lineMembership"
+                    )
+                except (OSError, TypeError, ValueError) as error:
+                    build_cache_hit = False
+                    if build_cache_lookup.directory is not None:
+                        shutil.rmtree(build_cache_lookup.directory, ignore_errors=True)
+                    print(
+                        f"[StopData] source={source_id} stage=build-cache "
+                        "status=INVALID reason=restore-failed "
+                        f"error={type(error).__name__} "
+                        f"duration={time.monotonic() - restore_started:.2f}s"
+                    )
+
             if source.get("buildStops", True):
-                entries, package_stops = build_external_stop_packages(
-                    archive,
-                    cities,
-                    source_output,
-                    stop_id_mode=str(source.get("stopIDMode", "exact")),
-                    namespace=namespace,
-                    publish_passenger_stop_ids=bool(
-                        source.get("publishPassengerStopIDs", False)
-                    ),
-                    supplemental_stop_catalog=supplemental_stop_catalog,
-                    supplemental_catalog_configuration=(
-                        supplemental_catalog_configuration
-                        if isinstance(supplemental_catalog_configuration, dict)
-                        else None
-                    ),
-                    exclusive_city_partition=bool(
-                        source.get("exclusiveCityPartition", False)
-                    ),
-                )
+                if not build_cache_hit:
+                    entries, package_stops = _timed_external_stage(
+                        source_id,
+                        "stops",
+                        partial(
+                            build_external_stop_packages,
+                            archive,
+                            cities,
+                            source_output,
+                            stop_id_mode=str(source.get("stopIDMode", "exact")),
+                            namespace=namespace,
+                            publish_passenger_stop_ids=bool(
+                                source.get("publishPassengerStopIDs", False)
+                            ),
+                            supplemental_stop_catalog=supplemental_stop_catalog,
+                            supplemental_catalog_configuration=(
+                                supplemental_catalog_configuration
+                                if isinstance(supplemental_catalog_configuration, dict)
+                                else None
+                            ),
+                            exclusive_city_partition=bool(
+                                source.get("exclusiveCityPartition", False)
+                            ),
+                        ),
+                    )
+                else:
+                    print(
+                        f"[StopData] source={source_id} stage=stops "
+                        "status=cache-hit duration=0.00s"
+                    )
                 if namespace or str(source.get("mergeGroup", "")).strip():
                     for city in cities:
                         city_id = str(city["id"])
@@ -2267,29 +2514,55 @@ def process_external_gtfs_sources(
                     package_stops_by_city_id.update(package_stops)
 
             if source.get("buildRoutes", True):
-                build_external_route_index(
-                    archive,
-                    cities,
-                    source_output,
-                    namespace=namespace,
-                )
+                if not build_cache_hit:
+                    _timed_external_stage(
+                        source_id,
+                        "routes",
+                        partial(
+                            build_external_route_index,
+                            archive,
+                            cities,
+                            source_output,
+                            namespace=namespace,
+                        ),
+                    )
+                else:
+                    print(
+                        f"[StopData] source={source_id} stage=routes "
+                        "status=cache-hit duration=0.00s"
+                    )
 
             if source.get("buildDepartures", True):
-                build_external_departure_index(
-                    archive,
-                    cities,
-                    source_output,
-                    timezone_name=str(source["timezone"]),
-                    namespace=namespace,
-                    departure_window_days=int(source.get("departurePackageDays", 3)),
+                _timed_external_stage(
+                    source_id,
+                    "departures",
+                    partial(
+                        build_external_departure_index,
+                        archive,
+                        cities,
+                        source_output,
+                        timezone_name=str(source["timezone"]),
+                        namespace=namespace,
+                        departure_window_days=int(source.get("departurePackageDays", 3)),
+                    ),
                 )
 
             if source.get("buildTripIndex", True):
-                build_external_trip_index(
-                    archive,
-                    cities,
-                    source_output,
-                    namespace=namespace,
+                _timed_external_stage(
+                    source_id,
+                    "trip-index",
+                    partial(
+                        build_external_trip_index,
+                        archive,
+                        cities,
+                        source_output,
+                        namespace=namespace,
+                    ),
+                )
+            elif source_id == CTA_PROVIDER_ID:
+                print(
+                    f"[StopData] source={source_id} stage=trip-index "
+                    "status=skipped reason=provider-config-disabled duration=0.00s"
                 )
 
             if source.get("buildRadarTopology", False):
@@ -2313,13 +2586,48 @@ def process_external_gtfs_sources(
                             )
 
             if package_stops:
-                lines_by_stop_id.update(
-                    build_external_lines(
-                        archive,
-                        package_stops,
-                        namespace=namespace,
+                if not build_cache_hit:
+                    provider_lines = _timed_external_stage(
+                        source_id,
+                        "lines",
+                        partial(
+                            build_external_lines,
+                            archive,
+                            package_stops,
+                            namespace=namespace,
+                        ),
                     )
-                )
+                else:
+                    print(
+                        f"[StopData] source={source_id} stage=lines "
+                        "status=cache-hit duration=0.00s"
+                    )
+                lines_by_stop_id.update(provider_lines)
+
+            if (
+                build_cache is not None
+                and build_cache_key is not None
+                and not build_cache_hit
+            ):
+                persist_started = time.monotonic()
+                try:
+                    build_cache.persist(
+                        build_cache_key,
+                        source_output,
+                        provider_lines,
+                    )
+                    print(
+                        f"[StopData] source={source_id} stage=cache-persist "
+                        "status=completed "
+                        f"duration={time.monotonic() - persist_started:.2f}s"
+                    )
+                except (OSError, TypeError, ValueError) as error:
+                    print(
+                        f"[StopData] source={source_id} stage=cache-persist "
+                        "status=failed "
+                        f"reason={type(error).__name__} "
+                        f"duration={time.monotonic() - persist_started:.2f}s"
+                    )
         finally:
             archive.close()
 
@@ -2329,12 +2637,18 @@ def process_external_gtfs_sources(
         )
 
     for city_id, records in namespaced_records.items():
+        merge_group_started = time.monotonic()
         _merge_namespaced_city_records_bounded(
             city_id,
             records,
             output,
             manifest_entries,
             package_stops_by_city_id,
+        )
+        print(
+            f"[ExternalGTFS] city={city_id} stage=merge-group "
+            f"duration={time.monotonic() - merge_group_started:.2f}s",
+            flush=True,
         )
         continue
 
@@ -2458,6 +2772,7 @@ def process_external_gtfs_sources(
         })
         package_stops_by_city_id[city_id] = merged_stops
 
+    provenance_started = time.monotonic()
     provenance_directory = output / "provenance"
     provenance_directory.mkdir(parents=True, exist_ok=True)
     (provenance_directory / "input-artifacts.json").write_text(
@@ -2468,8 +2783,19 @@ def process_external_gtfs_sources(
         ),
         encoding="utf-8",
     )
+    print(
+        "[ExternalGTFS] stage=merge-provenance "
+        f"duration={time.monotonic() - provenance_started:.2f}s",
+        flush=True,
+    )
 
+    cleanup_started = time.monotonic()
     shutil.rmtree(namespace_root, ignore_errors=True)
+    print(
+        "[ExternalGTFS] stage=merge-cleanup "
+        f"duration={time.monotonic() - cleanup_started:.2f}s",
+        flush=True,
+    )
     return (
         manifest_entries,
         list(external_cities_by_id.values()),
