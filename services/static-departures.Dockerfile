@@ -21,8 +21,12 @@ COPY services/kyiv_gateway.py /app/kyiv_gateway.py
 COPY services/kyiv_radar_inference.py /app/kyiv_radar_inference.py
 COPY services/stm_gateway.py /app/stm_gateway.py
 COPY services/fintraffic_gateway.py /app/fintraffic_gateway.py
+COPY services/poland_gateway.py /app/poland_gateway.py
+COPY scripts/dynamic_resource_resolver.py /app/dynamic_resource_resolver.py
 COPY config/apple /app/config/apple
 COPY config/finland-cities.json /app/config/finland-cities.json
+COPY config/poland-cities.json /app/config/poland-cities.json
+COPY config/poland-sources.json /app/config/poland-sources.json
 EXPOSE 8080
 HEALTHCHECK --interval=15s --timeout=3s --retries=3 CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/static-departures/health', timeout=2)"
 CMD ["python3", "/app/static_departures_api.py"]

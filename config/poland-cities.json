@@ -1,0 +1,2077 @@
+[
+  {
+    "id": "warsaw",
+    "name": "Warszawa",
+    "aliases": ["Warsaw", "Warszawa"],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 52.2297,
+    "longitude": 21.0122,
+    "radiusMeters": 42000,
+    "packageMode": "external",
+    "externalGTFSProviders": ["poland-warsaw", "poland-wkd"],
+    "transitRadar": [
+      {
+        "providerID": "poland-warsaw",
+        "adapter": "externalGTFS",
+        "isEnabled": true,
+        "isExperimental": true,
+        "features": ["liveVehicles", "firstDepartures", "stopLookup", "vehiclePositions", "alerts"],
+        "staticBaseURL": "https://api.asoftlabs.app",
+        "boardURL": "https://api.asoftlabs.app/static-departures",
+        "realtimeURL": "https://api.asoftlabs.app/poland/warsaw/realtime/vehicle-positions",
+        "alertsURL": "https://api.asoftlabs.app/poland/warsaw/realtime/alerts",
+        "region": {"minimumLongitude": 20.65, "minimumLatitude": 52.00, "maximumLongitude": 21.40, "maximumLatitude": 52.45},
+        "staticModes": ["bus", "tram", "metro", "train"],
+        "vehiclePositionModes": ["bus", "tram", "metro", "train"],
+        "alertModes": ["bus", "tram", "metro", "train"],
+        "sourceName": "Mikołaj Kuranowski / Warsaw City Hall open data",
+        "sourceURL": "https://mkuran.pl/gtfs/",
+        "sourceType": "community",
+        "license": "ZTM Warszawa Data Usage Terms, Warsaw Open Data Project Usage Terms, ODbL for bus shapes",
+        "attribution": "ZTM Warszawa, Miasto Stołeczne Warszawa, Mikołaj Kuranowski and OpenStreetMap contributors",
+        "supportsVehiclePositions": true,
+        "supportsTripUpdates": false,
+        "supportsAlerts": true,
+        "statusMessage": "Warszawa Live-Radar aus validierten Community-GPS-Daten"
+      },
+      {
+        "providerID": "poland-wkd",
+        "adapter": "externalGTFS",
+        "isEnabled": true,
+        "isExperimental": true,
+        "features": ["realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay", "tripUpdates"],
+        "staticBaseURL": "https://api.asoftlabs.app",
+        "boardURL": "https://api.asoftlabs.app/static-departures",
+        "tripUpdatesURL": "https://api.asoftlabs.app/poland/wkd/realtime/trip-updates",
+        "staticModes": ["train"],
+        "realtimeDepartureModes": ["train"],
+        "sourceName": "Mikołaj Kuranowski / Warszawska Kolej Dojazdowa",
+        "sourceURL": "https://mkuran.pl/gtfs/",
+        "sourceType": "community",
+        "license": "CC0 1.0",
+        "attribution": "Warszawska Kolej Dojazdowa and Mikołaj Kuranowski",
+        "supportsVehiclePositions": false,
+        "supportsTripUpdates": true,
+        "supportsAlerts": false,
+        "statusMessage": "WKD Live-Abfahrten"
+      }
+    ]
+  },
+  {
+    "id": "krakow",
+    "name": "Kraków",
+    "aliases": ["Krakow", "Cracow"],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 50.0647,
+    "longitude": 19.9450,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProviders": ["poland-krakow-a", "poland-krakow-m", "poland-krakow-t"],
+    "transitRadar": {
+      "providerID": "poland-krakow",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay", "tripUpdates", "vehiclePositions", "alerts", "stopSequence"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/krakow/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/krakow/realtime/trip-updates",
+      "alertsURL": "https://api.asoftlabs.app/poland/krakow/realtime/alerts",
+      "region": {"minimumLongitude": 19.65, "minimumLatitude": 49.85, "maximumLongitude": 20.25, "maximumLatitude": 50.30},
+      "staticModes": ["bus", "tram"],
+      "realtimeDepartureModes": ["bus", "tram"],
+      "vehiclePositionModes": ["bus", "tram"],
+      "alertModes": ["bus", "tram"],
+      "sourceName": "Zarząd Transportu Publicznego w Krakowie",
+      "sourceURL": "https://gtfs.ztp.krakow.pl/",
+      "sourceType": "official",
+      "license": "Official ZTP Kraków open-data terms",
+      "attribution": "Zarząd Transportu Publicznego w Krakowie",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": true,
+      "supportsAlerts": true,
+      "statusMessage": "Kraków Live-Radar und Live-Abfahrten"
+    }
+  },
+  {
+    "id": "poznan",
+    "name": "Poznań",
+    "aliases": ["Poznan"],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 52.4064,
+    "longitude": 16.9252,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-poznan",
+    "transitRadar": {
+      "providerID": "poland-poznan",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay", "tripUpdates", "vehiclePositions", "stopSequence"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/poznan/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/poznan/realtime/trip-updates",
+      "region": {"minimumLongitude": 16.55, "minimumLatitude": 52.20, "maximumLongitude": 17.30, "maximumLatitude": 52.65},
+      "staticModes": ["bus", "tram"],
+      "realtimeDepartureModes": ["bus", "tram"],
+      "vehiclePositionModes": ["bus", "tram"],
+      "sourceName": "ZTM Poznań",
+      "sourceURL": "https://www.ztm.poznan.pl/otwarte-dane/gtfs-rt/",
+      "sourceType": "official",
+      "license": "Official ZTM Poznań open-data terms",
+      "attribution": "Zarząd Transportu Miejskiego w Poznaniu",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": true,
+      "supportsAlerts": false,
+      "statusMessage": "Poznań Live-Radar und Live-Abfahrten"
+    }
+  },
+  {
+    "id": "lodz",
+    "name": "Łódź",
+    "aliases": ["Lodz", "Łódź"],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 51.7592,
+    "longitude": 19.4560,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-lodz",
+    "transitRadar": {
+      "providerID": "poland-lodz",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay", "tripUpdates", "vehiclePositions", "alerts", "stopSequence"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/lodz/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/lodz/realtime/trip-updates",
+      "alertsURL": "https://api.asoftlabs.app/poland/lodz/realtime/alerts",
+      "region": {"minimumLongitude": 19.15, "minimumLatitude": 51.55, "maximumLongitude": 19.80, "maximumLatitude": 51.95},
+      "staticModes": ["bus", "tram"],
+      "realtimeDepartureModes": ["bus", "tram"],
+      "vehiclePositionModes": ["bus", "tram"],
+      "alertModes": ["bus", "tram"],
+      "sourceName": "Łódź open data",
+      "sourceURL": "https://otwarte.miasto.lodz.pl/transport_komunikacja/",
+      "sourceType": "official",
+      "license": "Official Łódź open-data terms",
+      "attribution": "Miasto Łódź",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": true,
+      "supportsAlerts": true,
+      "statusMessage": "Łódź Live-Radar und Live-Abfahrten"
+    }
+  },
+  {
+    "id": "szczecin",
+    "name": "Szczecin",
+    "aliases": ["Stettin"],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 53.4285,
+    "longitude": 14.5528,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-szczecin",
+    "transitRadar": {
+      "providerID": "poland-szczecin",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay", "tripUpdates", "vehiclePositions", "alerts", "stopSequence"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/szczecin/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/szczecin/realtime/trip-updates",
+      "alertsURL": "https://api.asoftlabs.app/poland/szczecin/realtime/alerts",
+      "region": {"minimumLongitude": 14.15, "minimumLatitude": 53.15, "maximumLongitude": 14.95, "maximumLatitude": 53.75},
+      "staticModes": ["bus", "tram"],
+      "realtimeDepartureModes": ["bus", "tram"],
+      "vehiclePositionModes": ["bus", "tram"],
+      "alertModes": ["bus", "tram"],
+      "sourceName": "ZDiTM Szczecin",
+      "sourceURL": "https://www.zditm.szczecin.pl/en/zditm/for-developers/gtfs",
+      "sourceType": "official",
+      "license": "CC0 1.0",
+      "attribution": "Zarząd Dróg i Transportu Miejskiego w Szczecinie",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": true,
+      "supportsAlerts": true,
+      "statusMessage": "Szczecin Live-Radar und Live-Abfahrten"
+    }
+  },
+  {
+    "id": "katowice",
+    "name": "Katowice / GZM",
+    "aliases": ["Katowice", "GZM", "Gliwice", "Sosnowiec", "Zabrze", "Bytom", "Chorzów", "Dąbrowa Górnicza", "Tychy", "Ruda Śląska", "Mysłowice", "Siemianowice Śląskie", "Świętochłowice", "Będzin", "Tarnowskie Góry", "Piekary Śląskie"],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 50.2649,
+    "longitude": 19.0238,
+    "radiusMeters": 60000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-gzm",
+    "transitRadar": {
+      "providerID": "poland-gzm",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay", "tripUpdates", "vehiclePositions", "stopSequence"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/gzm/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/gzm/realtime/trip-updates",
+      "region": {"minimumLongitude": 17.90, "minimumLatitude": 49.85, "maximumLongitude": 19.95, "maximumLatitude": 50.75},
+      "staticModes": ["bus", "tram"],
+      "realtimeDepartureModes": ["bus", "tram"],
+      "vehiclePositionModes": ["bus", "tram"],
+      "sourceName": "Zarząd Transportu Metropolitalnego / GZM",
+      "sourceURL": "https://otwartedane.metropoliagzm.pl/dataset/rozklady-jazdy-i-lokalizacja-przystankow-gtfs-wersja-rozszerzona",
+      "sourceType": "official",
+      "license": "Creative Commons Attribution",
+      "attribution": "Zarząd Transportu Metropolitalnego / GZM",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": true,
+      "supportsAlerts": false,
+      "statusMessage": "GZM Live-Radar und Live-Abfahrten"
+    }
+  },
+  {
+    "id": "gdansk",
+    "name": "Gdańsk",
+    "aliases": ["Gdansk"],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 54.3520,
+    "longitude": 18.6466,
+    "radiusMeters": 35000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-gdansk",
+    "transitRadar": {
+      "providerID": "poland-gdansk",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": ["liveVehicles", "realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay", "tripUpdates", "vehiclePositions", "stopSequence"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/gdansk/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/gdansk/realtime/trip-updates",
+      "region": {"minimumLongitude": 18.20, "minimumLatitude": 54.15, "maximumLongitude": 19.10, "maximumLatitude": 54.65},
+      "staticModes": ["bus", "tram", "train"],
+      "realtimeDepartureModes": ["bus", "tram", "train"],
+      "vehiclePositionModes": ["bus", "tram", "train"],
+      "sourceName": "TRISTAR / Gdańsk open data",
+      "sourceURL": "https://ckan.multimediagdansk.pl/dataset/tristar",
+      "sourceType": "official",
+      "license": "Creative Commons Attribution + dataset terms",
+      "attribution": "Gdańsk public transport / TRISTAR",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": true,
+      "supportsAlerts": false,
+      "statusMessage": "Gdańsk Live-Radar und Live-Abfahrten"
+    }
+  },
+  {
+    "id": "wroclaw",
+    "name": "Wrocław",
+    "aliases": ["Wroclaw"],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 51.1079,
+    "longitude": 17.0385,
+    "radiusMeters": 35000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-wroclaw",
+    "transitRadar": {
+      "providerID": "poland-wroclaw",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": true,
+      "features": ["firstDepartures", "stopLookup"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "staticModes": ["bus", "tram"],
+      "sourceName": "Otwarty Wrocław",
+      "sourceURL": "https://open-data.cui.wroclaw.pl/hdb/db/14",
+      "sourceType": "official",
+      "license": "CC0 1.0",
+      "attribution": "Otwarty Wrocław / Miasto Wrocław",
+      "supportsVehiclePositions": false,
+      "supportsTripUpdates": false,
+      "supportsAlerts": false,
+      "statusMessage": "Wrocław Statische Abfahrten; offizieller GPS-Health-Check"
+    }
+  },
+  {
+    "id": "gdynia",
+    "name": "Gdynia",
+    "aliases": [],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 54.5189,
+    "longitude": 18.5305,
+    "radiusMeters": 28000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-gdynia",
+    "transitRadar": {
+      "providerID": "poland-gdynia",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": ["realtimeDepartures", "firstDepartures", "stopLookup", "realtimeDelay", "tripUpdates"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/gdynia/realtime/trip-updates",
+      "staticModes": ["bus", "trolleybus"],
+      "realtimeDepartureModes": ["bus", "trolleybus"],
+      "sourceName": "ZDiZ Gdynia / TRISTAR",
+      "sourceURL": "https://otwartedane.gdynia.pl/",
+      "sourceType": "official",
+      "license": "Creative Commons Attribution + dataset terms",
+      "attribution": "Zarząd Dróg i Zieleni w Gdyni",
+      "supportsVehiclePositions": false,
+      "supportsTripUpdates": false,
+      "supportsAlerts": false,
+      "statusMessage": "Gdynia Live-Abfahrten; Radar nicht verfügbar"
+    }
+  },
+    {
+  "id": "lublin",
+    "name": "Lublin",
+    "aliases": [
+      "Lublin"
+    ],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 51.2465,
+    "longitude": 22.5684,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-lublin",
+    "transitRadar": {
+      "providerID": "poland-lublin",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "vehiclePositions",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/lublin/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/lublin/realtime/trip-updates",
+      "region": {
+        "minimumLongitude": 21.9184,
+        "minimumLatitude": 50.7965,
+        "maximumLongitude": 23.2184,
+        "maximumLatitude": 51.6965
+      },
+      "staticModes": [
+        "bus",
+        "trolleybus"
+      ],
+      "realtimeDepartureModes": [
+        "bus",
+        "trolleybus"
+      ],
+      "vehiclePositionModes": [
+        "bus",
+        "trolleybus"
+      ],
+      "sourceName": "Mikołaj Kuranowski / ZDiTM Lublin",
+      "sourceURL": "https://mkuran.pl/gtfs/",
+      "sourceType": "community",
+      "license": "CC0 1.0",
+      "attribution": "ZDiTM Lublin and Mikołaj Kuranowski",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": true,
+      "supportsAlerts": false,
+      "statusMessage": "Lublin Live-Radar und Live-Abfahrten"
+    }
+  },
+    {
+    "id": "kielce",
+    "name": "Kielce",
+    "aliases": [],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 50.8661,
+    "longitude": 20.6286,
+    "radiusMeters": 28000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-kielce",
+    "transitRadar": {
+      "providerID": "poland-kielce",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "firstDepartures",
+        "stopLookup"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "staticModes": [
+        "bus"
+      ],
+      "sourceName": "Mikołaj Kuranowski / Urząd Miasta Kielce - Zarząd Transportu Miejskiego",
+      "sourceURL": "https://mkuran.pl/gtfs/",
+      "sourceType": "community",
+      "license": "Kielce City public-sector data usage terms",
+      "attribution": "Urząd Miasta Kielce - Zarząd Transportu Miejskiego; include the download timestamp; source data has been processed; Urząd Miasta Kielce is not responsible for processing, publishing, or re-use.",
+      "supportsVehiclePositions": false,
+      "supportsTripUpdates": false,
+      "supportsAlerts": false,
+      "statusMessage": "Kielce Statische Abfahrten; realtime ID compatibility blocker"
+    }
+  },
+  {
+    "id": "czestochowa",
+    "name": "Częstochowa",
+    "aliases": [
+      "Czestochowa"
+    ],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 50.8118,
+    "longitude": 19.1203,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-czestochowa",
+    "transitRadar": {
+      "providerID": "poland-czestochowa",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "vehiclePositions",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/czestochowa/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/czestochowa/realtime/trip-updates",
+      "region": {
+        "minimumLongitude": 18.4703,
+        "minimumLatitude": 50.3618,
+        "maximumLongitude": 19.7703,
+        "maximumLatitude": 51.2618
+      },
+      "staticModes": [
+        "bus",
+        "tram"
+      ],
+      "realtimeDepartureModes": [
+        "bus",
+        "tram"
+      ],
+      "vehiclePositionModes": [
+        "bus",
+        "tram"
+      ],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://api.zbiorkom.live/api6-open/czestochowa/gtfs/default",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": true,
+      "supportsAlerts": false,
+      "statusMessage": "Częstochowa Live-Radar und Live-Abfahrten",
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "MPK Częstochowa",
+      "provenance": "zbiorkom.live community publication"
+    }
+  },
+    {
+    "id": "bialystok",
+    "name": "Białystok",
+    "aliases": [
+      "Bialystok"
+    ],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 53.1325,
+    "longitude": 23.1688,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-bialystok",
+    "transitRadar": {
+      "providerID": "poland-bialystok",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "firstDepartures",
+        "stopLookup"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "staticModes": [
+        "bus"
+      ],
+      "sourceName": "Białostocka Komunikacja Miejska / BKM official open data",
+      "sourceURL": "https://komunikacja.bialystok.pl/pl/rozklad-jazdy/dane_otwarte",
+      "sourceType": "official",
+      "license": "CC0-1.0 (Transitland registry evidence for official BKM feed)",
+      "attribution": "Zarząd Białostockiej Komunikacji Miejskiej; official BKM GTFS publication",
+      "supportsVehiclePositions": false,
+      "supportsTripUpdates": false,
+      "supportsAlerts": false,
+      "statusMessage": "Białystok Statische Abfahrten; realtime ID compatibility blocker"
+    }
+  },
+  {
+    "id": "olsztyn",
+    "name": "Olsztyn",
+    "aliases": [],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 53.7784,
+    "longitude": 20.4801,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-olsztyn",
+    "transitRadar": {
+      "providerID": "poland-olsztyn",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "vehiclePositions",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/olsztyn/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/olsztyn/realtime/trip-updates",
+      "region": {
+        "minimumLongitude": 19.8301,
+        "minimumLatitude": 53.3284,
+        "maximumLongitude": 21.1301,
+        "maximumLatitude": 54.2284
+      },
+      "staticModes": [
+        "bus",
+        "tram"
+      ],
+      "realtimeDepartureModes": [
+        "bus",
+        "tram"
+      ],
+      "vehiclePositionModes": [
+        "bus",
+        "tram"
+      ],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://api.zbiorkom.live/api6-open/olsztyn/gtfs/default",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": true,
+      "supportsAlerts": false,
+      "statusMessage": "Olsztyn Live-Radar und Live-Abfahrten",
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "MPK Olsztyn",
+      "provenance": "zbiorkom.live community publication"
+    }
+  },
+  {
+    "id": "opole",
+    "name": "Opole",
+    "aliases": [],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 50.6751,
+    "longitude": 17.9213,
+    "radiusMeters": 28000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-opole",
+    "transitRadar": {
+      "providerID": "poland-opole",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "vehiclePositions",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/opole/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/opole/realtime/trip-updates",
+      "region": {
+        "minimumLongitude": 17.2713,
+        "minimumLatitude": 50.2251,
+        "maximumLongitude": 18.5713,
+        "maximumLatitude": 51.1251
+      },
+      "staticModes": [
+        "bus"
+      ],
+      "realtimeDepartureModes": [
+        "bus"
+      ],
+      "vehiclePositionModes": [
+        "bus"
+      ],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://api.zbiorkom.live/api6-open/opole/gtfs/default",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": true,
+      "supportsAlerts": false,
+      "statusMessage": "Opole Live-Radar und Live-Abfahrten",
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "MZK Opole",
+      "provenance": "zbiorkom.live community publication"
+    }
+  },
+    {
+    "id": "rzeszow",
+    "name": "Rzeszów",
+    "aliases": [
+      "Rzesow"
+    ],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 50.0412,
+    "longitude": 21.9991,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-rzeszow",
+    "transitRadar": {
+      "providerID": "poland-rzeszow",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "firstDepartures",
+        "stopLookup"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "staticModes": [
+        "bus"
+      ],
+      "sourceName": "Mikołaj Kuranowski / ZTM Rzeszów",
+      "sourceURL": "https://mkuran.pl/gtfs/",
+      "sourceType": "community",
+      "license": "Gmina Miasto Rzeszów public-sector data usage terms",
+      "attribution": "ZTM Rzeszów; source: https://otwartedane.erzeszow.pl/dataset/rozklady-jazdy-gtfs; include the download timestamp from attribution data; source data has been processed; Gmina Miasto Rzeszów is not responsible for processing, publishing, or re-use.",
+      "supportsVehiclePositions": false,
+      "supportsTripUpdates": false,
+      "supportsAlerts": false,
+      "statusMessage": "Rzeszów Statische Abfahrten; realtime ID compatibility blocker"
+    }
+  },
+    {
+    "id": "torun",
+    "name": "Toruń",
+    "aliases": [
+      "Torun"
+    ],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 53.0138,
+    "longitude": 18.5984,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-torun",
+    "transitRadar": {
+      "providerID": "poland-torun",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "firstDepartures",
+        "stopLookup"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "staticModes": [
+        "bus",
+        "tram"
+      ],
+      "sourceName": "Mikołaj Kuranowski / MZK Toruń",
+      "sourceURL": "https://mkuran.pl/gtfs/",
+      "sourceType": "community",
+      "license": "CC0 1.0",
+      "attribution": "MZK Toruń and Mikołaj Kuranowski",
+      "supportsVehiclePositions": false,
+      "supportsTripUpdates": false,
+      "supportsAlerts": false,
+      "statusMessage": "Toruń Statische Abfahrten; realtime ID compatibility blocker"
+    }
+  },
+  {
+  "id": "elblag",
+  "name": "Elbląg",
+  "aliases": [
+    "Elblag"
+  ],
+  "country": "PL",
+  "timezone": "Europe/Warsaw",
+  "latitude": 54.1561,
+  "longitude": 19.4045,
+  "radiusMeters": 28000,
+  "packageMode": "external",
+  "externalGTFSProvider": "poland-elblag",
+  "transitRadar": {
+    "providerID": "poland-elblag",
+    "adapter": "externalGTFS",
+    "isEnabled": true,
+    "isExperimental": false,
+    "features": [
+      "liveVehicles",
+      "realtimeDepartures",
+      "firstDepartures",
+      "stopLookup",
+      "realtimeDelay",
+      "tripUpdates",
+      "vehiclePositions",
+      "stopSequence"
+    ],
+    "staticBaseURL": "https://api.asoftlabs.app",
+    "boardURL": "https://api.asoftlabs.app/static-departures",
+    "realtimeURL": "https://api.asoftlabs.app/poland/elblag/realtime/vehicle-positions",
+    "tripUpdatesURL": "https://api.asoftlabs.app/poland/elblag/realtime/trip-updates",
+    "region": {
+      "minimumLongitude": 18.7545,
+      "minimumLatitude": 53.7061,
+      "maximumLongitude": 20.0545,
+      "maximumLatitude": 54.6061
+    },
+    "staticModes": [
+      "bus",
+      "tram"
+    ],
+    "realtimeDepartureModes": [
+      "bus",
+      "tram"
+    ],
+    "vehiclePositionModes": [
+      "bus",
+      "tram"
+    ],
+    "sourceName": "Mikołaj Kuranowski / ZKM Elbląg",
+    "sourceURL": "https://mkuran.pl/gtfs/",
+    "sourceType": "community",
+    "license": "CC0 1.0",
+    "attribution": "ZKM w Elblągu and Mikołaj Kuranowski",
+    "supportsVehiclePositions": true,
+    "supportsTripUpdates": true,
+    "supportsAlerts": false,
+    "statusMessage": "Elbląg Live-Radar und Live-Abfahrten"
+  }
+},
+  {
+  "id": "gorzow",
+  "name": "Gorzów Wielkopolski",
+  "aliases": [
+    "Gorzow Wielkopolski"
+  ],
+  "country": "PL",
+  "timezone": "Europe/Warsaw",
+  "latitude": 52.7325,
+  "longitude": 15.2369,
+  "radiusMeters": 28000,
+  "packageMode": "external",
+  "externalGTFSProvider": "poland-gorzow",
+  "transitRadar": {
+    "providerID": "poland-gorzow",
+    "adapter": "externalGTFS",
+    "isEnabled": true,
+    "isExperimental": false,
+    "features": [
+      "liveVehicles",
+      "realtimeDepartures",
+      "firstDepartures",
+      "stopLookup",
+      "realtimeDelay",
+      "tripUpdates",
+      "vehiclePositions",
+      "stopSequence"
+    ],
+    "staticBaseURL": "https://api.asoftlabs.app",
+    "boardURL": "https://api.asoftlabs.app/static-departures",
+    "realtimeURL": "https://api.asoftlabs.app/poland/gorzow/realtime/vehicle-positions",
+    "tripUpdatesURL": "https://api.asoftlabs.app/poland/gorzow/realtime/trip-updates",
+    "region": {
+      "minimumLongitude": 14.5869,
+      "minimumLatitude": 52.2825,
+      "maximumLongitude": 15.8869,
+      "maximumLatitude": 53.1825
+    },
+    "staticModes": [
+      "bus",
+      "tram"
+    ],
+    "realtimeDepartureModes": [
+      "bus",
+      "tram"
+    ],
+    "vehiclePositionModes": [
+      "bus",
+      "tram"
+    ],
+    "sourceName": "Mikołaj Kuranowski / MZK Gorzów",
+    "sourceURL": "https://mkuran.pl/gtfs/",
+    "sourceType": "community",
+    "license": "CC0 1.0",
+    "attribution": "MZK Gorzów and Mikołaj Kuranowski",
+    "supportsVehiclePositions": true,
+    "supportsTripUpdates": true,
+    "supportsAlerts": false,
+    "statusMessage": "Gorzów Wielkopolski Live-Radar und Live-Abfahrten"
+  }
+},
+  {
+    "id": "rybnik",
+    "name": "Rybnik",
+    "aliases": [],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 50.1022,
+    "longitude": 18.5463,
+    "radiusMeters": 28000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-rybnik",
+    "transitRadar": {
+      "providerID": "poland-rybnik",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "vehiclePositions",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/rybnik/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/rybnik/realtime/trip-updates",
+      "region": {
+        "minimumLongitude": 17.8963,
+        "minimumLatitude": 49.6522,
+        "maximumLongitude": 19.1963,
+        "maximumLatitude": 50.5522
+      },
+      "staticModes": [
+        "bus"
+      ],
+      "realtimeDepartureModes": [
+        "bus"
+      ],
+      "vehiclePositionModes": [
+        "bus"
+      ],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://cdn.zbiorkom.live/gtfs/rybnik.zip",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": true,
+      "supportsAlerts": false,
+      "statusMessage": "Rybnik Live-Radar und Live-Abfahrten",
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "unknown",
+      "provenance": "zbiorkom.live community publication"
+    }
+  },
+  {
+  "id": "radom",
+  "name": "Radom",
+  "aliases": [],
+  "country": "PL",
+  "timezone": "Europe/Warsaw",
+  "latitude": 51.4027,
+  "longitude": 21.1471,
+  "radiusMeters": 30000,
+  "packageMode": "external",
+  "externalGTFSProvider": "poland-radom",
+  "transitRadar": {
+    "providerID": "poland-radom",
+    "adapter": "externalGTFS",
+    "isEnabled": true,
+    "isExperimental": false,
+    "features": [
+      "liveVehicles",
+      "realtimeDepartures",
+      "firstDepartures",
+      "stopLookup",
+      "realtimeDelay",
+      "tripUpdates",
+      "vehiclePositions",
+      "stopSequence"
+    ],
+    "staticBaseURL": "https://api.asoftlabs.app",
+    "boardURL": "https://api.asoftlabs.app/static-departures",
+    "realtimeURL": "https://api.asoftlabs.app/poland/radom/realtime/vehicle-positions",
+    "tripUpdatesURL": "https://api.asoftlabs.app/poland/radom/realtime/trip-updates",
+    "alertsURL": "https://api.asoftlabs.app/poland/radom/realtime/alerts",
+    "region": {
+      "minimumLongitude": 20.4971,
+      "minimumLatitude": 50.9527,
+      "maximumLongitude": 21.7971,
+      "maximumLatitude": 51.8527
+    },
+    "staticModes": [
+      "bus"
+    ],
+    "realtimeDepartureModes": [
+      "bus"
+    ],
+    "vehiclePositionModes": [
+      "bus"
+    ],
+    "sourceName": "Miejski Zarząd Dróg i Komunikacji w Radomiu",
+    "sourceURL": "https://www.mzdik.pl/mzdik/pliki-do-pobrania/bazy-danych-rozkladow-jazdy",
+    "sourceType": "official",
+    "license": "MZDiK Radom open data terms (Regulamin bazy danych rozkładowych)",
+    "attribution": "MZDiK Radom",
+    "supportsVehiclePositions": true,
+    "supportsTripUpdates": true,
+    "supportsAlerts": true,
+    "statusMessage": "Radom Live-Radar und Live-Abfahrten"
+  }
+},
+  {
+    "id": "suwalki",
+    "name": "Suwałki",
+    "aliases": [
+      "Suwalki"
+    ],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 54.111,
+    "longitude": 22.9308,
+    "radiusMeters": 28000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-suwalki",
+    "transitRadar": {
+      "providerID": "poland-suwalki",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "firstDepartures",
+        "stopLookup"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "staticModes": [
+        "bus"
+      ],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://cdn.zbiorkom.live/gtfs/suwalki.zip",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": false,
+      "supportsTripUpdates": false,
+      "supportsAlerts": false,
+      "statusMessage": "Statische Abfahrten; realtime unavailable",
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "unknown",
+      "provenance": "zbiorkom.live community publication"
+    },
+    "supportsAlerts": false,
+    "statusMessage": "Statische Abfahrten; realtime unavailable"
+  },
+  {
+    "id": "przemysl",
+    "name": "Przemyśl",
+    "aliases": [
+      "Przemysl"
+    ],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 49.7839,
+    "longitude": 22.7678,
+    "radiusMeters": 28000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-przemysl",
+    "transitRadar": {
+      "providerID": "poland-przemysl",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "vehiclePositions",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/przemysl/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/przemysl/realtime/trip-updates",
+      "region": {
+        "minimumLongitude": 22.1178,
+        "minimumLatitude": 49.3339,
+        "maximumLongitude": 23.4178,
+        "maximumLatitude": 50.2339
+      },
+      "staticModes": [
+        "bus"
+      ],
+      "realtimeDepartureModes": [
+        "bus"
+      ],
+      "vehiclePositionModes": [
+        "bus"
+      ],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://cdn.zbiorkom.live/gtfs/przemysl.zip",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": true,
+      "supportsAlerts": false,
+      "statusMessage": "Przemyśl Live-Radar und Live-Abfahrten",
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "unknown",
+      "provenance": "zbiorkom.live community publication"
+    }
+  },
+  {
+    "id": "kutno",
+    "name": "Kutno",
+    "aliases": [],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 52.2306,
+    "longitude": 19.3641,
+    "radiusMeters": 26000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-kutno",
+    "transitRadar": {
+      "providerID": "poland-kutno",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "firstDepartures",
+        "stopLookup"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "staticModes": [
+        "bus"
+      ],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://cdn.zbiorkom.live/gtfs/kutno.zip",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": false,
+      "supportsTripUpdates": false,
+      "supportsAlerts": false,
+      "statusMessage": "Statische Abfahrten; realtime unavailable",
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "unknown",
+      "provenance": "zbiorkom.live community publication"
+    },
+    "supportsAlerts": false,
+    "statusMessage": "Statische Abfahrten; realtime unavailable"
+  },
+  {
+    "id": "legnica",
+    "name": "Legnica",
+    "aliases": [],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 51.207,
+    "longitude": 16.1553,
+    "radiusMeters": 28000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-legnica",
+    "transitRadar": {
+      "providerID": "poland-legnica",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "firstDepartures",
+        "stopLookup"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "staticModes": [
+        "bus"
+      ],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://cdn.zbiorkom.live/gtfs/legnica.zip",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": false,
+      "supportsTripUpdates": false,
+      "supportsAlerts": false,
+      "statusMessage": "Statische Abfahrten; realtime unavailable",
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "MPK Legnica",
+      "provenance": "zbiorkom.live community publication"
+    },
+    "supportsAlerts": false,
+    "statusMessage": "Statische Abfahrten; realtime unavailable"
+  },
+  {
+  "id": "elk",
+  "name": "Ełk",
+  "aliases": [
+    "Elk"
+  ],
+  "country": "PL",
+  "timezone": "Europe/Warsaw",
+  "latitude": 53.8282,
+  "longitude": 22.3647,
+  "radiusMeters": 26000,
+  "packageMode": "external",
+  "externalGTFSProvider": "poland-elk",
+  "transitRadar": {
+    "providerID": "poland-elk",
+    "adapter": "externalGTFS",
+    "isEnabled": true,
+    "isExperimental": false,
+    "features": [
+      "liveVehicles",
+      "realtimeDepartures",
+      "firstDepartures",
+      "stopLookup",
+      "realtimeDelay",
+      "tripUpdates",
+      "vehiclePositions",
+      "stopSequence"
+    ],
+    "staticBaseURL": "https://api.asoftlabs.app",
+    "boardURL": "https://api.asoftlabs.app/static-departures",
+    "realtimeURL": "https://api.asoftlabs.app/poland/elk/realtime/vehicle-positions",
+    "tripUpdatesURL": "https://api.asoftlabs.app/poland/elk/realtime/trip-updates",
+    "region": {
+      "minimumLongitude": 21.7147,
+      "minimumLatitude": 53.3782,
+      "maximumLongitude": 23.0147,
+      "maximumLatitude": 54.2782
+    },
+    "staticModes": [
+      "bus"
+    ],
+    "realtimeDepartureModes": [
+      "bus"
+    ],
+    "vehiclePositionModes": [
+      "bus"
+    ],
+    "sourceName": "Mikołaj Kuranowski / MZK Ełk",
+    "sourceURL": "https://mkuran.pl/gtfs/",
+    "sourceType": "community",
+    "license": "CC0 1.0",
+    "attribution": "MZK Ełk and Mikołaj Kuranowski",
+    "supportsVehiclePositions": true,
+    "supportsTripUpdates": true,
+    "supportsAlerts": false,
+    "statusMessage": "Ełk Live-Radar und Live-Abfahrten"
+  }
+},
+  {
+    "id": "kalisz",
+    "name": "Kalisz",
+    "aliases": [],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 51.7611,
+    "longitude": 18.091,
+    "radiusMeters": 28000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-kalisz",
+    "transitRadar": {
+      "providerID": "poland-kalisz",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "vehiclePositions",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/kalisz/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/kalisz/realtime/trip-updates",
+      "region": {
+        "minimumLongitude": 17.441,
+        "minimumLatitude": 51.3111,
+        "maximumLongitude": 18.741,
+        "maximumLatitude": 52.2111
+      },
+      "staticModes": [
+        "bus"
+      ],
+      "realtimeDepartureModes": [
+        "bus"
+      ],
+      "vehiclePositionModes": [
+        "bus"
+      ],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://api.zbiorkom.live/api6-open/kalisz/gtfs/default",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": true,
+      "supportsAlerts": false,
+      "statusMessage": "Kalisz Live-Radar und Live-Abfahrten",
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "KLA Kalisz",
+      "provenance": "zbiorkom.live community publication"
+    }
+  },
+  {
+    "id": "konin",
+    "name": "Konin",
+    "aliases": [],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 52.223,
+    "longitude": 18.251,
+    "radiusMeters": 26000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-konin",
+    "transitRadar": {
+      "providerID": "poland-konin",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "vehiclePositions",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/konin/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/konin/realtime/trip-updates",
+      "region": {
+        "minimumLongitude": 17.601,
+        "minimumLatitude": 51.773,
+        "maximumLongitude": 18.901,
+        "maximumLatitude": 52.673
+      },
+      "staticModes": [
+        "bus"
+      ],
+      "realtimeDepartureModes": [
+        "bus"
+      ],
+      "vehiclePositionModes": [
+        "bus"
+      ],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://api.zbiorkom.live/api6-open/konin/gtfs/default",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": true,
+      "supportsAlerts": false,
+      "statusMessage": "Konin Live-Radar und Live-Abfahrten",
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "MZK Konin",
+      "provenance": "zbiorkom.live community publication"
+    }
+  },
+  {
+    "id": "koszalin",
+    "name": "Koszalin",
+    "aliases": [],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 54.1944,
+    "longitude": 16.1722,
+    "radiusMeters": 28000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-koszalin",
+    "transitRadar": {
+      "providerID": "poland-koszalin",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "vehiclePositions",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/koszalin/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/koszalin/realtime/trip-updates",
+      "region": {
+        "minimumLongitude": 15.5222,
+        "minimumLatitude": 53.7444,
+        "maximumLongitude": 16.8222,
+        "maximumLatitude": 54.6444
+      },
+      "staticModes": [
+        "bus"
+      ],
+      "realtimeDepartureModes": [
+        "bus"
+      ],
+      "vehiclePositionModes": [
+        "bus"
+      ],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://api.zbiorkom.live/api6-open/koszalin/gtfs/default",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": true,
+      "supportsAlerts": false,
+      "statusMessage": "Koszalin Live-Radar und Live-Abfahrten",
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "MZK Koszalin",
+      "provenance": "zbiorkom.live community publication"
+    }
+  },
+  {
+    "id": "krosno",
+    "name": "Krosno",
+    "aliases": [],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 49.6826,
+    "longitude": 21.7661,
+    "radiusMeters": 26000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-krosno",
+    "transitRadar": {
+      "providerID": "poland-krosno",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/krosno/realtime/trip-updates",
+      "staticModes": [
+        "bus"
+      ],
+      "realtimeDepartureModes": [
+        "bus"
+      ],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://api.zbiorkom.live/api6-open/krosno/gtfs/default",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": false,
+      "supportsTripUpdates": true,
+      "supportsAlerts": false,
+      "statusMessage": "Realtime-Abfahrten; Radar nicht verfügbar",
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "MKS Krosno",
+      "provenance": "zbiorkom.live community publication"
+    },
+    "statusMessage": "Realtime-Abfahrten; Radar nicht verfügbar"
+  },
+  {
+    "id": "pila",
+    "name": "Piła",
+    "aliases": [
+      "Pila"
+    ],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 53.1515,
+    "longitude": 16.7382,
+    "radiusMeters": 26000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-pila",
+    "transitRadar": {
+      "providerID": "poland-pila",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/pila/realtime/trip-updates",
+      "staticModes": [
+        "bus"
+      ],
+      "realtimeDepartureModes": [
+        "bus"
+      ],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://api.zbiorkom.live/api6-open/pila/gtfs/default",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": false,
+      "supportsTripUpdates": true,
+      "supportsAlerts": false,
+      "statusMessage": "Realtime-Abfahrten; Radar nicht verfügbar",
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "MZK Piła",
+      "provenance": "zbiorkom.live community publication"
+    },
+    "statusMessage": "Realtime-Abfahrten; Radar nicht verfügbar"
+  },
+  {
+    "id": "siedlce",
+    "name": "Siedlce",
+    "aliases": [],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 52.1677,
+    "longitude": 22.2901,
+    "radiusMeters": 28000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-siedlce",
+    "transitRadar": {
+      "providerID": "poland-siedlce",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "vehiclePositions",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/siedlce/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/siedlce/realtime/trip-updates",
+      "region": {
+        "minimumLongitude": 21.6401,
+        "minimumLatitude": 51.7177,
+        "maximumLongitude": 22.9401,
+        "maximumLatitude": 52.6177
+      },
+      "staticModes": [
+        "bus"
+      ],
+      "realtimeDepartureModes": [
+        "bus"
+      ],
+      "vehiclePositionModes": [
+        "bus"
+      ],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://api.zbiorkom.live/api6-open/siedlce/gtfs/default",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": true,
+      "supportsAlerts": false,
+      "statusMessage": "Siedlce Live-Radar und Live-Abfahrten",
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "MPK Siedlce",
+      "provenance": "zbiorkom.live community publication"
+    }
+  },
+  {
+    "id": "starachowice",
+    "name": "Starachowice",
+    "aliases": [],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 51.0374,
+    "longitude": 21.0718,
+    "radiusMeters": 26000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-starachowice",
+    "transitRadar": {
+      "providerID": "poland-starachowice",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "vehiclePositions",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/starachowice/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/starachowice/realtime/trip-updates",
+      "region": {
+        "minimumLongitude": 20.4218,
+        "minimumLatitude": 50.5874,
+        "maximumLongitude": 21.7218,
+        "maximumLatitude": 51.4874
+      },
+      "staticModes": [
+        "bus"
+      ],
+      "realtimeDepartureModes": [
+        "bus"
+      ],
+      "vehiclePositionModes": [
+        "bus"
+      ],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://api.zbiorkom.live/api6-open/starachowice/gtfs/default",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": true,
+      "supportsAlerts": false,
+      "statusMessage": "Starachowice Live-Radar und Live-Abfahrten",
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "MPK Starachowice",
+      "provenance": "zbiorkom.live community publication"
+    }
+  },
+  {
+    "id": "tarnow",
+    "name": "Tarnów",
+    "aliases": [
+      "Tarnow"
+    ],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 50.0121,
+    "longitude": 20.9858,
+    "radiusMeters": 28000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-tarnow",
+    "transitRadar": {
+      "providerID": "poland-tarnow",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "vehiclePositions",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/tarnow/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/tarnow/realtime/trip-updates",
+      "region": {
+        "minimumLongitude": 20.3358,
+        "minimumLatitude": 49.5621,
+        "maximumLongitude": 21.6358,
+        "maximumLatitude": 50.4621
+      },
+      "staticModes": [
+        "bus"
+      ],
+      "realtimeDepartureModes": [
+        "bus"
+      ],
+      "vehiclePositionModes": [
+        "bus"
+      ],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://api.zbiorkom.live/api6-open/tarnow/gtfs/default",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": true,
+      "supportsAlerts": false,
+      "statusMessage": "Tarnów Live-Radar und Live-Abfahrten",
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "MPK Tarnów",
+      "provenance": "zbiorkom.live community publication"
+    }
+  },
+  {
+    "id": "walbrzych",
+    "name": "Wałbrzych",
+    "aliases": [
+      "Walbrzych"
+    ],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 50.7714,
+    "longitude": 16.2843,
+    "radiusMeters": 30000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-walbrzych",
+    "transitRadar": {
+      "providerID": "poland-walbrzych",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "vehiclePositions",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/walbrzych/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/walbrzych/realtime/trip-updates",
+      "region": {
+        "minimumLongitude": 15.6343,
+        "minimumLatitude": 50.3214,
+        "maximumLongitude": 16.9343,
+        "maximumLatitude": 51.2214
+      },
+      "staticModes": [
+        "bus"
+      ],
+      "realtimeDepartureModes": [
+        "bus"
+      ],
+      "vehiclePositionModes": [
+        "bus"
+      ],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://api.zbiorkom.live/api6-open/walbrzych/gtfs/default",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": true,
+      "supportsAlerts": false,
+      "statusMessage": "Wałbrzych Live-Radar und Live-Abfahrten",
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "MPK Wałbrzych",
+      "provenance": "zbiorkom.live community publication"
+    }
+  },
+    {
+    "id": "swinoujscie",
+    "name": "Świnoujście",
+    "aliases": [
+      "Swinoujscie"
+    ],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 53.91,
+    "longitude": 14.2471,
+    "radiusMeters": 26000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-swinoujscie",
+    "transitRadar": {
+      "providerID": "poland-swinoujscie",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "liveVehicles",
+        "firstDepartures",
+        "stopLookup",
+        "vehiclePositions",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/swinoujscie/realtime/vehicle-positions",
+      "region": {
+        "minimumLongitude": 14.0,
+        "minimumLatitude": 53.80,
+        "maximumLongitude": 14.60,
+        "maximumLatitude": 54.00
+      },
+      "staticModes": [
+        "bus"
+      ],
+      "vehiclePositionModes": [
+        "bus"
+      ],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://api.zbiorkom.live/api6-open/swinoujscie/gtfs/default",
+      "sourceType": "community",
+      "license": "unknown",
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "KA Świnoujście",
+      "provenance": "zbiorkom.live community publication",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": false,
+      "supportsAlerts": false,
+      "statusMessage": "Świnoujście Live-Radar und statische Abfahrten"
+    }
+  },
+  {
+    "id": "mielec",
+    "name": "Mielec",
+    "aliases": [],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 50.2871,
+    "longitude": 21.4239,
+    "radiusMeters": 26000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-mielec",
+    "transitRadar": {
+      "providerID": "poland-mielec",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "liveVehicles",
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "vehiclePositions",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/mielec/realtime/vehicle-positions",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/mielec/realtime/trip-updates",
+      "region": {
+        "minimumLongitude": 20.7739,
+        "minimumLatitude": 49.8371,
+        "maximumLongitude": 22.0739,
+        "maximumLatitude": 50.7371
+      },
+      "staticModes": [
+        "bus"
+      ],
+      "realtimeDepartureModes": [
+        "bus"
+      ],
+      "vehiclePositionModes": [
+        "bus"
+      ],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://api.zbiorkom.live/api6-open/mielec/gtfs/default",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": true,
+      "supportsAlerts": false,
+      "statusMessage": "Mielec Live-Radar und Live-Abfahrten",
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "MKS Mielec",
+      "provenance": "zbiorkom.live community publication"
+    }
+  },
+  {
+    "id": "oswiecim",
+    "name": "Oświęcim",
+    "aliases": [
+      "Oswiecim"
+    ],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 50.0344,
+    "longitude": 19.2097,
+    "radiusMeters": 26000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-oswiecim",
+    "transitRadar": {
+      "providerID": "poland-oswiecim",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/oswiecim/realtime/trip-updates",
+      "staticModes": [
+        "bus"
+      ],
+      "realtimeDepartureModes": [
+        "bus"
+      ],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://api.zbiorkom.live/api6-open/oswiecim/gtfs/default",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": false,
+      "supportsTripUpdates": true,
+      "supportsAlerts": false,
+      "statusMessage": "Realtime-Abfahrten; Radar nicht verfügbar",
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "MZK Oświęcim",
+      "provenance": "zbiorkom.live community publication"
+    },
+    "statusMessage": "Realtime-Abfahrten; Radar nicht verfügbar"
+  },
+  {
+    "id": "radomsko",
+    "name": "Radomsko",
+    "aliases": [],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 51.0671,
+    "longitude": 19.4448,
+    "radiusMeters": 26000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-radomsko",
+    "transitRadar": {
+      "providerID": "poland-radomsko",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": [
+        "realtimeDepartures",
+        "firstDepartures",
+        "stopLookup",
+        "realtimeDelay",
+        "tripUpdates",
+        "stopSequence"
+      ],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "tripUpdatesURL": "https://api.asoftlabs.app/poland/radomsko/realtime/trip-updates",
+      "staticModes": [
+        "bus"
+      ],
+      "realtimeDepartureModes": [
+        "bus"
+      ],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://api.zbiorkom.live/api6-open/radomsko/gtfs/default",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": false,
+      "supportsTripUpdates": true,
+      "supportsAlerts": false,
+      "statusMessage": "Realtime-Abfahrten; Radar nicht verfügbar",
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "MPK Radomsko",
+      "provenance": "zbiorkom.live community publication"
+    },
+    "statusMessage": "Realtime-Abfahrten; Radar nicht verfügbar"
+  },
+  {
+    "id": "bydgoszcz",
+    "name": "Bydgoszcz",
+    "aliases": ["Bydgoszcz"],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 53.1235,
+    "longitude": 18.0084,
+    "radiusMeters": 38000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-bydgoszcz",
+    "transitRadar": {
+      "providerID": "poland-bydgoszcz",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": ["firstDepartures", "stopLookup"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "staticModes": ["bus", "tram"],
+      "sourceName": "Mikołaj Kuranowski / ZDMiKP Bydgoszcz",
+      "sourceURL": "https://mkuran.pl/gtfs/bydgoszcz.zip",
+      "sourceType": "community",
+      "license": "CC0 1.0",
+      "supportsVehiclePositions": false,
+      "supportsTripUpdates": false,
+      "supportsAlerts": false,
+      "sourcePublisher": "Mikołaj Kuranowski",
+      "upstreamOperator": "ZDMiKP Bydgoszcz",
+      "provenance": "Mikołaj Kuranowski community publication of ZDMiKP Bydgoszcz GTFS",
+      "statusMessage": "Bydgoszcz statische Abfahrten"
+    },
+    "supportsAlerts": false,
+    "statusMessage": "Bydgoszcz statische Abfahrten"
+  },
+  {
+    "id": "kolobrzeg",
+    "name": "Kołobrzeg",
+    "aliases": ["Kolobrzeg"],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 54.1756,
+    "longitude": 15.5836,
+    "radiusMeters": 22000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-kolobrzeg",
+    "transitRadar": {
+      "providerID": "poland-kolobrzeg",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": ["liveVehicles", "firstDepartures", "stopLookup", "vehiclePositions", "stopSequence"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/kolobrzeg/realtime/vehicle-positions",
+      "region": {"minimumLongitude": 15.35, "minimumLatitude": 54.0, "maximumLongitude": 15.85, "maximumLatitude": 54.3},
+      "staticModes": ["bus"],
+      "vehiclePositionModes": ["bus"],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://api.zbiorkom.live/api6-open/kolobrzeg/gtfs/default",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": false,
+      "supportsAlerts": false,
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "KM Kołobrzeg",
+      "provenance": "zbiorkom.live community publication",
+      "statusMessage": "Kołobrzeg Live-Radar und statische Abfahrten"
+    },
+    "supportsAlerts": false,
+    "statusMessage": "Kołobrzeg Live-Radar und statische Abfahrten"
+  },
+  {
+    "id": "sanok",
+    "name": "Sanok",
+    "aliases": ["Sanok"],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 49.555,
+    "longitude": 22.206,
+    "radiusMeters": 18000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-sanok",
+    "transitRadar": {
+      "providerID": "poland-sanok",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": ["firstDepartures", "stopLookup"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "staticModes": ["bus"],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://api.zbiorkom.live/api6-open/sanok/gtfs/default",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": false,
+      "supportsTripUpdates": false,
+      "supportsAlerts": false,
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "SPGK Sanok",
+      "provenance": "zbiorkom.live community publication",
+      "statusMessage": "Sanok statische Abfahrten"
+    },
+    "supportsAlerts": false,
+    "statusMessage": "Sanok statische Abfahrten"
+  },
+  {
+    "id": "leszno",
+    "name": "Leszno",
+    "aliases": ["Leszno"],
+    "country": "PL",
+    "timezone": "Europe/Warsaw",
+    "latitude": 51.841,
+    "longitude": 16.574,
+    "radiusMeters": 22000,
+    "packageMode": "external",
+    "externalGTFSProvider": "poland-leszno",
+    "transitRadar": {
+      "providerID": "poland-leszno",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": false,
+      "features": ["liveVehicles", "firstDepartures", "stopLookup", "vehiclePositions", "stopSequence"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "realtimeURL": "https://api.asoftlabs.app/poland/leszno/realtime/vehicle-positions",
+      "region": {"minimumLongitude": 16.35, "minimumLatitude": 51.7, "maximumLongitude": 16.85, "maximumLatitude": 52.05},
+      "staticModes": ["bus"],
+      "vehiclePositionModes": ["bus"],
+      "sourceName": "zbiorkom.live community publication",
+      "sourceURL": "https://api.zbiorkom.live/api6-open/leszno/gtfs/default",
+      "sourceType": "community",
+      "license": "unknown",
+      "supportsVehiclePositions": true,
+      "supportsTripUpdates": false,
+      "supportsAlerts": false,
+      "sourcePublisher": "zbiorkom.live",
+      "upstreamOperator": "MZK Leszno",
+      "provenance": "zbiorkom.live community publication",
+      "statusMessage": "Leszno Live-Radar und statische Abfahrten"
+    },
+    "supportsAlerts": false,
+    "statusMessage": "Leszno Live-Radar und statische Abfahrten"
+  }
+]

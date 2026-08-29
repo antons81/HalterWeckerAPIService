@@ -260,6 +260,52 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
                 "australia-nt-alice-springs",
                 "australia-transport-nsw",
                 "australia-transport-canberra",
+                "poland-warsaw",
+                "poland-wkd",
+                "poland-krakow-a",
+                "poland-krakow-m",
+                "poland-krakow-t",
+                "poland-poznan",
+                "poland-lodz",
+                "poland-szczecin",
+                "poland-gzm",
+                "poland-gdansk",
+                "poland-wroclaw",
+                "poland-gdynia",
+                "poland-lublin",
+                "poland-kielce",
+                "poland-czestochowa",
+                "poland-bialystok",
+                "poland-olsztyn",
+                "poland-opole",
+                "poland-rzeszow",
+                "poland-torun",
+                "poland-elblag",
+                "poland-gorzow",
+                "poland-rybnik",
+                "poland-radom",
+                "poland-suwalki",
+                "poland-przemysl",
+                "poland-kutno",
+                "poland-legnica",
+                "poland-elk",
+                "poland-kalisz",
+                "poland-konin",
+                "poland-koszalin",
+                "poland-krosno",
+                "poland-pila",
+                "poland-siedlce",
+                "poland-starachowice",
+                "poland-tarnow",
+                "poland-walbrzych",
+                "poland-swinoujscie",
+                "poland-mielec",
+                "poland-oswiecim",
+                "poland-radomsko",
+                "poland-bydgoszcz",
+                "poland-kolobrzeg",
+                "poland-sanok",
+                "poland-leszno",
             },
         )
         sweden = next(source for source in sources if source["id"] == "sweden")
@@ -275,6 +321,196 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
         self.assertEqual(cities[0]["packageMode"], "external")
         self.assertEqual(cities[0]["externalGTFSProvider"], "sweden")
 
+    def test_poland_tier2_registry_metadata_and_static_only_exception(self) -> None:
+        expected = {
+            "lublin", "kielce", "czestochowa", "bialystok", "olsztyn", "opole",
+            "rzeszow", "torun", "elblag", "gorzow", "rybnik", "radom", "suwalki",
+            "przemysl", "kutno", "legnica", "elk", "kalisz", "konin", "koszalin",
+            "krosno", "pila", "siedlce", "starachowice", "tarnow", "walbrzych",
+            "swinoujscie", "mielec", "oswiecim", "radomsko",
+        }
+        cities = load_cities(REPOSITORY_ROOT / "config" / "poland-cities.json")
+        actual = {str(city["id"]) for city in cities}
+        self.assertTrue(expected.issubset(actual))
+        self.assertNotIn("plock", actual)
+
+        sources = load_external_gtfs_sources(
+            REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
+        )
+        community_unknown_license = {
+            "poland-czestochowa",
+            "poland-olsztyn",
+            "poland-opole",
+            "poland-rybnik",
+            "poland-suwalki",
+            "poland-przemysl",
+            "poland-kutno",
+            "poland-legnica",
+            "poland-kalisz",
+            "poland-konin",
+            "poland-koszalin",
+            "poland-krosno",
+            "poland-pila",
+            "poland-siedlce",
+            "poland-starachowice",
+            "poland-tarnow",
+            "poland-walbrzych",
+            "poland-mielec",
+            "poland-oswiecim",
+            "poland-radomsko",
+            "poland-swinoujscie",
+        }
+        for source in sources:
+            if str(source["id"]) not in {f"poland-{city}" for city in expected}:
+                continue
+            validate_external_gtfs_source(source, REPOSITORY_ROOT)
+            self.assertTrue(source["sourceURL"])
+            if source["id"] in community_unknown_license:
+                self.assertEqual(source["sourceType"], "community")
+                self.assertEqual(source["license"], "unknown")
+                self.assertTrue(source["sourcePublisher"])
+                self.assertTrue(source["upstreamOperator"])
+                self.assertTrue(source["provenance"])
+                self.assertNotIn("attribution", source)
+            else:
+                self.assertEqual(
+                    source["sourceType"],
+                    "official"
+                    if source["id"] in {"poland-radom", "poland-bialystok"}
+                    else "community",
+                )
+                self.assertTrue(source["license"])
+                self.assertTrue(source["attribution"])
+
+        legnica = next(city for city in cities if city["id"] == "legnica")
+        self.assertEqual(legnica["transitRadar"]["features"], ["firstDepartures", "stopLookup"])
+        self.assertFalse(legnica["transitRadar"]["supportsVehiclePositions"])
+
+        oswiecim = next(city for city in cities if city["id"] == "oswiecim")
+        self.assertNotIn("liveVehicles", oswiecim["transitRadar"]["features"])
+        self.assertNotIn("vehiclePositions", oswiecim["transitRadar"]["features"])
+        self.assertFalse(oswiecim["transitRadar"]["supportsVehiclePositions"])
+
+    def test_poland_tier2_release_sources_and_realtime_gates(self) -> None:
+        sources = {
+            source["id"]: source
+            for source in load_external_gtfs_sources(
+                REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
+            )
+        }
+        expected_static = {
+            "poland-lublin": "https://mkuran.pl/gtfs/lublin.zip",
+            "poland-kielce": "https://mkuran.pl/gtfs/kielce.zip",
+            "poland-bialystok": "https://komunikacja.bialystok.pl/cms/File/download/gtfs/google_transit.zip",
+            "poland-rzeszow": "https://mkuran.pl/gtfs/rzeszow.zip",
+            "poland-torun": "https://mkuran.pl/gtfs/torun.zip",
+            "poland-elblag": "https://mkuran.pl/gtfs/elblag.zip",
+            "poland-gorzow": "https://mkuran.pl/gtfs/gorzow_wlkp.zip",
+            "poland-elk": "https://mkuran.pl/gtfs/elk.zip",
+            "poland-swinoujscie": "https://api.zbiorkom.live/api6-open/swinoujscie/gtfs/default",
+        }
+        for provider_id, url in expected_static.items():
+            self.assertEqual(sources[provider_id]["url"], url)
+
+        self.assertEqual(
+            sources["poland-elk"]["realtime"],
+            {"combinedURL": "https://mkuran.pl/gtfs/elk.pb"},
+        )
+        self.assertEqual(
+            {
+                provider_id
+                for provider_id in expected_static
+                if sources[provider_id].get("realtime") is None
+            },
+            {
+                "poland-kielce",
+                "poland-bialystok",
+                "poland-rzeszow",
+                "poland-torun",
+            },
+        )
+
+        cities = {
+            city["id"]: city
+            for city in load_cities(REPOSITORY_ROOT / "config" / "poland-cities.json")
+        }
+        for city_id in ("kielce", "bialystok", "rzeszow", "torun"):
+            radar = cities[city_id]["transitRadar"]
+            self.assertEqual(radar["features"], ["firstDepartures", "stopLookup"])
+            self.assertFalse(radar["supportsVehiclePositions"])
+            self.assertFalse(radar["supportsTripUpdates"])
+            self.assertNotIn("realtimeURL", radar)
+            self.assertNotIn("tripUpdatesURL", radar)
+            self.assertNotIn("region", radar)
+
+        swinoujscie = cities["swinoujscie"]["transitRadar"]
+        self.assertEqual(
+            swinoujscie["features"],
+            ["liveVehicles", "firstDepartures", "stopLookup", "vehiclePositions", "stopSequence"],
+        )
+        self.assertTrue(swinoujscie["supportsVehiclePositions"])
+        self.assertFalse(swinoujscie["supportsTripUpdates"])
+        self.assertTrue(swinoujscie["realtimeURL"].endswith("/swinoujscie/realtime/vehicle-positions"))
+        self.assertIsInstance(swinoujscie["region"], dict)
+        self.assertEqual(swinoujscie["license"], "unknown")
+        self.assertNotIn("attribution", swinoujscie)
+
+    def test_poland_tier3_verified_registry_and_capabilities(self) -> None:
+        sources = {
+            source["id"]: source
+            for source in load_external_gtfs_sources(
+                REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
+            )
+        }
+        expected_providers = {
+            "poland-bydgoszcz",
+            "poland-kolobrzeg",
+            "poland-sanok",
+            "poland-leszno",
+        }
+        self.assertTrue(expected_providers.issubset(sources))
+        for provider_id in expected_providers:
+            source = sources[provider_id]
+            validate_external_gtfs_source(source, REPOSITORY_ROOT)
+            self.assertEqual(source["country"], "PL")
+            self.assertEqual(source["sourceType"], "community")
+            self.assertTrue(source["sourceURL"])
+            self.assertTrue(source["sourcePublisher"])
+            self.assertTrue(source["upstreamOperator"])
+            self.assertTrue(source["provenance"])
+
+        self.assertEqual(sources["poland-bydgoszcz"]["license"], "CC0 1.0")
+        for provider_id in {
+            "poland-kolobrzeg",
+            "poland-sanok",
+            "poland-leszno",
+        }:
+            self.assertEqual(sources[provider_id]["license"], "unknown")
+            self.assertNotIn("attribution", sources[provider_id])
+
+        cities = {
+            city["id"]: city
+            for city in load_cities(REPOSITORY_ROOT / "config" / "poland-cities.json")
+        }
+        self.assertTrue(
+            {"debica", "ostroleka", "wejherowo", "lomza", "gizycko"}.isdisjoint(cities)
+        )
+        for city_id in ("bydgoszcz", "sanok"):
+            radar = cities[city_id]["transitRadar"]
+            self.assertEqual(radar["features"], ["firstDepartures", "stopLookup"])
+            self.assertFalse(radar["supportsVehiclePositions"])
+            self.assertFalse(radar["supportsTripUpdates"])
+            self.assertNotIn("realtimeURL", radar)
+
+        for city_id in ("kolobrzeg", "leszno"):
+            radar = cities[city_id]["transitRadar"]
+            self.assertIn("liveVehicles", radar["features"])
+            self.assertIn("vehiclePositions", radar["features"])
+            self.assertTrue(radar["supportsVehiclePositions"])
+            self.assertFalse(radar["supportsTripUpdates"])
+            self.assertEqual(radar["license"], "unknown")
+            self.assertNotIn("attribution", radar)
+
     def test_kyiv_manifest_is_static_departures_plus_vehicle_positions(self) -> None:
         cities = load_cities(REPOSITORY_ROOT / "config" / "kyiv-cities.json")
         entry = transit_radar_manifest(cities)["cities"][0]
@@ -288,6 +524,26 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
         self.assertIn("vehiclePositions", provider["features"])
         self.assertNotIn("realtimeDepartures", provider["features"])
         self.assertNotIn("tripUpdates", provider["features"])
+
+    def test_wroclaw_manifest_disables_stale_radar_but_keeps_static_support(self) -> None:
+        cities = load_cities(REPOSITORY_ROOT / "config" / "poland-cities.json")
+        manifest = transit_radar_manifest(cities, skip_auto_radar_stops=True)
+        wroclaw = next(city for city in manifest["cities"] if city["appCityID"] == "wroclaw")
+        provider = next(item for item in wroclaw["providers"] if item["providerID"] == "poland-wroclaw")
+
+        self.assertEqual(provider["features"], ["firstDepartures", "stopLookup"])
+        self.assertFalse(provider["supportsVehiclePositions"])
+        self.assertNotIn("realtimeURL", provider)
+        self.assertNotIn("region", provider)
+
+        sources = load_external_gtfs_sources(
+            REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
+        )
+        source = next(item for item in sources if item["id"] == "poland-wroclaw")
+        self.assertEqual(
+            source["realtime"]["vehiclePositionsURL"],
+            "https://open-data.cui.wroclaw.pl/hdb/db/14?download=json",
+        )
 
     def test_validate_ireland_local_registry_and_city_coverage(self) -> None:
         sources = load_external_gtfs_sources(

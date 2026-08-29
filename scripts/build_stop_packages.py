@@ -923,6 +923,36 @@ def validate_transit_radar_provider(
     if adapter == "externalGTFS":
         provider_id = configuration.get("providerID")
         features = configuration.get("features")
+        if isinstance(provider_id, str) and provider_id.startswith("poland-"):
+            if (
+                not isinstance(features, list)
+                or not {"firstDepartures", "stopLookup"}.issubset(features)
+                or any(
+                    not isinstance(configuration.get(key), str)
+                    or not str(configuration[key]).startswith("https://")
+                    for key in ("staticBaseURL", "boardURL")
+                )
+            ):
+                raise ValueError(f"Invalid Polish external GTFS configuration for {city_id}")
+            has_live_vehicles = "liveVehicles" in features or "vehiclePositions" in features
+            if has_live_vehicles:
+                region = configuration.get("region")
+                if (
+                    not isinstance(region, dict)
+                    or not isinstance(configuration.get("realtimeURL"), str)
+                    or not str(configuration["realtimeURL"]).startswith("https://")
+                    or not {"liveVehicles", "vehiclePositions"}.issubset(features)
+                    or not region.get("minimumLatitude") < region.get("maximumLatitude")
+                    or not region.get("minimumLongitude") < region.get("maximumLongitude")
+                    or not region.get("minimumLatitude") <= latitude <= region.get("maximumLatitude")
+                    or not region.get("minimumLongitude") <= longitude <= region.get("maximumLongitude")
+                ):
+                    raise ValueError(f"Invalid Polish live external GTFS configuration for {city_id}")
+            elif configuration.get("region") is not None or "realtimeURL" in configuration:
+                raise ValueError(f"Invalid Polish static/realtime external GTFS configuration for {city_id}")
+            if "tripUpdates" in features and not isinstance(configuration.get("tripUpdatesURL"), str):
+                raise ValueError(f"Polish TripUpdates URL is missing for {city_id}")
+            return
         if configuration.get("staticOnly") is not True:
             required = {
                 "liveVehicles",
@@ -1615,6 +1645,24 @@ def transit_radar_manifest(
                 configured_modes = provider_configuration.get(mode_key)
                 if isinstance(configured_modes, list) and all(isinstance(value, str) for value in configured_modes):
                     provider[mode_key] = configured_modes
+            for metadata_key in (
+                "sourceName",
+                "sourceURL",
+                "sourceType",
+                "license",
+                "attribution",
+            ):
+                metadata_value = provider_configuration.get(metadata_key)
+                if isinstance(metadata_value, str) and metadata_value.strip():
+                    provider[metadata_key] = metadata_value.strip()
+            for capability_key in (
+                "supportsVehiclePositions",
+                "supportsTripUpdates",
+                "supportsAlerts",
+            ):
+                capability_value = provider_configuration.get(capability_key)
+                if isinstance(capability_value, bool):
+                    provider[capability_key] = capability_value
             providers.append(provider)
 
         if any(p.get("adapter") == "netherlands" for p in providers):
@@ -1639,6 +1687,10 @@ def transit_radar_manifest(
             country_suffix = "ua"
         elif any(p.get("adapter") == "fintraffic" for p in providers):
             country_suffix = "fi"
+        elif str(city.get("country", "")).upper() == "PL" or any(
+            str(p.get("providerID", "")).startswith("poland-") for p in providers
+        ):
+            country_suffix = "pl"
         elif any(p.get("adapter") in {"translinkSEQ", "translinkQueensland", "adelaideMetro", "externalGTFS"} for p in providers):
             country_suffix = "au"
         else:
@@ -2943,12 +2995,14 @@ def main(argv: list[str] | None = None) -> None:
 
     try:
         from .external_gtfs import (
+            load_external_gtfs_sources,
             parse_external_gtfs_url_args,
             process_external_gtfs_sources,
             validate_external_stop_packages,
         )
     except ImportError:
         from external_gtfs import (
+            load_external_gtfs_sources,
             parse_external_gtfs_url_args,
             process_external_gtfs_sources,
             validate_external_stop_packages,
@@ -3268,6 +3322,25 @@ def main(argv: list[str] | None = None) -> None:
             "url": "https://www.trafiklab.se/"
         }
     ]
+    try:
+        external_sources_for_attribution = load_external_gtfs_sources(
+            Path(args.external_gtfs_sources)
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        external_sources_for_attribution = []
+    seen_attribution_names = {str(item["name"]) for item in attributions}
+    for source in external_sources_for_attribution:
+        name = str(source.get("sourceName") or "").strip()
+        license_name = str(source.get("license") or "").strip()
+        source_url = str(source.get("sourceURL") or "").strip()
+        if not name or not license_name or not source_url or name in seen_attribution_names:
+            continue
+        attributions.append({
+            "name": name,
+            "license": license_name,
+            "url": source_url,
+        })
+        seen_attribution_names.add(name)
     (output / "attributions.json").write_text(
         json.dumps(attributions, ensure_ascii=False, indent=2),
         encoding="utf-8"

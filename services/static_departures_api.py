@@ -58,6 +58,11 @@ from fintraffic_gateway import (
     GTFSRealtimeVehiclePositionsGateway,
     PublicGTFSRealtimeHTTPTransport,
 )
+from poland_gateway import (
+    GdyniaDelaysGateway,
+    PolandGTFSRealtimeGateway,
+    _CombinedFeedCache,
+)
 from apple_store_business_events import normalize_notification
 from apple_store_notification_store import (
     AppleStoreNotificationStore,
@@ -743,6 +748,9 @@ class Handler(BaseHTTPRequestHandler):
     australia_queensland_trip_updates_gateways: dict[str, GTFSRealtimeTripUpdatesGateway] = {}
     australia_queensland_vehicle_positions_gateways: dict[str, GTFSRealtimeVehiclePositionsGateway] = {}
     stm_gateway: STMRealtimeGateway | None = None
+    poland_trip_updates_gateways: dict[str, PolandGTFSRealtimeGateway | GdyniaDelaysGateway] = {}
+    poland_vehicle_positions_gateways: dict[str, PolandGTFSRealtimeGateway] = {}
+    poland_alerts_gateways: dict[str, PolandGTFSRealtimeGateway] = {}
 
     def send_json(
         self,
@@ -818,6 +826,24 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed, query = urlparse(self.path), parse_qs(urlparse(self.path).query)
         try:
+            if parsed.path in self.poland_trip_updates_gateways:
+                response = self.poland_trip_updates_gateways[parsed.path].handle(
+                    parsed.path,
+                    query,
+                )
+                return self.send_json(response.status, response.payload, response.cache_control)
+            if parsed.path in self.poland_vehicle_positions_gateways:
+                response = self.poland_vehicle_positions_gateways[parsed.path].handle(
+                    parsed.path,
+                    query,
+                )
+                return self.send_json(response.status, response.payload, response.cache_control)
+            if parsed.path in self.poland_alerts_gateways:
+                response = self.poland_alerts_gateways[parsed.path].handle(
+                    parsed.path,
+                    query,
+                )
+                return self.send_json(response.status, response.payload, response.cache_control)
             if parsed.path.startswith("/tfl/"):
                 if self.tfl_gateway is None:
                     return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "TfL provider unavailable"})
@@ -1092,6 +1118,228 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request body"})
 
 
+def _load_poland_registry() -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    repository_root = Path(__file__).resolve().parents[1]
+    configured_path = os.environ.get("POLAND_EXTERNAL_GTFS_SOURCES", "").strip()
+    candidates = (
+        [Path(configured_path)]
+        if configured_path
+        else [
+            repository_root / "config" / "external-gtfs-sources.json",
+            repository_root / "config" / "poland-sources.json",
+            Path("/app/config/poland-sources.json"),
+        ]
+    )
+    sources_by_id: dict[str, dict[str, object]] = {}
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, list):
+            continue
+        for source in payload:
+            if not isinstance(source, dict):
+                continue
+            source_id = str(source.get("id", "")).strip()
+            if source_id.startswith("poland-"):
+                sources_by_id[source_id] = source
+
+    city_candidates = [
+        repository_root / "config" / "poland-cities.json",
+        Path("/app/config/poland-cities.json"),
+    ]
+    cities: list[dict[str, object]] = []
+    for candidate in city_candidates:
+        try:
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, list):
+            cities = [item for item in payload if isinstance(item, dict)]
+            break
+    return list(sources_by_id.values()), cities
+
+
+def _configure_poland_gateways(database: Database) -> None:
+    sources, cities = _load_poland_registry()
+    if not sources or not cities:
+        return
+
+    city_by_source: dict[str, set[str]] = {}
+    regions_by_provider: dict[str, dict[str, dict[str, object]]] = {}
+    active_kinds_by_provider: dict[str, set[str]] = {}
+    public_provider_ids: set[str] = set()
+    for city in cities:
+        city_id = str(city.get("id", "")).strip()
+        if not city_id:
+            continue
+        external_provider_ids = {
+            str(value).strip()
+            for value in (
+                city.get("externalGTFSProviders")
+                or ([city.get("externalGTFSProvider")] if city.get("externalGTFSProvider") else [])
+            )
+            if str(value).strip()
+        }
+        for source_id in external_provider_ids:
+            city_by_source.setdefault(source_id, set()).add(city_id)
+        radar = city.get("transitRadar")
+        radar_configurations = radar if isinstance(radar, list) else [radar]
+        for configuration in radar_configurations:
+            if not isinstance(configuration, dict):
+                continue
+            provider_id = str(configuration.get("providerID", "")).strip()
+            if not provider_id.startswith("poland-"):
+                continue
+            public_provider_ids.add(provider_id)
+            features = {
+                str(feature)
+                for feature in (configuration.get("features") or [])
+                if isinstance(feature, str)
+            }
+            active_kinds_by_provider[provider_id] = {
+                kind
+                for kind, feature in (
+                    ("tripUpdates", "tripUpdates"),
+                    ("vehiclePositions", "vehiclePositions"),
+                    ("alerts", "alerts"),
+                )
+                if feature in features
+            }
+            region = configuration.get("region")
+            if isinstance(region, dict):
+                regions_by_provider.setdefault(provider_id, {})[city_id] = region
+
+    source_by_id = {str(source["id"]): source for source in sources}
+
+    def poland_trip_stop_resolver(
+        source_id: str,
+        sequence_keys: set[tuple[str, int]],
+    ) -> dict[tuple[str, int], str]:
+        source = source_by_id.get(source_id)
+        if source is None:
+            return {}
+        namespace = str(source.get("namespace") or "")
+        internal_trip_ids = {
+            f"{namespace}{trip_id}" for trip_id, _sequence in sequence_keys
+        }
+        mapping = database.provider_trip_stop_registry(source_id, internal_trip_ids)
+        return {
+            (
+                trip_id[len(namespace):]
+                if namespace and trip_id.startswith(namespace)
+                else trip_id,
+                sequence,
+            ): (
+                stop_id[len(namespace):]
+                if namespace and stop_id.startswith(namespace)
+                else stop_id
+            )
+            for (trip_id, sequence), stop_id in mapping.items()
+        }
+
+    source_groups: dict[str, list[dict[str, object]]] = {}
+    for provider_id in sorted(public_provider_ids):
+        if provider_id == "poland-krakow":
+            group = [
+                source
+                for source in sources
+                if str(source.get("mergeGroup", "")) == provider_id
+            ]
+        else:
+            source = source_by_id.get(provider_id)
+            group = [source] if source is not None else []
+        if group:
+            source_groups[provider_id] = group
+
+    for provider_id, group in source_groups.items():
+        city_ids = set()
+        for source in group:
+            city_ids.update(city_by_source.get(str(source["id"]), set()))
+        if not city_ids:
+            continue
+        slug = provider_id.removeprefix("poland-")
+        common = {
+            "provider_id": provider_id,
+            "city_ids": city_ids,
+            "sources": group,
+            "city_regions": regions_by_provider.get(provider_id, {}),
+            "trip_stop_resolver": poland_trip_stop_resolver,
+        }
+        if any(
+            isinstance(source.get("realtime"), dict)
+            and source["realtime"].get("combinedURL")
+            for source in group
+        ):
+            common["combined_feed_cache"] = _CombinedFeedCache()
+        realtime_kinds = {
+            "tripUpdates": "trip-updates",
+            "vehiclePositions": "vehicle-positions",
+            "alerts": "alerts",
+        }
+        for kind, suffix in realtime_kinds.items():
+            if kind not in active_kinds_by_provider.get(provider_id, set()):
+                continue
+            has_source = any(
+                isinstance(source.get("realtime"), dict)
+                and (
+                    kind == "tripUpdates"
+                    and (
+                        source["realtime"].get("tripUpdatesURL")
+                        or source["realtime"].get("manifestURL")
+                        or source["realtime"].get("combinedURL")
+                    )
+                    or kind == "vehiclePositions"
+                    and (
+                        source["realtime"].get("vehiclePositionsURL")
+                        or source["realtime"].get("manifestURL")
+                        or source["realtime"].get("combinedURL")
+                    )
+                    or kind == "alerts"
+                    and (
+                        source["realtime"].get("alertsURL")
+                        or source["realtime"].get("manifestURL")
+                        or source["realtime"].get("combinedURL")
+                    )
+                )
+                for source in group
+            )
+            if not has_source:
+                continue
+            gateway = PolandGTFSRealtimeGateway(
+                **common,
+                path=f"/poland/{slug}/realtime/{suffix}",
+                kind=kind,
+            )
+            if kind == "tripUpdates":
+                Handler.poland_trip_updates_gateways[gateway._path] = gateway
+            elif kind == "vehiclePositions":
+                Handler.poland_vehicle_positions_gateways[gateway._path] = gateway
+            else:
+                Handler.poland_alerts_gateways[gateway._path] = gateway
+
+    gdynia_source = source_by_id.get("poland-gdynia")
+    if gdynia_source is not None:
+        city_ids = city_by_source.get("poland-gdynia", set())
+        if city_ids:
+            gateway = GdyniaDelaysGateway(
+                provider_id="poland-gdynia",
+                city_ids=city_ids,
+                source=gdynia_source,
+                path="/poland/gdynia/realtime/trip-updates",
+            )
+            Handler.poland_trip_updates_gateways[gateway._path] = gateway
+
+    LOGGER.info(
+        "event=poland_gateways_configured providers=%d trip=%d vehicle=%d alerts=%d",
+        len(source_groups),
+        len(Handler.poland_trip_updates_gateways),
+        len(Handler.poland_vehicle_positions_gateways),
+        len(Handler.poland_alerts_gateways),
+    )
+
+
 if __name__ == "__main__":
     database = Database(os.environ.get("DEPARTURES_DATABASE", "/data/departures-current.sqlite"))
     Handler.database = database
@@ -1102,6 +1350,7 @@ if __name__ == "__main__":
         )
     )
     Handler.telegram_sales_notifier = TelegramSalesNotifier.from_environment()
+    _configure_poland_gateways(database)
     Handler.geofox_gateway = GeofoxProxy.from_environment()
     Handler.tfl_gateway = TfLProxy.from_environment()
     Handler.translink_gateway = TransLinkProxy.from_environment()

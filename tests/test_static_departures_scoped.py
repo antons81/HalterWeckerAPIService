@@ -211,7 +211,7 @@ class StaticDepartureScopeTests(unittest.TestCase):
 
         self.assertEqual(
             [provider.provider_id for provider in providers],
-            ["translink", "ttc-surface", "ttc-subway"],
+            ["translink", "ttc-surface", "ttc-subway", "stm-montreal"],
         )
 
     def test_unknown_provider_is_rejected(self) -> None:

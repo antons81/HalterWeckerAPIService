@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 import binascii
 import gzip
+import math
+import struct
 import threading
 import time
 from dataclasses import dataclass
@@ -15,7 +17,7 @@ from typing import Callable
 
 
 DEFAULT_CACHE_TTL_SECONDS = 15.0
-DEFAULT_MAX_STALE_SECONDS = 180.0
+DEFAULT_MAX_STALE_SECONDS = 120.0
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,42 @@ class RealtimeUpdate:
 
 
 @dataclass(frozen=True)
+class RealtimeVehiclePosition:
+    vehicle_id: str
+    trip_id: str | None
+    route_id: str | None
+    direction_id: str | None
+    stop_id: str | None
+    stop_sequence: int | None
+    latitude: float
+    longitude: float
+    bearing: float | None
+    speed: float | None
+    timestamp: int | None
+
+
+@dataclass(frozen=True)
+class RealtimeAlert:
+    alert_id: str
+    cause: int | None
+    effect: int | None
+    header_text: str | None
+    description_text: str | None
+    url: str | None
+    active_periods: tuple[tuple[int | None, int | None], ...]
+    informed_entity_count: int
+
+
+@dataclass(frozen=True)
+class GTFSRealtimeFeed:
+    feed_timestamp: int | None
+    entity_count: int
+    trip_updates: tuple[RealtimeUpdate, ...]
+    vehicle_positions: tuple[RealtimeVehiclePosition, ...]
+    alerts: tuple[RealtimeAlert, ...]
+
+
+@dataclass(frozen=True)
 class _Snapshot:
     feed_timestamp: int | None
     retrieved_at: float
@@ -47,6 +85,10 @@ class _Snapshot:
 
 class GTFSRealtimeGatewayError(Exception):
     """An upstream or payload error safe to expose as a generic status."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def infer_identifier_prefix(values: object) -> str:
@@ -114,6 +156,136 @@ def _text(value: bytes) -> str:
         return value.decode("utf-8")
     except UnicodeDecodeError as error:
         raise GTFSRealtimeGatewayError("invalid protobuf text") from error
+
+
+def _float32(value: bytes) -> float:
+    if len(value) != 4:
+        raise GTFSRealtimeGatewayError("malformed protobuf")
+    return float(struct.unpack("<f", value)[0])
+
+
+def _parse_vehicle_descriptor(data: bytes) -> str:
+    for field, wire_type, value in _iter_fields(data):
+        if field == 1 and wire_type == 2:
+            return _text(value)
+    return ""
+
+
+def _parse_position(
+    data: bytes,
+) -> tuple[float | None, float | None, float | None, float | None]:
+    latitude = longitude = bearing = speed = None
+    for field, wire_type, value in _iter_fields(data):
+        if field == 1 and wire_type == 5:
+            latitude = _float32(value)
+        elif field == 2 and wire_type == 5:
+            longitude = _float32(value)
+        elif field == 3 and wire_type == 5:
+            bearing = _float32(value)
+        elif field == 5 and wire_type == 5:
+            speed = _float32(value)
+    return latitude, longitude, bearing, speed
+
+
+def _parse_vehicle_position(
+    data: bytes,
+    fallback_vehicle_id: str,
+) -> RealtimeVehiclePosition | None:
+    trip_id = route_id = ""
+    direction_id = stop_id = None
+    vehicle_id = fallback_vehicle_id
+    stop_sequence = timestamp = None
+    latitude = longitude = bearing = speed = None
+
+    for field, wire_type, value in _iter_fields(data):
+        if field == 1 and wire_type == 2:
+            trip_id, route_id, direction_id, _ = _parse_trip_descriptor(value)
+        elif field == 2 and wire_type == 2:
+            latitude, longitude, bearing, speed = _parse_position(value)
+        elif field == 3 and wire_type == 0:
+            stop_sequence = int(value)
+        elif field == 5 and wire_type == 0:
+            timestamp = int(value)
+        elif field == 7 and wire_type == 2:
+            stop_id = _text(value)
+        elif field == 8 and wire_type == 2:
+            candidate = _parse_vehicle_descriptor(value)
+            if candidate:
+                vehicle_id = candidate
+
+    if not vehicle_id or latitude is None or longitude is None:
+        return None
+    if not math.isfinite(latitude) or not math.isfinite(longitude):
+        return None
+    if bearing is not None and not math.isfinite(bearing):
+        bearing = None
+    if speed is not None and (not math.isfinite(speed) or speed <= 0):
+        speed = None
+    return RealtimeVehiclePosition(
+        vehicle_id=vehicle_id,
+        trip_id=trip_id or None,
+        route_id=route_id or None,
+        direction_id=direction_id,
+        stop_id=stop_id,
+        stop_sequence=stop_sequence,
+        latitude=latitude,
+        longitude=longitude,
+        bearing=bearing % 360.0 if bearing is not None else None,
+        speed=speed,
+        timestamp=timestamp,
+    )
+
+
+def _translated_text(data: bytes) -> str | None:
+    for field, wire_type, value in _iter_fields(data):
+        if field == 1 and wire_type == 2:
+            for translation_field, translation_wire_type, translation_value in _iter_fields(value):
+                if translation_field == 1 and translation_wire_type == 2:
+                    return _text(translation_value)
+            try:
+                return _text(value)
+            except GTFSRealtimeGatewayError:
+                continue
+    return None
+
+
+def _parse_alert(data: bytes, fallback_alert_id: str) -> RealtimeAlert:
+    cause = effect = None
+    header_text = description_text = url = None
+    active_periods: list[tuple[int | None, int | None]] = []
+    informed_entity_count = 0
+    for field, wire_type, value in _iter_fields(data):
+        if field == 1 and wire_type == 2:
+            start = end = None
+            for period_field, period_wire_type, period_value in _iter_fields(value):
+                if period_field in (1, 2) and period_wire_type == 0:
+                    if period_field == 1:
+                        start = int(period_value)
+                    else:
+                        end = int(period_value)
+            active_periods.append((start, end))
+        elif field == 5 and wire_type == 2:
+            informed_entity_count += 1
+        elif field == 6 and wire_type == 0:
+            cause = int(value)
+        elif field == 7 and wire_type == 0:
+            effect = int(value)
+        elif field == 8 and wire_type == 2:
+            url = _translated_text(value)
+        elif field == 10 and wire_type == 2:
+            header_text = _translated_text(value)
+        elif field == 11 and wire_type == 2:
+            description_text = _translated_text(value)
+    return RealtimeAlert(
+        alert_id=fallback_alert_id,
+        cause=cause,
+        effect=effect,
+        header_text=header_text,
+        description_text=description_text,
+        url=url,
+        active_periods=tuple(active_periods),
+        informed_entity_count=informed_entity_count,
+    )
 
 
 def _validate_gtfs_realtime_payload(data: bytes) -> None:
@@ -217,27 +389,49 @@ def _parse_trip_update(
     return trip, stop_updates
 
 
-def parse_trip_updates(data: bytes) -> tuple[int | None, int, tuple[RealtimeUpdate, ...]]:
-    """Decode only the GTFS-RT fields needed by the normalized client API."""
+def _feed_timestamp(data: bytes) -> int | None:
     feed_timestamp: int | None = None
-    entity_count = 0
-    updates: dict[tuple[str, str, int | None], RealtimeUpdate] = {}
     for field, wire_type, value in _iter_fields(data):
         if field == 1 and wire_type == 2:
             for header_field, header_wire_type, header_value in _iter_fields(value):
                 if header_field in (3, 4) and header_wire_type == 0:
                     feed_timestamp = int(header_value)
-        elif field == 2 and wire_type == 2:
-            entity_count += 1
-            for entity_field, entity_wire_type, entity_value in _iter_fields(value):
-                if entity_field != 3 or entity_wire_type != 2:
-                    continue
-                trip, stop_updates = _parse_trip_update(entity_value)
-                trip_id, route_id, direction_id, is_cancelled = trip
-                if not trip_id:
-                    continue
+    return feed_timestamp
+
+
+def parse_gtfs_realtime_feed(
+    data: bytes,
+    *,
+    include_missing_stop_ids: bool = False,
+) -> GTFSRealtimeFeed:
+    """Decode TripUpdates, VehiclePositions, and ServiceAlerts from one feed."""
+    feed_timestamp = _feed_timestamp(data)
+    entity_count = 0
+    updates: dict[tuple[str, str, int | None], RealtimeUpdate] = {}
+    vehicles: dict[str, RealtimeVehiclePosition] = {}
+    alerts: dict[str, RealtimeAlert] = {}
+    for field, wire_type, value in _iter_fields(data):
+        if field != 2 or wire_type != 2:
+            continue
+        entity_count += 1
+        entity_id = ""
+        trip_update_payload = vehicle_payload = alert_payload = None
+        for entity_field, entity_wire_type, entity_value in _iter_fields(value):
+            if entity_field == 1 and entity_wire_type == 2:
+                entity_id = _text(entity_value)
+            elif entity_field == 3 and entity_wire_type == 2:
+                trip_update_payload = entity_value
+            elif entity_field == 4 and entity_wire_type == 2:
+                vehicle_payload = entity_value
+            elif entity_field == 5 and entity_wire_type == 2:
+                alert_payload = entity_value
+
+        if trip_update_payload is not None:
+            trip, stop_updates = _parse_trip_update(trip_update_payload)
+            trip_id, route_id, direction_id, is_cancelled = trip
+            if trip_id:
                 for stop_id, stop_sequence, event_time, delay_seconds, skipped in stop_updates:
-                    if not stop_id or skipped:
+                    if skipped or (not stop_id and not include_missing_stop_ids):
                         continue
                     updates[(trip_id, stop_id, stop_sequence)] = RealtimeUpdate(
                         trip_id=trip_id,
@@ -249,33 +443,109 @@ def parse_trip_updates(data: bytes) -> tuple[int | None, int, tuple[RealtimeUpda
                         delay_seconds=delay_seconds,
                         is_cancelled=is_cancelled,
                     )
-    return feed_timestamp, entity_count, tuple(updates.values())
+        if vehicle_payload is not None:
+            vehicle = _parse_vehicle_position(vehicle_payload, entity_id)
+            if vehicle is not None:
+                vehicles[vehicle.vehicle_id] = vehicle
+        if alert_payload is not None:
+            alert = _parse_alert(alert_payload, entity_id)
+            alerts[alert.alert_id] = alert
+    return GTFSRealtimeFeed(
+        feed_timestamp=feed_timestamp,
+        entity_count=entity_count,
+        trip_updates=tuple(updates.values()),
+        vehicle_positions=tuple(vehicles.values()),
+        alerts=tuple(alerts.values()),
+    )
 
 
-class _HTTPTransport:
-    def __init__(self, user_agent: str) -> None:
+def parse_trip_updates(data: bytes) -> tuple[int | None, int, tuple[RealtimeUpdate, ...]]:
+    """Decode TripUpdates while preserving the existing gateway contract."""
+    feed = parse_gtfs_realtime_feed(data)
+    return feed.feed_timestamp, feed.entity_count, feed.trip_updates
+
+
+def parse_vehicle_positions(
+    data: bytes,
+) -> tuple[int | None, int, tuple[RealtimeVehiclePosition, ...]]:
+    """Decode VehiclePositions while preserving all-feed entity diagnostics."""
+    feed = parse_gtfs_realtime_feed(data)
+    return feed.feed_timestamp, feed.entity_count, feed.vehicle_positions
+
+
+@dataclass(frozen=True)
+class GTFSRealtimeHTTPResponse:
+    status: int
+    content_type: str
+    body: bytes
+
+
+class GTFSRealtimeHTTPTransport:
+    """Shared public GTFS-RT HTTP transport with optional response metadata."""
+
+    def __init__(
+        self,
+        user_agent: str,
+        headers: dict[str, str] | None = None,
+        timeout: float = 15.0,
+    ) -> None:
         self.user_agent = user_agent
+        self.headers = dict(headers or {})
+        self.timeout = timeout
 
-    def __call__(self, url: str) -> bytes:
+    def fetch_raw(
+        self,
+        url: str,
+        *,
+        accept: str = "application/x-protobuf, application/protobuf",
+    ) -> GTFSRealtimeHTTPResponse:
         request = Request(
             url,
             headers={
-                "Accept": "application/x-protobuf, application/protobuf",
+                "Accept": accept,
                 "Accept-Encoding": "gzip",
                 "User-Agent": self.user_agent,
+                **self.headers,
             },
         )
         try:
-            with urlopen(request, timeout=15) as response:
+            with urlopen(request, timeout=self.timeout) as response:
                 body = response.read()
                 if response.headers.get("Content-Encoding", "").lower() == "gzip":
                     body = gzip.decompress(body)
-                return decode_gtfs_realtime_body(
-                    body,
+                return GTFSRealtimeHTTPResponse(
+                    status=int(response.status),
                     content_type=response.headers.get("Content-Type", ""),
+                    body=body,
                 )
-        except (HTTPError, URLError, TimeoutError, OSError) as error:
+        except HTTPError as error:
+            raise GTFSRealtimeGatewayError(
+                f"upstream HTTP status {error.code}",
+                status_code=error.code,
+            ) from error
+        except (URLError, TimeoutError, OSError) as error:
             raise GTFSRealtimeGatewayError("upstream unavailable") from error
+
+    def fetch(self, url: str) -> GTFSRealtimeHTTPResponse:
+        response = self.fetch_raw(url)
+        try:
+            body = decode_gtfs_realtime_body(
+                response.body,
+                content_type=response.content_type,
+            )
+        except GTFSRealtimeGatewayError:
+            raise
+        return GTFSRealtimeHTTPResponse(
+            status=response.status,
+            content_type=response.content_type,
+            body=body,
+        )
+
+    def __call__(self, url: str) -> bytes:
+        return self.fetch(url).body
+
+
+_HTTPTransport = GTFSRealtimeHTTPTransport
 
 
 class GTFSRealtimeGateway:

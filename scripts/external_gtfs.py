@@ -25,6 +25,11 @@ except ImportError:
     from gtfs_source_cache import GTFSArtifactCache, REQUIRED_GTFS_FILES
 
 try:
+    from .dynamic_resource_resolver import resolve_gtfs_resource
+except ImportError:
+    from dynamic_resource_resolver import resolve_gtfs_resource
+
+try:
     from .external_staging import ExternalDepartureStage, ExternalMergeStage, iter_departure_payload, iter_json_array, iter_json_object
 except ImportError:
     from external_staging import ExternalDepartureStage, ExternalMergeStage, iter_departure_payload, iter_json_array, iter_json_object
@@ -448,7 +453,14 @@ def load_external_cities(
             for city in cities
             if source_id in {
                 str(provider).strip()
-                for provider in (city.get("externalGTFSProviders") or [])
+                for provider in (
+                    city.get("externalGTFSProviders")
+                    or (
+                        [city.get("externalGTFSProvider")]
+                        if city.get("externalGTFSProvider")
+                        else []
+                    )
+                )
                 if str(provider).strip()
             }
         ]
@@ -2349,8 +2361,12 @@ def process_external_gtfs_sources(
                         f"rawSHA={raw_artifact_digest[:12]} providerConfig=n/a builder=n/a"
                     )
 
+        dynamic_resource = None
+        if source_id not in url_by_provider and isinstance(source.get("dynamicResource"), dict):
+            dynamic_resource = resolve_gtfs_resource(source)
+        source_url = dynamic_resource.url if dynamic_resource is not None else url
         request_url, headers = authenticated_external_request(
-            source_id, url, environ=environ
+            source_id, source_url, environ=environ
         )
         source_started = time.monotonic()
         resilience_policy = external_gtfs_resilience_policy(source)
@@ -2361,6 +2377,11 @@ def process_external_gtfs_sources(
                 headers=headers,
                 allow_stale=bool(resilience_policy["allowStale"]),
                 state_url=url,
+                source_version=(
+                    {"dynamicVersion": dynamic_resource.version}
+                    if dynamic_resource is not None
+                    else None
+                ),
                 metadata_probe=bool(resilience_policy["metadataProbe"]),
                 retry_attempts=int(resilience_policy["retryAttempts"]),
                 validator=(
@@ -2378,7 +2399,13 @@ def process_external_gtfs_sources(
                 size=raw_artifact_size,
                 origin="external-gtfs-cache",
                 status=result.status,
-            ) | {"resourceIdentity": url}
+            ) | {
+                "resourceIdentity": (
+                    dynamic_resource.version
+                    if dynamic_resource is not None
+                    else url
+                )
+            }
         else:
             archive = load_gtfs_archive(request_url, headers=headers)
         archive = agency_scoped_archive(archive, source.get("agencyID"))

@@ -20,6 +20,7 @@ from external_gtfs import (
     source_classification,
     validate_kyiv_gtfs_archive,
 )
+from dynamic_resource_resolver import resolve_gtfs_resource
 from gtfs_source_cache import DEFAULT_CACHE_ROOT, ArtifactResult, GTFSArtifactCache
 
 
@@ -186,7 +187,11 @@ def main() -> None:
                 f"status=local path={local_kind}"
             )
             continue
-        url = external_urls.get(source_id, configured_external_url(source))
+        configured_url = configured_external_url(source)
+        dynamic_configuration = source.get("dynamicResource")
+        if not configured_url and isinstance(dynamic_configuration, dict):
+            configured_url = str(dynamic_configuration.get("metadataURL") or "").strip()
+        url = external_urls.get(source_id, configured_url)
         if not url:
             reason = f"no URL or localPath configured for {source_id}"
             if classification == "required":
@@ -202,9 +207,13 @@ def main() -> None:
                 f"classification={classification} reason={reason}"
             )
             continue
+        dynamic_resource = None
+        if source_id not in external_urls and isinstance(dynamic_configuration, dict):
+            dynamic_resource = resolve_gtfs_resource(source)
+        request_url = dynamic_resource.url if dynamic_resource is not None else url
         try:
             request_url, headers = authenticated_external_request(
-                source_id, url, environ=os.environ
+                source_id, request_url, environ=os.environ
             )
         except ValueError:
             if classification == "required" or not bool(source.get("allowStale", True)):
@@ -237,6 +246,11 @@ def main() -> None:
                 else bool(source.get("allowStale", True))
             ),
             state_url=url,
+            source_version=(
+                {"dynamicVersion": dynamic_resource.version}
+                if dynamic_resource is not None
+                else None
+            ),
             metadata_probe=(
                 bool(resilience_policy["metadataProbe"])
                 if resilience_policy is not None
