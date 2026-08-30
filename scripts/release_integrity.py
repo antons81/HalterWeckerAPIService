@@ -223,7 +223,10 @@ def _safe_release_file(root: Path, relative_path: object) -> Path | None:
     return candidate
 
 
-def _load_city_stops(stop_data_root: Path, city: Mapping[str, object]) -> set[str]:
+def _load_city_stops(
+    stop_data_root: Path,
+    city: Mapping[str, object],
+) -> list[Mapping[str, object]]:
     path = _safe_release_file(stop_data_root, city.get("url"))
     if path is None or not path.is_file():
         raise ValueError(
@@ -239,16 +242,16 @@ def _load_city_stops(stop_data_root: Path, city: Mapping[str, object]) -> set[st
         raise ValueError(
             f"Active stops package is invalid for lost city {city.get('id', '<unknown>')}"
         )
-    stop_ids = {
-        str(stop.get("id")).strip()
+    stops = [
+        stop
         for stop in payload
         if isinstance(stop, Mapping) and str(stop.get("id", "")).strip()
-    }
-    if not stop_ids:
+    ]
+    if not stops:
         raise ValueError(
             f"Active stops package is empty for lost city {city.get('id', '<unknown>')}"
         )
-    return stop_ids
+    return stops
 
 
 def _json_count(path: Path, *, departure_payload: bool = False) -> int:
@@ -289,7 +292,7 @@ def _city_service_counts(stop_data_root: Path, city: Mapping[str, object]) -> di
     }
 
 
-def _gtfs_stop_ids(path: Path) -> set[str]:
+def _gtfs_stops_by_id(path: Path) -> dict[str, list[dict[str, str]]]:
     required_files = {"stops.txt", "routes.txt", "trips.txt", "stop_times.txt"}
     if path.is_dir():
         missing = sorted(name for name in required_files if not (path / name).is_file())
@@ -329,11 +332,11 @@ def _gtfs_stop_ids(path: Path) -> set[str]:
         reader = csv.DictReader(stream)
         if not reader.fieldnames or "stop_id" not in reader.fieldnames:
             raise ValueError(f"GTFS source stops.txt has no stop_id column: {path}")
-        stop_ids = {
-            str(row.get("stop_id", "")).strip()
-            for row in reader
-            if str(row.get("stop_id", "")).strip()
-        }
+        stops_by_id: dict[str, list[dict[str, str]]] = {}
+        for row in reader:
+            stop_id = str(row.get("stop_id", "")).strip()
+            if stop_id:
+                stops_by_id.setdefault(stop_id, []).append(dict(row))
     except (UnicodeDecodeError, csv.Error) as error:
         raise ValueError(f"GTFS source stops.txt is invalid: {path}") from error
     finally:
@@ -341,28 +344,47 @@ def _gtfs_stop_ids(path: Path) -> set[str]:
             stream.close()
         if archive is not None:
             archive.close()
-    if not stop_ids:
+    if not stops_by_id:
         raise ValueError(f"GTFS source stops.txt has no data rows: {path}")
-    return stop_ids
+    return stops_by_id
 
 
-def _source_stop_ids_in_feed(
-    active_stop_ids: set[str],
+def _source_stop_id_variants(
+    stop_id: str,
     source: Mapping[str, object],
 ) -> set[str]:
-    prefixes = [
-        str(source.get("identifierPrefix", "")),
-        str(source.get("namespace", "")),
-    ]
-    raw_ids = set(active_stop_ids)
-    for prefix in prefixes:
-        if prefix:
-            raw_ids.update(
-                stop_id[len(prefix):]
-                for stop_id in active_stop_ids
-                if stop_id.startswith(prefix)
-            )
-    return raw_ids
+    variants = {stop_id}
+    for prefix_key in ("identifierPrefix", "namespace"):
+        prefix = str(source.get(prefix_key, ""))
+        if prefix and stop_id.startswith(prefix):
+            variants.add(stop_id[len(prefix):])
+    return variants
+
+
+def _stop_identity_matches(
+    active_stop: Mapping[str, object],
+    candidate_stop: Mapping[str, object],
+) -> bool:
+    active_name = " ".join(str(active_stop.get("name", "")).casefold().split())
+    candidate_name = " ".join(
+        str(candidate_stop.get("stop_name", "")).casefold().split()
+    )
+    if active_name and candidate_name and active_name == candidate_name:
+        return True
+
+    try:
+        active_lat = float(active_stop["latitude"])
+        active_lon = float(active_stop["longitude"])
+        candidate_lat = float(candidate_stop["stop_lat"])
+        candidate_lon = float(candidate_stop["stop_lon"])
+    except (KeyError, TypeError, ValueError):
+        return True
+    if abs(active_lat - candidate_lat) <= 0.0001 and abs(active_lon - candidate_lon) <= 0.0001:
+        return True
+
+    # A reused source ID with both a different name and distant coordinates is
+    # a different physical stop, so the active stop was legitimately removed.
+    return not (active_name and candidate_name and active_name != candidate_name)
 
 
 def _source_config_by_id(registry: Iterable[Mapping[str, object]]) -> dict[str, Mapping[str, object]]:
@@ -442,7 +464,7 @@ def validate_previous_release_city_retirements(
                 candidate_entry,
                 base_dir=candidate_artifacts_root,
             )
-            candidate_stop_ids = _gtfs_stop_ids(candidate_path)
+            candidate_stops_by_id = _gtfs_stops_by_id(candidate_path)
         except ValueError as error:
             failures.append(f"{city_id}: source import is not valid ({error})")
             continue
@@ -474,11 +496,27 @@ def validate_previous_release_city_retirements(
             )
             continue
 
-        active_stop_ids = _load_city_stops(active_stop_data, city)
+        active_stops = _load_city_stops(active_stop_data, city)
         source_config_entry = source_config.get(source_id, {})
-        raw_active_stop_ids = _source_stop_ids_in_feed(active_stop_ids, source_config_entry)
-        if raw_active_stop_ids & candidate_stop_ids:
-            failures.append(f"{city_id}: active stop still exists in candidate source")
+        matching_active_stops = [
+            stop
+            for stop in active_stops
+            if any(
+                _stop_identity_matches(stop, candidate_stop)
+                for raw_stop_id in _source_stop_id_variants(
+                    str(stop.get("id", "")).strip(), source_config_entry
+                )
+                for candidate_stop in candidate_stops_by_id.get(raw_stop_id, [])
+            )
+        ]
+        if matching_active_stops:
+            matching_ids = ", ".join(
+                str(stop.get("id", "<unknown>")) for stop in matching_active_stops
+            )
+            failures.append(
+                f"{city_id}: active stop still exists in candidate source "
+                f"({matching_ids})"
+            )
             continue
 
         service_counts = _city_service_counts(active_stop_data, city)
@@ -494,7 +532,7 @@ def validate_previous_release_city_retirements(
             "cityID": city_id,
             "sourceID": source_id,
             "reason": "upstream-stop-removal",
-            "activeStopCount": len(active_stop_ids),
+            "activeStopCount": len(active_stops),
             "serviceCounts": service_counts,
         })
 

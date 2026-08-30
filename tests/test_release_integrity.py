@@ -14,12 +14,24 @@ from release_integrity import (  # noqa: E402
 
 
 class PreviousReleaseCityRetirementTests(unittest.TestCase):
-    def _write_gtfs(self, path: Path, stop_ids: list[str]) -> tuple[str, int]:
+    def _write_gtfs(
+        self,
+        path: Path,
+        stop_ids: list[str],
+        stop_overrides: dict[str, tuple[str, float, float]] | None = None,
+    ) -> tuple[str, int]:
+        stop_overrides = stop_overrides or {}
+        stop_rows = []
+        for stop_id in stop_ids:
+            name, latitude, longitude = stop_overrides.get(
+                stop_id, (f"Stop {stop_id}", 50.0, 19.0)
+            )
+            stop_rows.append(f"{stop_id},{name},{latitude},{longitude}\n")
         with zipfile.ZipFile(path, "w") as archive:
             archive.writestr(
                 "stops.txt",
                 "stop_id,stop_name,stop_lat,stop_lon\n"
-                + "".join(f"{stop_id},Stop {stop_id},50.0,19.0\n" for stop_id in stop_ids),
+                + "".join(stop_rows),
             )
             archive.writestr(
                 "routes.txt",
@@ -53,6 +65,7 @@ class PreviousReleaseCityRetirementTests(unittest.TestCase):
         old_cities: list[dict[str, object]] | None = None,
         service_city_ids: set[str] | None = None,
         candidate_city_ids: list[str] | None = None,
+        candidate_stop_overrides: dict[str, tuple[str, float, float]] | None = None,
     ) -> tuple[
         tuple[dict[str, object], dict[str, object], dict[str, object], Path, Path],
         dict[str, object],
@@ -70,7 +83,12 @@ class PreviousReleaseCityRetirementTests(unittest.TestCase):
         for city in old_cities:
             city_id = str(city["id"])
             (active_root / str(city["url"])).write_text(
-                json.dumps([{"id": f"{city_id}-stop", "name": city_id}]),
+                json.dumps([{
+                    "id": f"{city_id}-stop",
+                    "name": f"Stop {city_id}-stop",
+                    "latitude": 50.0,
+                    "longitude": 19.0,
+                }]),
                 encoding="utf-8",
             )
             if city_id in service_city_ids:
@@ -98,7 +116,7 @@ class PreviousReleaseCityRetirementTests(unittest.TestCase):
         candidate_gtfs = root / "candidate-germany.zip"
         active_digest, active_size = self._write_gtfs(active_gtfs, ["fixture-city-stop"])
         candidate_digest, candidate_size = self._write_gtfs(
-            candidate_gtfs, candidate_stop_ids
+            candidate_gtfs, candidate_stop_ids, candidate_stop_overrides
         )
         registry = [{
             "id": "germany",
@@ -156,6 +174,18 @@ class PreviousReleaseCityRetirementTests(unittest.TestCase):
     def test_orphan_stop_removed_by_changed_upstream_passes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = self._fixture(Path(temporary), candidate_stop_ids=["new-stop"])
+            retirements = self._validate(fixture)
+            self.assertEqual(retirements[0]["cityID"], "fixture-city")
+
+    def test_reused_source_id_with_different_identity_is_retired(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._fixture(
+                Path(temporary),
+                candidate_stop_ids=["fixture-city-stop"],
+                candidate_stop_overrides={
+                    "fixture-city-stop": ("Replacement Stop", 51.0, 20.0),
+                },
+            )
             retirements = self._validate(fixture)
             self.assertEqual(retirements[0]["cityID"], "fixture-city")
 
