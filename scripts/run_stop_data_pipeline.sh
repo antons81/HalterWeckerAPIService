@@ -491,7 +491,7 @@ if old_manifest_path.is_file():
                 old_manifest=old_manifest,
                 candidate_manifest=manifest,
                 active_stop_data=old_root / "stop-data",
-                candidate_stop_data=BUILD_DIR,
+                candidate_stop_data=manifest_path.parent,
                 active_artifacts=old_artifacts,
                 candidate_artifacts=artifacts,
                 registry=registry,
