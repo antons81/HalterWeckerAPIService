@@ -344,6 +344,7 @@ manifest_city_ids = {
 sys.path.insert(0, str(repository_root / "scripts"))
 from release_integrity import validate_candidate_sources
 from release_integrity import (
+    validate_previous_release_city_retirements,
     validate_previous_release_cities,
     validate_previous_release_sources,
 )
@@ -456,6 +457,7 @@ old_root = (
     else previous_release_link
 )
 old_artifacts_path = old_root / "gtfs-artifacts.json"
+old_artifacts = None
 if old_artifacts_path.is_file():
     old_artifacts = json.loads(old_artifacts_path.read_text(encoding="utf-8"))
     old_ids = {
@@ -483,15 +485,28 @@ if old_manifest_path.is_file():
         for city in old_manifest.get("cities", [])
         if isinstance(city, dict) and city.get("id")
     }
-    missing_old_cities = sorted(old_city_ids - manifest_city_ids)
     try:
-        validate_previous_release_cities(old_city_ids, manifest_city_ids)
+        if isinstance(old_artifacts, dict):
+            retirements = validate_previous_release_city_retirements(
+                old_manifest=old_manifest,
+                candidate_manifest=manifest,
+                active_stop_data=old_root / "stop-data",
+                candidate_stop_data=BUILD_DIR,
+                active_artifacts=old_artifacts,
+                candidate_artifacts=artifacts,
+                registry=registry,
+                repository_root=repository_root,
+                candidate_artifacts_root=artifacts_path.parent,
+            )
+            if retirements:
+                print(
+                    "[StopData] legitimate source retirements="
+                    + json.dumps(retirements, ensure_ascii=False, sort_keys=True)
+                )
+        else:
+            validate_previous_release_cities(old_city_ids, manifest_city_ids)
     except ValueError as error:
         raise SystemExit(str(error)) from error
-    if missing_old_cities:
-        raise SystemExit(
-            "Candidate lost cities from active release: " + ", ".join(missing_old_cities)
-        )
 manifest["sourceArtifacts"] = source_artifacts
 manifest["inputProvenance"] = supplemental
 manifest_path.write_text(

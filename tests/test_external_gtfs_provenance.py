@@ -456,4 +456,3 @@ class ExternalGTFSProvenanceTests(unittest.TestCase):
         validate_previous_release_sources({"fixture"}, set(), allowlisted={"fixture"})
         with self.assertRaisesRegex(ValueError, "lost cities"):
             validate_previous_release_cities({"fixture-city"}, set())
-        validate_previous_release_cities({"fixture-city"}, set(), allowlisted={"fixture-city"})
