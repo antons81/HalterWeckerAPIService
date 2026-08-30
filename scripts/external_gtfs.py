@@ -30,9 +30,9 @@ except ImportError:
     from dynamic_resource_resolver import resolve_gtfs_resource
 
 try:
-    from .external_staging import ExternalDepartureStage, ExternalMergeStage, iter_departure_payload, iter_json_array, iter_json_object
+    from .external_staging import ExternalDepartureStage, ExternalMergeStage, iter_departure_payload_items, iter_json_array, iter_json_object, log_memory_stage
 except ImportError:
-    from external_staging import ExternalDepartureStage, ExternalMergeStage, iter_departure_payload, iter_json_array, iter_json_object
+    from external_staging import ExternalDepartureStage, ExternalMergeStage, iter_departure_payload_items, iter_json_array, iter_json_object, log_memory_stage
 
 try:
     from .gtfs_agency import agency_scoped_archive
@@ -1878,10 +1878,10 @@ def build_external_lines_bounded(
             """
         )
         connection.commit()
-        print(f"[ExternalGTFS] lines stage SQL materialization complete", flush=True)
+        log_memory_stage("lines-sql-materialization")
 
         result: dict[str, dict[str, dict[str, object]]] = {}
-        started = time.perf_counter()
+        started = time.monotonic()
         for city_id, stops in package_stops_by_city_id.items():
             for stop in stops:
                 stop_id = str(stop["id"])
@@ -1911,7 +1911,7 @@ def build_external_lines_bounded(
                     stop_result[_published_id(route_id, namespace)] = line
                 if stop_result:
                     result[stop_id] = stop_result
-        print(f"[ExternalGTFS] lines stage output assembly duration={time.perf_counter() - started:.2f}s", flush=True)
+        log_memory_stage("lines-output-assembly", started=started)
         return result
     finally:
         connection.close()
@@ -1932,7 +1932,10 @@ def build_external_trip_index_bounded(
     connection = sqlite3.connect(Path(temporary.name) / "trips.sqlite")
     try:
         connection.executescript(
-            "CREATE TABLE trips(trip_id TEXT PRIMARY KEY, route_id TEXT NOT NULL) WITHOUT ROWID;"
+            """
+            CREATE TABLE trips(trip_id TEXT PRIMARY KEY, route_id TEXT NOT NULL) WITHOUT ROWID;
+            CREATE TABLE trip_headsigns(trip_id TEXT PRIMARY KEY, headsign TEXT NOT NULL) WITHOUT ROWID;
+            """
         )
         connection.executemany(
             "INSERT OR IGNORE INTO trips VALUES (?, ?)",
@@ -1954,32 +1957,49 @@ def build_external_trip_index_bounded(
             } if route_path.exists() else set()
             if not route_ids:
                 continue
-            headsigns: dict[str, str] = {}
             departures_path = output / "departures" / f"{city_id}.json"
             if departures_path.exists():
-                for kind, _stop_id, value in iter_departure_payload(departures_path):
-                    if kind != "stop" or not isinstance(value, list):
-                        continue
-                    for item in value:
-                        if not isinstance(item, dict):
+                def departure_headsigns():
+                    for kind, _stop_id, value in iter_departure_payload_items(departures_path):
+                        if kind != "stop" or not isinstance(value, dict):
                             continue
-                        trip_id = str(item.get("t", ""))
-                        raw_trip_id = trip_id[len(namespace):] if namespace and trip_id.startswith(namespace) else trip_id
-                        headsign = str(item.get("h", "") or "")
+                        trip_id = str(value.get("t", ""))
+                        raw_trip_id = (
+                            trip_id[len(namespace):]
+                            if namespace and trip_id.startswith(namespace)
+                            else trip_id
+                        )
+                        headsign = str(value.get("h", "") or "")
                         if raw_trip_id and headsign:
-                            headsigns.setdefault(raw_trip_id, headsign)
+                            yield raw_trip_id, headsign
+
+                connection.executemany(
+                    "INSERT OR IGNORE INTO trip_headsigns VALUES (?, ?)",
+                    departure_headsigns(),
+                )
+                connection.commit()
+                log_memory_stage(
+                    "trip-index-headsign-staging",
+                    source=city_id,
+                )
             path = trips_directory / f"{city_id}.json"
             placeholders = ",".join("?" for _ in route_ids)
             with path.open("w", encoding="utf-8") as stream:
                 stream.write("{")
                 first = True
-                for trip_id, route_id in connection.execute(
-                    f"SELECT trip_id, route_id FROM trips WHERE route_id IN ({placeholders}) ORDER BY trip_id",
+                for trip_id, route_id, headsign in connection.execute(
+                    f"""
+                    SELECT trips.trip_id, trips.route_id, trip_headsigns.headsign
+                    FROM trips
+                    LEFT JOIN trip_headsigns ON trip_headsigns.trip_id=trips.trip_id
+                    WHERE trips.route_id IN ({placeholders})
+                    ORDER BY trips.trip_id
+                    """,
                     tuple(route_ids),
                 ):
                     entry: dict[str, str] = {"r": _published_id(route_id, namespace)}
-                    if trip_id in headsigns:
-                        entry["h"] = headsigns[trip_id]
+                    if headsign:
+                        entry["h"] = headsign
                     if not first:
                         stream.write(",")
                     stream.write(json.dumps(_published_id(trip_id, namespace), ensure_ascii=False))
@@ -2005,16 +2025,17 @@ def _timed_external_stage(
     try:
         result = operation()
     except Exception:
-        print(
-            f"[StopData] source={source_id} stage={stage} status=failed "
-            f"duration={time.monotonic() - started:.2f}s",
-            flush=True,
+        log_memory_stage(
+            stage,
+            source=source_id,
+            started=started,
+            status="failed",
         )
         raise
-    print(
-        f"[StopData] source={source_id} stage={stage} status=completed "
-        f"duration={time.monotonic() - started:.2f}s",
-        flush=True,
+    log_memory_stage(
+        stage,
+        source=source_id,
+        started=started,
     )
     return result
 
@@ -2097,10 +2118,10 @@ def _merge_namespaced_city_records_bounded(
                 stage.add_departures(departure_path)
             if trip_path.exists():
                 stage.add_object_file(trip_path, "trips", source_id)
-        print(
-            f"[ExternalGTFS] city={city_id} stage=merge-input-read "
-            f"duration={time.monotonic() - input_started:.2f}s",
-            flush=True,
+        log_memory_stage(
+            "merge-input-read",
+            source=city_id,
+            started=input_started,
         )
 
         if len(stage.timezones) > 1:
@@ -2110,10 +2131,10 @@ def _merge_namespaced_city_records_bounded(
             )
         staging_started = time.monotonic()
         stage.commit()
-        print(
-            f"[ExternalGTFS] city={city_id} stage=merge-sqlite-staging "
-            f"duration={time.monotonic() - staging_started:.2f}s",
-            flush=True,
+        log_memory_stage(
+            "merge-sqlite-staging",
+            source=city_id,
+            started=staging_started,
         )
         departure_count = stage.connection.execute(
             "SELECT count(*) FROM departures"
@@ -2123,10 +2144,10 @@ def _merge_namespaced_city_records_bounded(
 
         output_started = time.monotonic()
         stop_count, _metadata = stage.write_outputs(output, city_id)
-        print(
-            f"[ExternalGTFS] city={city_id} stage=merge-output-assembly-write "
-            f"duration={time.monotonic() - output_started:.2f}s",
-            flush=True,
+        log_memory_stage(
+            "merge-output-assembly-write",
+            source=city_id,
+            started=output_started,
         )
         merged_stops = [
             item for item in iter_json_array(output / "stops" / f"{city_id}.json")
@@ -2147,11 +2168,7 @@ def _merge_namespaced_city_records_bounded(
     finally:
         cleanup_started = time.monotonic()
         stage.close()
-        print(
-            f"[ExternalGTFS] city={city_id} stage=merge-cleanup "
-            f"duration={time.monotonic() - cleanup_started:.2f}s",
-            flush=True,
-        )
+        log_memory_stage("merge-cleanup", source=city_id, started=cleanup_started)
         print(
             f"[ExternalGTFS] city={city_id} stage=merge-total "
             f"duration={time.monotonic() - total_started:.2f}s",
@@ -2206,6 +2223,7 @@ def process_external_gtfs_sources(
         source_id = str(source["id"])
         if selected_source_ids is not None and source_id not in selected_source_ids:
             continue
+        log_memory_stage("before-source", source=source_id)
         validate_external_gtfs_source(
             source,
             repository_root,
@@ -2527,7 +2545,6 @@ def process_external_gtfs_sources(
                             "source": source,
                             "city": city,
                             "output": source_output,
-                            "packageStops": package_stops.get(city_id, []),
                         })
                 else:
                     for entry in entries:
@@ -2657,6 +2674,11 @@ def process_external_gtfs_sources(
                     )
         finally:
             archive.close()
+            log_memory_stage("source-cleanup", source=source_id)
+
+        package_stops = {}
+        entries = []
+        provider_lines = {}
 
         print(
             f"[StopData] source={source_id} stage=build "

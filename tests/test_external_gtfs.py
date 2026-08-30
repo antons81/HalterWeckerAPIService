@@ -36,7 +36,12 @@ from external_gtfs import (  # noqa: E402
     external_gtfs_resilience_policy,
     validate_kyiv_gtfs_archive,
 )
-from external_staging import ExternalMergeStage, iter_departure_payload  # noqa: E402
+from external_staging import (  # noqa: E402
+    ExternalMergeStage,
+    JSONStream,
+    iter_departure_payload,
+    iter_departure_payload_items,
+)
 from gtfs_source_cache import GTFSArtifactCache  # noqa: E402
 
 
@@ -161,6 +166,66 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
             self.assertEqual(
                 sum(1 for kind, _key, _value in iter_departure_payload(output / "departures" / "city.json") if kind == "stop"),
                 1200,
+            )
+
+    def test_mta_departure_items_do_not_materialize_stop_arrays(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "mta-departures.json"
+            departures = [
+                {
+                    "t": f"mta-ny-subway:trip-{index}",
+                    "r": "mta-ny-subway:route-1",
+                    "h": "Terminal",
+                    "d": "0",
+                    "p": "08:00:00",
+                    "q": "1",
+                }
+                for index in range(256)
+            ]
+            path.write_text(
+                json.dumps({
+                    "generatedAt": "2026-08-30T00:00:00Z",
+                    "timezone": "America/New_York",
+                    "stops": {"mta-ny-subway:stop-1": departures},
+                    "platforms": {"mta-ny-subway:stop-1": ["stop-2"]},
+                }),
+                encoding="utf-8",
+            )
+
+            original_value = JSONStream.value
+
+            def reject_materialized_lists(stream: JSONStream) -> object:
+                value = original_value(stream)
+                if isinstance(value, list):
+                    raise AssertionError("departure array was materialized")
+                return value
+
+            with mock.patch.object(JSONStream, "value", reject_materialized_lists):
+                items = list(iter_departure_payload_items(path))
+
+            self.assertEqual(
+                sum(1 for kind, _key, _value in items if kind == "stop"),
+                256,
+            )
+            self.assertEqual(
+                [item for kind, _key, item in items if kind == "platform"],
+                ["stop-2"],
+            )
+
+            path.write_text(
+                json.dumps({
+                    "generatedAt": "2026-08-30T00:00:00Z",
+                    "timezone": "America/New_York",
+                    "stops": {},
+                    "platforms": {"mta-ny-subway:stop-1": ["stop-2"]},
+                }),
+                encoding="utf-8",
+            )
+            with mock.patch.object(JSONStream, "value", reject_materialized_lists):
+                empty_stop_items = list(iter_departure_payload_items(path))
+            self.assertEqual(
+                [item for kind, _key, item in empty_stop_items if kind == "platform"],
+                ["stop-2"],
             )
 
     def test_identical_merged_stop_ids_are_deduplicated(self) -> None:
@@ -1596,6 +1661,88 @@ class ExternalStopAndDepartureTests(unittest.TestCase):
             self.assertEqual(trip_index["1410000012345678"]["h"], "Vasttrafik Headsign")
             # Trips whose route is not present in routes.txt are excluded.
             self.assertNotIn("NON_REALTIME_ID", trip_index)
+
+    def test_mta_namespace_trip_index_preserves_headsigns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            archive_path = root / "mta.zip"
+            _gtfs_zip(
+                archive_path,
+                stops=(
+                    "stop_id,stop_name,stop_lat,stop_lon\n"
+                    "MTA-STOP-1,Times Square,40.758,-73.985\n"
+                    "MTA-STOP-2,Union Square,40.735,-73.990\n"
+                ),
+                routes=(
+                    "route_id,route_short_name,route_long_name,route_type\n"
+                    "MTA-R1,1,Broadway,1\n"
+                ),
+                trips=(
+                    "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+                    "MTA-R1,S1,MTA-T1,South Ferry,0\n"
+                    "MTA-R1,S1,MTA-T2,Van Cortlandt Park,1\n"
+                ),
+                stop_times=(
+                    "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+                    "MTA-T1,08:00:00,08:00:00,MTA-STOP-1,1\n"
+                    "MTA-T1,08:10:00,08:10:00,MTA-STOP-2,2\n"
+                    "MTA-T2,09:00:00,09:00:00,MTA-STOP-1,1\n"
+                    "MTA-T2,09:10:00,09:10:00,MTA-STOP-2,2\n"
+                ),
+            )
+            cities = [{
+                "id": "new-york",
+                "name": "New York",
+                "aliases": [],
+                "latitude": 40.75,
+                "longitude": -73.98,
+                "radiusMeters": 30_000,
+                "packageMode": "external",
+            }]
+            out = root / "out"
+            namespace = "mta-ny-subway:"
+            with zipfile.ZipFile(archive_path) as archive:
+                build_external_stop_packages(
+                    archive,
+                    cities,
+                    out,
+                    stop_id_mode="exact",
+                    namespace=namespace,
+                )
+                build_external_departure_index(
+                    archive,
+                    cities,
+                    out,
+                    timezone_name="America/New_York",
+                    namespace=namespace,
+                )
+                build_external_route_index(
+                    archive,
+                    cities,
+                    out,
+                    namespace=namespace,
+                )
+                build_external_trip_index(
+                    archive,
+                    cities,
+                    out,
+                    namespace=namespace,
+                )
+
+            trip_index = json.loads((out / "trips" / "new-york.json").read_text())
+            self.assertEqual(
+                trip_index,
+                {
+                    "mta-ny-subway:MTA-T1": {
+                        "r": "mta-ny-subway:MTA-R1",
+                        "h": "South Ferry",
+                    },
+                    "mta-ny-subway:MTA-T2": {
+                        "r": "mta-ny-subway:MTA-R1",
+                        "h": "Van Cortlandt Park",
+                    },
+                },
+            )
 
     def test_sweden_appears_once_with_production_static_urls_in_manifests(self) -> None:
         cities = load_cities(REPOSITORY_ROOT / "config" / "sweden-cities.json")

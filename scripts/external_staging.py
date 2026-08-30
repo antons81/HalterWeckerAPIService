@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import resource
 import sqlite3
+import sys
 import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -152,8 +154,93 @@ def iter_departure_payload(path: Path) -> Iterator[tuple[str, str, object]]:
         stream.close()
 
 
+def iter_departure_payload_items(path: Path) -> Iterator[tuple[str, str, object]]:
+    """Yield generated metadata and individual departure/platform items."""
+    stream = JSONStream(path)
+    try:
+        stream._consume("{")
+        stream._skip_whitespace()
+        if stream._buffer.startswith("}"):
+            stream._buffer = stream._buffer[1:]
+            return
+        while True:
+            key = stream.string()
+            stream._consume(":")
+            if key in {"generatedAt", "timezone"}:
+                yield key, "", stream.value()
+            elif key in {"stops", "platforms"}:
+                stream._consume("{")
+                stream._skip_whitespace()
+                if stream._buffer.startswith("}"):
+                    stream._buffer = stream._buffer[1:]
+                else:
+                    while True:
+                        item_key = stream.string()
+                        stream._consume(":")
+                        stream._skip_whitespace()
+                        if stream._buffer.startswith("["):
+                            for item in stream.array_items():
+                                yield (
+                                    "stop" if key == "stops" else "platform",
+                                    item_key,
+                                    item,
+                                )
+                        else:
+                            stream.value()
+                        stream._skip_whitespace()
+                        if stream._buffer.startswith("}"):
+                            stream._buffer = stream._buffer[1:]
+                            break
+                        stream._consume(",")
+            else:
+                stream.value()
+            stream._skip_whitespace()
+            if stream._buffer.startswith("}"):
+                stream._buffer = stream._buffer[1:]
+                return
+            stream._consume(",")
+    finally:
+        stream.close()
+
+
 def canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _rss_kib() -> int:
+    """Return current RSS in KiB on Linux, or the process peak elsewhere."""
+    try:
+        with Path("/proc/self/status").open(encoding="ascii") as status_file:
+            for line in status_file:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return _peak_rss_kib()
+
+
+def _peak_rss_kib() -> int:
+    value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return int(value / 1024) if sys.platform == "darwin" else int(value)
+
+
+def log_memory_stage(
+    stage: str,
+    *,
+    source: str | None = None,
+    started: float | None = None,
+    status: str = "completed",
+) -> None:
+    fields = ["[ExternalGTFS]"]
+    if source:
+        fields.append(f"source={source}")
+    fields.append(f"stage={stage}")
+    fields.append(f"status={status}")
+    if started is not None:
+        fields.append(f"duration={time.monotonic() - started:.2f}s")
+    fields.append(f"rss_kib={_rss_kib()}")
+    fields.append(f"peak_rss_kib={_peak_rss_kib()}")
+    print(" ".join(fields), flush=True)
 
 
 class ExternalMergeStage:
@@ -251,7 +338,7 @@ class ExternalMergeStage:
             )
 
     def add_departures(self, path: Path) -> None:
-        for kind, key, value in iter_departure_payload(path):
+        for kind, key, value in iter_departure_payload_items(path):
             if kind in {"generatedAt", "timezone"}:
                 if kind == "timezone" and isinstance(value, str) and value:
                     self.timezones.add(value)
@@ -261,21 +348,17 @@ class ExternalMergeStage:
                     "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
                     (kind, json.dumps(value, ensure_ascii=False)),
                 )
-            elif kind == "stop" and isinstance(value, list):
-                for item in value:
-                    if not isinstance(item, dict):
-                        continue
-                    payload = canonical_json(item)
-                    self.connection.execute(
-                        "INSERT OR IGNORE INTO departures(stop_id, identity, payload) VALUES (?, ?, ?)",
-                        (key, canonical_json(item), payload),
-                    )
-            elif kind == "platform" and isinstance(value, list):
-                for child_id in value:
-                    self.connection.execute(
-                        "INSERT OR IGNORE INTO platforms(parent_id, child_id) VALUES (?, ?)",
-                        (key, str(child_id)),
-                    )
+            elif kind == "stop" and isinstance(value, dict):
+                payload = canonical_json(value)
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO departures(stop_id, identity, payload) VALUES (?, ?, ?)",
+                    (key, canonical_json(value), payload),
+                )
+            elif kind == "platform":
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO platforms(parent_id, child_id) VALUES (?, ?)",
+                    (key, str(value)),
+                )
         self.connection.commit()
 
     def commit(self) -> None:
@@ -478,7 +561,7 @@ class ExternalDepartureStage:
     ) -> None:
         from build_german_departure_index import parse_gtfs_time
 
-        started = time.perf_counter()
+        started = time.monotonic()
         self.connection.executemany(
             "INSERT INTO routes VALUES (?, ?, ?)",
             (
@@ -524,9 +607,9 @@ class ExternalDepartureStage:
                 and str(row.get("service_id", "")).strip() in active_by_service
             ),
         )
-        print(f"[ExternalGTFS] departure stage feed tables duration={time.perf_counter() - started:.2f}s", flush=True)
+        log_memory_stage("departure-feed-tables", started=started)
 
-        started = time.perf_counter()
+        started = time.monotonic()
         for (stop_id,) in self.connection.execute("SELECT stop_id FROM feed_stops"):
             current = stop_id
             chain: list[str] = []
@@ -548,9 +631,9 @@ class ExternalDepartureStage:
                 ((node, resolved) for node in chain),
             )
         self.connection.commit()
-        print(f"[ExternalGTFS] departure stage stop resolution duration={time.perf_counter() - started:.2f}s", flush=True)
+        log_memory_stage("departure-stop-resolution", started=started)
 
-        started = time.perf_counter()
+        started = time.monotonic()
         def valid_stop_times():
             for row in _iter_table(archive, "stop_times.txt"):
                 trip_id = str(row.get("trip_id", "")).strip()
@@ -571,8 +654,8 @@ class ExternalDepartureStage:
             valid_stop_times(),
         )
         self.connection.commit()
-        print(f"[ExternalGTFS] departure stage stop_times staging duration={time.perf_counter() - started:.2f}s", flush=True)
-        started = time.perf_counter()
+        log_memory_stage("departure-stop-times-staging", started=started)
+        started = time.monotonic()
         self.connection.executescript(
             """
             INSERT INTO terminal_stops(trip_id, sequence, stop_id)
@@ -597,9 +680,9 @@ class ExternalDepartureStage:
             WHERE resolved.public_stop_id IS NOT NULL;
             """
         )
-        print(f"[ExternalGTFS] departure stage SQL materialization duration={time.perf_counter() - started:.2f}s", flush=True)
+        log_memory_stage("departure-sql-materialization", started=started)
 
-        started = time.perf_counter()
+        started = time.monotonic()
         for child_id, parent_id, location_type in self.connection.execute(
             "SELECT stop_id, parent_station, location_type FROM feed_stops WHERE parent_station!=''"
         ):
@@ -614,7 +697,7 @@ class ExternalDepartureStage:
                     (child[0], child_id),
                 )
         self.connection.commit()
-        print(f"[ExternalGTFS] departure stage platforms duration={time.perf_counter() - started:.2f}s", flush=True)
+        log_memory_stage("departure-platforms", started=started)
 
     def write_outputs(
         self,
@@ -628,6 +711,7 @@ class ExternalDepartureStage:
         departures_directory = output / "departures"
         departures_directory.mkdir(parents=True, exist_ok=True)
         for city in cities:
+            started = time.monotonic()
             city_id = str(city["id"])
             path = departures_directory / f"{city_id}.json"
             with path.open("w", encoding="utf-8") as stream:
@@ -698,6 +782,11 @@ class ExternalDepartureStage:
                     stream.write("]")
                     first_platform = False
                 stream.write("}}")
+            log_memory_stage(
+                "departures-write",
+                source=city_id,
+                started=started,
+            )
 
 
 def _iter_table(archive, filename: str) -> Iterator[dict[str, str]]:
