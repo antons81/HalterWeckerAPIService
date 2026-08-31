@@ -23,6 +23,16 @@ DEFAULT_INPUTS = (
     "scripts/build_german_departure_index.py",
     "scripts/import_static_departures_database.py",
     "scripts/static_departures_ownership.py",
+    "scripts/prepare_custom_gtfs_artifacts.py",
+    "scripts/preserve_nl_assets.py",
+    "scripts/validate_austrian_stop_packages.py",
+    "scripts/release_integrity.py",
+    "scripts/artifact_provenance.py",
+    "scripts/validate_stop_data_provenance.py",
+    "scripts/validate_release_consistency.py",
+    "scripts/run_stop_data_pipeline.sh",
+    "scripts/run_static_departures_pipeline.sh",
+    "scripts/release_state.py",
 )
 
 

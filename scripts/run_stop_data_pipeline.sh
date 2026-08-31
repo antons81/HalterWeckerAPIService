@@ -2,10 +2,32 @@
 set -euo pipefail
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
+RUN_MODE="normal"
+RESUME_RELEASE_ID=""
+if [[ "${1:-}" == "--resume" ]]; then
+  if [[ "$#" -ne 2 ]]; then
+    echo "usage: $0 [--resume RELEASE_ID]" >&2
+    exit 64
+  fi
+  RUN_MODE="resume"
+  RESUME_RELEASE_ID="$2"
+elif [[ "$#" -ne 0 ]]; then
+  echo "usage: $0 [--resume RELEASE_ID]" >&2
+  exit 64
+fi
+
 REPO="${REPO:-/srv/haltewecker/pipeline/HalterWeckerAPIService}"
 DATA_ROOT="${DATA_ROOT:-/srv/haltewecker/data}"
 RELEASES="$DATA_ROOT/releases"
-RELEASE_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+if [[ "$RUN_MODE" == "resume" ]]; then
+  if ! [[ "$RESUME_RELEASE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "[StopData] ERROR: invalid release ID for resume: $RESUME_RELEASE_ID" >&2
+    exit 64
+  fi
+  RELEASE_ID="$RESUME_RELEASE_ID"
+else
+  RELEASE_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+fi
 RELEASE_DIR="$RELEASES/$RELEASE_ID"
 BUILD_DIR="$RELEASE_DIR/stop-data"
 ARTIFACTS_JSON="$RELEASE_DIR/gtfs-artifacts.json"
@@ -58,6 +80,8 @@ FLOCK_BIN="${FLOCK_BIN:-flock}"
 AUSTRIAN_DATA_ROOT="${AUSTRIAN_DATA_ROOT:-$DATA_ROOT/austria}"
 MVO_ENV_FILE="${MVO_ENV_FILE:-$AUSTRIAN_DATA_ROOT/.env}"
 STATIC_DEPARTURES_PIPELINE="${STATIC_DEPARTURES_PIPELINE:-$REPO/scripts/run_static_departures_pipeline.sh}"
+RELEASE_STATE_SCRIPT="$REPO/scripts/release_state.py"
+CUSTOM_ARTIFACTS_JSON="$RELEASE_DIR/custom-gtfs-artifacts.json"
 
 mkdir -p "$(dirname "$STOP_DATA_LOCK")"
 exec 9>"$STOP_DATA_LOCK"
@@ -74,8 +98,11 @@ fi
 
 # Invalidate the standalone static-departures handoff before starting a new
 # stop-data build. A failed build must never leave the previous release eligible
-# for the downstream nightly static-departures timer.
-rm -f "$STATIC_DEPARTURES_RELEASE"
+# for the downstream nightly static-departures timer. Resume preserves the
+# existing handoff until activation-state inspection has completed.
+if [[ "$RUN_MODE" == "normal" ]]; then
+  rm -f "$STATIC_DEPARTURES_RELEASE"
+fi
 
 run_systemctl() {
   "$SUDO_BIN" -n "$SYSTEMCTL_BIN" "$@"
@@ -116,6 +143,36 @@ os.replace(sys.argv[1], sys.argv[2])
 PY
 }
 
+persist_release_stage() {
+  local completed_stage="$1"
+  python3 "$RELEASE_STATE_SCRIPT" write-state \
+    --release-dir "$RELEASE_DIR" \
+    --release-id "$RELEASE_ID" \
+    --completed-stage "$completed_stage" \
+    --build-fingerprint "$BUILD_FINGERPRINT"
+  echo "[StopData] release=$RELEASE_ID state completedStage=$completed_stage persisted"
+}
+
+inspect_resume() {
+  local resume_info
+  BUILD_FINGERPRINT="$(python3 "$REPO/scripts/build_fingerprint.py" --repository "$REPO")"
+  if ! resume_info="$(python3 "$RELEASE_STATE_SCRIPT" inspect-resume \
+    --releases-root "$RELEASES" \
+    --release-id "$RELEASE_ID" \
+    --repository "$REPO" \
+    --current-fingerprint "$BUILD_FINGERPRINT" \
+    --current "$CURRENT" \
+    --current-release "$CURRENT_RELEASE" \
+    --static-departures-release "$STATIC_DEPARTURES_RELEASE" \
+    --departures-current "$DEPARTURES_CURRENT" \
+    --previous "$PREVIOUS" \
+    --format tsv)"; then
+    return 1
+  fi
+  IFS=$'\t' read -r RESUME_STATUS RESUME_COMPLETED_STAGE RESUME_NEXT_STAGE <<<"$resume_info"
+  echo "[StopData] release=$RELEASE_ID resume=true completedStage=$RESUME_COMPLETED_STAGE nextStage=$RESUME_NEXT_STAGE status=$RESUME_STATUS"
+}
+
 prepare_runtime() {
   echo "[StopData] release=$RELEASE_ID preparing candidate runtime readiness"
   if ! READINESS_ONLY=1 \
@@ -141,7 +198,8 @@ activate_runtime() {
 
 cd "$REPO"
 TOTAL_STARTED=$SECONDS
-echo "[StopData] release=$RELEASE_ID stage=build started"
+run_build_stage() {
+  echo "[StopData] release=$RELEASE_ID stage=build started"
 
 mkdir -p "$BUILD_DIR" "$RELEASES"
 if [[ -f "$MVO_ENV_FILE" ]]; then
@@ -171,7 +229,6 @@ PREPARE_ARGS+=(--output "$ARTIFACTS_JSON")
 python3 "$REPO/scripts/prepare_gtfs_artifacts.py" "${PREPARE_ARGS[@]}"
 VBB_INPUT_URL="${VBB_GTFS_URL:-https://unternehmen.vbb.de/fileadmin/user_upload/VBB/Dokumente/API-Datensaetze/gtfs-mastscharf/GTFS.zip}"
 RNV_INPUT_URL="${RNV_GTFS_URL:-https://gtfs-sandbox-dds.rnv-online.de/latest/gtfs.zip}"
-CUSTOM_ARTIFACTS_JSON="$RELEASE_DIR/custom-gtfs-artifacts.json"
 python3 "$REPO/scripts/prepare_custom_gtfs_artifacts.py" \
   --cache-root "${GTFS_CACHE_ROOT:-/srv/haltewecker/cache/gtfs}" \
   --vbb-url "$VBB_INPUT_URL" \
@@ -288,8 +345,10 @@ if [[ -f "$MVO_ENV_FILE" ]]; then
 fi
 
 echo "[StopData] release=$RELEASE_ID stage=build duration=$(elapsed_seconds "$TOTAL_STARTED")"
-VALIDATION_STARTED=$SECONDS
-test -f "$CUSTOM_ARTIFACTS_JSON"
+}
+run_candidate_validation() {
+  VALIDATION_STARTED=$SECONDS
+  test -f "$CUSTOM_ARTIFACTS_JSON"
 if [[ -f "$MVO_ENV_FILE" ]]; then
   test -f "$RELEASE_DIR/austrian-artifacts.json"
 fi
@@ -526,18 +585,20 @@ metadata_path.write_text(
     encoding="utf-8",
 )
 PY
-echo "[StopData] release=$RELEASE_ID stage=validation duration=$(elapsed_seconds "$VALIDATION_STARTED")"
+  echo "[StopData] release=$RELEASE_ID stage=validation duration=$(elapsed_seconds "$VALIDATION_STARTED")"
+}
 
-STATIC_STARTED=$SECONDS
-EXTERNAL_GTFS_ARTIFACTS_JSON="$ARTIFACTS_JSON" \
+run_static_departures_stage() {
+  STATIC_STARTED=$SECONDS
+  EXTERNAL_GTFS_ARTIFACTS_JSON="$ARTIFACTS_JSON" \
 STOP_DATA_PATH="$BUILD_DIR" \
 NEXT_DATABASE_PATH="$RELEASE_DIR/departures.sqlite" \
 RELEASE_ID="$RELEASE_ID" \
 SKIP_ACTIVATION=1 \
   "$STATIC_DEPARTURES_PIPELINE"
-python3 "$REPO/scripts/validate_release_consistency.py" --release-dir "$RELEASE_DIR"
+  python3 "$REPO/scripts/validate_release_consistency.py" --release-dir "$RELEASE_DIR"
 
-echo "[StaticDepartures] release=$RELEASE_ID stage=import duration=$(elapsed_seconds "$STATIC_STARTED")"
+  echo "[StaticDepartures] release=$RELEASE_ID stage=import duration=$(elapsed_seconds "$STATIC_STARTED")"
 
 if [ -n "${SWEDEN_GTFS_URL:-}" ]; then
   for sweden_city in stockholm malmo goteborg uppsala vaxjo helsingborg linkoping jonkoping orebro vasteras; do
@@ -589,13 +650,67 @@ if not expected.issubset(manifest_ids) or not expected.issubset(radar_ids):
 print("[StopData] Ireland external packages validated")
 PY
 fi
+}
+
+if [[ "$RUN_MODE" == "normal" ]]; then
+  run_build_stage
+  persist_release_stage "build"
+  run_candidate_validation
+  persist_release_stage "candidate-validation"
+  run_static_departures_stage
+  persist_release_stage "static-departures"
+else
+  inspect_resume
+  if [[ "$RESUME_STATUS" == "already-active" ]]; then
+    if [[ "$RESUME_COMPLETED_STAGE" != "commit" ]]; then
+      persist_release_stage "commit"
+    fi
+    echo "[StopData] release=$RELEASE_ID resume=true already-active; state reconciled without activation"
+    exit 0
+  fi
+  case "$RESUME_COMPLETED_STAGE" in
+    build)
+      echo "[StopData] release=$RELEASE_ID resume=true skipping_completed_stage=build"
+      run_candidate_validation
+      persist_release_stage "candidate-validation"
+      run_static_departures_stage
+      persist_release_stage "static-departures"
+      ;;
+    candidate-validation)
+      echo "[StopData] release=$RELEASE_ID resume=true skipping_completed_stage=build"
+      echo "[StopData] release=$RELEASE_ID resume=true skipping_completed_stage=candidate-validation"
+      run_static_departures_stage
+      persist_release_stage "static-departures"
+      ;;
+    static-departures)
+      echo "[StopData] release=$RELEASE_ID resume=true skipping_completed_stage=build"
+      echo "[StopData] release=$RELEASE_ID resume=true skipping_completed_stage=candidate-validation"
+      echo "[StopData] release=$RELEASE_ID resume=true skipping_completed_stage=static-departures"
+      ;;
+    handoff-readiness)
+      echo "[StopData] release=$RELEASE_ID resume=true skipping_completed_stage=build"
+      echo "[StopData] release=$RELEASE_ID resume=true skipping_completed_stage=candidate-validation"
+      echo "[StopData] release=$RELEASE_ID resume=true skipping_completed_stage=static-departures"
+      echo "[StopData] release=$RELEASE_ID resume=true skipping_completed_stage=handoff-readiness"
+      ;;
+    *)
+      echo "[StopData] ERROR: unsupported resume stage: $RESUME_COMPLETED_STAGE" >&2
+      exit 1
+      ;;
+  esac
+fi
 
 OLD_RELEASE_TARGET=""
 if [[ -L "$CURRENT_RELEASE" ]]; then
   OLD_RELEASE_TARGET="$(readlink "$CURRENT_RELEASE")"
 fi
-if ! prepare_runtime; then
-  exit 1
+if [[ "$RUN_MODE" == "normal" || "$RESUME_COMPLETED_STAGE" != "handoff-readiness" ]]; then
+  if ! prepare_runtime; then
+    exit 1
+  fi
+  persist_release_stage "handoff-readiness"
+else
+  echo "[StopData] release=$RELEASE_ID resume=true skipping_completed_stage=handoff-readiness"
 fi
 mkdir -p "$ROLLBACK"
 if [[ -d "$CURRENT" && ! -L "$CURRENT" ]]; then
@@ -645,5 +760,6 @@ if [[ -n "$OLD_RELEASE_TARGET" ]]; then
   rm -rf "$PREVIOUS"
   ln -s "../releases/${OLD_RELEASE_TARGET#releases/}/stop-data" "$PREVIOUS"
 fi
+persist_release_stage "commit"
 echo "[StopData] release=$RELEASE_ID stage=commit duration=$(elapsed_seconds "$COMMIT_STARTED")"
 echo "[StopData] release=$RELEASE_ID total duration=$(elapsed_seconds "$TOTAL_STARTED")"

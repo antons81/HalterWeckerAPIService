@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -40,10 +41,36 @@ exec \"$@\"
 [ "${FLOCK_FAIL:-0}" != "1" ] || exit 1
 exit 0
 """)
+        self.write_mock("ln", """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$LINK_CALLS_LOG"
+exec /bin/ln "$@"
+""")
         self.write_mock("python3", """#!/usr/bin/env bash
 set -euo pipefail
 
 case \"${1:-}\" in
+  *release_state.py)
+    stage=\"\"
+    previous=\"\"
+    for argument in \"$@\"; do
+      if [ \"$previous\" = \"--completed-stage\" ]; then
+        stage=\"$argument\"
+        break
+      fi
+      previous=\"$argument\"
+    done
+    if [ \"${2:-}\" = \"write-state\" ]; then
+      printf '%s\\n' \"$*\" >> \"$STATE_WRITE_CALLS_LOG\"
+    fi
+    if [ \"${CRASH_BEFORE_COMMIT:-0}\" = \"1\" ] && [ \"$stage\" = \"commit\" ]; then
+      exit 99
+    fi
+    \"$REAL_PYTHON\" \"$@\"
+    if [ \"${CRASH_AFTER_STATE:-}\" = \"1\" ] && [ \"$stage\" = \"${CRASH_AFTER_STAGE:-}\" ]; then
+      exit 99
+    fi
+    exit 0
+    ;;
   *prepare_gtfs_artifacts.py)
     output=\"\"
     while [ \"$#\" -gt 0 ]; do
@@ -103,6 +130,7 @@ PY
       shift
     done
     mkdir -p \"$output/swiss-static\"
+    mkdir -p \"$output/stops\" \"$output/routes\" \"$output/departures\" \"$output/trips\" \"$output/transit\" \"$output/radar\"
     mkdir -p "$output/provenance"
     printf '{"sources":{}}' > "$output/provenance/input-artifacts.json"
     \"$REAL_PYTHON\" - \"$output\" \"${BUILD_INVALID:-0}\" <<'PY'
@@ -115,8 +143,13 @@ cities = [{\"id\": \"test-city\", \"name\": \"Test City\", \"url\": \"stops/test
 if not invalid:
     cities.extend({\"id\": city_id, \"name\": city_id, \"url\": f\"stops/{city_id}.json\"} for city_id in (\"san-francisco\", \"oakland\", \"berkeley\", \"san-jose\"))
 (output / \"manifest.json\").write_text(json.dumps({\"version\": \"2026-07-30\", \"cities\": cities}), encoding=\"utf-8\")
+for city in cities:
+    package_path = output / city[\"url\"]
+    package_path.parent.mkdir(parents=True, exist_ok=True)
+    package_path.write_text(\"{}\", encoding=\"utf-8\")
 if not invalid:
-    (output / \"transit-radar-cities.json\").touch()
+    (output / \"transit-radar-cities.json\").write_text(\"{}\", encoding=\"utf-8\")
+(output / \"swiss-static\" / \"manifest.json\").write_text(\"{}\", encoding=\"utf-8\")
 PY
     printf 'new' > \"$output/release-marker\"
     exit 0
@@ -207,7 +240,7 @@ PY
       shift
     done
     mkdir -p \"$output\"
-    : > \"$output/manifest.json\"
+    printf '{}' > \"$output/manifest.json\"
     ;;
   *validate_release_consistency.py)
     exit 0
@@ -253,6 +286,7 @@ exit 64
         self.write_mock("static-departures-pipeline", """#!/usr/bin/env bash
 set -euo pipefail
 
+printf '%s\\n' "${READINESS_ONLY:-0}" >> "$STATIC_CALLS_LOG"
 if [ "${READINESS_ONLY:-0}" = "1" ]; then
   [ "${READINESS_FAIL:-0}" != "1" ] || exit 1
   exit 0
@@ -260,7 +294,26 @@ fi
 [ "${STATIC_IMPORT_FAIL:-0}" != "1" ] || exit 1
 printf '%s\\n' "${STOP_DATA_PATH}" > "${STAGED_STOP_DATA_LOG}"
 mkdir -p "$(dirname "$NEXT_DATABASE_PATH")"
-printf 'releaseID=%s\\n' "$RELEASE_ID" > "$NEXT_DATABASE_PATH"
+"$REAL_PYTHON" - "$NEXT_DATABASE_PATH" "$RELEASE_ID" <<'PY'
+import sqlite3
+import sys
+from pathlib import Path
+
+database_path = Path(sys.argv[1])
+release_id = sys.argv[2]
+connection = sqlite3.connect(database_path)
+connection.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+connection.executemany(
+    "INSERT INTO metadata VALUES (?, ?)",
+    [
+        ("releaseID", release_id),
+        ("stopDataReleaseID", release_id),
+        ("stopDataManifestVersion", "2026-07-30"),
+    ],
+)
+connection.commit()
+connection.close()
+PY
 """)
 
     def tearDown(self) -> None:
@@ -271,7 +324,7 @@ printf 'releaseID=%s\\n' "$RELEASE_ID" > "$NEXT_DATABASE_PATH"
         path.write_text(content, encoding="utf-8")
         path.chmod(0o755)
 
-    def run_pipeline(self, **extra_environment: str) -> subprocess.CompletedProcess[str]:
+    def run_pipeline(self, *arguments: str, **extra_environment: str) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment.update({
             "REPO": str(REPOSITORY_ROOT),
@@ -282,6 +335,9 @@ printf 'releaseID=%s\\n' "$RELEASE_ID" > "$NEXT_DATABASE_PATH"
             "SYSTEMCTL_LOG": str(self.systemctl_log),
             "BUILD_ARGS_LOG": str(self.root / "build-args.log"),
             "BUILD_CALLS_LOG": str(self.root / "build-calls.log"),
+            "LINK_CALLS_LOG": str(self.root / "link-calls.log"),
+            "STATE_WRITE_CALLS_LOG": str(self.root / "state-write-calls.log"),
+            "STATIC_CALLS_LOG": str(self.root / "static-calls.log"),
             "STAGED_STOP_DATA_LOG": str(self.root / "staged-stop-data.log"),
             "STATIC_DEPARTURES_PIPELINE": str(self.bin_directory / "static-departures-pipeline"),
             "REAL_PYTHON": sys.executable,
@@ -292,7 +348,7 @@ printf 'releaseID=%s\\n' "$RELEASE_ID" > "$NEXT_DATABASE_PATH"
         })
         environment.update(extra_environment)
         return subprocess.run(
-            ["bash", str(PIPELINE)],
+            ["bash", str(PIPELINE), *arguments],
             cwd=REPOSITORY_ROOT,
             env=environment,
             text=True,
@@ -304,6 +360,32 @@ printf 'releaseID=%s\\n' "$RELEASE_ID" > "$NEXT_DATABASE_PATH"
         if not self.systemctl_log.exists():
             return []
         return self.systemctl_log.read_text(encoding="utf-8").splitlines()
+
+    def configure_resume_pointer_layout(self) -> None:
+        old_release = self.data_root / "releases" / "old"
+        old_stop_data = old_release / "stop-data"
+        old_stop_data.mkdir(parents=True)
+        (old_stop_data / "release-marker").write_text("old", encoding="utf-8")
+        (old_release / "departures.sqlite").write_bytes(b"old")
+        current = self.data_root / "current"
+        (current / "release-marker").unlink()
+        current.rmdir()
+        self._link(self.data_root / "current-release", old_release)
+        self._link(current, old_stop_data)
+        self._link(self.data_root / "departures-current.sqlite", old_release / "departures.sqlite")
+
+    def _link(self, path: Path, target: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.symlink_to(os.path.relpath(target, path.parent))
+
+    def candidate_release_id(self) -> str:
+        releases = [
+            path
+            for path in (self.data_root / "releases").iterdir()
+            if path.is_dir() and path.name != "old"
+        ]
+        self.assertEqual(len(releases), 1)
+        return releases[0].name
 
     def test_successful_publication_waits_for_static_departures_service(self) -> None:
         result = self.run_pipeline()
@@ -317,7 +399,16 @@ printf 'releaseID=%s\\n' "$RELEASE_ID" > "$NEXT_DATABASE_PATH"
         staged_path = (self.root / "staged-stop-data.log").read_text().strip()
         self.assertIn("/releases/", staged_path)
         self.assertTrue(staged_path.endswith("/stop-data"))
-        self.assertIn("releaseID=", (self.data_root / "departures-current.sqlite").read_text())
+        with sqlite3.connect(self.data_root / "departures-current.sqlite") as database:
+            metadata = dict(database.execute("SELECT key, value FROM metadata"))
+        published_release = next(
+            path
+            for path in (self.data_root / "releases").iterdir()
+            if not path.name.startswith("legacy-")
+        )
+        self.assertEqual(metadata["releaseID"], published_release.name)
+        state = json.loads((published_release / "release-state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["completedStage"], "commit")
         self.assertEqual(
             (self.data_root / "current" / "release-marker").read_text(),
             "new",
@@ -446,6 +537,193 @@ printf 'releaseID=%s\\n' "$RELEASE_ID" > "$NEXT_DATABASE_PATH"
         self.assertEqual((self.data_root / "current" / "release-marker").read_text(encoding="utf-8"), "old")
         self.assertIn("another stop-data publication is already running", result.stderr)
         self.assertEqual(self.systemctl_calls(), [])
+
+    def test_resume_requires_an_existing_explicit_release(self) -> None:
+        result = self.run_pipeline("--resume", "missing-release")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("release directory is missing", result.stderr)
+        self.assertFalse((self.root / "build-calls.log").exists())
+
+    def test_resume_rejects_unsafe_release_id(self) -> None:
+        result = self.run_pipeline("--resume", "../candidate")
+
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("invalid release ID", result.stderr)
+
+    def test_resume_rejects_mutated_candidate_without_running_downstream_stages(self) -> None:
+        interrupted = self.run_pipeline(
+            CRASH_AFTER_STATE="1",
+            CRASH_AFTER_STAGE="candidate-validation",
+        )
+        self.assertEqual(interrupted.returncode, 99, interrupted.stderr)
+        release_id = self.candidate_release_id()
+        manifest_path = self.data_root / "releases" / release_id / "stop-data" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["cities"][0]["name"] = "Changed after validation"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        resumed = self.run_pipeline("--resume", release_id)
+
+        self.assertNotEqual(resumed.returncode, 0)
+        self.assertIn("candidate integrity", resumed.stderr)
+        self.assertEqual(
+            (self.root / "build-calls.log").read_text(encoding="utf-8").splitlines(),
+            ["build"],
+        )
+        self.assertFalse((self.root / "static-calls.log").exists())
+        self.assertFalse((self.root / "systemctl.log").exists())
+        self.assertFalse((self.root / "link-calls.log").exists())
+
+    def test_resume_rejects_fifo_candidate_without_running_downstream_stages(self) -> None:
+        interrupted = self.run_pipeline(
+            CRASH_AFTER_STATE="1",
+            CRASH_AFTER_STAGE="candidate-validation",
+        )
+        self.assertEqual(interrupted.returncode, 99, interrupted.stderr)
+        release_id = self.candidate_release_id()
+        fifo_path = self.data_root / "releases" / release_id / "stop-data" / "routes" / "unsupported.fifo"
+        os.mkfifo(fifo_path)
+
+        resumed = self.run_pipeline("--resume", release_id)
+
+        self.assertNotEqual(resumed.returncode, 0)
+        self.assertIn("FIFO", resumed.stderr)
+        self.assertEqual(
+            (self.root / "build-calls.log").read_text(encoding="utf-8").splitlines(),
+            ["build"],
+        )
+        self.assertFalse((self.root / "static-calls.log").exists())
+        self.assertFalse((self.root / "systemctl.log").exists())
+        self.assertFalse((self.root / "link-calls.log").exists())
+
+    def test_resume_after_each_persisted_stage_skips_heavy_build(self) -> None:
+        for stage in (
+            "build",
+            "candidate-validation",
+            "static-departures",
+            "handoff-readiness",
+            "commit",
+        ):
+            with self.subTest(stage=stage):
+                if stage != "build":
+                    self.tearDown()
+                    self.setUp()
+                self.configure_resume_pointer_layout()
+                interrupted = self.run_pipeline(
+                    CRASH_AFTER_STATE="1",
+                    CRASH_AFTER_STAGE=stage,
+                )
+
+                self.assertEqual(interrupted.returncode, 99, interrupted.stderr)
+                release_id = self.candidate_release_id()
+                state = json.loads(
+                    (self.data_root / "releases" / release_id / "release-state.json").read_text()
+                )
+                self.assertEqual(state["completedStage"], stage)
+
+                resumed = self.run_pipeline("--resume", release_id)
+
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                self.assertEqual(
+                    (self.root / "build-calls.log").read_text(encoding="utf-8").splitlines(),
+                    ["build"],
+                )
+                if stage == "commit":
+                    self.assertIn("already-active", resumed.stdout)
+                else:
+                    final_state = json.loads(
+                        (self.data_root / "releases" / release_id / "release-state.json").read_text()
+                    )
+                    self.assertEqual(final_state["completedStage"], "commit")
+
+    def test_crash_after_activation_reconciles_state_without_activation(self) -> None:
+        self.configure_resume_pointer_layout()
+        interrupted = self.run_pipeline(CRASH_BEFORE_COMMIT="1")
+
+        self.assertEqual(interrupted.returncode, 99, interrupted.stderr)
+        release_id = self.candidate_release_id()
+        release_dir = self.data_root / "releases" / release_id
+        state = json.loads((release_dir / "release-state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["completedStage"], "handoff-readiness")
+
+        build_calls = (self.root / "build-calls.log").read_text(encoding="utf-8").splitlines()
+        static_calls = (self.root / "static-calls.log").read_text(encoding="utf-8").splitlines()
+        systemctl_calls = self.systemctl_calls()
+        link_calls = (self.root / "link-calls.log").read_text(encoding="utf-8").splitlines()
+        previous_target = os.readlink(self.data_root / "previous" / "stop-data")
+
+        resumed = self.run_pipeline("--resume", release_id)
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertIn("already-active", resumed.stdout)
+        self.assertIn("state reconciled without activation", resumed.stdout)
+        self.assertNotIn("activating canonical runtime", resumed.stdout)
+        final_state = json.loads((release_dir / "release-state.json").read_text(encoding="utf-8"))
+        self.assertEqual(final_state["completedStage"], "commit")
+        self.assertEqual(
+            (self.root / "build-calls.log").read_text(encoding="utf-8").splitlines(),
+            build_calls,
+        )
+        self.assertEqual(
+            (self.root / "static-calls.log").read_text(encoding="utf-8").splitlines(),
+            static_calls,
+        )
+        self.assertEqual(self.systemctl_calls(), systemctl_calls)
+        self.assertEqual(
+            (self.root / "link-calls.log").read_text(encoding="utf-8").splitlines(),
+            link_calls,
+        )
+        self.assertEqual(os.readlink(self.data_root / "previous" / "stop-data"), previous_target)
+        self.assertFalse(list(release_dir.glob(".release-state-*.tmp")))
+
+    def test_already_committed_resume_does_not_rewrite_state(self) -> None:
+        self.configure_resume_pointer_layout()
+        successful = self.run_pipeline()
+
+        self.assertEqual(successful.returncode, 0, successful.stderr)
+        release_id = self.candidate_release_id()
+        release_dir = self.data_root / "releases" / release_id
+        state_path = release_dir / "release-state.json"
+        state_bytes = state_path.read_bytes()
+        state_payload = json.loads(state_bytes)
+        state_mtime_ns = state_path.stat().st_mtime_ns
+        state_write_calls = (self.root / "state-write-calls.log").read_text(encoding="utf-8").splitlines()
+        build_calls = (self.root / "build-calls.log").read_text(encoding="utf-8").splitlines()
+        static_calls = (self.root / "static-calls.log").read_text(encoding="utf-8").splitlines()
+        systemctl_calls = self.systemctl_calls()
+        link_calls = (self.root / "link-calls.log").read_text(encoding="utf-8").splitlines()
+        previous_path = self.data_root / "previous" / "stop-data"
+        previous_target = os.readlink(previous_path)
+        previous_mtime_ns = previous_path.lstat().st_mtime_ns
+
+        resumed = self.run_pipeline("--resume", release_id)
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertIn("already-active", resumed.stdout)
+        self.assertNotIn("activating canonical runtime", resumed.stdout)
+        self.assertEqual(state_path.read_bytes(), state_bytes)
+        self.assertEqual(json.loads(state_path.read_bytes())["updatedAt"], state_payload["updatedAt"])
+        self.assertEqual(state_path.stat().st_mtime_ns, state_mtime_ns)
+        self.assertEqual(
+            (self.root / "state-write-calls.log").read_text(encoding="utf-8").splitlines(),
+            state_write_calls,
+        )
+        self.assertEqual(
+            (self.root / "build-calls.log").read_text(encoding="utf-8").splitlines(),
+            build_calls,
+        )
+        self.assertEqual(
+            (self.root / "static-calls.log").read_text(encoding="utf-8").splitlines(),
+            static_calls,
+        )
+        self.assertEqual(self.systemctl_calls(), systemctl_calls)
+        self.assertEqual(
+            (self.root / "link-calls.log").read_text(encoding="utf-8").splitlines(),
+            link_calls,
+        )
+        self.assertEqual(os.readlink(previous_path), previous_target)
+        self.assertEqual(previous_path.lstat().st_mtime_ns, previous_mtime_ns)
 
 
 if __name__ == "__main__":
