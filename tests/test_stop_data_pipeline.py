@@ -90,6 +90,14 @@ from pathlib import Path
 output = Path(sys.argv[1])
 root = output.parent
 def artifact(source_id):
+    if source_id == "ireland":
+        sys.path.insert(0, os.environ["REPO"] + "/scripts")
+        from artifact_provenance import artifact_provenance
+        path = root / "external-artifacts" / "ireland"
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "stops.txt").write_text("stop_id,stop_name\\nA,Alpha\\n", encoding="utf-8")
+        digest, size = artifact_provenance(path)
+        return {"path": str(path), "sha256": digest, "size": size}
     path = root / f\"{source_id}.zip\"
     path.write_bytes(source_id.encode(\"utf-8\"))
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -142,13 +150,21 @@ invalid = sys.argv[2] == \"1\"
 cities = [{\"id\": \"test-city\", \"name\": \"Test City\", \"url\": \"stops/test-city.json\"}]
 if not invalid:
     cities.extend({\"id\": city_id, \"name\": city_id, \"url\": f\"stops/{city_id}.json\"} for city_id in (\"san-francisco\", \"oakland\", \"berkeley\", \"san-jose\"))
+    cities.extend({\"id\": city_id, \"name\": city_id, \"url\": f\"stops/{city_id}.json\"} for city_id in (\"dublin\", \"cork\", \"galway\", \"limerick\", \"waterford\"))
 (output / \"manifest.json\").write_text(json.dumps({\"version\": \"2026-07-30\", \"cities\": cities}), encoding=\"utf-8\")
 for city in cities:
     package_path = output / city[\"url\"]
     package_path.parent.mkdir(parents=True, exist_ok=True)
     package_path.write_text(\"{}\", encoding=\"utf-8\")
+for city_id in (\"dublin\", \"cork\", \"galway\", \"limerick\", \"waterford\"):
+    for directory in (\"routes\", \"departures\"):
+        package_path = output / directory / f\"{city_id}.json\"
+        package_path.write_text(\"{}\", encoding=\"utf-8\")
 if not invalid:
-    (output / \"transit-radar-cities.json\").write_text(\"{}\", encoding=\"utf-8\")
+    (output / \"transit-radar-cities.json\").write_text(
+        json.dumps({\"cities\": [{\"appCityID\": city_id} for city_id in (\"dublin\", \"cork\", \"galway\", \"limerick\", \"waterford\")]}),
+        encoding=\"utf-8\",
+    )
 (output / \"swiss-static\" / \"manifest.json\").write_text(\"{}\", encoding=\"utf-8\")
 PY
     printf 'new' > \"$output/release-marker\"

@@ -30,6 +30,7 @@ from external_gtfs import (
     load_external_gtfs_sources,
 )
 from gtfs_source_cache import DEFAULT_CACHE_ROOT, GTFSArtifactCache
+from ireland_artifact_snapshot import capture_ireland_snapshot
 from import_static_departures_database import (
     add_external_gtfs,
     configured_external_city_ids,
@@ -299,6 +300,8 @@ def resolve_gtfs_artifact(
 def resolve_external_artifact(
     provider: StaticProvider,
     environment: dict[str, str],
+    *,
+    release_root: Path | None = None,
 ) -> Path:
     assert provider.source is not None
     configured_url = str(
@@ -310,6 +313,12 @@ def resolve_external_artifact(
     if local_path:
         path = Path(local_path)
         if path.is_dir():
+            if provider.provider_id == "ireland":
+                if release_root is None:
+                    raise ValueError(
+                        "Ireland local directory requires a release-local snapshot root"
+                    )
+                return capture_ireland_snapshot(path, release_root).path
             return path
         if not path.is_file():
             raise ValueError(
@@ -991,7 +1000,9 @@ def scoped_rebuild(
                 external_artifacts = timed_stage(
                     "resolve-external-artifacts",
                     lambda: {
-                        provider.provider_id: resolve_external_artifact(provider, environment)
+                        provider.provider_id: resolve_external_artifact(
+                            provider, environment, release_root=release_dir
+                        )
                         for provider in external
                     },
                 )

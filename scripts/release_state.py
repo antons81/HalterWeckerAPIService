@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Mapping
 
 from artifact_provenance import artifact_provenance
+from ireland_artifact_snapshot import validate_ireland_release_snapshot
 
 
 STATE_FILE_NAME = "release-state.json"
@@ -440,6 +441,8 @@ def _validate_artifact_manifest(
             if not isinstance(entry, Mapping) or not entry.get("path"):
                 continue
             try:
+                if str(source_id) == "ireland":
+                    validate_ireland_release_snapshot(entry, release_dir)
                 validate_artifact_entry(
                     str(source_id),
                     entry,
@@ -497,9 +500,12 @@ def _validate_candidate(
 
     if STAGE_ORDER[validation_stage] >= STAGE_ORDER["candidate-validation"]:
         _verify_candidate_integrity(release_dir, validation_stage, state)
+        artifacts_path = release_dir / "gtfs-artifacts.json"
+        artifacts = _read_object(artifacts_path)
+        _validate_artifact_manifest(release_dir, repository_root, artifacts)
         return
 
-    manifest = _validate_required_artifacts(release_dir)
+    _validate_required_artifacts(release_dir)
     artifacts_path = release_dir / "gtfs-artifacts.json"
     artifacts = _read_object(artifacts_path)
     _validate_artifact_manifest(release_dir, repository_root, artifacts)

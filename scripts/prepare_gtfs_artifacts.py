@@ -22,6 +22,7 @@ from external_gtfs import (
 )
 from dynamic_resource_resolver import resolve_gtfs_resource
 from gtfs_source_cache import DEFAULT_CACHE_ROOT, ArtifactResult, GTFSArtifactCache
+from ireland_artifact_snapshot import capture_ireland_snapshot
 
 
 def safe_error_reason(error: BaseException) -> str:
@@ -33,12 +34,31 @@ def safe_error_reason(error: BaseException) -> str:
     return type(error).__name__
 
 
-def artifact_payload(result: ArtifactResult) -> dict[str, object]:
+def artifact_payload(
+    result: ArtifactResult,
+    *,
+    release_root: Path | None = None,
+) -> dict[str, object]:
+    snapshot = None
+    if result.source_id == "ireland" and result.path.is_dir():
+        if release_root is None:
+            raise ValueError(
+                "Ireland local directory requires a release-local snapshot root"
+            )
+        snapshot = capture_ireland_snapshot(result.path, release_root)
+        result_path = snapshot.path
+        digest = snapshot.sha256
+        size = snapshot.size
+    else:
+        result_path = result.path
+        digest = None
+        size = None
     state = result.state or {}
-    digest = state.get("sha256")
-    size = state.get("size")
-    if result.path.is_dir() or not isinstance(digest, str) or not digest:
-        digest, size = artifact_provenance(result.path)
+    if digest is None:
+        digest = state.get("sha256")
+        size = state.get("size")
+    if result_path.is_dir() or not isinstance(digest, str) or not digest:
+        digest, size = artifact_provenance(result_path)
     if not isinstance(digest, str) or not digest:
         raise ValueError(
             f"GTFS artifact {result.source_id} has no validated SHA-256 provenance."
@@ -47,13 +67,14 @@ def artifact_payload(result: ArtifactResult) -> dict[str, object]:
         raise ValueError(
             f"GTFS artifact {result.source_id} has no validated size provenance."
         )
-    published_path = immutable_file_path(result.path, digest)
-    return {
+    published_path = immutable_file_path(result_path, digest)
+    payload = {
         "path": str(published_path),
         "status": result.status,
         "sha256": digest,
         "size": size,
     }
+    return payload
 
 
 def resolve_one(
@@ -145,6 +166,11 @@ def main() -> None:
     parser.add_argument("--external-sources", default="config/external-gtfs-sources.json")
     parser.add_argument("--external-gtfs-url", action="append", default=[])
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--release-root",
+        type=Path,
+        help="Release directory used for the Ireland local-source snapshot.",
+    )
     args = parser.parse_args()
 
     cache = GTFSArtifactCache(args.cache_root)
@@ -180,7 +206,8 @@ def main() -> None:
                     path,
                     "local",
                     f"local path ({local_kind})",
-                )
+                ),
+                release_root=args.release_root,
             )
             print(
                 f"[GTFSCache] source={source_id} stage=resolve "

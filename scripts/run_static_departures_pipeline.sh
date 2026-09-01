@@ -118,13 +118,14 @@ EXTERNAL_GTFS_IMPORT_ARGS=()
 while IFS= read -r external_mapping; do
   [[ -n "$external_mapping" ]] || continue
   EXTERNAL_GTFS_IMPORT_ARGS+=(--external-gtfs-url "$external_mapping")
-done < <(python3 - "${EXTERNAL_GTFS_ARTIFACTS_JSON:-}" "$REPO/config/external-gtfs-sources.json" <<'PY'
+done < <(python3 - "${EXTERNAL_GTFS_ARTIFACTS_JSON:-}" "$REPO/config/external-gtfs-sources.json" "$REPO" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 artifact_path = sys.argv[1].strip()
 sources_path = Path(sys.argv[2])
+repository_root = Path(sys.argv[3])
 sources = json.loads(sources_path.read_text(encoding="utf-8"))
 enabled = {
     str(source["id"])
@@ -135,12 +136,20 @@ enabled = {
 if artifact_path:
     payload = json.loads(Path(artifact_path).read_text(encoding="utf-8"))
     external = payload.get("external", {})
+    sys.path.insert(0, str(repository_root / "scripts"))
     for source_id in sorted(enabled):
         entry = external.get(source_id)
         if not isinstance(entry, dict) or not entry.get("path"):
             raise SystemExit(
                 f"Static-enabled source is missing from release import plan: {source_id}"
             )
+        if source_id == "ireland":
+            from ireland_artifact_snapshot import validate_ireland_release_snapshot
+
+            try:
+                validate_ireland_release_snapshot(entry, Path(artifact_path).parent)
+            except ValueError as error:
+                raise SystemExit(str(error)) from error
         print(f"{source_id}={entry['path']}")
 else:
     for source in sources:
@@ -150,6 +159,10 @@ else:
         value = str(
             source.get("localPath") or source.get("url") or source.get("scopedURL") or ""
         ).strip()
+        if source_id == "ireland" and source.get("localPath"):
+            raise SystemExit(
+                "Ireland static import requires a release-scoped artifact manifest"
+            )
         if not value:
             raise SystemExit(f"Static-enabled source has no configured input: {source_id}")
         print(f"{source_id}={value}")

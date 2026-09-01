@@ -226,6 +226,7 @@ if [[ ${#EXTERNAL_URL_OVERRIDES[@]} -gt 0 ]]; then
   PREPARE_ARGS+=("${EXTERNAL_URL_OVERRIDES[@]}")
 fi
 PREPARE_ARGS+=(--output "$ARTIFACTS_JSON")
+PREPARE_ARGS+=(--release-root "$RELEASE_DIR")
 python3 "$REPO/scripts/prepare_gtfs_artifacts.py" "${PREPARE_ARGS[@]}"
 VBB_INPUT_URL="${VBB_GTFS_URL:-https://unternehmen.vbb.de/fileadmin/user_upload/VBB/Dokumente/API-Datensaetze/gtfs-mastscharf/GTFS.zip}"
 RNV_INPUT_URL="${RNV_GTFS_URL:-https://gtfs-sandbox-dds.rnv-online.de/latest/gtfs.zip}"
@@ -379,9 +380,16 @@ for group in ("sources", "external"):
         if not isinstance(entry.get("size"), int) or entry["size"] <= 0:
             raise SystemExit(f"GTFS artifact size provenance is missing for {source_id}")
         artifact_path = Path(str(entry["path"]))
+        sys.path.insert(0, str(repository_root / "scripts"))
+        if source_id == "ireland":
+            from ireland_artifact_snapshot import validate_ireland_release_snapshot
+
+            try:
+                validate_ireland_release_snapshot(entry, artifacts_path.parent)
+            except ValueError as error:
+                raise SystemExit(str(error)) from error
         if not artifact_path.exists():
             raise SystemExit(f"GTFS artifact path is missing for {source_id}: {artifact_path}")
-        sys.path.insert(0, str(repository_root / "scripts"))
         from artifact_provenance import artifact_provenance
         actual_digest, actual_size = artifact_provenance(artifact_path)
         if actual_digest != entry["sha256"] or actual_size != entry["size"]:
@@ -630,7 +638,7 @@ print("[StopData] Sweden external packages validated")
 PY
 fi
 
-if [[ -d "$DATA_ROOT/ireland/static" ]]; then
+if [[ -d "$RELEASE_DIR/external-artifacts/ireland" ]]; then
   for ireland_city in dublin cork galway limerick waterford; do
     test -f "$BUILD_DIR/stops/$ireland_city.json"
     test -f "$BUILD_DIR/routes/$ireland_city.json"

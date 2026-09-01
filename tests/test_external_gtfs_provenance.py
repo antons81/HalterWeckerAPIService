@@ -377,13 +377,15 @@ class ExternalGTFSProvenanceTests(unittest.TestCase):
             directory = root / "ireland"
             directory.mkdir()
             (directory / "stops.txt").write_text("stop_id,stop_name\nS,Stop\n", encoding="utf-8")
+            (root / "release").mkdir()
             directory_payload = artifact_payload(
-                ArtifactResult("ireland", directory, "local")
+                ArtifactResult("ireland", directory, "local"),
+                release_root=root / "release",
             )
             self.assertTrue(directory_payload["sha256"])
             self.assertGreater(directory_payload["size"], 0)
             self.assertEqual(
-                artifact_provenance(directory),
+                artifact_provenance(Path(directory_payload["path"])),
                 (directory_payload["sha256"], directory_payload["size"]),
             )
 
