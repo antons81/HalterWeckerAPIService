@@ -9,8 +9,11 @@ import os
 import sqlite3
 import time
 import uuid
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 
 from build_german_departure_index import (
     DEFAULT_TIMEZONE, connect, load_city_aliases,
@@ -30,6 +33,7 @@ from external_gtfs import (
     validate_external_gtfs_source,
 )
 from static_departures_ownership import (
+    ensure_provider_entity_lookup_index,
     has_ownership_schema,
     rebuild_city_departure_modes,
     rebuild_city_stops,
@@ -39,6 +43,59 @@ from static_departures_ownership import (
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
+
+@dataclass(frozen=True)
+class CityScopedStopIDPrefixes:
+    prefixes_by_city: Mapping[str, Mapping[str, str]]
+    _authoritative_city_ids: frozenset[str] = field(
+        default_factory=frozenset,
+        init=False,
+        repr=False,
+    )
+
+    @classmethod
+    def from_authoritative_provider_cities(
+        cls,
+        source_cities_by_provider: Mapping[str, list[dict[str, object]]],
+        stop_id_prefixes: Mapping[str, str],
+    ) -> "CityScopedStopIDPrefixes":
+        prefixes_by_city: dict[str, dict[str, str]] = {}
+        for provider_id in sorted(source_cities_by_provider):
+            if provider_id not in stop_id_prefixes:
+                raise ValueError(
+                    f"Missing stop ID prefix for authoritative provider {provider_id}"
+                )
+            for city in source_cities_by_provider[provider_id]:
+                city_id = city.get("id")
+                if not isinstance(city_id, str) or not city_id:
+                    raise ValueError(
+                        f"Invalid city ID for authoritative provider {provider_id}"
+                    )
+                prefixes_by_city.setdefault(city_id, {})[provider_id] = str(
+                    stop_id_prefixes[provider_id]
+                )
+
+        immutable_prefixes_by_city = MappingProxyType(
+            {
+                city_id: MappingProxyType(dict(provider_prefixes))
+                for city_id, provider_prefixes in prefixes_by_city.items()
+            }
+        )
+        result = cls(immutable_prefixes_by_city)
+        object.__setattr__(
+            result,
+            "_authoritative_city_ids",
+            frozenset(immutable_prefixes_by_city),
+        )
+        return result
+
+    def authoritative_prefixes_for_city(
+        self, city_id: str
+    ) -> Mapping[str, str] | None:
+        if city_id not in self._authoritative_city_ids:
+            return None
+        return self.prefixes_by_city.get(city_id)
 
 
 def timed_stage(source: str, stage: str, callback):
@@ -203,8 +260,13 @@ def populate_provider_city_memberships(
     stop_id_prefix_by_provider: dict[str, str] | None = None,
     indexed_ownership_lookup: bool = False,
     catalog_only_city_ids: set[str] | None = None,
+    city_scoped_prefixes: CityScopedStopIDPrefixes | None = None,
 ) -> set[str]:
-    """Map package memberships to the providers that own their GTFS stop IDs."""
+    """Map package memberships to the providers that own their GTFS stop IDs.
+
+    City-scoped prefixes are used only for cities explicitly proven complete;
+    all other cities retain the global provider-prefix fallback.
+    """
     manifest = json.loads((stop_data / "manifest.json").read_text(encoding="utf-8"))
     cities = manifest.get("cities")
     if not isinstance(cities, list):
@@ -222,6 +284,7 @@ def populate_provider_city_memberships(
             included_city_ids,
             stop_id_prefix_by_provider,
             catalog_only_city_ids or set(),
+            city_scoped_prefixes,
         )
 
     city_ids: set[str] = set()
@@ -320,6 +383,7 @@ def _populate_provider_city_memberships_indexed(
     included_city_ids: set[str],
     stop_id_prefix_by_provider: dict[str, str] | None,
     catalog_only_city_ids: set[str],
+    city_scoped_prefixes: CityScopedStopIDPrefixes | None = None,
 ) -> set[str]:
     """Resolve scoped package ownership through one indexed TEMP set."""
     manifest = json.loads((stop_data / "manifest.json").read_text(encoding="utf-8"))
@@ -327,7 +391,15 @@ def _populate_provider_city_memberships_indexed(
     if not isinstance(cities, list):
         raise ValueError("Stop manifest must contain a cities array.")
 
-    city_packages: list[tuple[str, list[dict[str, object]], dict[str, str], bool]] = []
+    city_packages: list[
+        tuple[
+            str,
+            list[dict[str, object]],
+            dict[str, str],
+            dict[str, str],
+            bool,
+        ]
+    ] = []
     candidate_stop_ids: set[str] = set()
     for city in cities:
         if not isinstance(city, dict) or not isinstance(city.get("id"), str):
@@ -339,24 +411,64 @@ def _populate_provider_city_memberships_indexed(
         package = json.loads(package_path.read_text(encoding="utf-8"))
         if not isinstance(package, list):
             raise ValueError(f"Invalid stop package for {city_id}")
+        complete_prefix_by_provider = (
+            city_scoped_prefixes.authoritative_prefixes_for_city(city_id)
+            if city_scoped_prefixes is not None
+            else None
+        )
         prefix_by_provider = dict(stop_id_prefix_by_provider or {})
+        candidate_prefix_by_provider = (
+            dict(complete_prefix_by_provider)
+            if complete_prefix_by_provider
+            else dict(prefix_by_provider)
+        )
         for provider_id, prefix in connection.execute(
             "SELECT provider_id, stop_id_prefix FROM provider_city_modes WHERE city_id=?",
             (city_id,),
         ):
             prefix_by_provider.setdefault(str(provider_id), str(prefix))
+            candidate_prefix_by_provider.setdefault(str(provider_id), str(prefix))
         typed_package = [stop for stop in package if isinstance(stop, dict)]
         catalog_only = city_id in catalog_only_city_ids or city.get("catalogOnly") is True
-        city_packages.append((city_id, typed_package, prefix_by_provider, catalog_only))
+        city_packages.append(
+            (
+                city_id,
+                typed_package,
+                prefix_by_provider,
+                candidate_prefix_by_provider,
+                catalog_only,
+            )
+        )
         for stop in typed_package:
             if not stop.get("id"):
                 continue
             stop_ids = {str(stop["id"])}
             stop_ids.update(str(alias) for alias in stop.get("sourceStopIDs", []) if alias)
             candidate_stop_ids.update(stop_ids)
-            for prefix in prefix_by_provider.values():
+            for prefix in candidate_prefix_by_provider.values():
                 if prefix:
                     candidate_stop_ids.update(f"{prefix}{stop_id}" for stop_id in stop_ids)
+
+    global_candidate_stop_ids: set[str] = set(candidate_stop_ids)
+    for (
+        _city_id,
+        package,
+        prefix_by_provider,
+        _candidate_prefixes,
+        _catalog_only,
+    ) in city_packages:
+        for stop in package:
+            if not stop.get("id"):
+                continue
+            stop_ids = {str(stop["id"])}
+            stop_ids.update(str(alias) for alias in stop.get("sourceStopIDs", []) if alias)
+            for stop_id in stop_ids:
+                global_candidate_stop_ids.add(stop_id)
+                global_candidate_stop_ids.update(
+                    f"{prefix}{stop_id}"
+                    for prefix in prefix_by_provider.values()
+                    if prefix
+                )
 
     connection.execute(
         "DROP TABLE IF EXISTS temp.scoped_membership_candidate_stop_ids"
@@ -365,6 +477,7 @@ def _populate_provider_city_memberships_indexed(
         "DROP TABLE IF EXISTS temp.scoped_membership_stop_owners"
     )
     try:
+        ensure_provider_entity_lookup_index(connection)
         connection.executescript(
             """
             CREATE TEMP TABLE scoped_membership_candidate_stop_ids(
@@ -386,18 +499,41 @@ def _populate_provider_city_memberships_indexed(
             INSERT INTO scoped_membership_stop_owners(stop_id, provider_id)
             SELECT entities.key_1, entities.provider_id
             FROM provider_entities AS entities
-            JOIN scoped_membership_candidate_stop_ids AS candidates
-              ON candidates.stop_id = entities.key_1
             WHERE entities.entity_type = 'raw_stops'
+              AND entities.key_1 IN (
+                  SELECT stop_id FROM scoped_membership_candidate_stop_ids
+              )
             """
         )
         owners_by_stop: dict[str, list[tuple[str, str]]] = {}
-        for stop_id, provider_id in connection.execute(
-            "SELECT stop_id, provider_id FROM scoped_membership_stop_owners"
-        ):
-            owners_by_stop.setdefault(str(stop_id), []).append(
-                (str(provider_id), str(stop_id))
+        def load_owners() -> None:
+            owners_by_stop.clear()
+            for stop_id, provider_id in connection.execute(
+                "SELECT stop_id, provider_id FROM scoped_membership_stop_owners"
+            ):
+                owners_by_stop.setdefault(str(stop_id), []).append(
+                    (str(provider_id), str(stop_id))
+                )
+
+        load_owners()
+        additional_global_candidates = global_candidate_stop_ids - candidate_stop_ids
+        if additional_global_candidates:
+            connection.executemany(
+                "INSERT OR IGNORE INTO scoped_membership_candidate_stop_ids(stop_id) VALUES (?)",
+                ((stop_id,) for stop_id in sorted(additional_global_candidates)),
             )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO scoped_membership_stop_owners(stop_id, provider_id)
+                SELECT entities.key_1, entities.provider_id
+                FROM provider_entities AS entities
+                WHERE entities.entity_type = 'raw_stops'
+                  AND entities.key_1 IN (
+                      SELECT stop_id FROM scoped_membership_candidate_stop_ids
+                  )
+                """
+            )
+            load_owners()
     finally:
         connection.execute(
             "DROP TABLE IF EXISTS temp.scoped_membership_stop_owners"
@@ -407,7 +543,13 @@ def _populate_provider_city_memberships_indexed(
         )
 
     city_ids: set[str] = set()
-    for city_id, package, prefix_by_provider, catalog_only in city_packages:
+    for (
+        city_id,
+        package,
+        prefix_by_provider,
+        candidate_prefix_by_provider,
+        catalog_only,
+    ) in city_packages:
         package_stop_ids: set[str] = set()
         owned_ids: dict[str, set[str]] = {}
         for stop in package:
@@ -425,6 +567,7 @@ def _populate_provider_city_memberships_indexed(
                 for candidate_id in sorted(candidate_ids)
                 for owner in owners_by_stop.get(candidate_id, ())
             ]
+            owners = sorted(set(owners))
             preferred_owners = [
                 (provider, stop_id)
                 for provider, stop_id in owners
@@ -617,10 +760,12 @@ def add_external_gtfs(
         for source_id, source in sources_by_id.items()
         if source_id in url_by_provider
     }
+    source_cities_by_provider: dict[str, list[dict[str, object]]] = {}
     for source_id in sorted(url_by_provider):
         source = sources_by_id[source_id]
         validate_external_gtfs_source(source, repository_root)
         cities = load_external_cities(source, repository_root)
+        source_cities_by_provider[source_id] = cities
         catalog_only_city_ids.update(
             str(city["id"])
             for city in cities
@@ -663,6 +808,11 @@ def add_external_gtfs(
     if not imported_city_ids:
         return imported_city_ids
 
+    city_scoped_prefixes = CityScopedStopIDPrefixes.from_authoritative_provider_cities(
+        source_cities_by_provider,
+        source_stop_id_prefixes,
+    )
+
     provider_scope = (source_id for source_id in url_by_provider) if scoped else None
     if stage_runner is None:
         resolve_canonical_stops(connection, provider_ids=provider_scope)
@@ -683,6 +833,7 @@ def add_external_gtfs(
                     stop_id_prefix_by_provider=source_stop_id_prefixes,
                     indexed_ownership_lookup=True,
                     catalog_only_city_ids=catalog_only_city_ids,
+                    city_scoped_prefixes=city_scoped_prefixes,
                 ),
             )
         else:
@@ -695,6 +846,7 @@ def add_external_gtfs(
                     stop_id_prefix_by_provider=source_stop_id_prefixes,
                     indexed_ownership_lookup=True,
                     catalog_only_city_ids=catalog_only_city_ids,
+                    city_scoped_prefixes=city_scoped_prefixes,
                 ),
             )
     provider_scope = tuple(url_by_provider) if scoped else None

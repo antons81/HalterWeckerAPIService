@@ -9,6 +9,7 @@ from collections.abc import Iterable
 
 
 OWNERSHIP_SCHEMA_VERSION = "1"
+PROVIDER_ENTITIES_BY_TYPE_KEY_INDEX = "provider_entities_by_type_key"
 
 
 def ensure_ownership_schema(connection: sqlite3.Connection) -> None:
@@ -71,6 +72,16 @@ def has_ownership_schema(connection: sqlite3.Connection) -> bool:
         "provider_city_modes",
         "ownership_metadata",
     }.issubset(tables)
+
+
+def ensure_provider_entity_lookup_index(connection: sqlite3.Connection) -> None:
+    """Create the lookup index after provider entity bulk population."""
+    connection.execute(
+        f"""
+        CREATE INDEX IF NOT EXISTS {PROVIDER_ENTITIES_BY_TYPE_KEY_INDEX}
+            ON provider_entities(entity_type, key_1, provider_id)
+        """
+    )
 
 
 def register_entities(
