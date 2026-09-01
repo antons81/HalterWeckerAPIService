@@ -172,6 +172,69 @@ class ReleaseStateTests(unittest.TestCase):
         self.assertEqual(info.completed_stage, "build")
         self.assertEqual(info.next_stage, "candidate-validation")
 
+    def test_missing_previous_with_valid_current_allows_resume(self) -> None:
+        self._write_state("build")
+        self._write_old_primary_pointers()
+
+        info = self._inspect()
+
+        self.assertEqual(info.status, "candidate-not-activated")
+        self.assertEqual(info.next_stage, "candidate-validation")
+
+    def test_dangling_previous_for_deleted_release_allows_resume(self) -> None:
+        self._write_state("build")
+        self._write_old_primary_pointers()
+        self.previous.parent.mkdir(parents=True, exist_ok=True)
+        self.previous.symlink_to(Path("../releases/deleted-release/stop-data"))
+
+        info = self._inspect()
+
+        self.assertEqual(info.status, "candidate-not-activated")
+        self.assertEqual(info.next_stage, "candidate-validation")
+
+    def test_dangling_previous_with_existing_release_but_missing_target_fails_closed(
+        self,
+    ) -> None:
+        self._write_state("build")
+        self._write_old_primary_pointers()
+        malformed_release = self.releases_root / "malformed-release"
+        malformed_release.mkdir()
+        self.previous.parent.mkdir(parents=True, exist_ok=True)
+        self.previous.symlink_to(Path("../releases/malformed-release/stop-data"))
+
+        with self.assertRaisesRegex(ResumeError, "invalid or unsafe canonical pointer"):
+            self._inspect()
+
+    def test_malformed_previous_pointer_fails_closed(self) -> None:
+        self._write_state("build")
+        self._write_old_primary_pointers()
+        outside = self.root / "outside"
+        outside.mkdir()
+        self.previous.parent.mkdir(parents=True, exist_ok=True)
+        self.previous.symlink_to(outside / "stop-data")
+
+        with self.assertRaisesRegex(ResumeError, "invalid or unsafe canonical pointer"):
+            self._inspect()
+
+    def test_valid_previous_release_remains_usable(self) -> None:
+        self._write_state("build")
+        self._write_old_primary_pointers()
+        self._link(self.previous, self.releases_root / "old" / "stop-data")
+
+        info = self._inspect()
+
+        self.assertEqual(info.status, "candidate-not-activated")
+        self.assertEqual(info.next_stage, "candidate-validation")
+
+    def test_invalid_current_pointer_fails_closed_without_previous(self) -> None:
+        self._write_state("build")
+        self._write_old_primary_pointers()
+        self.current_release.unlink()
+        self._link(self.current_release, self.releases_root / "missing")
+
+        with self.assertRaisesRegex(ResumeError, "invalid or unsafe canonical pointer"):
+            self._inspect()
+
     def test_crash_point_d_provenance_mismatch_is_refused(self) -> None:
         self._write_state("candidate-validation")
         metadata_path = self.candidate / "release-metadata.json"

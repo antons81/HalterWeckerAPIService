@@ -519,6 +519,7 @@ def _pointer_kind(
     releases_root: Path,
     candidate_release_dir: Path,
     suffix: str,
+    allow_dangling_release_pointer: bool = False,
 ) -> tuple[str, str | None]:
     if not path.is_symlink():
         if path.exists():
@@ -527,6 +528,22 @@ def _pointer_kind(
 
     resolved = Path(os.path.realpath(path))
     if not resolved.exists():
+        if allow_dangling_release_pointer:
+            try:
+                relative = resolved.relative_to(releases_root.resolve())
+            except ValueError:
+                return "invalid", None
+            parts = relative.parts
+            if suffix:
+                if len(parts) != 2 or parts[1] != suffix:
+                    return "invalid", None
+            elif len(parts) != 1:
+                return "invalid", None
+            release_id = parts[0]
+            if not RELEASE_ID_PATTERN.fullmatch(release_id):
+                return "invalid", None
+            if not (releases_root / release_id).is_dir():
+                return "absent", None
         return "invalid", None
     candidate_target = candidate_release_dir / suffix if suffix else candidate_release_dir
     if resolved == candidate_target.resolve():
@@ -571,6 +588,7 @@ def detect_activation_state(
             releases_root=releases_root,
             candidate_release_dir=candidate_release_dir,
             suffix=suffix,
+            allow_dangling_release_pointer=name == "previous",
         )
         for name, (path, suffix) in specs.items()
     }
