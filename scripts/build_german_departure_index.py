@@ -152,6 +152,7 @@ def connect(database_path: Path) -> sqlite3.Connection:
             direction_id TEXT NOT NULL,
             terminal_stop_id TEXT NOT NULL DEFAULT ''
         ) WITHOUT ROWID;
+        CREATE INDEX trips_by_route ON trips(route_id, trip_id);
         CREATE INDEX trips_by_service ON trips(service_id);
         CREATE TABLE calendar (
             service_id TEXT PRIMARY KEY,

@@ -744,6 +744,9 @@ def add_external_gtfs(
     via raw_stops.canonical_stop_id. Per-city modes are written to
     city_departure_modes with the source timezone. Returns the imported city IDs.
     """
+    # Older releases may predate the route index. Ensure incremental and
+    # provider-scoped rebuilds do not carry that performance regression forward.
+    connection.execute("CREATE INDEX IF NOT EXISTS trips_by_route ON trips(route_id, trip_id)")
     sources = load_external_gtfs_sources(sources_path)
     sources_by_id = {str(source["id"]): source for source in sources}
     unknown = sorted(set(url_by_provider) - set(sources_by_id))

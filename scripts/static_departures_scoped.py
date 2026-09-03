@@ -767,6 +767,10 @@ def prepare_staging_release(
     release_dir = data_root / "releases" / release_id
     release_dir.mkdir(parents=True, exist_ok=False)
     clone_database(source_database, release_dir / "departures.sqlite")
+    with sqlite3.connect(release_dir / "departures.sqlite") as connection:
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS trips_by_route ON trips(route_id, trip_id)"
+        )
     shutil.copytree(source_stop_data, release_dir / "stop-data", symlinks=True)
     source_metadata = source_database.parent / "release-metadata.json"
     if source_metadata.is_file():

@@ -9,10 +9,26 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from build_german_departure_index import build_german_departure_index, parse_gtfs_time, validate_departure_output
+from build_german_departure_index import (
+    build_german_departure_index,
+    connect,
+    parse_gtfs_time,
+    validate_departure_output,
+)
 
 
 class GermanDepartureIndexTests(unittest.TestCase):
+    def test_schema_indexes_trips_by_route(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            connection = connect(Path(temp) / "departures.sqlite")
+            try:
+                indexes = {
+                    str(row[1]) for row in connection.execute("PRAGMA index_list(trips)")
+                }
+            finally:
+                connection.close()
+        self.assertIn("trips_by_route", indexes)
+
     def test_accepts_gtfs_times_after_midnight(self) -> None:
         self.assertEqual(parse_gtfs_time("24:15:30"), 87_330)
         self.assertIsNone(parse_gtfs_time("24:60:00"))
