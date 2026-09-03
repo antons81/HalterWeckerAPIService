@@ -18,6 +18,14 @@ except ImportError:
     from gtfs_csv import normalized_dict_reader
 
 
+def legacy_int_or_none(value: object, default: int = 0) -> int | None:
+    """Match the legacy int(value or default) conversion exactly."""
+    try:
+        return int(value or str(default))
+    except (TypeError, ValueError):
+        return None
+
+
 class JSONStream:
     """Incrementally decode generated JSON without reading the whole file."""
 
@@ -237,10 +245,319 @@ def log_memory_stage(
     fields.append(f"stage={stage}")
     fields.append(f"status={status}")
     if started is not None:
-        fields.append(f"duration={time.monotonic() - started:.2f}s")
+        fields.append(f"duration={time.monotonic() - started:.4f}s")
     fields.append(f"rss_kib={_rss_kib()}")
     fields.append(f"peak_rss_kib={_peak_rss_kib()}")
     print(" ".join(fields), flush=True)
+
+
+class NormalizedProviderContext:
+    """Disk-backed normalized GTFS tables shared by one provider build."""
+
+    def __init__(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory(
+            prefix="haltewecker-external-normalized-"
+        )
+        self.connection = sqlite3.connect(
+            Path(self._temporary.name) / "normalized.sqlite"
+        )
+        self.connection.executescript(
+            """
+            CREATE TABLE routes (
+                route_id TEXT NOT NULL,
+                route_short_name TEXT NOT NULL,
+                route_long_name TEXT NOT NULL,
+                route_type TEXT NOT NULL,
+                agency_id TEXT NOT NULL
+            );
+            CREATE TABLE stops (
+                stop_id TEXT NOT NULL,
+                stop_name TEXT NOT NULL,
+                stop_lat TEXT NOT NULL,
+                stop_lon TEXT NOT NULL,
+                stop_code TEXT NOT NULL,
+                parent_station TEXT NOT NULL,
+                location_type INTEGER NOT NULL,
+                platform_code TEXT NOT NULL
+            );
+            CREATE TABLE trips (
+                trip_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                service_id TEXT NOT NULL,
+                trip_headsign TEXT NOT NULL,
+                direction_id TEXT NOT NULL
+            );
+            CREATE TABLE stop_times (
+                trip_id TEXT NOT NULL,
+                stop_id TEXT NOT NULL,
+                arrival_time TEXT NOT NULL,
+                departure_time TEXT NOT NULL,
+                arrival_seconds INTEGER,
+                departure_seconds INTEGER,
+                stop_sequence INTEGER NOT NULL
+            );
+            CREATE TABLE calendar (
+                service_id TEXT PRIMARY KEY,
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                monday INTEGER NOT NULL,
+                tuesday INTEGER NOT NULL,
+                wednesday INTEGER NOT NULL,
+                thursday INTEGER NOT NULL,
+                friday INTEGER NOT NULL,
+                saturday INTEGER NOT NULL,
+                sunday INTEGER NOT NULL
+            ) WITHOUT ROWID;
+            CREATE TABLE calendar_dates (
+                service_id TEXT NOT NULL,
+                service_date TEXT NOT NULL,
+                exception_type INTEGER NOT NULL,
+                PRIMARY KEY (service_id, service_date)
+            ) WITHOUT ROWID;
+            """
+        )
+
+    @classmethod
+    def from_archive(cls, archive) -> "NormalizedProviderContext":
+        context = cls()
+        try:
+            context._populate(archive)
+        except Exception:
+            context.close()
+            raise
+        return context
+
+    def close(self) -> None:
+        self.connection.close()
+        self._temporary.cleanup()
+
+    def _populate(self, archive) -> None:
+        try:
+            from .build_german_departure_index import parse_gtfs_time
+        except ImportError:
+            from build_german_departure_index import parse_gtfs_time
+
+        self.connection.executemany(
+            "INSERT INTO routes VALUES (?, ?, ?, ?, ?)",
+            (
+                (
+                    str(row.get("route_id", "")),
+                    str(row.get("route_short_name", "")),
+                    str(row.get("route_long_name", "")),
+                    str(row.get("route_type", "3")),
+                    str(row.get("agency_id", "")),
+                )
+                for row in _iter_table(archive, "routes.txt")
+                if row.get("route_id")
+            ),
+        )
+        self.connection.commit()
+
+        self.connection.executemany(
+            "INSERT INTO stops VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                (
+                    str(row.get("stop_id", "")),
+                    str(row.get("stop_name", "") or ""),
+                    str(row.get("stop_lat", "") or ""),
+                    str(row.get("stop_lon", "") or ""),
+                    str(row.get("stop_code", "") or ""),
+                    str(row.get("parent_station", "") or ""),
+                    int(str(row.get("location_type", "0") or "0"))
+                    if str(row.get("location_type", "0") or "0").strip().isdigit()
+                    else 0,
+                    str(row.get("platform_code", "") or ""),
+                )
+                for row in _iter_table(archive, "stops.txt")
+                if row.get("stop_id")
+            ),
+        )
+        self.connection.commit()
+
+        self.connection.executemany(
+            "INSERT INTO trips VALUES (?, ?, ?, ?, ?)",
+            (
+                (
+                    str(row.get("trip_id", "")),
+                    str(row.get("route_id", "")),
+                    str(row.get("service_id", "")),
+                    str(row.get("trip_headsign", "") or ""),
+                    str(row.get("direction_id", "0")),
+                )
+                for row in _iter_table(archive, "trips.txt")
+                if str(row.get("trip_id", ""))
+            ),
+        )
+        self.connection.commit()
+
+        self.connection.executemany(
+            "INSERT INTO stop_times VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                (
+                    trip_id,
+                    stop_id,
+                    arrival_time,
+                    departure_time,
+                    parse_gtfs_time(arrival_time),
+                    parse_gtfs_time(departure_time),
+                    sequence,
+                )
+                for row in _iter_table(archive, "stop_times.txt")
+                for trip_id in [str(row.get("trip_id", ""))]
+                for stop_id in [str(row.get("stop_id", ""))]
+                for arrival_time in [str(row.get("arrival_time", "") or "").strip()]
+                for departure_time in [
+                    str(row.get("departure_time", "") or "").strip()
+                ]
+                for sequence_value in [
+                    legacy_int_or_none(row.get("stop_sequence", "0"))
+                ]
+                for sequence in [sequence_value if sequence_value is not None else 0]
+                if trip_id and stop_id
+            ),
+        )
+        self.connection.commit()
+
+        self.connection.executemany(
+            "INSERT OR REPLACE INTO calendar VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                (
+                    str(row.get("service_id", "")).strip(),
+                    str(row.get("start_date", "00000000")),
+                    str(row.get("end_date", "99999999")),
+                    *[
+                        int(row.get(day, "0") or "0")
+                        for day in (
+                            "monday",
+                            "tuesday",
+                            "wednesday",
+                            "thursday",
+                            "friday",
+                            "saturday",
+                            "sunday",
+                        )
+                    ],
+                )
+                for row in _iter_table(archive, "calendar.txt")
+                if str(row.get("service_id", "")).strip()
+            ),
+        )
+        self.connection.commit()
+
+        self.connection.executemany(
+            "INSERT OR REPLACE INTO calendar_dates VALUES (?, ?, ?)",
+            (
+                (
+                    str(row.get("service_id", "")).strip(),
+                    str(row.get("date", "")).strip(),
+                    exception_type,
+                )
+                for row in _iter_table(archive, "calendar_dates.txt")
+                for exception_type in [
+                    legacy_int_or_none(row.get("exception_type", "0"))
+                ]
+                if str(row.get("service_id", "")).strip()
+                and str(row.get("date", "")).strip()
+                and exception_type is not None
+            ),
+        )
+        self.connection.commit()
+        self.connection.executescript(
+            """
+            CREATE INDEX stop_times_trip_sequence
+                ON stop_times(trip_id, stop_sequence);
+            CREATE INDEX stop_times_stop_trip
+                ON stop_times(stop_id, trip_id);
+            CREATE INDEX trips_service
+                ON trips(service_id);
+            """
+        )
+        self.connection.commit()
+
+    def iter_table(self, filename: str) -> Iterator[dict[str, object]]:
+        definitions = {
+            "routes.txt": (
+                "routes",
+                (
+                    "route_id",
+                    "route_short_name",
+                    "route_long_name",
+                    "route_type",
+                    "agency_id",
+                ),
+            ),
+            "stops.txt": (
+                "stops",
+                (
+                    "stop_id",
+                    "stop_name",
+                    "stop_lat",
+                    "stop_lon",
+                    "stop_code",
+                    "parent_station",
+                    "location_type",
+                    "platform_code",
+                ),
+            ),
+            "trips.txt": (
+                "trips",
+                ("trip_id", "route_id", "service_id", "trip_headsign", "direction_id"),
+            ),
+            "stop_times.txt": (
+                "stop_times",
+                (
+                    "trip_id",
+                    "stop_id",
+                    "arrival_time",
+                    "departure_time",
+                    "arrival_seconds",
+                    "departure_seconds",
+                    "stop_sequence",
+                ),
+            ),
+        }
+        definition = definitions.get(filename)
+        if definition is None:
+            return
+        table, columns = definition
+        query = f"SELECT {', '.join(columns)} FROM {table}"
+        if table in {"routes", "stops", "trips"}:
+            query += " ORDER BY rowid"
+        for row in self.connection.execute(query):
+            yield dict(zip(columns, row))
+
+    def load_table(self, filename: str) -> list[dict[str, object]]:
+        return list(self.iter_table(filename))
+
+    def service_calendar(self) -> dict[str, dict[str, object]]:
+        calendar: dict[str, dict[str, object]] = {}
+        for row in self.connection.execute(
+            "SELECT service_id, start_date, end_date, monday, tuesday, wednesday, "
+            "thursday, friday, saturday, sunday FROM calendar"
+        ):
+            service_id = str(row[0])
+            calendar[service_id] = {
+                "startDate": row[1],
+                "endDate": row[2],
+                "weekdays": list(row[3:]),
+                "exceptions": {},
+            }
+        for service_id, service_date, exception_type in self.connection.execute(
+            "SELECT service_id, service_date, exception_type FROM calendar_dates"
+        ):
+            entry = calendar.setdefault(
+                str(service_id),
+                {
+                    "startDate": "00000000",
+                    "endDate": "99999999",
+                    "weekdays": [0] * 7,
+                    "exceptions": {},
+                },
+            )
+            exceptions = entry["exceptions"]
+            if isinstance(exceptions, dict):
+                exceptions[str(service_date)] = int(exception_type)
+        return calendar
 
 
 class ExternalMergeStage:
@@ -558,8 +875,17 @@ class ExternalDepartureStage:
         archive,
         active_by_service: dict[str, list[str]],
         public_stop_ids: set[str],
+        context: NormalizedProviderContext | None = None,
     ) -> None:
-        from build_german_departure_index import parse_gtfs_time
+        try:
+            from .build_german_departure_index import parse_gtfs_time
+        except ImportError:
+            from build_german_departure_index import parse_gtfs_time
+
+        def source_rows(filename: str):
+            if context is not None:
+                return context.iter_table(filename)
+            return _iter_table(archive, filename)
 
         started = time.monotonic()
         self.connection.executemany(
@@ -570,7 +896,7 @@ class ExternalDepartureStage:
                     str(row.get("route_short_name", "")).strip(),
                     str(row.get("route_long_name", "")).strip(),
                 )
-                for row in _iter_table(archive, "routes.txt")
+                for row in source_rows("routes.txt")
                 if str(row.get("route_id", "")).strip()
             ),
         )
@@ -586,7 +912,7 @@ class ExternalDepartureStage:
                     if str(row.get("location_type", "0") or "0").strip().isdigit()
                     else 0,
                 )
-                for row in _iter_table(archive, "stops.txt")
+                for row in source_rows("stops.txt")
                 if str(row.get("stop_id", "")).strip()
             ),
         )
@@ -599,7 +925,7 @@ class ExternalDepartureStage:
                     str(row.get("trip_headsign", "") or "").strip(),
                     str(row.get("direction_id", "0") or "0"),
                 )
-                for row in _iter_table(archive, "trips.txt")
+                for row in source_rows("trips.txt")
                 for trip_id in [str(row.get("trip_id", "")).strip()]
                 for route_id in [str(row.get("route_id", "")).strip()]
                 if trip_id
@@ -635,18 +961,16 @@ class ExternalDepartureStage:
 
         started = time.monotonic()
         def valid_stop_times():
-            for row in _iter_table(archive, "stop_times.txt"):
+            for row in source_rows("stop_times.txt"):
                 trip_id = str(row.get("trip_id", "")).strip()
                 stop_id = str(row.get("stop_id", "")).strip()
                 departure_time = str(row.get("departure_time", "") or "").strip()
+                departure_seconds = row.get("departure_seconds")
                 if not trip_id or not stop_id or not departure_time:
                     continue
-                if parse_gtfs_time(departure_time) is None:
+                if departure_seconds is None and parse_gtfs_time(departure_time) is None:
                     continue
-                try:
-                    sequence = int(str(row.get("stop_sequence", "0") or "0"))
-                except ValueError:
-                    sequence = 0
+                sequence = legacy_int_or_none(row.get("stop_sequence", "0")) or 0
                 yield trip_id, stop_id, departure_time, sequence
 
         self.connection.executemany(

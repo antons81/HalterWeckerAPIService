@@ -30,9 +30,27 @@ except ImportError:
     from dynamic_resource_resolver import resolve_gtfs_resource
 
 try:
-    from .external_staging import ExternalDepartureStage, ExternalMergeStage, iter_departure_payload_items, iter_json_array, iter_json_object, log_memory_stage
+    from .external_staging import (
+        ExternalDepartureStage,
+        ExternalMergeStage,
+        NormalizedProviderContext,
+        legacy_int_or_none,
+        iter_departure_payload_items,
+        iter_json_array,
+        iter_json_object,
+        log_memory_stage,
+    )
 except ImportError:
-    from external_staging import ExternalDepartureStage, ExternalMergeStage, iter_departure_payload_items, iter_json_array, iter_json_object, log_memory_stage
+    from external_staging import (
+        ExternalDepartureStage,
+        ExternalMergeStage,
+        NormalizedProviderContext,
+        legacy_int_or_none,
+        iter_departure_payload_items,
+        iter_json_array,
+        iter_json_object,
+        log_memory_stage,
+    )
 
 try:
     from .gtfs_agency import agency_scoped_archive
@@ -82,23 +100,27 @@ try:
     from .external_build_cache import (
         CACHEABLE_PROVIDER_CITY_IDS,
         CTA_PROVIDER_ID,
+        TRANSFORMED_CACHE_PROVIDER_IDS,
         CacheKey,
         CacheKeyUnavailable,
         ExternalBuildCache,
         cache_enabled,
-        cache_provider_allowed,
         cache_key,
+        cache_provider_allowed,
+        transformed_cache_enabled,
     )
 except ImportError:
     from external_build_cache import (
         CACHEABLE_PROVIDER_CITY_IDS,
         CTA_PROVIDER_ID,
+        TRANSFORMED_CACHE_PROVIDER_IDS,
         CacheKey,
         CacheKeyUnavailable,
         ExternalBuildCache,
         cache_enabled,
-        cache_provider_allowed,
         cache_key,
+        cache_provider_allowed,
+        transformed_cache_enabled,
     )
 
 
@@ -602,12 +624,33 @@ def _parse_location_type(value: object) -> int:
 
 def _feed_stop_rows(
     archive: zipfile.ZipFile,
+    context: NormalizedProviderContext | None = None,
 ) -> dict[str, dict[str, str]]:
     return {
         str(row["stop_id"]): row
-        for row in iter_table(archive, "stops.txt")
+        for row in _source_iter_table(archive, "stops.txt", context)
         if row.get("stop_id")
     }
+
+
+def _source_iter_table(
+    archive: zipfile.ZipFile,
+    filename: str,
+    context: NormalizedProviderContext | None,
+):
+    if context is not None:
+        return context.iter_table(filename)
+    return iter_table(archive, filename)
+
+
+def _source_load_table(
+    archive: zipfile.ZipFile,
+    filename: str,
+    context: NormalizedProviderContext | None,
+):
+    if context is not None:
+        return context.load_table(filename)
+    return load_table(archive, filename)
 
 
 def _published_id(raw_id: str, namespace: str) -> str:
@@ -665,10 +708,13 @@ def _stop_resolution_map(
 DUPLICATE_STOP_DISTANCE_METERS = 150.0
 
 
-def _load_served_platform_ids(archive: zipfile.ZipFile) -> set[str]:
+def _load_served_platform_ids(
+    archive: zipfile.ZipFile,
+    context: NormalizedProviderContext | None = None,
+) -> set[str]:
     """Stop ids that receive at least one stop_time in the timetable."""
     served: set[str] = set()
-    for row in iter_table(archive, "stop_times.txt"):
+    for row in _source_iter_table(archive, "stop_times.txt", context):
         stop_id = str(row.get("stop_id", "") or "").strip()
         if stop_id:
             served.add(stop_id)
@@ -952,6 +998,7 @@ def build_external_stop_packages(
     supplemental_stop_catalog: object | None = None,
     supplemental_catalog_configuration: dict[str, object] | None = None,
     exclusive_city_partition: bool = False,
+    context: NormalizedProviderContext | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, list[dict[str, object]]]]:
     if stop_id_mode != "exact":
         raise ValueError(f"Unsupported stopIDMode: {stop_id_mode!r}")
@@ -961,7 +1008,7 @@ def build_external_stop_packages(
     raw_by_city_id: dict[str, list[dict[str, object]]] = {
         str(city["id"]): [] for city in cities
     }
-    for row in iter_table(archive, "stops.txt"):
+    for row in _source_iter_table(archive, "stops.txt", context):
         stop_id = str(row.get("stop_id", "")).strip()
         name = str(row.get("stop_name", "") or "").strip()
         if not stop_id or not name:
@@ -1017,7 +1064,7 @@ def build_external_stop_packages(
     package_stops: dict[str, list[dict[str, object]]] = {}
     city_public: dict[str, list[dict[str, object]]] = {}
     city_children: dict[str, dict[str, list[str]]] = {}
-    served_platform_ids: set[str] = _load_served_platform_ids(archive)
+    served_platform_ids: set[str] = _load_served_platform_ids(archive, context)
     for city in cities:
         city_id = str(city["id"])
         raw_stops = raw_by_city_id[city_id]
@@ -1220,13 +1267,14 @@ def build_external_route_index(
     cities: list[dict[str, object]],
     output: Path,
     namespace: str = "",
+    context: NormalizedProviderContext | None = None,
 ) -> None:
     if not cities:
         return
 
     routes = {
         str(row["route_id"]): row
-        for row in load_table(archive, "routes.txt")
+        for row in _source_load_table(archive, "routes.txt", context)
         if row.get("route_id")
     }
     if not routes:
@@ -1234,7 +1282,7 @@ def build_external_route_index(
 
     trip_routes: dict[str, str] = {}
     trip_headsigns: dict[str, tuple[str, str]] = {}
-    for trip in iter_table(archive, "trips.txt"):
+    for trip in _source_iter_table(archive, "trips.txt", context):
         route_id = str(trip.get("route_id", ""))
         trip_id = str(trip.get("trip_id", ""))
         if route_id in routes and trip_id:
@@ -1245,7 +1293,7 @@ def build_external_route_index(
                 trip_headsigns[trip_id] = (direction_id, headsign)
 
     stop_route_ids: dict[str, set[str]] = {}
-    feed_stops = _feed_stop_rows(archive)
+    feed_stops = _feed_stop_rows(archive, context)
     packages_directory = output / "stops"
     routes_directory = output / "routes"
     routes_directory.mkdir(parents=True, exist_ok=True)
@@ -1266,7 +1314,7 @@ def build_external_route_index(
         public_stop_ids.update(ids)
 
     resolve = _stop_resolution_map(feed_stops, public_stop_ids)
-    for stop_time in iter_table(archive, "stop_times.txt"):
+    for stop_time in _source_iter_table(archive, "stop_times.txt", context):
         stop_id = str(stop_time.get("stop_id", ""))
         trip_id = str(stop_time.get("trip_id", ""))
         route_id = trip_routes.get(trip_id)
@@ -1312,6 +1360,7 @@ def build_external_trip_index(
     cities: list[dict[str, object]],
     output: Path,
     namespace: str = "",
+    context: NormalizedProviderContext | None = None,
 ) -> None:
     """Write a compact realtime trip index: tripId -> {"r": routeId, "h": headsign}.
 
@@ -1332,12 +1381,12 @@ def build_external_trip_index(
 
     routes = {
         str(row["route_id"]): row
-        for row in load_table(archive, "routes.txt")
+        for row in _source_load_table(archive, "routes.txt", context)
         if row.get("route_id")
     }
 
     trip_route: dict[str, str] = {}
-    for trip in iter_table(archive, "trips.txt"):
+    for trip in _source_iter_table(archive, "trips.txt", context):
         trip_id = str(trip.get("trip_id", "")).strip()
         route_id = str(trip.get("route_id", "")).strip()
         if trip_id and route_id in routes:
@@ -1402,6 +1451,15 @@ def build_external_trip_index(
 
 
 def _service_calendar(archive: zipfile.ZipFile) -> dict[str, dict[str, object]]:
+    return _service_calendar_from_source(archive, None)
+
+
+def _service_calendar_from_source(
+    archive: zipfile.ZipFile,
+    context: NormalizedProviderContext | None,
+) -> dict[str, dict[str, object]]:
+    if context is not None:
+        return context.service_calendar()
     calendar: dict[str, dict[str, object]] = {}
     names = set(archive.namelist())
     if "calendar.txt" in names:
@@ -1441,9 +1499,8 @@ def _service_calendar(archive: zipfile.ZipFile) -> dict[str, dict[str, object]]:
                     "exceptions": {},
                 },
             )
-            try:
-                exception_type = int(row.get("exception_type", "0") or "0")
-            except ValueError:
+            exception_type = legacy_int_or_none(row.get("exception_type", "0"))
+            if exception_type is None:
                 continue
             exceptions = entry["exceptions"]
             if isinstance(exceptions, dict):
@@ -1503,6 +1560,7 @@ def build_external_departure_index(
     timezone_name: str,
     namespace: str = "",
     departure_window_days: int = 3,
+    context: NormalizedProviderContext | None = None,
 ) -> None:
     if not cities:
         return
@@ -1516,7 +1574,7 @@ def build_external_departure_index(
         (today + timedelta(days=offset)).strftime("%Y%m%d")
         for offset in offsets
     ]
-    calendar = _service_calendar(archive)
+    calendar = _service_calendar_from_source(archive, context)
     active_by_service: dict[str, list[str]] = {}
     for service_id, service in calendar.items():
         active_dates = [
@@ -1529,17 +1587,17 @@ def build_external_departure_index(
 
     routes = {
         str(row["route_id"]): row
-        for row in load_table(archive, "routes.txt")
+        for row in _source_load_table(archive, "routes.txt", context)
         if row.get("route_id")
     }
     stop_names = {
         str(row["stop_id"]): row.get("stop_name", "").strip()
-        for row in load_table(archive, "stops.txt")
+        for row in _source_load_table(archive, "stops.txt", context)
         if row.get("stop_id")
     }
 
     trip_meta: dict[str, dict[str, str]] = {}
-    for trip in iter_table(archive, "trips.txt"):
+    for trip in _source_iter_table(archive, "trips.txt", context):
         trip_id = str(trip.get("trip_id", "")).strip()
         service_id = str(trip.get("service_id", "")).strip()
         if not trip_id or service_id not in active_by_service:
@@ -1569,22 +1627,19 @@ def build_external_departure_index(
             if raw_id
         )
 
-    feed_stops = _feed_stop_rows(archive)
+    feed_stops = _feed_stop_rows(archive, context)
     resolve = _stop_resolution_map(feed_stops, public_stop_ids)
 
     # Stream stop_times once: collect departures for package stops and terminal stops.
     stop_departures: dict[str, list[tuple[str, str, str, str, int]]] = {}
     terminal_by_trip: dict[str, tuple[int, str]] = {}
-    for stop_time in iter_table(archive, "stop_times.txt"):
+    for stop_time in _source_iter_table(archive, "stop_times.txt", context):
         trip_id = str(stop_time.get("trip_id", "")).strip()
         if trip_id not in trip_meta:
             continue
         stop_id = str(stop_time.get("stop_id", "")).strip()
         departure_time = stop_time.get("departure_time", "").strip()
-        try:
-            sequence = int(stop_time.get("stop_sequence", "0") or "0")
-        except ValueError:
-            sequence = 0
+        sequence = legacy_int_or_none(stop_time.get("stop_sequence", "0")) or 0
         if stop_id and departure_time:
             public_stop_id = resolve(stop_id)
             if public_stop_id is not None:
@@ -1679,6 +1734,9 @@ def build_external_departure_index(
         )
 
 
+_legacy_build_external_departure_index = build_external_departure_index
+
+
 def build_external_departure_index_bounded(
     archive: zipfile.ZipFile,
     cities: list[dict[str, object]],
@@ -1686,6 +1744,7 @@ def build_external_departure_index_bounded(
     timezone_name: str,
     namespace: str = "",
     departure_window_days: int = 3,
+    context: NormalizedProviderContext | None = None,
 ) -> None:
     """Build departure JSON through a disk-backed SQLite staging database."""
     if not cities:
@@ -1700,7 +1759,7 @@ def build_external_departure_index_bounded(
         for offset in offsets
     ]
     active_by_service: dict[str, list[str]] = {}
-    for service_id, service in _service_calendar(archive).items():
+    for service_id, service in _service_calendar_from_source(archive, context).items():
         active_dates = [
             service_date
             for service_date in service_dates
@@ -1727,7 +1786,7 @@ def build_external_departure_index_bounded(
 
     stage = ExternalDepartureStage()
     try:
-        stage.populate(archive, active_by_service, public_stop_ids)
+        stage.populate(archive, active_by_service, public_stop_ids, context=context)
         stage.write_outputs(output, cities, city_stop_ids, namespace, timezone_name)
     finally:
         stage.close()
@@ -1740,6 +1799,7 @@ def build_external_lines(
     archive: zipfile.ZipFile,
     package_stops_by_city_id: dict[str, list[dict[str, object]]],
     namespace: str = "",
+    context: NormalizedProviderContext | None = None,
 ) -> dict[str, dict[str, dict[str, object]]]:
     included_stop_ids = {
         raw_id
@@ -1750,12 +1810,12 @@ def build_external_lines(
     }
     if not included_stop_ids:
         return {}
-    stop_rows = list(iter_table(archive, "stops.txt"))
-    feed_stops = _feed_stop_rows(archive)
+    stop_rows = list(_source_iter_table(archive, "stops.txt", context))
+    feed_stops = _feed_stop_rows(archive, context)
     resolve = _stop_resolution_map(feed_stops, included_stop_ids)
 
     def resolved_stop_times():
-        for stop_time in iter_table(archive, "stop_times.txt"):
+        for stop_time in _source_iter_table(archive, "stop_times.txt", context):
             public_stop_id = resolve(str(stop_time.get("stop_id", "")))
             if public_stop_id is None:
                 continue
@@ -1764,8 +1824,8 @@ def build_external_lines(
     lines = build_lines_by_stop_id_noncanonical(
         stop_rows=stop_rows,
         stop_times=resolved_stop_times(),
-        trips=load_table(archive, "trips.txt"),
-        routes=load_table(archive, "routes.txt"),
+        trips=_source_load_table(archive, "trips.txt", context),
+        routes=_source_load_table(archive, "routes.txt", context),
         included_stop_ids=included_stop_ids,
     )
     if not namespace:
@@ -1783,10 +1843,14 @@ def build_external_lines(
     }
 
 
+_legacy_build_external_lines = build_external_lines
+
+
 def build_external_lines_bounded(
     archive: zipfile.ZipFile,
     package_stops_by_city_id: dict[str, list[dict[str, object]]],
     namespace: str = "",
+    context: NormalizedProviderContext | None = None,
 ) -> dict[str, dict[str, dict[str, object]]]:
     """Build line membership through SQLite instead of trip-sized dictionaries."""
     included_stop_ids = {
@@ -1827,7 +1891,7 @@ def build_external_lines_bounded(
                     str(row.get("route_type", "3")).strip(),
                     str(row.get("agency_id", "")).strip(),
                 )
-                for row in iter_table(archive, "routes.txt")
+                for row in _source_iter_table(archive, "routes.txt", context)
                 if str(row.get("route_id", "")).strip()
             ),
         )
@@ -1835,7 +1899,7 @@ def build_external_lines_bounded(
             "INSERT INTO trip_routes VALUES (?, ?)",
             (
                 (str(row.get("trip_id", "")).strip(), str(row.get("route_id", "")).strip())
-                for row in iter_table(archive, "trips.txt")
+                for row in _source_iter_table(archive, "trips.txt", context)
                 if str(row.get("trip_id", "")).strip() and str(row.get("route_id", "")).strip()
             ),
         )
@@ -1843,7 +1907,7 @@ def build_external_lines_bounded(
             "INSERT INTO feed_stops VALUES (?, ?)",
             (
                 (str(row.get("stop_id", "")).strip(), str(row.get("parent_station", "") or "").strip())
-                for row in iter_table(archive, "stops.txt")
+                for row in _source_iter_table(archive, "stops.txt", context)
                 if str(row.get("stop_id", "")).strip()
             ),
         )
@@ -1863,7 +1927,7 @@ def build_external_lines_bounded(
             "INSERT INTO raw_stop_times VALUES (?, ?)",
             (
                 (str(row.get("trip_id", "")).strip(), str(row.get("stop_id", "")).strip())
-                for row in iter_table(archive, "stop_times.txt")
+                for row in _source_iter_table(archive, "stop_times.txt", context)
                 if str(row.get("trip_id", "")).strip() and str(row.get("stop_id", "")).strip()
             ),
         )
@@ -1926,6 +1990,8 @@ def build_external_trip_index_bounded(
     cities: list[dict[str, object]],
     output: Path,
     namespace: str = "",
+    context: NormalizedProviderContext | None = None,
+    immutable_output: bool = False,
 ) -> None:
     """Write trip indexes from SQLite cursors without a trip-sized dictionary."""
     temporary = tempfile.TemporaryDirectory(prefix="haltewecker-external-trips-")
@@ -1941,13 +2007,22 @@ def build_external_trip_index_bounded(
             "INSERT OR IGNORE INTO trips VALUES (?, ?)",
             (
                 (str(row.get("trip_id", "")).strip(), str(row.get("route_id", "")).strip())
-                for row in iter_table(archive, "trips.txt")
+                for row in _source_iter_table(archive, "trips.txt", context)
                 if str(row.get("trip_id", "")).strip() and str(row.get("route_id", "")).strip()
             ),
         )
         connection.commit()
         trips_directory = output / "trips"
         trips_directory.mkdir(parents=True, exist_ok=True)
+        base_directory = output / "trip-index-base" if immutable_output else trips_directory
+        base_directory.mkdir(parents=True, exist_ok=True)
+        if not connection.execute("SELECT 1 FROM trips LIMIT 1").fetchone():
+            for city in cities:
+                (base_directory / f"{city['id']}.json").write_text(
+                    "{}",
+                    encoding="utf-8",
+                )
+            return
         for city in cities:
             city_id = str(city["id"])
             route_path = output / "routes" / f"{city_id}.json"
@@ -1956,11 +2031,15 @@ def build_external_trip_index_bounded(
                 for route_id, _payload in iter_json_object(route_path)
             } if route_path.exists() else set()
             if not route_ids:
+                (base_directory / f"{city_id}.json").write_text(
+                    "{}",
+                    encoding="utf-8",
+                )
                 continue
             departures_path = output / "departures" / f"{city_id}.json"
-            if departures_path.exists():
-                def departure_headsigns():
-                    for kind, _stop_id, value in iter_departure_payload_items(departures_path):
+            if departures_path.exists() and not immutable_output:
+                def departure_headsigns(path=departures_path):
+                    for kind, _stop_id, value in iter_departure_payload_items(path):
                         if kind != "stop" or not isinstance(value, dict):
                             continue
                         trip_id = str(value.get("t", ""))
@@ -1982,7 +2061,7 @@ def build_external_trip_index_bounded(
                     "trip-index-headsign-staging",
                     source=city_id,
                 )
-            path = trips_directory / f"{city_id}.json"
+            path = base_directory / f"{city_id}.json"
             placeholders = ",".join("?" for _ in route_ids)
             with path.open("w", encoding="utf-8") as stream:
                 stream.write("{")
@@ -1998,7 +2077,7 @@ def build_external_trip_index_bounded(
                     tuple(route_ids),
                 ):
                     entry: dict[str, str] = {"r": _published_id(route_id, namespace)}
-                    if headsign:
+                    if headsign and not immutable_output:
                         entry["h"] = headsign
                     if not first:
                         stream.write(",")
@@ -2013,7 +2092,88 @@ def build_external_trip_index_bounded(
         temporary.cleanup()
 
 
+_legacy_build_external_trip_index = build_external_trip_index
+
+
 build_external_trip_index = build_external_trip_index_bounded
+
+
+def apply_current_departure_headsign_enrichment(
+    output: Path,
+    cities: list[dict[str, object]],
+    namespace: str = "",
+) -> None:
+    """Add current-window headsigns to an immutable trip-index base."""
+    for city in cities:
+        city_id = str(city["id"])
+        base_path = output / "trip-index-base" / f"{city_id}.json"
+        final_path = output / "trips" / f"{city_id}.json"
+        if not base_path.is_file():
+            continue
+
+        temporary = tempfile.TemporaryDirectory(prefix="haltewecker-trip-headsigns-")
+        connection = sqlite3.connect(Path(temporary.name) / "headsigns.sqlite")
+        try:
+            connection.execute(
+                "CREATE TABLE headsigns(trip_id TEXT PRIMARY KEY, headsign TEXT NOT NULL)"
+            )
+            departures_path = output / "departures" / f"{city_id}.json"
+            if departures_path.is_file():
+                connection.executemany(
+                    "INSERT OR IGNORE INTO headsigns VALUES (?, ?)",
+                    (
+                        (
+                            str(value.get("t", ""))[len(namespace):]
+                            if namespace and str(value.get("t", "")).startswith(namespace)
+                            else str(value.get("t", "")),
+                            str(value.get("h", "") or ""),
+                        )
+                        for kind, _stop_id, value in iter_departure_payload_items(
+                            departures_path
+                        )
+                        if kind == "stop"
+                        and isinstance(value, dict)
+                        and str(value.get("t", "")).strip()
+                        and str(value.get("h", "") or "").strip()
+                    ),
+                )
+                connection.commit()
+
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            with final_path.open("w", encoding="utf-8") as stream:
+                stream.write("{")
+                first = True
+                for trip_id, value in iter_json_object(base_path):
+                    if not isinstance(value, dict):
+                        raise TypeError(f"Trip index base entry is invalid: {trip_id}")
+                    if set(value) != {"r"} or not isinstance(value.get("r"), str):
+                        raise ValueError(
+                            f"Trip index base entry is not immutable: {trip_id}"
+                        )
+                    entry = {"r": value["r"]}
+                    raw_trip_id = (
+                        trip_id[len(namespace):]
+                        if namespace and trip_id.startswith(namespace)
+                        else trip_id
+                    )
+                    row = connection.execute(
+                        "SELECT headsign FROM headsigns WHERE trip_id=?",
+                        (raw_trip_id,),
+                    ).fetchone()
+                    if row is not None and row[0]:
+                        entry["h"] = str(row[0])
+                    if not first:
+                        stream.write(",")
+                    stream.write(json.dumps(trip_id, ensure_ascii=False))
+                    stream.write(":")
+                    stream.write(
+                        json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+                    )
+                    first = False
+                stream.write("}")
+        finally:
+            connection.close()
+            temporary.cleanup()
 
 
 def _timed_external_stage(
@@ -2045,36 +2205,24 @@ def _external_cache_is_eligible(
     cities: list[dict[str, object]],
 ) -> tuple[bool, str, str | None]:
     provider_id = str(source.get("id"))
-    expected_city_id = CACHEABLE_PROVIDER_CITY_IDS.get(provider_id)
-    if expected_city_id is None:
-        return False, "provider-not-in-class-a", None
-    if len(cities) != 1 or str(cities[0].get("id")) != expected_city_id:
-        return False, "class-a-requires-single-configured-city", None
-    if str(source.get("namespace", "")):
-        return False, "namespaced-source-not-supported", None
-    if str(source.get("mergeGroup", "")).strip():
-        return False, "merged-source-not-supported", None
-    if source.get("supplementalStopCatalog") is not None:
-        return False, "supplemental-stop-catalog-not-supported", None
-    if source.get("agencyID") is not None:
-        return False, "agency-scoped-source-not-supported", None
-    if source.get("localPath") is not None:
-        return False, "local-staged-source-not-supported", None
-    if source.get("filterCitiesByProvider", False):
-        return False, "provider-filtered-city-set-not-supported", None
+    if provider_id not in TRANSFORMED_CACHE_PROVIDER_IDS:
+        return False, "provider-not-in-reviewed-transform-class", None
+    city_ids = [str(city.get("id", "")).strip() for city in cities]
+    if not city_ids or any(not city_id for city_id in city_ids):
+        return False, "city-id-missing", None
+    if len(set(city_ids)) != len(city_ids):
+        return False, "duplicate-city-id", None
+    if provider_id == "ireland":
+        return False, "ireland-snapshot-architecture-not-supported", None
     if source.get("buildStops", True) is not True:
         return False, "stop-builder-disabled", None
     if source.get("buildRoutes", True) is not True:
         return False, "route-builder-disabled", None
-    if source.get("buildDepartures", True) is not True:
-        return False, "departure-builder-disabled", None
     if source.get("buildRadarTopology", False) is not False:
         return False, "radar-topology-not-supported", None
     if str(source.get("stopIDMode", "exact")) != "exact":
         return False, "stop-id-mode-not-supported", None
-    if source.get("exclusiveCityPartition", False) is not False:
-        return False, "exclusive-city-partition-not-supported", None
-    return True, "eligible", expected_city_id
+    return True, "eligible-reviewed-transformed-source", city_ids[0]
 
 
 def _cached_external_manifest_entry(
@@ -2189,6 +2337,7 @@ def process_external_gtfs_sources(
     load_stop_catalog: Callable[[dict[str, object]], object] | None = None,
     gtfs_cache: GTFSArtifactCache | None = None,
     kyiv_resource_cache: KyivResourceCache | None = None,
+    use_normalized_context: bool = True,
 ) -> tuple[
     list[dict[str, object]],
     list[dict[str, object]],
@@ -2218,6 +2367,16 @@ def process_external_gtfs_sources(
     input_provenance: dict[str, dict[str, object]] = {}
     skipped_sources: dict[str, dict[str, object]] = {}
     namespace_root = output / ".external-namespaces"
+    merge_group_members_by_group: dict[str, tuple[str, ...]] = {}
+    for candidate in sources:
+        candidate_id = str(candidate["id"])
+        if selected_source_ids is not None and candidate_id not in selected_source_ids:
+            continue
+        merge_group = str(candidate.get("mergeGroup", "")).strip()
+        if merge_group:
+            members = list(merge_group_members_by_group.get(merge_group, ()))
+            members.append(candidate_id)
+            merge_group_members_by_group[merge_group] = tuple(members)
 
     for source in sources:
         source_id = str(source["id"])
@@ -2267,6 +2426,7 @@ def process_external_gtfs_sources(
 
         raw_artifact_digest: str | None = None
         raw_artifact_size: int | None = None
+        raw_sha_started = time.monotonic()
         if Path(url).is_file() or Path(url).is_dir():
             raw_artifact_digest, raw_artifact_size = artifact_provenance(Path(url))
             input_provenance[source_id] = provenance_record(
@@ -2284,6 +2444,12 @@ def process_external_gtfs_sources(
                 "status": "used",
                 "resourceIdentity": url,
             }
+        print(
+            f"[ExternalGTFS] source={source_id} stage=raw-sha "
+            f"status={'completed' if raw_artifact_digest else 'unavailable'} "
+            f"duration={time.monotonic() - raw_sha_started:.4f}s",
+            flush=True,
+        )
 
         cities = load_external_cities(source, repository_root)
         for city in cities:
@@ -2314,70 +2480,10 @@ def process_external_gtfs_sources(
         build_cache_lookup = None
         build_cache_hit = False
         cache_city_id: str | None = None
-        if source_id in CACHEABLE_PROVIDER_CITY_IDS:
-            eligible, eligibility_reason, cache_city_id = _external_cache_is_eligible(
-                source, cities
-            )
-            if not cache_enabled(environ):
-                print(
-                    f"[StopData] source={source_id} stage=build-cache status=DISABLED "
-                    "reason=feature-gate-off"
-                )
-            elif not cache_provider_allowed(source_id, environ):
-                print(
-                    f"[StopData] source={source_id} stage=build-cache status=DISABLED "
-                    "reason=provider-not-allowlisted"
-                )
-            elif not eligible or cache_city_id is None:
-                print(
-                    f"[StopData] source={source_id} stage=build-cache status=DISABLED "
-                    f"reason={eligibility_reason}"
-                )
-            elif raw_artifact_digest is None:
-                print(
-                    f"[StopData] source={source_id} stage=build-cache status=MISS "
-                    "reason=raw-sha-unavailable rawSHA=n/a "
-                    "providerConfig=n/a builder=n/a"
-                )
-            elif gtfs_cache is None:
-                print(
-                    f"[StopData] source={source_id} stage=build-cache status=MISS "
-                    "reason=cache-root-unavailable rawSHA="
-                    f"{raw_artifact_digest[:12]} providerConfig=n/a builder=n/a"
-                )
-            else:
-                try:
-                    build_cache_key = cache_key(
-                        repository_root=repository_root,
-                        provider_id=source_id,
-                        raw_sha256=raw_artifact_digest,
-                        source=source,
-                        city_id=cache_city_id,
-                    )
-                    build_cache = ExternalBuildCache(
-                        Path(gtfs_cache.root) / "external-build",
-                        provider_id=source_id,
-                        city_id=cache_city_id,
-                    )
-                    lookup_started = time.monotonic()
-                    build_cache_lookup = build_cache.lookup(build_cache_key)
-                    build_cache_hit = build_cache_lookup.status == "HIT"
-                    print(
-                        f"[StopData] source={source_id} stage=build-cache "
-                        f"status={build_cache_lookup.status} reason={build_cache_lookup.reason} "
-                        f"duration={time.monotonic() - lookup_started:.2f}s "
-                        f"key={build_cache_key.value[:12]} rawSHA={raw_artifact_digest[:12]} "
-                        f"providerConfig={build_cache_key.provider_config_fingerprint[:12]} "
-                        f"builder={build_cache_key.builder_fingerprint[:12]}"
-                    )
-                except (CacheKeyUnavailable, OSError, ValueError) as error:
-                    build_cache = None
-                    build_cache_key = None
-                    print(
-                        f"[StopData] source={source_id} stage=build-cache status=MISS "
-                        f"reason=fingerprint-unavailable:{type(error).__name__} "
-                        f"rawSHA={raw_artifact_digest[:12]} providerConfig=n/a builder=n/a"
-                    )
+        merge_group_members = merge_group_members_by_group.get(
+            str(source.get("mergeGroup", "")).strip(),
+            (),
+        )
 
         dynamic_resource = None
         if source_id not in url_by_provider and isinstance(source.get("dynamicResource"), dict):
@@ -2387,6 +2493,7 @@ def process_external_gtfs_sources(
             source_id, source_url, environ=environ
         )
         source_started = time.monotonic()
+        archive_started = time.monotonic()
         resilience_policy = external_gtfs_resilience_policy(source)
         if resilience_policy is not None and gtfs_cache is not None:
             result = gtfs_cache.resolve(
@@ -2426,9 +2533,15 @@ def process_external_gtfs_sources(
             }
         else:
             archive = load_gtfs_archive(request_url, headers=headers)
+        print(
+            f"[ExternalGTFS] source={source_id} stage=archive-load "
+            f"status=completed duration={time.monotonic() - archive_started:.4f}s",
+            flush=True,
+        )
         archive = agency_scoped_archive(archive, source.get("agencyID"))
         supplemental_catalog_configuration = source.get("supplementalStopCatalog")
         supplemental_stop_catalog: object | None = None
+        supplemental_input_digests: dict[str, str] = {}
         try:
             if supplemental_catalog_configuration is not None:
                 if not isinstance(supplemental_catalog_configuration, dict):
@@ -2461,14 +2574,117 @@ def process_external_gtfs_sources(
                     size=size,
                     origin="Kyiv supplemental stop catalog",
                 )
+                supplemental_input_digests[
+                    f"{source_id}:supplemental-stop-catalog"
+                ] = digest
         except Exception:
             archive.close()
             raise
+
+        if source_id in TRANSFORMED_CACHE_PROVIDER_IDS:
+            eligible, eligibility_reason, cache_city_id = _external_cache_is_eligible(
+                source, cities
+            )
+            if not cache_enabled(environ):
+                print(
+                    f"[StopData] source={source_id} stage=build-cache status=DISABLED "
+                    "reason=feature-gate-off"
+                )
+            elif (
+                source_id not in CACHEABLE_PROVIDER_CITY_IDS
+                and not transformed_cache_enabled(environ)
+            ):
+                print(
+                    f"[StopData] source={source_id} stage=build-cache status=DISABLED "
+                    "reason=transformed-feature-gate-off"
+                )
+            elif not cache_provider_allowed(source_id, environ):
+                print(
+                    f"[StopData] source={source_id} stage=build-cache status=DISABLED "
+                    "reason=provider-not-allowlisted"
+                )
+            elif not eligible or cache_city_id is None:
+                print(
+                    f"[StopData] source={source_id} stage=build-cache status=DISABLED "
+                    f"reason={eligibility_reason}"
+                )
+            elif raw_artifact_digest is None:
+                print(
+                    f"[StopData] source={source_id} stage=build-cache status=MISS "
+                    "reason=raw-sha-unavailable rawSHA=n/a "
+                    "providerConfig=n/a builder=n/a"
+                )
+            elif gtfs_cache is None:
+                print(
+                    f"[StopData] source={source_id} stage=build-cache status=MISS "
+                    "reason=cache-root-unavailable rawSHA="
+                    f"{raw_artifact_digest[:12]} providerConfig=n/a builder=n/a"
+                )
+            else:
+                try:
+                    build_cache_key = cache_key(
+                        repository_root=repository_root,
+                        provider_id=source_id,
+                        raw_sha256=raw_artifact_digest,
+                        source=source,
+                        city_id=cache_city_id,
+                        city_ids=tuple(str(city["id"]) for city in cities),
+                        merge_group_members=merge_group_members,
+                        supplemental_input_digests=supplemental_input_digests,
+                    )
+                    build_cache = ExternalBuildCache(
+                        Path(gtfs_cache.root) / "external-build",
+                        provider_id=source_id,
+                        city_id=cache_city_id,
+                        city_ids=tuple(str(city["id"]) for city in cities),
+                        include_trip_index=bool(source.get("buildTripIndex", True)),
+                    )
+                    lookup_started = time.monotonic()
+                    build_cache_lookup = build_cache.lookup(build_cache_key)
+                    build_cache_hit = build_cache_lookup.status == "HIT"
+                    print(
+                        f"[StopData] source={source_id} stage=build-cache "
+                        f"status={build_cache_lookup.status} reason={build_cache_lookup.reason} "
+                        f"duration={time.monotonic() - lookup_started:.4f}s "
+                        f"key={build_cache_key.value[:12]} rawSHA={raw_artifact_digest[:12]} "
+                        f"providerConfig={build_cache_key.provider_config_fingerprint[:12]} "
+                        f"builder={build_cache_key.builder_fingerprint[:12]} "
+                        f"supplemental={build_cache_key.supplemental_inputs_fingerprint[:12]}"
+                    )
+                except (CacheKeyUnavailable, OSError, ValueError) as error:
+                    build_cache = None
+                    build_cache_key = None
+                    print(
+                        f"[StopData] source={source_id} stage=build-cache status=MISS "
+                        f"reason=fingerprint-unavailable:{type(error).__name__} "
+                        f"rawSHA={raw_artifact_digest[:12]} providerConfig=n/a builder=n/a"
+                    )
         source_output = output
         if namespace or str(source.get("mergeGroup", "")).strip():
             source_output = namespace_root / source_id
             shutil.rmtree(source_output, ignore_errors=True)
             source_output.mkdir(parents=True, exist_ok=True)
+        normalized_context: NormalizedProviderContext | None = None
+        if use_normalized_context and not build_cache_hit and any(
+            source.get(name, True)
+            for name in (
+                "buildStops",
+                "buildRoutes",
+                "buildDepartures",
+                "buildTripIndex",
+            )
+        ):
+            context_started = time.monotonic()
+            try:
+                normalized_context = NormalizedProviderContext.from_archive(archive)
+            except Exception:
+                archive.close()
+                raise
+            log_memory_stage(
+                "normalized-provider-context",
+                source=source_id,
+                started=context_started,
+            )
         try:
             package_stops: dict[str, list[dict[str, object]]] = {}
             entries: list[dict[str, object]] = []
@@ -2482,18 +2698,24 @@ def process_external_gtfs_sources(
                 restore_started = time.monotonic()
                 try:
                     restored = build_cache.restore(build_cache_lookup, source_output)
-                    package_stops = {cache_city_id: restored.stops}
+                    package_stops = restored.package_stops_by_city_id or {
+                        cache_city_id: restored.stops
+                    }
                     provider_lines = restored.lines_by_stop_id
                     entries = [
                         _cached_external_manifest_entry(
-                            cities[0], len(restored.stops)
+                            city,
+                            len(package_stops[str(city["id"])]),
                         )
+                        for city in cities
                     ]
                     print(
                         f"[StopData] source={source_id} stage=cache-restore "
                         "status=completed "
-                        f"duration={time.monotonic() - restore_started:.2f}s "
-                        "mode=copy artifacts=stops,routes,lineMembership"
+                        f"duration={time.monotonic() - restore_started:.4f}s "
+                        "mode=copy "
+                        f"reusedOutputs={','.join(name for name, _path in build_cache.artifacts)} "
+                        "recomputedOutputs=departures"
                     )
                 except (OSError, TypeError, ValueError) as error:
                     build_cache_hit = False
@@ -2503,7 +2725,7 @@ def process_external_gtfs_sources(
                         f"[StopData] source={source_id} stage=build-cache "
                         "status=INVALID reason=restore-failed "
                         f"error={type(error).__name__} "
-                        f"duration={time.monotonic() - restore_started:.2f}s"
+                        f"duration={time.monotonic() - restore_started:.4f}s"
                     )
 
             if source.get("buildStops", True):
@@ -2524,12 +2746,13 @@ def process_external_gtfs_sources(
                             supplemental_stop_catalog=supplemental_stop_catalog,
                             supplemental_catalog_configuration=(
                                 supplemental_catalog_configuration
-                                if isinstance(supplemental_catalog_configuration, dict)
-                                else None
+                            if isinstance(supplemental_catalog_configuration, dict)
+                            else None
                             ),
                             exclusive_city_partition=bool(
                                 source.get("exclusiveCityPartition", False)
                             ),
+                            context=normalized_context,
                         ),
                     )
                 else:
@@ -2568,6 +2791,7 @@ def process_external_gtfs_sources(
                             cities,
                             source_output,
                             namespace=namespace,
+                            context=normalized_context,
                         ),
                     )
                 else:
@@ -2588,18 +2812,37 @@ def process_external_gtfs_sources(
                         timezone_name=str(source["timezone"]),
                         namespace=namespace,
                         departure_window_days=int(source.get("departurePackageDays", 3)),
+                        context=normalized_context,
                     ),
                 )
 
             if source.get("buildTripIndex", True):
+                if not build_cache_hit:
+                    _timed_external_stage(
+                        source_id,
+                        "trip-index",
+                        partial(
+                            build_external_trip_index,
+                            archive,
+                            cities,
+                            source_output,
+                            namespace=namespace,
+                            context=normalized_context,
+                            immutable_output=True,
+                        ),
+                    )
+                else:
+                    print(
+                        f"[StopData] source={source_id} stage=trip-index "
+                        "status=cache-hit duration=0.00s"
+                    )
                 _timed_external_stage(
                     source_id,
-                    "trip-index",
+                    "trip-index-headsign-enrichment",
                     partial(
-                        build_external_trip_index,
-                        archive,
-                        cities,
+                        apply_current_departure_headsign_enrichment,
                         source_output,
+                        cities,
                         namespace=namespace,
                     ),
                 )
@@ -2639,6 +2882,7 @@ def process_external_gtfs_sources(
                             archive,
                             package_stops,
                             namespace=namespace,
+                            context=normalized_context,
                         ),
                     )
                 else:
@@ -2663,16 +2907,18 @@ def process_external_gtfs_sources(
                     print(
                         f"[StopData] source={source_id} stage=cache-persist "
                         "status=completed "
-                        f"duration={time.monotonic() - persist_started:.2f}s"
+                        f"duration={time.monotonic() - persist_started:.4f}s"
                     )
                 except (OSError, TypeError, ValueError) as error:
                     print(
                         f"[StopData] source={source_id} stage=cache-persist "
                         "status=failed "
                         f"reason={type(error).__name__} "
-                        f"duration={time.monotonic() - persist_started:.2f}s"
+                        f"duration={time.monotonic() - persist_started:.4f}s"
                     )
         finally:
+            if normalized_context is not None:
+                normalized_context.close()
             archive.close()
             log_memory_stage("source-cleanup", source=source_id)
 
@@ -2682,7 +2928,7 @@ def process_external_gtfs_sources(
 
         print(
             f"[StopData] source={source_id} stage=build "
-            f"duration={time.monotonic() - source_started:.2f}s"
+            f"duration={time.monotonic() - source_started:.4f}s"
         )
 
     for city_id, records in namespaced_records.items():

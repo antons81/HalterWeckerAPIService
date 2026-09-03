@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -18,7 +19,7 @@ except ImportError:
     from artifact_provenance import artifact_provenance
 
 
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 3
 CTA_PROVIDER_ID = "cta-chicago"
 FEATURE_GATE = "HALTEWECKER_EXTERNAL_BUILD_CACHE"
 PROVIDER_ALLOWLIST = "HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS"
@@ -29,6 +30,21 @@ CACHEABLE_PROVIDER_CITY_IDS = {
     "king-county-metro": "seattle",
     "stm-montreal": "montreal",
 }
+TRANSFORMED_CACHE_PROVIDER_IDS = frozenset(
+    {
+        *CACHEABLE_PROVIDER_CITY_IDS,
+        "finland-hsl",
+        "poland-warsaw",
+        "wmata-bus",
+        "mbta-boston",
+        "sweden",
+        "mta-ny-nyct-bus",
+        "ttc-surface",
+        "australia-transport-nsw",
+    }
+)
+TRANSFORMED_CACHE_LAYER = "external-transformed-provider-v1"
+TRANSFORMED_FEATURE_GATE = "HALTEWECKER_EXTERNAL_TRANSFORMED_BUILD_CACHE"
 BUILDER_FAMILY = "external-standard-immutable-v1"
 BUILDER_INPUTS = (
     "scripts/external_gtfs.py",
@@ -39,14 +55,43 @@ BUILDER_INPUTS = (
 )
 
 
-def expected_artifacts(city_id: str) -> tuple[tuple[str, str], ...]:
-    if not city_id or Path(city_id).name != city_id:
-        raise ValueError(f"invalid cache city id: {city_id!r}")
-    return (
-        ("stops", f"stops/{city_id}.json"),
-        ("routes", f"routes/{city_id}.json"),
-        ("lineMembership", "line-membership.json"),
-    )
+def expected_artifacts(
+    city_id: str,
+    *,
+    city_ids: tuple[str, ...] | None = None,
+    include_trip_index: bool = True,
+) -> tuple[tuple[str, str], ...]:
+    normalized_city_ids = city_ids or (city_id,)
+    if not normalized_city_ids or any(
+        not value or Path(value).name != value for value in normalized_city_ids
+    ):
+        raise ValueError(f"invalid cache city ids: {normalized_city_ids!r}")
+    artifacts: list[tuple[str, str]] = []
+    single_city = len(normalized_city_ids) == 1
+    for normalized_city_id in normalized_city_ids:
+        artifacts.extend(
+            [
+                (
+                    "stops" if single_city else f"stops:{normalized_city_id}",
+                    f"stops/{normalized_city_id}.json",
+                ),
+                (
+                    "routes" if single_city else f"routes:{normalized_city_id}",
+                    f"routes/{normalized_city_id}.json",
+                ),
+            ]
+        )
+        if include_trip_index:
+            artifacts.append(
+                (
+                    "tripIndexBase"
+                    if single_city
+                    else f"tripIndexBase:{normalized_city_id}",
+                    f"trip-index-base/{normalized_city_id}.json",
+                )
+            )
+    artifacts.append(("lineMembership", "line-membership.json"))
+    return tuple(artifacts)
 
 
 SENSITIVE_CONFIG_MARKERS = (
@@ -74,6 +119,8 @@ class CacheKey:
     supplemental_inputs_fingerprint: str = ""
     provider_id: str = ""
     city_id: str = ""
+    projection_fingerprint: str = ""
+    city_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -89,11 +136,17 @@ class CacheLookup:
 class CacheRestore:
     stops: list[dict[str, object]]
     lines_by_stop_id: dict[str, dict[str, dict[str, object]]]
+    package_stops_by_city_id: dict[str, list[dict[str, object]]] | None = None
 
 
 def cache_enabled(environ: Mapping[str, str] | None = None) -> bool:
     values = environ if environ is not None else os.environ
     return values.get(FEATURE_GATE, "0").strip() == "1"
+
+
+def transformed_cache_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    values = environ if environ is not None else os.environ
+    return values.get(TRANSFORMED_FEATURE_GATE, "0").strip() == "1"
 
 
 def cache_provider_allowed(
@@ -135,6 +188,26 @@ def _supplemental_inputs_fingerprint(
         for name, digest in sorted(values.items(), key=lambda item: str(item[0]))
     }
     return _sha256_json(normalized)
+
+
+def projection_fingerprint(
+    source: Mapping[str, object],
+    city_ids: tuple[str, ...],
+    merge_group_members: tuple[str, ...] = (),
+) -> str:
+    """Hash the source-to-city transformation semantics explicitly."""
+    payload = {
+        "namespace": source.get("namespace", ""),
+        "mergeGroup": source.get("mergeGroup"),
+        "filterCitiesByProvider": source.get("filterCitiesByProvider", False),
+        "exclusiveCityPartition": source.get("exclusiveCityPartition", False),
+        "agencyID": source.get("agencyID"),
+        "stopIDMode": source.get("stopIDMode", "exact"),
+        "publishPassengerStopIDs": source.get("publishPassengerStopIDs", False),
+        "cityIDs": list(city_ids),
+        "mergeGroupMembers": list(merge_group_members),
+    }
+    return _sha256_json(payload)
 
 
 def _safe_config_value(key: str, value: object) -> object:
@@ -208,6 +281,8 @@ def cache_key(
     raw_sha256: str,
     source: Mapping[str, object],
     city_id: str = "",
+    city_ids: tuple[str, ...] | None = None,
+    merge_group_members: tuple[str, ...] = (),
     supplemental_input_digests: Mapping[str, str] | None = None,
 ) -> CacheKey:
     if not raw_sha256 or len(raw_sha256) != 64:
@@ -215,18 +290,31 @@ def cache_key(
     provider_fingerprint = provider_config_fingerprint(source)
     cities_fingerprint = city_config_fingerprint(repository_root, source)
     build_fingerprint = builder_fingerprint(repository_root)
+    normalized_city_ids = tuple(city_ids or ((city_id,) if city_id else ()))
+    if not normalized_city_ids or any(
+        not value or Path(value).name != value for value in normalized_city_ids
+    ):
+        raise CacheKeyUnavailable("cache city IDs are unavailable")
+    projection = projection_fingerprint(
+        source,
+        normalized_city_ids,
+        merge_group_members,
+    )
     supplemental_fingerprint = _supplemental_inputs_fingerprint(
         supplemental_input_digests
     )
     payload = {
         "cacheSchemaVersion": CACHE_SCHEMA_VERSION,
         "builderFamily": BUILDER_FAMILY,
+        "cacheLayer": TRANSFORMED_CACHE_LAYER,
         "providerID": provider_id,
         "cityID": city_id,
+        "cityIDs": list(normalized_city_ids),
         "rawGTFSsha256": raw_sha256,
         "providerConfigFingerprint": provider_fingerprint,
         "cityConfigFingerprint": cities_fingerprint,
         "builderFingerprint": build_fingerprint,
+        "projectionFingerprint": projection,
         "supplementalInputsFingerprint": supplemental_fingerprint,
     }
     return CacheKey(
@@ -238,6 +326,8 @@ def cache_key(
         supplemental_inputs_fingerprint=supplemental_fingerprint,
         provider_id=provider_id,
         city_id=city_id,
+        projection_fingerprint=projection,
+        city_ids=normalized_city_ids,
     )
 
 
@@ -248,6 +338,24 @@ def _safe_relative_path(value: object) -> Path | None:
     if ".." in path.parts:
         return None
     return path
+
+
+def _immutable_trip_index_base_is_valid(path: Path) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    for trip_id, entry in payload.items():
+        if (
+            not isinstance(trip_id, str)
+            or not isinstance(entry, dict)
+            or set(entry) != {"r"}
+            or not isinstance(entry["r"], str)
+        ):
+            return False
+    return True
 
 
 def _manifest_matches(
@@ -261,6 +369,10 @@ def _manifest_matches(
         return False, "manifest is not an object"
     if manifest.get("cacheSchemaVersion") != CACHE_SCHEMA_VERSION:
         return False, "cache schema mismatch"
+    if manifest.get("cacheLayer") != TRANSFORMED_CACHE_LAYER:
+        return False, "cache layer mismatch"
+    if manifest.get("builderFamily") != BUILDER_FAMILY:
+        return False, "builder family mismatch"
     if manifest.get("providerID") != provider_id:
         return False, "provider mismatch"
     if manifest.get("key") != expected.value:
@@ -276,6 +388,21 @@ def _manifest_matches(
         return False, "city configuration fingerprint mismatch"
     if manifest.get("builderFingerprint") != expected.builder_fingerprint:
         return False, "builder fingerprint mismatch"
+    if manifest.get("projectionFingerprint") != expected.projection_fingerprint:
+        return False, "projection fingerprint mismatch"
+    expected_city_ids = expected.city_ids or (
+        (expected.city_id,) if expected.city_id else ()
+    )
+    if manifest.get("cityIDs") != list(expected_city_ids):
+        return False, "cache city set mismatch"
+    manifest_supplemental = manifest.get("supplementalInputsFingerprint")
+    if manifest_supplemental is not None:
+        if manifest_supplemental != expected.supplemental_inputs_fingerprint:
+            return False, "supplemental input fingerprint mismatch"
+    elif expected.supplemental_inputs_fingerprint != _supplemental_inputs_fingerprint(
+        {}
+    ):
+        return False, "supplemental input fingerprint is missing"
     if manifest.get("status") != "complete" or manifest.get("complete") is not True:
         return False, "cache is not complete"
     cached_outputs = manifest.get("cachedOutputs")
@@ -286,6 +413,8 @@ def _manifest_matches(
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
             return False, "cached output entry is invalid"
         entries[str(item["name"])] = item
+    if len(entries) != len(cached_outputs):
+        return False, "cached output names are duplicated"
     if set(entries) != {name for name, _path in artifacts}:
         return False, "cached output set mismatch"
     for name, expected_path in artifacts:
@@ -298,6 +427,11 @@ def _manifest_matches(
         artifact = directory / relative
         if not artifact.is_file():
             return False, f"cached artifact is missing for {name}"
+        if (
+            name.startswith("tripIndexBase")
+            and not _immutable_trip_index_base_is_valid(artifact)
+        ):
+            return False, f"immutable trip index base is invalid for {name}"
         try:
             digest, size = artifact_provenance(artifact)
         except (OSError, ValueError):
@@ -315,11 +449,18 @@ class ExternalBuildCache:
         root: Path | str,
         provider_id: str = CTA_PROVIDER_ID,
         city_id: str = "chicago",
+        city_ids: tuple[str, ...] | None = None,
+        include_trip_index: bool = True,
     ) -> None:
         self.root = Path(root) / provider_id
         self.provider_id = provider_id
         self.city_id = city_id
-        self.artifacts = expected_artifacts(city_id)
+        self.city_ids = city_ids or (city_id,)
+        self.artifacts = expected_artifacts(
+            city_id,
+            city_ids=self.city_ids,
+            include_trip_index=include_trip_index,
+        )
 
     def _directory(self, key: CacheKey) -> Path:
         return self.root / key.value
@@ -350,13 +491,16 @@ class ExternalBuildCache:
         if lookup.status != "HIT" or lookup.directory is None:
             raise ValueError("only a validated cache HIT can be restored")
         source_directory = lookup.directory
-        stops: list[dict[str, object]] | None = None
+        package_stops: dict[str, list[dict[str, object]]] = {}
         lines_by_stop_id: dict[str, dict[str, dict[str, object]]] | None = None
         for name, relative_value in self.artifacts:
             source = source_directory / relative_value
             if name == "lineMembership":
                 payload = json.loads(source.read_text(encoding="utf-8"))
-                if not isinstance(payload, dict):
+                if (
+                    not isinstance(payload, dict)
+                    or payload.get("schemaVersion") != CACHE_SCHEMA_VERSION
+                ):
                     raise ValueError("cached line membership is invalid")
                 value = payload.get("linesByStopID")
                 if not isinstance(value, dict):
@@ -388,16 +532,29 @@ class ExternalBuildCache:
                 os.replace(temporary, destination)
             finally:
                 temporary.unlink(missing_ok=True)
-            if name == "stops":
+            if Path(relative_value).parts[0] == "stops":
                 payload = json.loads(destination.read_text(encoding="utf-8"))
                 if not isinstance(payload, list) or not all(
                     isinstance(item, dict) for item in payload
                 ):
                     raise ValueError("cached stops payload is invalid")
-                stops = payload
-        if stops is None or lines_by_stop_id is None:
+                package_stops[Path(relative_value).stem] = payload
+            elif Path(relative_value).parts[0] in {"routes", "trips"}:
+                payload = json.loads(destination.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict) or not all(
+                    isinstance(key, str) and isinstance(value, dict)
+                    for key, value in payload.items()
+                ):
+                    raise ValueError(
+                        f"cached {Path(relative_value).parts[0]} payload is invalid"
+                    )
+        if set(package_stops) != set(self.city_ids) or lines_by_stop_id is None:
             raise ValueError("cache restore is incomplete")
-        return CacheRestore(stops, lines_by_stop_id)
+        return CacheRestore(
+            package_stops[self.city_ids[0]],
+            lines_by_stop_id,
+            package_stops_by_city_id=package_stops,
+        )
 
     def persist(
         self,
@@ -405,13 +562,18 @@ class ExternalBuildCache:
         output: Path,
         lines_by_stop_id: Mapping[str, Mapping[str, Mapping[str, object]]],
     ) -> None:
+        expected_city_ids = key.city_ids or ((key.city_id,) if key.city_id else ())
+        if tuple(expected_city_ids) != self.city_ids:
+            raise ValueError("cache key city set does not match cache storage")
         self.root.mkdir(parents=True, exist_ok=True)
         final_directory = self._directory(key)
         temporary_directory = Path(
             tempfile.mkdtemp(prefix=f".{key.value}.tmp-", dir=self.root)
         )
         try:
-            for _name, relative_value in self.artifacts[:2]:
+            for _name, relative_value in self.artifacts:
+                if _name == "lineMembership":
+                    continue
                 source = output / relative_value
                 if not source.is_file():
                     raise ValueError(f"cacheable output is missing: {relative_value}")
@@ -446,12 +608,17 @@ class ExternalBuildCache:
                 )
             manifest = {
                 "cacheSchemaVersion": CACHE_SCHEMA_VERSION,
+                "cacheLayer": TRANSFORMED_CACHE_LAYER,
+                "builderFamily": BUILDER_FAMILY,
                 "providerID": self.provider_id,
                 "key": key.value,
                 "rawGTFSsha256": key.raw_sha256,
                 "providerConfigFingerprint": key.provider_config_fingerprint,
                 "cityConfigFingerprint": key.city_config_fingerprint,
                 "builderFingerprint": key.builder_fingerprint,
+                "projectionFingerprint": key.projection_fingerprint,
+                "cityIDs": list(key.city_ids or self.city_ids),
+                "supplementalInputsFingerprint": key.supplemental_inputs_fingerprint,
                 "createdAt": _now(),
                 "cachedOutputs": cached_outputs,
                 "status": "complete",
@@ -462,8 +629,19 @@ class ExternalBuildCache:
                 json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
-            os.replace(temporary_directory, final_directory)
-            temporary_directory = Path()
+            published = False
+            try:
+                os.replace(temporary_directory, final_directory)
+                published = True
+            except OSError as error:
+                # Another writer published the same validated key first.
+                if (
+                    error.errno not in {errno.EEXIST, errno.ENOTEMPTY}
+                    or not final_directory.is_dir()
+                ):
+                    raise
+            if published:
+                temporary_directory = Path()
         finally:
             if temporary_directory != Path():
                 shutil.rmtree(temporary_directory, ignore_errors=True)
