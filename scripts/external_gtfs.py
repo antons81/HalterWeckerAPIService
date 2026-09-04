@@ -1278,7 +1278,7 @@ def build_external_route_index(
         if row.get("route_id")
     }
     if not routes:
-        return
+        raise ValueError("External GTFS route stage produced no valid routes.")
 
     trip_routes: dict[str, str] = {}
     trip_headsigns: dict[str, tuple[str, str]] = {}

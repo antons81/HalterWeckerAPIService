@@ -18,6 +18,7 @@ from build_stop_packages import (  # noqa: E402
     transit_radar_manifest,
 )
 import import_static_departures_database as static_importer  # noqa: E402
+import external_gtfs as external_gtfs_module  # noqa: E402
 from external_gtfs import (  # noqa: E402
     authenticated_external_request,
     build_external_departure_index,
@@ -1086,6 +1087,162 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
                 set(trips), {"ttc-surface:trip-600", "ttc-subway:trip-600"}
             )
             self.assertEqual(set(lines), {"ttc-surface:100", "ttc-subway:100"})
+
+    def test_nt_namespaced_route_stage_materializes_member_routes(self) -> None:
+        providers = (
+            ("australia-nt-darwin", "darwin", "au-nt-darwin:", -12.4634, 130.8456),
+            (
+                "australia-nt-alice-springs",
+                "alice-springs",
+                "au-nt-alice:",
+                -23.6980,
+                133.8807,
+            ),
+        )
+        for provider_id, city_id, namespace, latitude, longitude in providers:
+            with self.subTest(provider_id=provider_id), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                (root / "config").mkdir()
+                (root / "config" / "cities.json").write_text(
+                    json.dumps(
+                        [
+                            {
+                                "id": city_id,
+                                "name": city_id.replace("-", " ").title(),
+                                "aliases": [],
+                                "latitude": latitude,
+                                "longitude": longitude,
+                                "radiusMeters": 25_000,
+                                "packageMode": "external",
+                                "externalGTFSProviders": [provider_id],
+                            }
+                        ]
+                    )
+                )
+                archive_path = _gtfs_zip(
+                    root / f"{provider_id}.zip",
+                    stops=(
+                        "stop_id,stop_name,stop_lat,stop_lon\n"
+                        f"S1,Central,{latitude},{longitude}\n"
+                    ),
+                    routes="route_id,route_short_name,route_long_name,route_type\n"
+                    "R1,1,Route 1,3\n",
+                    trips="route_id,service_id,trip_id,trip_headsign,direction_id\n"
+                    "R1,S1,T1,Central,0\n",
+                    stop_times=(
+                        "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+                        "T1,08:00:00,08:00:00,S1,1\n"
+                    ),
+                )
+                source = {
+                    "id": provider_id,
+                    "url": str(archive_path),
+                    "cities": "config/cities.json",
+                    "filterCitiesByProvider": True,
+                    "timezone": "Australia/Darwin",
+                    "identifierPrefix": namespace,
+                    "namespace": namespace,
+                    "stopIDMode": "exact",
+                    "country": "AU",
+                }
+                sources_path = root / "sources.json"
+                sources_path.write_text(json.dumps([source]))
+                output = root / "out"
+
+                original_merge = (
+                    external_gtfs_module._merge_namespaced_city_records_bounded
+                )
+
+                def assert_member_routes(
+                    merge_city_id,
+                    records,
+                    merge_output,
+                    manifest_entries,
+                    package_stops_by_city_id,
+                    merge_function=original_merge,
+                ):
+                    member_route_path = (
+                        Path(records[0]["output"])
+                        / "routes"
+                        / f"{merge_city_id}.json"
+                    )
+                    self.assertTrue(member_route_path.is_file())
+                    self.assertTrue(json.loads(member_route_path.read_text()))
+                    return merge_function(
+                        merge_city_id,
+                        records,
+                        merge_output,
+                        manifest_entries,
+                        package_stops_by_city_id,
+                    )
+
+                with mock.patch.object(
+                    external_gtfs_module,
+                    "_merge_namespaced_city_records_bounded",
+                    side_effect=assert_member_routes,
+                ):
+                    manifest, _cities, _packages, _lines = (
+                        process_external_gtfs_sources(
+                            repository_root=root,
+                            sources_path=sources_path,
+                            url_by_provider={},
+                            output=output,
+                            load_gtfs_archive=load_gtfs_archive,
+                        )
+                    )
+
+                self.assertTrue((output / "routes" / f"{city_id}.json").is_file())
+                self.assertEqual([entry["id"] for entry in manifest], [city_id])
+
+    def test_namespaced_route_stage_fails_without_actual_routes_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "config").mkdir()
+            (root / "config" / "cities.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "alice-springs",
+                            "name": "Alice Springs",
+                            "aliases": [],
+                            "latitude": -23.6980,
+                            "longitude": 133.8807,
+                            "radiusMeters": 25_000,
+                            "packageMode": "external",
+                            "externalGTFSProviders": ["australia-nt-alice-springs"],
+                        }
+                    ]
+                )
+            )
+            archive_path = _gtfs_zip(
+                root / "alice-springs.zip",
+                stops="stop_id,stop_name,stop_lat,stop_lon\nS1,Central,-23.6980,133.8807\n",
+                routes="route_id,route_short_name,route_long_name,route_type\n",
+                trips="route_id,service_id,trip_id,trip_headsign,direction_id\n",
+                stop_times="trip_id,arrival_time,departure_time,stop_id,stop_sequence\n",
+            )
+            source = {
+                "id": "australia-nt-alice-springs",
+                "url": str(archive_path),
+                "cities": "config/cities.json",
+                "filterCitiesByProvider": True,
+                "timezone": "Australia/Darwin",
+                "identifierPrefix": "au-nt-alice:",
+                "namespace": "au-nt-alice:",
+                "stopIDMode": "exact",
+                "country": "AU",
+            }
+            sources_path = root / "sources.json"
+            sources_path.write_text(json.dumps([source]))
+
+            with self.assertRaisesRegex(ValueError, "no valid routes"):
+                process_external_gtfs_sources(
+                    repository_root=root,
+                    sources_path=sources_path,
+                    url_by_provider={},
+                    output=root / "out",
+                    load_gtfs_archive=load_gtfs_archive,
+                )
 
     def test_norway_radar_manifest_preserves_multiple_codespaces(self) -> None:
         cities = load_cities(REPOSITORY_ROOT / "config" / "norway-cities.json")
