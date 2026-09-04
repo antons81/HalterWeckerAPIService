@@ -41,6 +41,7 @@ from external_gtfs import (  # noqa: E402
 from external_staging import (  # noqa: E402
     ExternalMergeStage,
     JSONStream,
+    NormalizedProviderContext,
     iter_departure_payload,
     iter_departure_payload_items,
 )
@@ -1243,6 +1244,99 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
                     output=root / "out",
                     load_gtfs_archive=load_gtfs_archive,
                 )
+
+    def test_alice_springs_leading_blank_routes_load_into_normalized_context(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            route_rows = [
+                f"{route_id},AS{index:03d},Alice route {index},3"
+                for index, route_id in enumerate(
+                    ("1490", "1537", "1586", "1665", "1868", "2093", "2154", "2295"),
+                    start=100,
+                )
+            ]
+            trip_rows = [
+                f"{route_id},S1,T{index},Terminal {index},0"
+                for index, route_id in enumerate(
+                    ("1490", "1537", "1586", "1665", "1868", "2093", "2154", "2295"),
+                    start=1,
+                )
+            ]
+            stop_time_rows = [
+                f"T{index},08:{index:02d}:00,08:{index:02d}:00,S1,1"
+                for index in range(1, 9)
+            ]
+            archive_path = _gtfs_zip(
+                root / "alice-springs.zip",
+                stops="stop_id,stop_name,stop_lat,stop_lon\nS1,Central,-23.6980,133.8807\n",
+                routes="\n"
+                "route_id,route_short_name,route_long_name,route_type\n"
+                + "\n".join(route_rows)
+                + "\n",
+                trips="route_id,service_id,trip_id,trip_headsign,direction_id\n"
+                + "\n".join(trip_rows)
+                + "\n",
+                stop_times="trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+                + "\n".join(stop_time_rows)
+                + "\n",
+            )
+            city = {
+                "id": "alice-springs",
+                "name": "Alice Springs",
+                "aliases": [],
+                "latitude": -23.6980,
+                "longitude": 133.8807,
+                "radiusMeters": 25_000,
+                "packageMode": "external",
+            }
+            output = root / "out"
+
+            with zipfile.ZipFile(archive_path) as archive:
+                context = NormalizedProviderContext.from_archive(archive)
+                try:
+                    self.assertEqual(
+                        context.connection.execute(
+                            "SELECT count(*) FROM routes"
+                        ).fetchone()[0],
+                        8,
+                    )
+                    build_external_stop_packages(
+                        archive,
+                        [city],
+                        output,
+                        namespace="au-nt-alice:",
+                        context=context,
+                    )
+                    build_external_route_index(
+                        archive,
+                        [city],
+                        output,
+                        namespace="au-nt-alice:",
+                        context=context,
+                    )
+                finally:
+                    context.close()
+
+            routes = json.loads((output / "routes" / "alice-springs.json").read_text())
+            self.assertEqual(len(routes), 8)
+            self.assertEqual(
+                set(routes),
+                {
+                    f"au-nt-alice:{route_id}"
+                    for route_id in (
+                        "1490",
+                        "1537",
+                        "1586",
+                        "1665",
+                        "1868",
+                        "2093",
+                        "2154",
+                        "2295",
+                    )
+                },
+            )
 
     def test_norway_radar_manifest_preserves_multiple_codespaces(self) -> None:
         cities = load_cities(REPOSITORY_ROOT / "config" / "norway-cities.json")

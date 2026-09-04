@@ -7,11 +7,34 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from build_stop_packages import iter_table  # noqa: E402
-from gtfs_csv import GTFSHeaderError, normalized_dict_reader  # noqa: E402
+from build_stop_packages import iter_table
+from gtfs_csv import GTFSHeaderError, normalized_dict_reader
 
 
 class GTFSCSVHeaderTests(unittest.TestCase):
+    def test_leading_blank_line_is_skipped_before_header(self) -> None:
+        reader = normalized_dict_reader(
+            io.StringIO("\nroute_id,route_short_name\n1490,AS100\n1537,AS101\n")
+        )
+
+        self.assertEqual(reader.fieldnames, ["route_id", "route_short_name"])
+        self.assertEqual(
+            list(reader),
+            [
+                {"route_id": "1490", "route_short_name": "AS100"},
+                {"route_id": "1537", "route_short_name": "AS101"},
+            ],
+        )
+
+    def test_multiple_leading_whitespace_lines_are_skipped(self) -> None:
+        reader = normalized_dict_reader(
+            io.StringIO("\n   \n\t\nroute_id,route_short_name\n1490,AS100\n")
+        )
+
+        self.assertEqual(
+            list(reader), [{"route_id": "1490", "route_short_name": "AS100"}]
+        )
+
     def test_normal_header_is_unchanged(self) -> None:
         reader = normalized_dict_reader(
             io.StringIO("stop_id,stop_lat,stop_lon\nS1,-27.4,153.0\n")
@@ -31,7 +54,9 @@ class GTFSCSVHeaderTests(unittest.TestCase):
         self.assertEqual(reader.fieldnames, ["stop_id", "stop_lat", "stop_lon"])
         self.assertEqual(next(reader)["stop_lat"], "-27.4")
 
-    def test_mixed_ascii_header_whitespace_is_stripped_without_trimming_values(self) -> None:
+    def test_mixed_ascii_header_whitespace_is_stripped_without_trimming_values(
+        self,
+    ) -> None:
         reader = normalized_dict_reader(
             io.StringIO("\t stop_id\t,\tstop_lat , stop_lon\n S1 ,-27.4 ,153.0 \n")
         )
@@ -44,6 +69,22 @@ class GTFSCSVHeaderTests(unittest.TestCase):
     def test_duplicate_headers_after_normalization_fail_closed(self) -> None:
         with self.assertRaisesRegex(GTFSHeaderError, "stop_id"):
             normalized_dict_reader(io.StringIO("stop_id, stop_id\nS1,S2\n"))
+
+    def test_blank_only_file_has_no_synthetic_header_or_rows(self) -> None:
+        reader = normalized_dict_reader(io.StringIO("\n \n\t\n"))
+
+        self.assertEqual(reader.fieldnames, [])
+        self.assertEqual(list(reader), [])
+
+    def test_leading_blanks_do_not_guess_a_malformed_header(self) -> None:
+        reader = normalized_dict_reader(
+            io.StringIO("\nnot_a_gtfs_header,other\n1490,AS100\n")
+        )
+
+        self.assertEqual(reader.fieldnames, ["not_a_gtfs_header", "other"])
+        row = next(reader)
+        self.assertNotIn("route_id", row)
+        self.assertEqual(row, {"not_a_gtfs_header": "1490", "other": "AS100"})
 
     def test_transperth_style_header_works_through_stop_package_reader(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
