@@ -2254,18 +2254,57 @@ def _merge_namespaced_city_records_bounded(
         for record in records:
             source_output = Path(record["output"])
             source_id = str(record["sourceID"])
-            stop_path = source_output / "stops" / f"{city_id}.json"
-            route_path = source_output / "routes" / f"{city_id}.json"
-            departure_path = source_output / "departures" / f"{city_id}.json"
-            trip_path = source_output / "trips" / f"{city_id}.json"
-            if stop_path.exists():
-                stage.add_stops(stop_path, source_id)
-            if route_path.exists():
-                stage.add_object_file(route_path, "routes", source_id)
-            if departure_path.exists():
-                stage.add_departures(departure_path)
-            if trip_path.exists():
-                stage.add_object_file(trip_path, "trips", source_id)
+            source = record["source"]
+            member_paths = {
+                "stops": source_output / "stops" / f"{city_id}.json",
+                "routes": source_output / "routes" / f"{city_id}.json",
+                "departures": source_output / "departures" / f"{city_id}.json",
+                "trips": source_output / "trips" / f"{city_id}.json",
+            }
+            required_assets = {
+                "stops": source.get("buildStops", True) is True,
+                "routes": source.get("buildRoutes", True) is True,
+                "departures": source.get("buildDepartures", True) is True,
+                "trips": source.get("buildTripIndex", True) is True,
+            }
+            for asset_name, asset_path in member_paths.items():
+                if required_assets[asset_name] and not asset_path.is_file():
+                    raise ValueError(
+                        f"Merged external city {city_id} member {source_id} "
+                        f"is missing {asset_name} asset."
+                    )
+
+            if required_assets["stops"] and not stage.add_stops(
+                member_paths["stops"], source_id
+            ):
+                raise ValueError(
+                    f"Merged external city {city_id} member {source_id} "
+                    "has empty stops asset."
+                )
+            if required_assets["routes"] and not stage.add_object_file(
+                member_paths["routes"], "routes", source_id
+            ):
+                raise ValueError(
+                    f"Merged external city {city_id} member {source_id} "
+                    "has empty routes asset."
+                )
+            if required_assets["departures"]:
+                departure_sections = stage.add_departures(member_paths["departures"])
+                required_sections = {"generatedAt", "timezone", "stops", "platforms"}
+                if departure_sections != required_sections:
+                    missing_sections = sorted(required_sections - departure_sections)
+                    raise ValueError(
+                        f"Merged external city {city_id} member {source_id} "
+                        "has structurally incomplete departures asset: "
+                        + ", ".join(missing_sections)
+                    )
+            if required_assets["trips"] and not stage.add_object_file(
+                member_paths["trips"], "trips", source_id
+            ):
+                raise ValueError(
+                    f"Merged external city {city_id} member {source_id} "
+                    "has empty trips asset."
+                )
         log_memory_stage(
             "merge-input-read",
             source=city_id,
@@ -2284,12 +2323,6 @@ def _merge_namespaced_city_records_bounded(
             source=city_id,
             started=staging_started,
         )
-        departure_count = stage.connection.execute(
-            "SELECT count(*) FROM departures"
-        ).fetchone()[0]
-        if not departure_count:
-            raise ValueError(f"Merged external city {city_id} has incomplete assets.")
-
         output_started = time.monotonic()
         stop_count, _metadata = stage.write_outputs(output, city_id)
         log_memory_stage(

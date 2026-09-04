@@ -8,9 +8,9 @@ import sqlite3
 import sys
 import tempfile
 import time
+from collections.abc import Callable, Iterator
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator
 
 try:
     from .gtfs_csv import normalized_dict_reader
@@ -162,7 +162,12 @@ def iter_departure_payload(path: Path) -> Iterator[tuple[str, str, object]]:
         stream.close()
 
 
-def iter_departure_payload_items(path: Path) -> Iterator[tuple[str, str, object]]:
+def iter_departure_payload_items(
+    path: Path,
+    *,
+    strict: bool = False,
+    on_section: Callable[[str], None] | None = None,
+) -> Iterator[tuple[str, str, object]]:
     """Yield generated metadata and individual departure/platform items."""
     stream = JSONStream(path)
     try:
@@ -177,6 +182,8 @@ def iter_departure_payload_items(path: Path) -> Iterator[tuple[str, str, object]
             if key in {"generatedAt", "timezone"}:
                 yield key, "", stream.value()
             elif key in {"stops", "platforms"}:
+                if on_section is not None:
+                    on_section(key)
                 stream._consume("{")
                 stream._skip_whitespace()
                 if stream._buffer.startswith("}"):
@@ -188,12 +195,23 @@ def iter_departure_payload_items(path: Path) -> Iterator[tuple[str, str, object]
                         stream._skip_whitespace()
                         if stream._buffer.startswith("["):
                             for item in stream.array_items():
+                                if strict and (
+                                    (key == "stops" and not isinstance(item, dict))
+                                    or (key == "platforms" and not isinstance(item, str))
+                                ):
+                                    raise ValueError(
+                                        f"Invalid departure payload item in {key}"
+                                    )
                                 yield (
                                     "stop" if key == "stops" else "platform",
                                     item_key,
                                     item,
                                 )
                         else:
+                            if strict:
+                                raise ValueError(
+                                    f"Departure payload entry in {key} is not an array"
+                                )
                             stream.value()
                         stream._skip_whitespace()
                         if stream._buffer.startswith("}"):
@@ -607,7 +625,8 @@ class ExternalMergeStage:
         self.connection.close()
         self._temporary.cleanup()
 
-    def add_stops(self, path: Path, source_id: str) -> None:
+    def add_stops(self, path: Path, source_id: str) -> int:
+        inserted = 0
         for item in iter_json_array(path):
             if not isinstance(item, dict) or not item.get("id"):
                 continue
@@ -631,8 +650,11 @@ class ExternalMergeStage:
                 "INSERT INTO stops VALUES (?, ?, ?, ?, ?)",
                 (stop_id, payload, signature, source_id, str(item.get("searchName", ""))),
             )
+            inserted += 1
+        return inserted
 
-    def add_object_file(self, path: Path, table: str, source_id: str) -> None:
+    def add_object_file(self, path: Path, table: str, source_id: str) -> int:
+        inserted = 0
         for key, value in iter_json_object(path):
             if not isinstance(value, dict):
                 continue
@@ -653,10 +675,28 @@ class ExternalMergeStage:
                 f"INSERT INTO {table} ({column}, payload, source_id) VALUES (?, ?, ?)",
                 (str(key), payload, source_id),
             )
+            inserted += 1
+        return inserted
 
-    def add_departures(self, path: Path) -> None:
-        for kind, key, value in iter_departure_payload_items(path):
+    def add_departures(self, path: Path) -> set[str]:
+        sections: set[str] = set()
+
+        def record_section(section: str) -> None:
+            if section in sections:
+                raise ValueError(f"Duplicate departure payload section: {section}")
+            sections.add(section)
+
+        for kind, key, value in iter_departure_payload_items(
+            path,
+            strict=True,
+            on_section=record_section,
+        ):
             if kind in {"generatedAt", "timezone"}:
+                if kind in sections:
+                    raise ValueError(f"Duplicate departure payload field: {kind}")
+                if not isinstance(value, str) or not value:
+                    raise ValueError(f"Invalid departure payload field: {kind}")
+                sections.add(kind)
                 if kind == "timezone" and isinstance(value, str) and value:
                     self.timezones.add(value)
                 if kind == "generatedAt" and isinstance(value, str):
@@ -677,6 +717,7 @@ class ExternalMergeStage:
                     (key, str(value)),
                 )
         self.connection.commit()
+        return sections
 
     def commit(self) -> None:
         self.connection.commit()

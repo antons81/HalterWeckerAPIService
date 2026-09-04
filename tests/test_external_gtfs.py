@@ -26,6 +26,7 @@ from external_gtfs import (  # noqa: E402
     build_external_stop_packages,
     build_external_trip_index,
     _deduplicate_merged_stops,
+    _merge_namespaced_city_records_bounded,
     external_city_ids,
     load_external_cities,
     load_external_gtfs_sources,
@@ -76,6 +77,114 @@ def _gtfs_zip(
         if calendar_dates is not None:
             archive.writestr("calendar_dates.txt", calendar_dates)
     return path
+
+
+def _toronto_merge_member(
+    root: Path,
+    provider_id: str,
+    *,
+    departure_items: list[dict[str, str]] | None = None,
+    missing_assets: set[str] | None = None,
+    malformed_departures: str | None = None,
+    incomplete_departures: bool = False,
+) -> dict[str, object]:
+    output = root / provider_id
+    missing = missing_assets or set()
+    route_id = f"{provider_id}:route"
+    trip_id = f"{provider_id}:trip"
+    stop_id = f"{provider_id}:stop"
+    assets = {
+        "stops": [
+            {
+                "id": stop_id,
+                "name": f"{provider_id} stop",
+                "latitude": 43.6532,
+                "longitude": -79.3832,
+                "searchName": f"{provider_id} stop",
+            }
+        ],
+        "routes": {route_id: {"short_name": provider_id}},
+        "trips": {trip_id: {"r": route_id}},
+    }
+    for asset_name, payload in assets.items():
+        if asset_name in missing:
+            continue
+        directory = output / asset_name
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "toronto.json").write_text(
+            json.dumps(payload),
+            encoding="utf-8",
+        )
+    if "departures" not in missing:
+        departures_directory = output / "departures"
+        departures_directory.mkdir(parents=True, exist_ok=True)
+        departure_path = departures_directory / "toronto.json"
+        if malformed_departures is not None:
+            departure_path.write_text(malformed_departures, encoding="utf-8")
+        elif incomplete_departures:
+            departure_path.write_text(
+                json.dumps(
+                    {
+                        "generatedAt": "2026-09-04T00:00:00Z",
+                        "timezone": "America/Toronto",
+                        "stops": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+        else:
+            departure_path.write_text(
+                json.dumps(
+                    {
+                        "generatedAt": "2026-09-04T00:00:00Z",
+                        "timezone": "America/Toronto",
+                        "stops": {stop_id: departure_items or []},
+                        "platforms": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+    return {
+        "sourceID": provider_id,
+        "source": {"country": "CA"},
+        "city": {"id": "toronto", "name": "Toronto", "aliases": []},
+        "output": output,
+    }
+
+
+def _merge_toronto_fixture(
+    root: Path,
+    *,
+    departure_items_by_provider: dict[str, list[dict[str, str]]] | None = None,
+    missing_assets_by_provider: dict[str, set[str]] | None = None,
+    malformed_provider: str | None = None,
+    incomplete_provider: str | None = None,
+) -> Path:
+    departure_items_by_provider = departure_items_by_provider or {}
+    missing_assets_by_provider = missing_assets_by_provider or {}
+    records = []
+    for provider_id in ("ttc-surface", "ttc-subway"):
+        records.append(
+            _toronto_merge_member(
+                root,
+                provider_id,
+                departure_items=departure_items_by_provider.get(provider_id),
+                missing_assets=missing_assets_by_provider.get(provider_id),
+                malformed_departures='{"generatedAt":'
+                if provider_id == malformed_provider
+                else None,
+                incomplete_departures=provider_id == incomplete_provider,
+            )
+        )
+    output = root / "merged"
+    _merge_namespaced_city_records_bounded(
+        "toronto",
+        records,
+        output,
+        [],
+        {},
+    )
+    return output
 
 
 class ExternalGTFSRegistryTests(unittest.TestCase):
@@ -805,6 +914,87 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
         self.assertIn("Unit=haltewecker-static-departures.service", toronto_timer)
         self.assertIn("Persistent=true", vancouver_timer)
         self.assertIn("Persistent=true", toronto_timer)
+
+    def test_toronto_merge_allows_valid_empty_departures(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            output = _merge_toronto_fixture(Path(temp))
+
+            self.assertTrue((output / "stops" / "toronto.json").is_file())
+            self.assertTrue((output / "routes" / "toronto.json").is_file())
+            self.assertTrue((output / "trips" / "toronto.json").is_file())
+            departures = json.loads(
+                (output / "departures" / "toronto.json").read_text()
+            )
+            self.assertEqual(departures["stops"], {})
+            self.assertEqual(departures["platforms"], {})
+
+    def test_toronto_merge_rejects_missing_departures_asset(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            self.assertRaisesRegex(ValueError, "missing departures asset"),
+        ):
+            _merge_toronto_fixture(
+                Path(temp),
+                missing_assets_by_provider={"ttc-subway": {"departures"}},
+            )
+
+    def test_toronto_merge_rejects_malformed_departures_asset(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, self.assertRaises(ValueError):
+            _merge_toronto_fixture(
+                Path(temp),
+                malformed_provider="ttc-subway",
+            )
+
+    def test_toronto_merge_rejects_incomplete_departures_structure(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            self.assertRaisesRegex(
+                ValueError, "structurally incomplete departures asset"
+            ),
+        ):
+            _merge_toronto_fixture(
+                Path(temp),
+                incomplete_provider="ttc-subway",
+            )
+
+    def test_toronto_merge_rejects_missing_structural_member_assets(self) -> None:
+        for asset_name in ("stops", "routes", "trips"):
+            with (
+                self.subTest(asset_name=asset_name),
+                tempfile.TemporaryDirectory() as temp,
+                self.assertRaisesRegex(ValueError, f"missing {asset_name} asset"),
+            ):
+                _merge_toronto_fixture(
+                    Path(temp),
+                    missing_assets_by_provider={
+                        "ttc-subway": {asset_name},
+                    },
+                )
+
+    def test_toronto_merge_preserves_non_empty_departures_with_empty_member(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            departure = {
+                "t": "ttc-subway:trip",
+                "r": "ttc-subway:route",
+                "h": "Terminal",
+                "d": "0",
+                "p": "08:00:00",
+                "q": "1",
+            }
+            output = _merge_toronto_fixture(
+                Path(temp),
+                departure_items_by_provider={"ttc-subway": [departure]},
+            )
+
+            departures = json.loads(
+                (output / "departures" / "toronto.json").read_text()
+            )
+            self.assertEqual(
+                departures["stops"],
+                {"ttc-subway:stop": [departure]},
+            )
 
     def test_toronto_namespaced_sources_merge_without_cross_join(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
