@@ -981,6 +981,28 @@ def validate_transit_radar_provider(
             ):
                 raise ValueError(f"Invalid Australian external GTFS configuration for {city_id}")
             return
+        if provider_id == "israel-mot":
+            if (
+                not isinstance(features, list)
+                or not {"firstDepartures", "stopLookup"}.issubset(features)
+                or configuration.get("region") is not None
+                or any(
+                    feature in features
+                    for feature in (
+                        "liveVehicles",
+                        "realtimeDepartures",
+                        "realtimeDelay",
+                        "tripUpdates",
+                        "vehiclePositions",
+                    )
+                )
+            ):
+                raise ValueError(f"Invalid Israel static-only external GTFS configuration for {city_id}")
+            for key in ("staticBaseURL", "boardURL"):
+                value = configuration.get(key)
+                if not isinstance(value, str) or not value.startswith("https://"):
+                    raise ValueError(f"Israel static-only external GTFS requires an HTTPS {key} for {city_id}")
+            return
         if (
             not isinstance(provider_id, str)
             or not provider_id.startswith("australia-")
@@ -1691,6 +1713,12 @@ def transit_radar_manifest(
             str(p.get("providerID", "")).startswith("poland-") for p in providers
         ):
             country_suffix = "pl"
+        elif any(
+            p.get("adapter") == "externalGTFS"
+            and str(p.get("providerID", "")) == "israel-mot"
+            for p in providers
+        ) or str(city.get("country", "")).upper() == "IL":
+            country_suffix = "il"
         elif any(p.get("adapter") in {"translinkSEQ", "translinkQueensland", "adelaideMetro", "externalGTFS"} for p in providers):
             country_suffix = "au"
         else:

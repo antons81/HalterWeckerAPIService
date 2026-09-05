@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from build_stop_packages import load_gtfs_archive, normalized
 from gtfs_csv import normalized_dict_reader
 from static_departures_ownership import ensure_ownership_schema, register_entities
+from gtfs_stop_metadata import display_stop_metadata
 
 
 SCHEMA_VERSION = 1
@@ -129,6 +130,10 @@ def connect(database_path: Path) -> sqlite3.Connection:
             parent_station TEXT NOT NULL,
             stop_name TEXT NOT NULL,
             platform_code TEXT NOT NULL,
+            location_type INTEGER NOT NULL DEFAULT 0,
+            stop_desc TEXT NOT NULL DEFAULT '',
+            platform_display TEXT NOT NULL DEFAULT '',
+            floor_display TEXT NOT NULL DEFAULT '',
             source_order INTEGER NOT NULL,
             canonical_stop_id TEXT
         ) WITHOUT ROWID;
@@ -142,7 +147,12 @@ def connect(database_path: Path) -> sqlite3.Connection:
             route_id TEXT PRIMARY KEY,
             short_name TEXT NOT NULL,
             long_name TEXT NOT NULL,
-            route_type TEXT NOT NULL DEFAULT ''
+            route_type TEXT NOT NULL DEFAULT '',
+            agency_id TEXT NOT NULL DEFAULT ''
+        ) WITHOUT ROWID;
+        CREATE TABLE agencies (
+            agency_id TEXT PRIMARY KEY,
+            agency_name TEXT NOT NULL DEFAULT ''
         ) WITHOUT ROWID;
         CREATE TABLE trips (
             trip_id TEXT PRIMARY KEY,
@@ -295,24 +305,67 @@ def populate_gtfs(
         connection.execute(
             "ALTER TABLE routes ADD COLUMN route_type TEXT NOT NULL DEFAULT ''"
         )
+    if "agency_id" not in route_columns:
+        connection.execute(
+            "ALTER TABLE routes ADD COLUMN agency_id TEXT NOT NULL DEFAULT ''"
+        )
 
-    _run_import_stage(
-        stage_runner,
-        "agencies",
-        lambda: sum(1 for _ in gtfs_rows(archive, "agency.txt")),
+    raw_stop_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(raw_stops)")
+    }
+    for column, definition in (
+        ("location_type", "INTEGER NOT NULL DEFAULT 0"),
+        ("stop_desc", "TEXT NOT NULL DEFAULT ''"),
+        ("platform_display", "TEXT NOT NULL DEFAULT ''"),
+        ("floor_display", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        if column not in raw_stop_columns:
+            connection.execute(f"ALTER TABLE raw_stops ADD COLUMN {column} {definition}")
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS agencies (agency_id TEXT PRIMARY KEY, agency_name TEXT NOT NULL DEFAULT '') WITHOUT ROWID"
     )
+
+    def import_agencies() -> int:
+        rows = [
+            (
+                identifier_prefix + row["agency_id"].strip(),
+                row.get("agency_name", "").strip(),
+            )
+            for row in gtfs_rows(archive, "agency.txt")
+            if row.get("agency_id", "").strip()
+        ]
+        connection.executemany(
+            "INSERT OR REPLACE INTO agencies(agency_id, agency_name) VALUES (?, ?)",
+            rows,
+        )
+        return len(rows)
+
+    _run_import_stage(stage_runner, "agencies", import_agencies)
 
     stop_ids: list[str] = []
 
     def import_stops() -> int:
         connection.executemany(
-            "INSERT INTO raw_stops(stop_id, parent_station, stop_name, platform_code, source_order) VALUES (?, ?, ?, ?, ?)",
+            """INSERT INTO raw_stops(
+                stop_id, parent_station, stop_name, platform_code, location_type,
+                stop_desc, platform_display, floor_display, source_order
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 (
                     internal_stop_id(row["stop_id"], stop_id_prefix),
                     internal_stop_id(row.get("parent_station", ""), stop_id_prefix),
                     row.get("stop_name", "").strip(),
                     row.get("platform_code", "").strip(),
+                    int(row.get("location_type", "0") or 0)
+                    if str(row.get("location_type", "0") or "0").strip().isdigit()
+                    else 0,
+                    row.get("stop_desc", "").strip(),
+                    display_stop_metadata(
+                        row.get("stop_desc", ""), row.get("platform_code", "")
+                    )[0],
+                    display_stop_metadata(
+                        row.get("stop_desc", ""), row.get("platform_code", "")
+                    )[1],
                     index,
                 )
                 for index, row in enumerate(gtfs_rows(archive, "stops.txt"))
@@ -342,13 +395,14 @@ def populate_gtfs(
 
     def import_routes() -> int:
         connection.executemany(
-            "INSERT INTO routes(route_id, short_name, long_name, route_type) VALUES (?, ?, ?, ?)",
+            "INSERT INTO routes(route_id, short_name, long_name, route_type, agency_id) VALUES (?, ?, ?, ?, ?)",
             (
                 (
                     identifier_prefix + row["route_id"].strip(),
                     row.get("route_short_name", "").strip(),
                     row.get("route_long_name", "").strip(),
                     row.get("route_type", "").strip(),
+                    prefixed_optional_identifier(row.get("agency_id", ""), identifier_prefix),
                 )
                 for row in gtfs_rows(archive, "routes.txt") if row.get("route_id", "").strip()
             ),

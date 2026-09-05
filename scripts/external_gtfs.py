@@ -58,6 +58,11 @@ except ImportError:
     from gtfs_agency import agency_scoped_archive
 
 try:
+    from .gtfs_stop_metadata import display_stop_metadata
+except ImportError:
+    from gtfs_stop_metadata import display_stop_metadata
+
+try:
     from .build_stop_packages import (
         build_lines_by_stop_id_noncanonical,
         distance_meters,
@@ -1030,7 +1035,13 @@ def build_external_stop_packages(
             "location_type": _parse_location_type(row.get("location_type")),
             "parent_station": str(row.get("parent_station", "") or "").strip(),
             "platform_code": str(row.get("platform_code", "") or "").strip(),
+            "stop_desc": str(row.get("stop_desc", "") or "").strip(),
         }
+        platform_display, floor_display = display_stop_metadata(
+            record["stop_desc"], record["platform_code"]
+        )
+        record["platform_display"] = platform_display
+        record["floor_display"] = floor_display
         if exclusive_city_partition:
             nearest_city = min(
                 cities,
@@ -1142,6 +1153,15 @@ def build_external_stop_packages(
                 "longitude": stop["longitude"],
                 "searchName": stop["searchName"],
                 "stopCode": stop["stopCode"] or None,
+                "locationType": int(stop["location_type"]),
+                "parentStation": (
+                    _published_id(str(stop["parent_station"]), namespace)
+                    if stop["parent_station"] else None
+                ),
+                "platformCode": stop["platform_code"] or None,
+                "platform": stop["platform_display"] or None,
+                "floor": stop["floor_display"] or None,
+                "stopDescription": stop["stop_desc"] or None,
             }
             for stop in city_public[city_id]
         ]
@@ -1272,6 +1292,11 @@ def build_external_route_index(
     if not cities:
         return
 
+    agencies = {
+        str(row.get("agency_id", "")).strip(): str(row.get("agency_name", "") or "").strip()
+        for row in iter_table(archive, "agency.txt")
+        if str(row.get("agency_id", "")).strip()
+    }
     routes = {
         str(row["route_id"]): row
         for row in _source_load_table(archive, "routes.txt", context)
@@ -1336,6 +1361,11 @@ def build_external_route_index(
                         "long_name": str(route.get("route_long_name", "")),
                         "type": str(route.get("route_type", "3")),
                         "agency": str(route.get("agency_id", "")),
+                        "agencyName": (
+                            str(route.get("agency_name", "") or "").strip()
+                            or agencies.get(str(route.get("agency_id", "")).strip(), "")
+                            or None
+                        ),
                         "headsigns": {},
                     }
         for trip_id, (direction_id, headsign) in trip_headsigns.items():
@@ -1565,6 +1595,12 @@ def build_external_departure_index(
     if not cities:
         return
 
+    agencies = {
+        str(row.get("agency_id", "")).strip(): str(row.get("agency_name", "") or "").strip()
+        for row in iter_table(archive, "agency.txt")
+        if str(row.get("agency_id", "")).strip()
+    }
+
     zone = ZoneInfo(timezone_name)
     today = datetime.now(zone).date()
     if departure_window_days < 1:
@@ -1630,8 +1666,18 @@ def build_external_departure_index(
     feed_stops = _feed_stop_rows(archive, context)
     resolve = _stop_resolution_map(feed_stops, public_stop_ids)
 
+    def public_parent_stop_id(stop_id: str) -> str | None:
+        seen: set[str] = set()
+        current = str(feed_stops.get(stop_id, {}).get("parent_station", "") or "").strip()
+        while current and current not in seen:
+            if current in public_stop_ids:
+                return current
+            seen.add(current)
+            current = str(feed_stops.get(current, {}).get("parent_station", "") or "").strip()
+        return None
+
     # Stream stop_times once: collect departures for package stops and terminal stops.
-    stop_departures: dict[str, list[tuple[str, str, str, str, int]]] = {}
+    stop_departures: dict[str, list[tuple[str, str, str, int]]] = {}
     terminal_by_trip: dict[str, tuple[int, str]] = {}
     for stop_time in _source_iter_table(archive, "stop_times.txt", context):
         trip_id = str(stop_time.get("trip_id", "")).strip()
@@ -1643,14 +1689,14 @@ def build_external_departure_index(
         if stop_id and departure_time:
             public_stop_id = resolve(stop_id)
             if public_stop_id is not None:
-                platform_code = ""
-                if public_stop_id != stop_id:
-                    platform_code = str(
-                        feed_stops.get(stop_id, {}).get("platform_code", "") or ""
-                    ).strip()
                 stop_departures.setdefault(public_stop_id, []).append(
-                    (departure_time, trip_id, stop_id, platform_code, sequence)
+                    (departure_time, trip_id, stop_id, sequence)
                 )
+                parent_public_stop_id = public_parent_stop_id(stop_id)
+                if parent_public_stop_id and parent_public_stop_id != public_stop_id:
+                    stop_departures.setdefault(parent_public_stop_id, []).append(
+                        (departure_time, trip_id, stop_id, sequence)
+                    )
         if stop_id:
             previous = terminal_by_trip.get(trip_id)
             if previous is None or sequence >= previous[0]:
@@ -1681,9 +1727,9 @@ def build_external_departure_index(
             if not stop_id:
                 continue
             items: list[dict[str, str]] = []
-            for departure_time, trip_id, orig_stop_id, platform_code, sequence in sorted(
+            for departure_time, trip_id, orig_stop_id, sequence in sorted(
                 stop_departures.get(stop_id, []),
-                key=lambda value: (value[0], value[1], value[4]),
+                key=lambda value: (value[0], value[1], value[3]),
             ):
                 meta = trip_meta[trip_id]
                 route_id = meta["route_id"]
@@ -1695,6 +1741,11 @@ def build_external_departure_index(
                         route, route_id
                     )
                 direction_id = meta["direction_id"]
+                stop_metadata = feed_stops.get(orig_stop_id, {})
+                platform_display, floor_display = display_stop_metadata(
+                    stop_metadata.get("stop_desc", ""),
+                    stop_metadata.get("platform_code", ""),
+                )
                 item: dict[str, str] = {
                     "t": _published_id(trip_id, namespace),
                     "r": _published_id(route_id, namespace),
@@ -1705,8 +1756,28 @@ def build_external_departure_index(
                 }
                 if orig_stop_id != stop_id:
                     item["s"] = _published_id(orig_stop_id, namespace)
-                    if platform_code:
-                        item["platform"] = platform_code
+                if platform_display:
+                    item["platform"] = platform_display
+                if floor_display:
+                    item["floor"] = floor_display
+                parent_station = str(stop_metadata.get("parent_station", "") or "").strip()
+                if parent_station:
+                    item["parentStation"] = _published_id(parent_station, namespace)
+                stop_desc = str(stop_metadata.get("stop_desc", "") or "").strip()
+                if stop_desc:
+                    item["stopDesc"] = stop_desc
+                agency_id = str(route.get("agency_id", "") or "").strip()
+                if agency_id:
+                    item["agencyID"] = agency_id
+                agency_name = (
+                    str(route.get("agency_name", "") or "").strip()
+                    or agencies.get(agency_id, "")
+                )
+                if agency_name:
+                    item["operator"] = agency_name
+                route_type = str(route.get("route_type", "") or "").strip()
+                if route_type:
+                    item["routeType"] = route_type
                 items.append(item)
             if items:
                 items.sort(key=lambda item: (item["p"], item["t"], item["r"]))

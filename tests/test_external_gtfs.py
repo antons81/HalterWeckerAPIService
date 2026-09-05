@@ -381,6 +381,7 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
         self.assertEqual(
             {source["id"] for source in sources},
             {
+                "israel-mot",
                 "sweden",
                 "norway",
                 "ireland",

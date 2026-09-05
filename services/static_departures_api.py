@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import sqlite3
@@ -145,6 +146,253 @@ IRELAND_REALTIME_ROOT = Path(
 DEFAULT_APPLE_NOTIFICATION_STORE_PATH = "/data/apple-store-notifications/events.sqlite3"
 
 
+class ExternalStaticData:
+    """Read-only JSON service for generic external GTFS static packages."""
+
+    def __init__(
+        self,
+        root: str,
+        city_id: str = "israel",
+        namespace: str = "israel:",
+        timezone_name: str = "Asia/Jerusalem",
+    ) -> None:
+        self.root = Path(root) if root else None
+        self.city_id = city_id
+        self.namespace = namespace
+        self.timezone_name = timezone_name
+        self.lock = threading.RLock()
+        self.signature = None
+        self.stops: dict[str, dict[str, object]] = {}
+        self.routes: dict[str, dict[str, object]] = {}
+        self.departures: dict[str, list[dict[str, object]]] = {}
+        self.platforms: dict[str, list[str]] = {}
+
+    def _path(self, directory: str, filename: str) -> Path:
+        if self.root is None:
+            raise FileNotFoundError("external static data root is not configured")
+        return self.root / directory / filename
+
+    @staticmethod
+    def _file_signature(path: Path) -> tuple[int, int] | None:
+        try:
+            stat_result = path.stat()
+        except FileNotFoundError:
+            return None
+        return stat_result.st_mtime_ns, stat_result.st_size
+
+    def _load_if_needed(self) -> None:
+        stops_path = self._path("stops", f"{self.city_id}.json")
+        routes_path = self._path("routes", f"{self.city_id}.json")
+        departures_path = self._path("departures", f"{self.city_id}.json")
+        signature = (
+            self._file_signature(stops_path),
+            self._file_signature(routes_path),
+            self._file_signature(departures_path),
+        )
+        if signature == self.signature:
+            return
+        if signature[0] is None or signature[2] is None:
+            raise FileNotFoundError("external static package is incomplete")
+        stops_payload = json.loads(stops_path.read_text(encoding="utf-8"))
+        routes_payload = (
+            json.loads(routes_path.read_text(encoding="utf-8"))
+            if signature[1] is not None
+            else {}
+        )
+        departures_payload = json.loads(departures_path.read_text(encoding="utf-8"))
+        if not isinstance(stops_payload, list) or not isinstance(departures_payload, dict):
+            raise ValueError("invalid external static package")
+        self.stops = {
+            str(item["id"]): item
+            for item in stops_payload
+            if isinstance(item, dict) and item.get("id")
+        }
+        self.routes = (
+            {str(key): value for key, value in routes_payload.items() if isinstance(value, dict)}
+            if isinstance(routes_payload, dict)
+            else {}
+        )
+        raw_departures = departures_payload.get("stops", {})
+        self.departures = (
+            {
+                str(key): value
+                for key, value in raw_departures.items()
+                if isinstance(value, list)
+            }
+            if isinstance(raw_departures, dict)
+            else {}
+        )
+        raw_platforms = departures_payload.get("platforms", {})
+        self.platforms = (
+            {
+                str(key): [str(child) for child in value if child]
+                for key, value in raw_platforms.items()
+                if isinstance(value, list)
+            }
+            if isinstance(raw_platforms, dict)
+            else {}
+        )
+        self.signature = signature
+
+    def _ensure_loaded(self) -> None:
+        with self.lock:
+            self._load_if_needed()
+
+    def _storage_id(self, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or value.startswith(self.namespace):
+            return value
+        return f"{self.namespace}{value}"
+
+    def _public_id(self, value: str) -> str:
+        value = str(value or "")
+        return value[len(self.namespace):] if value.startswith(self.namespace) else value
+
+    def _parent_id(self, stop: dict[str, object]) -> str:
+        return self._storage_id(str(stop.get("parentStation") or ""))
+
+    def _has_valid_parent(self, stop: dict[str, object]) -> bool:
+        parent_id = self._parent_id(stop)
+        parent = self.stops.get(parent_id)
+        return bool(parent and int(parent.get("locationType") or 0) == 1)
+
+    def _visible_stops(self) -> list[dict[str, object]]:
+        return [
+            stop
+            for stop in self.stops.values()
+            if int(stop.get("locationType") or 0) != 0
+            or not self._has_valid_parent(stop)
+        ]
+
+    def _station_payload(self, stop: dict[str, object], include_children: bool = False) -> dict[str, object]:
+        stop_id = str(stop["id"])
+        payload: dict[str, object] = {
+            "id": self._public_id(stop_id),
+            "name": stop.get("name", ""),
+            "latitude": stop.get("latitude"),
+            "longitude": stop.get("longitude"),
+            "locationType": int(stop.get("locationType") or 0),
+            "parentStation": self._public_id(self._parent_id(stop)) or None,
+            "platform": stop.get("platform"),
+            "floor": stop.get("floor"),
+        }
+        children = [
+            child
+            for child in self.stops.values()
+            if self._parent_id(child) == stop_id and int(child.get("locationType") or 0) == 0
+        ]
+        payload["childPlatformCount"] = len(children)
+        if include_children:
+            payload["platforms"] = [
+                self._station_payload(child)
+                for child in sorted(children, key=lambda item: str(item.get("id")))
+            ]
+        return payload
+
+    def nearby(self, latitude: float, longitude: float, radius_meters: float, limit: int) -> list[dict[str, object]]:
+        self._ensure_loaded()
+        matches = []
+        for stop in self._visible_stops():
+            try:
+                stop_latitude = float(stop["latitude"])
+                stop_longitude = float(stop["longitude"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            lat1, lon1, lat2, lon2 = map(math.radians, (latitude, longitude, stop_latitude, stop_longitude))
+            distance = 2 * 6371000 * math.asin(math.sqrt(
+                math.sin((lat2 - lat1) / 2) ** 2
+                + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2
+            ))
+            if distance <= radius_meters:
+                item = self._station_payload(stop)
+                item["distanceMeters"] = round(distance, 1)
+                matches.append(item)
+        matches.sort(key=lambda item: (float(item["distanceMeters"]), str(item["id"])))
+        return matches[:limit]
+
+    def search(self, query: str, limit: int) -> list[dict[str, object]]:
+        self._ensure_loaded()
+        normalized_query = " ".join(query.casefold().split())
+        matches = [
+            self._station_payload(stop)
+            for stop in self._visible_stops()
+            if normalized_query in " ".join(str(stop.get("name", "")).casefold().split())
+        ]
+        return sorted(matches, key=lambda item: (str(item.get("name", "")).casefold(), str(item["id"])))[:limit]
+
+    def station(self, stop_id: str) -> dict[str, object] | None:
+        self._ensure_loaded()
+        stop = self.stops.get(self._storage_id(stop_id))
+        return self._station_payload(stop, include_children=True) if stop else None
+
+    @staticmethod
+    def _departure_seconds(value: object) -> int:
+        try:
+            hour, minute, second = (int(part) for part in str(value).split(":"))
+            return hour * 3600 + minute * 60 + second
+        except (TypeError, ValueError):
+            return 2**31 - 1
+
+    def _raw_departures(self, stop_id: str) -> list[dict[str, object]]:
+        requested = self._storage_id(stop_id)
+        stop = self.stops.get(requested)
+        if stop is None:
+            return []
+        items = list(self.departures.get(requested, []))
+        if int(stop.get("locationType") or 0) == 1 and not items:
+            child_ids = self.platforms.get(requested, [])
+            for child_id in child_ids:
+                items.extend(self.departures.get(child_id, []))
+        return items
+
+    def departures_for(self, stop_id: str, limit: int) -> list[dict[str, object]]:
+        self._ensure_loaded()
+        requested = self._storage_id(stop_id)
+        stop = self.stops.get(requested)
+        if stop is None:
+            return []
+        result = []
+        for item in self._raw_departures(requested):
+            if not isinstance(item, dict):
+                continue
+            route_id = str(item.get("r") or "")
+            route = self.routes.get(route_id, {})
+            actual_stop_id = str(item.get("s") or requested)
+            actual_stop = self.stops.get(actual_stop_id, stop)
+            route_type = str(item.get("routeType") or route.get("type") or "")
+            mode = {
+                "0": "tram", "1": "subway", "2": "train", "3": "bus",
+                "4": "ferry", "5": "cableCar", "6": "gondola", "7": "funicular",
+                "11": "trolleybus", "12": "monorail",
+            }.get(route_type)
+            result.append({
+                "tripID": self._public_id(str(item.get("t") or "")),
+                "routeID": self._public_id(route_id),
+                "line": route.get("short_name") or route.get("shortName") or self._public_id(route_id),
+                "destination": item.get("h") or None,
+                "directionID": item.get("d") or None,
+                "scheduledTime": item.get("p") or None,
+                "scheduledDeparture": item.get("p") or None,
+                "operatorID": item.get("agencyID") or route.get("agency") or None,
+                "operator": item.get("operator") or route.get("agencyName") or None,
+                "stopID": self._public_id(actual_stop_id),
+                "parentStation": self._public_id(str(item.get("parentStation") or actual_stop.get("parentStation") or "")) or None,
+                "platform": item.get("platform") or actual_stop.get("platform") or None,
+                "floor": item.get("floor") or actual_stop.get("floor") or None,
+                "transportMode": mode or "unknown",
+                "routeType": int(route_type) if route_type.isdigit() else None,
+                "isRealtime": False,
+                "source": "scheduled-static",
+            })
+        result.sort(key=lambda item: (
+            self._departure_seconds(item.get("scheduledTime")),
+            str(item.get("tripID") or ""),
+            str(item.get("routeID") or ""),
+            str(item.get("stopID") or ""),
+        ))
+        return result[:limit]
+
+
 class Database:
     @staticmethod
     def _direction_key(route_id: str, direction_id: str | None, destination_stop_id: str | None, destination: str) -> str:
@@ -174,6 +422,12 @@ class Database:
             self.identity = identity
         self.checked_at = now
         return self.connection
+
+    def _table_columns(self, table: str) -> set[str]:
+        return {
+            str(row[1])
+            for row in self._connection().execute(f"PRAGMA table_info({table})")
+        }
 
     def meta(self) -> dict[str, str]:
         with self.lock:
@@ -639,18 +893,37 @@ class Database:
             stop_predicate = f"rs.canonical_stop_id IN ({','.join('?' for _ in canonical_ids)})"
             stop_parameters = canonical_ids
         with self.lock:
+            raw_stop_columns = self._table_columns("raw_stops")
+            route_columns = self._table_columns("routes")
+            has_agencies = bool(self._table_columns("agencies"))
+            platform_expression = (
+                "COALESCE(NULLIF(rs.platform_display,''),NULLIF(rs.platform_code,''))"
+                if "platform_display" in raw_stop_columns
+                else "rs.platform_code"
+            )
+            floor_expression = "rs.floor_display" if "floor_display" in raw_stop_columns else "''"
+            location_type_expression = "rs.location_type" if "location_type" in raw_stop_columns else "0"
+            stop_desc_expression = "rs.stop_desc" if "stop_desc" in raw_stop_columns else "''"
+            agency_id_expression = "r.agency_id" if "agency_id" in route_columns else "''"
+            agency_join = "LEFT JOIN agencies a ON a.agency_id=r.agency_id" if has_agencies and "agency_id" in route_columns else ""
+            agency_name_expression = "a.agency_name" if agency_join else "''"
+            route_type_expression = "r.route_type" if "route_type" in route_columns else "''"
             cursor = self._connection().execute(
                 f"""
                 SELECT a.service_date,s.departure_time,s.departure_seconds,s.stop_sequence,s.raw_stop_id,
                        t.trip_id,t.route_id,
                        COALESCE(NULLIF(r.short_name,''),NULLIF(r.long_name,''),t.route_id),
                        COALESCE(NULLIF(t.headsign,''),NULLIF(destination_stops.stop_name,''),'Unbekanntes Ziel'),
-                       t.direction_id, t.terminal_stop_id, rs.platform_code
+                       t.direction_id, t.terminal_stop_id, {platform_expression},
+                       {floor_expression}, rs.parent_station, {location_type_expression},
+                       {stop_desc_expression}, {agency_id_expression}, {agency_name_expression},
+                       {route_type_expression}
                 FROM stop_times s
                 JOIN raw_stops rs ON rs.stop_id=s.raw_stop_id
                 JOIN trips t ON t.trip_id=s.trip_id
                 JOIN active_services a ON a.service_id=t.service_id
                 LEFT JOIN routes r ON r.route_id=t.route_id
+                {agency_join}
                 LEFT JOIN raw_stops AS destination_stops ON destination_stops.stop_id=t.terminal_stop_id
                 WHERE {stop_predicate} AND a.service_date BETWEEN ? AND ?
                 ORDER BY a.service_date,s.departure_seconds,t.trip_id,s.stop_sequence
@@ -677,9 +950,17 @@ class Database:
                 "platform": platform or None,
                 "stopID": self._public_identifier_multi(raw_stop_id, stop_prefixes),
                 "stopSequence": stop_sequence,
-                "isRealtime": False
+                "isRealtime": False,
+                "operator": operator or None,
+                "agencyID": self._public_identifier_multi(agency_id, identifier_prefixes) if agency_id else None,
+                "parentStation": self._public_identifier_multi(parent_station, stop_prefixes) if parent_station else None,
+                "platformStopID": self._public_identifier_multi(raw_stop_id, stop_prefixes),
+                "floor": floor or None,
+                "stopDesc": stop_desc or None,
+                "locationType": location_type,
+                "routeType": int(route_type) if route_type and str(route_type).isdigit() else None,
             }
-            for service_date, departure_time, _seconds, stop_sequence, raw_stop_id, trip_id, route_id, line, destination, direction, destination_stop_id, platform in rows
+            for service_date, departure_time, _seconds, stop_sequence, raw_stop_id, trip_id, route_id, line, destination, direction, destination_stop_id, platform, floor, parent_station, location_type, stop_desc, agency_id, operator, route_type in rows
             for public_route_id in [self._public_identifier_multi(route_id, identifier_prefixes)]
             for public_destination_stop_id in [self._public_identifier_multi(destination_stop_id, stop_prefixes)]
         ]
@@ -718,6 +999,7 @@ class Handler(BaseHTTPRequestHandler):
         return "HalteWecker"
 
     database: Database
+    external_static_data: ExternalStaticData | None = None
     tfl_gateway: TfLProxy | None = None
     translink_gateway: TransLinkProxy | None = None
     ttc_gateway: TTCProxy | None = None
@@ -823,9 +1105,66 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
+    def send_israel_static(self, parsed_path: str, query: dict[str, list[str]]) -> None:
+        store = self.external_static_data
+        if store is None:
+            return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Israel static data unavailable"})
+        segments = [unquote(part) for part in parsed_path.split("/") if part]
+        try:
+            if segments == ["israel", "stations", "nearby"]:
+                latitude = float((query.get("latitude") or query.get("lat") or [""])[0])
+                longitude = float((query.get("longitude") or query.get("lon") or [""])[0])
+                radius = min(max(float((query.get("radiusMeters") or query.get("radius") or ["3000"])[0]), 1), 50000)
+                payload = {
+                    "timezone": store.timezone_name,
+                    "stations": store.nearby(latitude, longitude, radius, bounded_limit(query.get("limit", [None])[0])),
+                }
+                return self.send_json(HTTPStatus.OK, payload, "public, max-age=60")
+            if segments == ["israel", "stations", "search"]:
+                search_query = (query.get("q") or query.get("query") or [""])[0].strip()
+                if not search_query:
+                    return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "q is required"})
+                payload = {
+                    "timezone": store.timezone_name,
+                    "stations": store.search(search_query, bounded_limit(query.get("limit", [None])[0])),
+                }
+                return self.send_json(HTTPStatus.OK, payload, "public, max-age=60")
+            if len(segments) == 3 and segments[:2] == ["israel", "stations"]:
+                station = store.station(segments[2])
+                if station is None:
+                    return self.send_json(HTTPStatus.NOT_FOUND, {"error": "unknown station"})
+                return self.send_json(HTTPStatus.OK, station, "public, max-age=300")
+            if len(segments) == 4 and segments[:2] == ["israel", "stations"] and segments[3] == "departures":
+                station_id = segments[2]
+                if store.station(station_id) is None:
+                    return self.send_json(HTTPStatus.NOT_FOUND, {"error": "unknown station"})
+                return self.send_json(HTTPStatus.OK, {
+                    "stationID": station_id,
+                    "timezone": store.timezone_name,
+                    "source": "scheduled-static",
+                    "departures": store.departures_for(station_id, bounded_limit(query.get("limit", [None])[0])),
+                }, "public, max-age=60")
+            if len(segments) == 4 and segments[:2] == ["israel", "platforms"] and segments[3] == "departures":
+                platform_id = segments[2]
+                station = store.station(platform_id)
+                if station is None or int(station.get("locationType") or 0) != 0:
+                    return self.send_json(HTTPStatus.NOT_FOUND, {"error": "unknown platform"})
+                return self.send_json(HTTPStatus.OK, {
+                    "platformID": platform_id,
+                    "timezone": store.timezone_name,
+                    "source": "scheduled-static",
+                    "departures": store.departures_for(platform_id, bounded_limit(query.get("limit", [None])[0])),
+                }, "public, max-age=60")
+            return self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError, KeyError):
+            LOGGER.exception("Invalid Israel static request path=%s", parsed_path)
+            return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Israel static data unavailable"})
+
     def do_GET(self) -> None:
         parsed, query = urlparse(self.path), parse_qs(urlparse(self.path).query)
         try:
+            if parsed.path.startswith("/israel/"):
+                return self.send_israel_static(parsed.path, query)
             if parsed.path in self.poland_trip_updates_gateways:
                 response = self.poland_trip_updates_gateways[parsed.path].handle(
                     parsed.path,
@@ -1343,6 +1682,7 @@ def _configure_poland_gateways(database: Database) -> None:
 if __name__ == "__main__":
     database = Database(os.environ.get("DEPARTURES_DATABASE", "/data/departures-current.sqlite"))
     Handler.database = database
+    Handler.external_static_data = ExternalStaticData(STATIC_DATA_ROOT)
     Handler.apple_store_notification_store = AppleStoreNotificationStore(
         os.environ.get(
             "APPLE_NOTIFICATION_STORE_PATH",

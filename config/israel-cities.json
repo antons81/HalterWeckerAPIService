@@ -1,0 +1,32 @@
+[
+  {
+    "id": "israel",
+    "name": "Israel",
+    "aliases": ["ישראל"],
+    "country": "IL",
+    "timezone": "Asia/Jerusalem",
+    "latitude": 31.5,
+    "longitude": 34.9,
+    "radiusMeters": 300000,
+    "packageMode": "external",
+    "externalGTFSProvider": "israel-mot",
+    "staticDepartures": true,
+    "transitRadar": {
+      "providerID": "israel-mot",
+      "adapter": "externalGTFS",
+      "isEnabled": true,
+      "isExperimental": true,
+      "staticOnly": true,
+      "features": ["firstDepartures", "stopLookup"],
+      "staticBaseURL": "https://api.asoftlabs.app",
+      "boardURL": "https://api.asoftlabs.app/static-departures",
+      "staticModes": ["bus", "train", "tram", "lightRail"],
+      "sourceName": "Israel Ministry of Transport",
+      "sourceURL": "https://gtfs.mot.gov.il/gtfsfiles/",
+      "sourceType": "official",
+      "license": "Israel Ministry of Transport GTFS terms",
+      "attribution": "Israel Ministry of Transport",
+      "statusMessage": "Statische Israel-GTFS-Abfahrten"
+    }
+  }
+]

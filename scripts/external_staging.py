@@ -17,6 +17,11 @@ try:
 except ImportError:
     from gtfs_csv import normalized_dict_reader
 
+try:
+    from .gtfs_stop_metadata import display_stop_metadata
+except ImportError:
+    from gtfs_stop_metadata import display_stop_metadata
+
 
 def legacy_int_or_none(value: object, default: int = 0) -> int | None:
     """Match the legacy int(value or default) conversion exactly."""
@@ -286,7 +291,8 @@ class NormalizedProviderContext:
                 route_short_name TEXT NOT NULL,
                 route_long_name TEXT NOT NULL,
                 route_type TEXT NOT NULL,
-                agency_id TEXT NOT NULL
+                agency_id TEXT NOT NULL,
+                agency_name TEXT NOT NULL
             );
             CREATE TABLE stops (
                 stop_id TEXT NOT NULL,
@@ -296,7 +302,10 @@ class NormalizedProviderContext:
                 stop_code TEXT NOT NULL,
                 parent_station TEXT NOT NULL,
                 location_type INTEGER NOT NULL,
-                platform_code TEXT NOT NULL
+                platform_code TEXT NOT NULL,
+                stop_desc TEXT NOT NULL,
+                platform_display TEXT NOT NULL,
+                floor_display TEXT NOT NULL
             );
             CREATE TABLE trips (
                 trip_id TEXT NOT NULL,
@@ -355,8 +364,13 @@ class NormalizedProviderContext:
         except ImportError:
             from build_german_departure_index import parse_gtfs_time
 
+        agencies = {
+            str(row.get("agency_id", "")).strip(): str(row.get("agency_name", "") or "").strip()
+            for row in _iter_table(archive, "agency.txt")
+            if str(row.get("agency_id", "")).strip()
+        }
         self.connection.executemany(
-            "INSERT INTO routes VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO routes VALUES (?, ?, ?, ?, ?, ?)",
             (
                 (
                     str(row.get("route_id", "")),
@@ -364,6 +378,7 @@ class NormalizedProviderContext:
                     str(row.get("route_long_name", "")),
                     str(row.get("route_type", "3")),
                     str(row.get("agency_id", "")),
+                    agencies.get(str(row.get("agency_id", "")).strip(), ""),
                 )
                 for row in _iter_table(archive, "routes.txt")
                 if row.get("route_id")
@@ -372,7 +387,7 @@ class NormalizedProviderContext:
         self.connection.commit()
 
         self.connection.executemany(
-            "INSERT INTO stops VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO stops VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 (
                     str(row.get("stop_id", "")),
@@ -385,6 +400,13 @@ class NormalizedProviderContext:
                     if str(row.get("location_type", "0") or "0").strip().isdigit()
                     else 0,
                     str(row.get("platform_code", "") or ""),
+                    str(row.get("stop_desc", "") or ""),
+                    display_stop_metadata(
+                        row.get("stop_desc", ""), row.get("platform_code", "")
+                    )[0],
+                    display_stop_metadata(
+                        row.get("stop_desc", ""), row.get("platform_code", "")
+                    )[1],
                 )
                 for row in _iter_table(archive, "stops.txt")
                 if row.get("stop_id")
@@ -502,6 +524,7 @@ class NormalizedProviderContext:
                     "route_long_name",
                     "route_type",
                     "agency_id",
+                    "agency_name",
                 ),
             ),
             "stops.txt": (
@@ -515,6 +538,9 @@ class NormalizedProviderContext:
                     "parent_station",
                     "location_type",
                     "platform_code",
+                    "stop_desc",
+                    "platform_display",
+                    "floor_display",
                 ),
             ),
             "trips.txt": (
@@ -852,12 +878,18 @@ class ExternalDepartureStage:
                 parent_station TEXT NOT NULL,
                 stop_name TEXT NOT NULL,
                 platform_code TEXT NOT NULL,
-                location_type INTEGER NOT NULL
+                location_type INTEGER NOT NULL,
+                stop_desc TEXT NOT NULL,
+                platform_display TEXT NOT NULL,
+                floor_display TEXT NOT NULL
             ) WITHOUT ROWID;
             CREATE TABLE routes (
                 route_id TEXT PRIMARY KEY,
                 short_name TEXT NOT NULL,
-                long_name TEXT NOT NULL
+                long_name TEXT NOT NULL,
+                route_type TEXT NOT NULL,
+                agency_id TEXT NOT NULL,
+                agency_name TEXT NOT NULL
             ) WITHOUT ROWID;
             CREATE TABLE active_trips (
                 trip_id TEXT PRIMARY KEY,
@@ -929,20 +961,28 @@ class ExternalDepartureStage:
             return _iter_table(archive, filename)
 
         started = time.monotonic()
+        agencies = {
+            str(row.get("agency_id", "")).strip(): str(row.get("agency_name", "") or "").strip()
+            for row in _iter_table(archive, "agency.txt")
+            if str(row.get("agency_id", "")).strip()
+        }
         self.connection.executemany(
-            "INSERT INTO routes VALUES (?, ?, ?)",
+            "INSERT INTO routes VALUES (?, ?, ?, ?, ?, ?)",
             (
                 (
                     str(row.get("route_id", "")).strip(),
                     str(row.get("route_short_name", "")).strip(),
                     str(row.get("route_long_name", "")).strip(),
+                    str(row.get("route_type", "3")).strip(),
+                    str(row.get("agency_id", "")).strip(),
+                    agencies.get(str(row.get("agency_id", "")).strip(), ""),
                 )
                 for row in source_rows("routes.txt")
                 if str(row.get("route_id", "")).strip()
             ),
         )
         self.connection.executemany(
-            "INSERT INTO feed_stops VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO feed_stops VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 (
                     str(row.get("stop_id", "")).strip(),
@@ -952,6 +992,13 @@ class ExternalDepartureStage:
                     int(str(row.get("location_type", "0") or "0"))
                     if str(row.get("location_type", "0") or "0").strip().isdigit()
                     else 0,
+                    str(row.get("stop_desc", "") or "").strip(),
+                    display_stop_metadata(
+                        row.get("stop_desc", ""), row.get("platform_code", "")
+                    )[0],
+                    display_stop_metadata(
+                        row.get("stop_desc", ""), row.get("platform_code", "")
+                    )[1],
                 )
                 for row in source_rows("stops.txt")
                 if str(row.get("stop_id", "")).strip()
@@ -1043,6 +1090,19 @@ class ExternalDepartureStage:
             JOIN resolved_stops resolved ON resolved.stop_id=raw.stop_id
             JOIN feed_stops feed ON feed.stop_id=raw.stop_id
             WHERE resolved.public_stop_id IS NOT NULL;
+            INSERT OR IGNORE INTO departures(
+                public_stop_id, departure_time, trip_id, original_stop_id, platform_code, sequence
+            )
+            SELECT parent_resolved.public_stop_id, raw.departure_time, raw.trip_id, raw.stop_id,
+                   feed.platform_code, raw.sequence
+            FROM raw_stop_times raw
+            JOIN active_trips active ON active.trip_id=raw.trip_id
+            JOIN resolved_stops resolved ON resolved.stop_id=raw.stop_id
+            JOIN feed_stops feed ON feed.stop_id=raw.stop_id
+            JOIN resolved_stops parent_resolved
+              ON parent_resolved.stop_id=feed.parent_station
+            WHERE parent_resolved.public_stop_id IS NOT NULL
+              AND parent_resolved.public_stop_id != resolved.public_stop_id;
             """
         )
         log_memory_stage("departure-sql-materialization", started=started)
@@ -1056,10 +1116,13 @@ class ExternalDepartureStage:
             child = self.connection.execute(
                 "SELECT public_stop_id FROM resolved_stops WHERE stop_id=?", (child_id,)
             ).fetchone()
-            if child and child[0] and child[0] != child_id:
+            parent = self.connection.execute(
+                "SELECT public_stop_id FROM resolved_stops WHERE stop_id=?", (parent_id,)
+            ).fetchone()
+            if child and child[0] and parent and parent[0]:
                 self.connection.execute(
                     "INSERT OR IGNORE INTO platforms VALUES (?, ?)",
-                    (child[0], child_id),
+                    (parent[0], child_id),
                 )
         self.connection.commit()
         log_memory_stage("departure-platforms", started=started)
@@ -1094,14 +1157,17 @@ class ExternalDepartureStage:
                         stream.write(",")
                     stream.write(json.dumps(published_id, ensure_ascii=False) + ":[")
                     first_item = True
-                    for departure_time, trip_id, original_stop_id, platform_code, sequence, route_id, headsign, direction_id, short_name, long_name, terminal_stop_id, terminal_name in self.connection.execute(
+                    for departure_time, trip_id, original_stop_id, platform_code, platform_display, floor_display, parent_station, stop_desc, sequence, route_id, headsign, direction_id, short_name, long_name, route_type, agency_id, agency_name, terminal_stop_id, terminal_name in self.connection.execute(
                         """
-                        SELECT d.departure_time, d.trip_id, d.original_stop_id, d.platform_code, d.sequence,
-                               t.route_id, t.headsign, t.direction_id, r.short_name, r.long_name,
+                        SELECT d.departure_time, d.trip_id, d.original_stop_id, d.platform_code,
+                               feed.platform_display, feed.floor_display, feed.parent_station,
+                               feed.stop_desc, d.sequence, t.route_id, t.headsign, t.direction_id,
+                               r.short_name, r.long_name, r.route_type, r.agency_id, r.agency_name,
                                terminal.stop_id, terminal_feed.stop_name
                         FROM departures d
                         JOIN active_trips t ON t.trip_id=d.trip_id
                         LEFT JOIN routes r ON r.route_id=t.route_id
+                        LEFT JOIN feed_stops feed ON feed.stop_id=d.original_stop_id
                         LEFT JOIN terminal_stops terminal ON terminal.trip_id=d.trip_id
                         LEFT JOIN feed_stops terminal_feed ON terminal_feed.stop_id=terminal.stop_id
                         WHERE d.public_stop_id=?
@@ -1120,8 +1186,20 @@ class ExternalDepartureStage:
                         }
                         if original_stop_id != raw_id:
                             item["s"] = f"{namespace}{original_stop_id}" if namespace else original_stop_id
-                            if platform_code:
-                                item["platform"] = platform_code
+                        if platform_display:
+                            item["platform"] = platform_display
+                        if floor_display:
+                            item["floor"] = floor_display
+                        if parent_station:
+                            item["parentStation"] = f"{namespace}{parent_station}" if namespace else parent_station
+                        if stop_desc:
+                            item["stopDesc"] = stop_desc
+                        if agency_id:
+                            item["agencyID"] = agency_id
+                        if agency_name:
+                            item["operator"] = agency_name
+                        if route_type:
+                            item["routeType"] = route_type
                         if not first_item:
                             stream.write(",")
                         stream.write(canonical_json(item))
@@ -1135,9 +1213,10 @@ class ExternalDepartureStage:
                     for published_id in city_stop_ids.get(city_id, set())
                 }
                 for (parent_id,) in self.connection.execute(
-                    "SELECT DISTINCT parent_id FROM platforms WHERE parent_id IN (%s) ORDER BY parent_id" % ",".join("?" for _ in raw_city_ids),
-                    tuple(raw_city_ids),
+                    "SELECT DISTINCT parent_id FROM platforms ORDER BY parent_id"
                 ) if raw_city_ids else ():
+                    if parent_id not in raw_city_ids:
+                        continue
                     if not first_platform:
                         stream.write(",")
                     published_parent = f"{namespace}{parent_id}" if namespace else parent_id
