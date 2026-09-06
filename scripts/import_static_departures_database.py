@@ -747,6 +747,10 @@ def add_external_gtfs(
     # Older releases may predate the route index. Ensure incremental and
     # provider-scoped rebuilds do not carry that performance regression forward.
     connection.execute("CREATE INDEX IF NOT EXISTS trips_by_route ON trips(route_id, trip_id)")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS stop_times_by_stop_departure "
+        "ON stop_times(raw_stop_id, departure_seconds, trip_id, stop_sequence)"
+    )
     sources = load_external_gtfs_sources(sources_path)
     sources_by_id = {str(source["id"]): source for source in sources}
     unknown = sorted(set(url_by_provider) - set(sources_by_id))
@@ -1080,6 +1084,8 @@ def main() -> None:
                 ) WITHOUT ROWID;
                 CREATE INDEX raw_stops_by_canonical ON raw_stops(canonical_stop_id, stop_id);
                 CREATE INDEX stop_times_by_stop ON stop_times(raw_stop_id, trip_id, departure_seconds);
+                CREATE INDEX IF NOT EXISTS stop_times_by_stop_departure
+                    ON stop_times(raw_stop_id, departure_seconds, trip_id, stop_sequence);
                 CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
                 CREATE TABLE city_departure_modes (
                     city_id TEXT PRIMARY KEY,

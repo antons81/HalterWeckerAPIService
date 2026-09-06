@@ -195,6 +195,8 @@ def connect(database_path: Path) -> sqlite3.Connection:
             stop_sequence INTEGER NOT NULL
         );
         CREATE INDEX stop_times_by_trip ON stop_times(trip_id, stop_sequence);
+        CREATE INDEX stop_times_by_stop_departure
+            ON stop_times(raw_stop_id, departure_seconds, trip_id, stop_sequence);
         """
     )
     ensure_ownership_schema(connection)

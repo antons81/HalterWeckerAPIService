@@ -7,8 +7,10 @@ import json
 import logging
 import math
 import os
+import resource
 import shutil
 import sqlite3
+import sys
 import threading
 import time
 import unicodedata
@@ -147,6 +149,37 @@ IRELAND_REALTIME_ROOT = Path(
 DEFAULT_APPLE_NOTIFICATION_STORE_PATH = "/data/apple-store-notifications/events.sqlite3"
 
 
+def _rss_kib() -> int:
+    """Return current RSS in KiB on Linux, or the process peak elsewhere."""
+    try:
+        with Path("/proc/self/status").open(encoding="ascii") as status_file:
+            for line in status_file:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return int(value / 1024) if sys.platform == "darwin" else int(value)
+
+
+def log_memory_stage(stage: str, **fields: object) -> None:
+    """Log opt-in process memory checkpoints without changing normal startup."""
+    enabled = os.environ.get("STATIC_DEPARTURES_MEMORY_INSTRUMENTATION", "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return
+    details = [f"stage={stage}", f"rss_kib={_rss_kib()}"]
+    peak_rss_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    details.append(
+        f"peak_rss_kib={int(peak_rss_kib / 1024) if sys.platform == 'darwin' else int(peak_rss_kib)}"
+    )
+    details.extend(
+        f"{key}={value}"
+        for key, value in fields.items()
+        if value is not None
+    )
+    print("[StaticDeparturesMemory] " + " ".join(details), flush=True)
+
+
 class ExternalStaticData:
     """Read-only JSON service for generic external GTFS static packages."""
 
@@ -157,6 +190,7 @@ class ExternalStaticData:
         namespace: str = "israel:",
         timezone_name: str = "Asia/Jerusalem",
         now_provider: Callable[[], datetime] | None = None,
+        database: Database | None = None,
     ) -> None:
         self.root = Path(root) if root else None
         self.city_id = city_id
@@ -164,6 +198,7 @@ class ExternalStaticData:
         self.timezone_name = timezone_name
         self.timezone = ZoneInfo(timezone_name)
         self.now_provider = now_provider or (lambda: datetime.now(self.timezone))
+        self.database = database
         self.lock = threading.RLock()
         self.signature = None
         self.stops: dict[str, dict[str, object]] = {}
@@ -186,24 +221,44 @@ class ExternalStaticData:
 
     def _load_if_needed(self) -> None:
         stops_path = self._path("stops", f"{self.city_id}.json")
-        routes_path = self._path("routes", f"{self.city_id}.json")
-        departures_path = self._path("departures", f"{self.city_id}.json")
+        routes_path = (
+            self._path("routes", f"{self.city_id}.json")
+            if self.database is None
+            else None
+        )
+        departures_path = (
+            self._path("departures", f"{self.city_id}.json")
+            if self.database is None
+            else None
+        )
         signature = (
             self._file_signature(stops_path),
-            self._file_signature(routes_path),
-            self._file_signature(departures_path),
+            self._file_signature(routes_path) if routes_path is not None else None,
+            self._file_signature(departures_path) if departures_path is not None else None,
         )
         if signature == self.signature:
             return
-        if signature[0] is None or signature[2] is None:
+        if signature[0] is None or (self.database is None and signature[2] is None):
             raise FileNotFoundError("external static package is incomplete")
+        log_memory_stage(
+            "external-before-load",
+            city=self.city_id,
+            stops_bytes=signature[0][1],
+            routes_bytes=signature[1][1] if signature[1] is not None else 0,
+            departures_bytes=signature[2][1] if signature[2] is not None else 0,
+            departures_source="sqlite" if self.database is not None else "json",
+        )
         stops_payload = json.loads(stops_path.read_text(encoding="utf-8"))
         routes_payload = (
             json.loads(routes_path.read_text(encoding="utf-8"))
-            if signature[1] is not None
+            if routes_path is not None and signature[1] is not None
             else {}
         )
-        departures_payload = json.loads(departures_path.read_text(encoding="utf-8"))
+        departures_payload = (
+            json.loads(departures_path.read_text(encoding="utf-8"))
+            if departures_path is not None
+            else {}
+        )
         if not isinstance(stops_payload, list) or not isinstance(departures_payload, dict):
             raise ValueError("invalid external static package")
         self.stops = {}
@@ -215,13 +270,34 @@ class ExternalStaticData:
             if item.get("parentStation"):
                 normalized["parentStation"] = self._storage_id(str(item["parentStation"]))
             self.stops[normalized["id"]] = normalized
+        log_memory_stage(
+            "external-after-stops",
+            city=self.city_id,
+            stop_records=len(self.stops),
+            raw_stop_records=len(stops_payload),
+        )
         self.routes = (
             {str(key): value for key, value in routes_payload.items() if isinstance(value, dict)}
             if isinstance(routes_payload, dict)
             else {}
         )
+        log_memory_stage(
+            "external-after-routes",
+            city=self.city_id,
+            route_records=len(self.routes),
+            raw_route_records=len(routes_payload) if isinstance(routes_payload, dict) else 0,
+            routes_source="sqlite" if self.database is not None else "json",
+            status="not-loaded-by-api" if self.database is not None else "completed",
+        )
+        log_memory_stage(
+            "external-after-trips",
+            city=self.city_id,
+            trip_records=0,
+            status="not-loaded-by-api",
+        )
         raw_departures = departures_payload.get("stops", {})
         self.departures = {}
+        departure_count = 0
         if isinstance(raw_departures, dict):
             for key, value in raw_departures.items():
                 if not isinstance(value, list):
@@ -236,9 +312,19 @@ class ExternalStaticData:
                     if item.get("parentStation"):
                         normalized_item["parentStation"] = self._storage_id(str(item["parentStation"]))
                     normalized_items.append(normalized_item)
+                departure_count += len(normalized_items)
                 self.departures[self._storage_id(str(key))] = normalized_items
+        log_memory_stage(
+            "external-after-departures",
+            city=self.city_id,
+            departure_stop_keys=len(self.departures),
+            departure_records=departure_count,
+            raw_departure_stop_keys=len(raw_departures) if isinstance(raw_departures, dict) else 0,
+            departures_source="sqlite" if self.database is not None else "json",
+        )
         raw_platforms = departures_payload.get("platforms", {})
         self.platforms = {}
+        platform_link_count = 0
         if isinstance(raw_platforms, dict):
             for key, value in raw_platforms.items():
                 if not isinstance(value, list):
@@ -250,6 +336,13 @@ class ExternalStaticData:
                         child_id = self._storage_id(str(child))
                         if child_id not in child_ids:
                             child_ids.append(child_id)
+                            platform_link_count += 1
+        log_memory_stage(
+            "external-after-hierarchy-indexes",
+            city=self.city_id,
+            parent_indexes=len(self.platforms),
+            platform_links=platform_link_count,
+        )
         self.signature = signature
 
     def _ensure_loaded(self) -> None:
@@ -421,6 +514,14 @@ class ExternalStaticData:
         from_datetime: datetime | None = None,
     ) -> list[dict[str, object]]:
         self._ensure_loaded()
+        if self.database is not None:
+            return self.database.external_departures_for(
+                self.city_id,
+                stop_id,
+                limit,
+                from_datetime,
+                self.timezone_name,
+            )
         requested = self._storage_id(stop_id)
         stop = self.stops.get(requested)
         if stop is None:
@@ -508,6 +609,7 @@ class Database:
             self.connection = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, check_same_thread=False)
             self.connection.execute("PRAGMA query_only=ON")
             self.identity = identity
+            log_memory_stage("after-db-open", database=self.path)
         self.checked_at = now
         return self.connection
 
@@ -524,6 +626,7 @@ class Database:
                 metadata = dict(cursor.fetchall())
             finally:
                 cursor.close()
+            log_memory_stage("after-metadata-load", metadata_entries=len(metadata))
             return metadata
 
     def close(self) -> None:
@@ -959,6 +1062,203 @@ class Database:
             for public_route_id in [self._public_identifier_multi(route_id, identifier_prefixes)]
             for public_destination_stop_id in [self._public_identifier_multi(destination_stop_id, stop_prefixes)]
         ]
+
+    def _external_stop_time_ids(self, city_id: str, stop_id: str) -> tuple[str, ...]:
+        _, _, stop_id_prefix, _ = self.city_departure_mode(city_id)
+        internal_stop_id = (
+            stop_id
+            if not stop_id_prefix or stop_id.startswith(stop_id_prefix)
+            else f"{stop_id_prefix}{stop_id}"
+        )
+        raw_stop_columns = self._table_columns("raw_stops")
+        parent_expression = "parent_station" if "parent_station" in raw_stop_columns else "''"
+        location_type_expression = "location_type" if "location_type" in raw_stop_columns else "0"
+        with self.lock:
+            row = self._connection().execute(
+                f"SELECT stop_id, {location_type_expression} FROM raw_stops WHERE stop_id=?",
+                (internal_stop_id,),
+            ).fetchone()
+            if row is None or int(row[1] or 0) != 1:
+                return (internal_stop_id,)
+            children = self._connection().execute(
+                f"""
+                SELECT stop_id
+                FROM raw_stops
+                WHERE {parent_expression}=? AND {location_type_expression}=0
+                ORDER BY stop_id
+                """,
+                (internal_stop_id,),
+            ).fetchall()
+        return (internal_stop_id, *(str(child[0]) for child in children))
+
+    @staticmethod
+    def _external_departure_datetime(
+        service_date: object,
+        departure_time: object,
+        timezone: ZoneInfo,
+    ) -> datetime | None:
+        try:
+            raw_date = str(service_date)
+            parsed_date = datetime.strptime(raw_date, "%Y%m%d").date()
+            hour, minute, second = (int(part) for part in str(departure_time).split(":"))
+        except (TypeError, ValueError):
+            return None
+        if hour < 0 or minute not in range(60) or second not in range(60):
+            return None
+        return datetime(
+            parsed_date.year,
+            parsed_date.month,
+            parsed_date.day,
+            tzinfo=timezone,
+        ) + timedelta(hours=hour, minutes=minute, seconds=second)
+
+    def external_departures_for(
+        self,
+        city_id: str,
+        stop_id: str,
+        limit: int,
+        from_datetime: datetime | None,
+        timezone_name: str,
+        now_provider: Callable[[], datetime] | None = None,
+    ) -> list[dict[str, object]]:
+        timezone = ZoneInfo(timezone_name)
+        lower_bound = from_datetime or (now_provider() if now_provider is not None else datetime.now(timezone))
+        if lower_bound.tzinfo is None:
+            lower_bound = lower_bound.replace(tzinfo=timezone)
+        lower_bound = lower_bound.astimezone(timezone)
+        stop_ids = self._external_stop_time_ids(city_id, stop_id)
+        if not stop_ids:
+            return []
+
+        raw_stop_columns = self._table_columns("raw_stops")
+        route_columns = self._table_columns("routes")
+        stop_time_columns = self._table_columns("stop_times")
+        agency_columns = self._table_columns("agencies")
+        platform_expression = (
+            "COALESCE(NULLIF(rs.platform_display,''),NULLIF(rs.platform_code,''))"
+            if "platform_display" in raw_stop_columns
+            else "rs.platform_code"
+        )
+        floor_expression = "rs.floor_display" if "floor_display" in raw_stop_columns else "''"
+        parent_expression = "rs.parent_station" if "parent_station" in raw_stop_columns else "''"
+        agency_id_expression = "r.agency_id" if "agency_id" in route_columns else "''"
+        agency_join = (
+            "LEFT JOIN agencies ag ON ag.agency_id=r.agency_id"
+            if "agency_name" in agency_columns and "agency_id" in route_columns
+            else ""
+        )
+        agency_name_expression = "ag.agency_name" if agency_join else "''"
+        route_type_expression = "r.route_type" if "route_type" in route_columns else "''"
+        departure_seconds_expression = (
+            "s.departure_seconds"
+            if "departure_seconds" in stop_time_columns
+            else ""
+            "CAST(substr(s.departure_time, 1, instr(s.departure_time, ':') - 1) AS INTEGER) * 3600 "
+            "+ CAST(substr(s.departure_time, instr(s.departure_time, ':') + 1, 2) AS INTEGER) * 60 "
+            "+ CAST(substr(s.departure_time, length(s.departure_time) - 1, 2) AS INTEGER)"
+        )
+        service_day_expression = (
+            "julianday(substr(a.service_date,1,4) || '-' || "
+            "substr(a.service_date,5,2) || '-' || substr(a.service_date,7,2))"
+        )
+        absolute_key = f"({service_day_expression} + ({departure_seconds_expression}) / 86400.0)"
+        placeholders = ",".join("?" for _ in stop_ids)
+        service_from = (lower_bound.date() - timedelta(days=1)).strftime("%Y%m%d")
+        service_to = (lower_bound.date() + timedelta(days=1)).strftime("%Y%m%d")
+        lower_date = lower_bound.date().isoformat()
+        lower_seconds = (
+            lower_bound.hour * 3600
+            + lower_bound.minute * 60
+            + lower_bound.second
+            + lower_bound.microsecond / 1_000_000
+        )
+        requested_limit = max(1, int(limit))
+        stop_prefixes, identifier_prefixes = self.city_departure_prefixes(city_id)
+        query = f"""
+            SELECT a.service_date, s.departure_time, s.stop_sequence, s.raw_stop_id,
+                   t.trip_id, t.route_id,
+                   COALESCE(NULLIF(r.short_name,''),NULLIF(r.long_name,''),t.route_id),
+                   COALESCE(NULLIF(t.headsign,''),NULLIF(destination_stops.stop_name,''),'Unbekanntes Ziel'),
+                   t.direction_id, {platform_expression}, {floor_expression},
+                   {parent_expression}, {agency_id_expression}, {agency_name_expression},
+                   {route_type_expression}
+            FROM stop_times s
+            JOIN raw_stops rs ON rs.stop_id=s.raw_stop_id
+            JOIN trips t ON t.trip_id=s.trip_id
+            JOIN active_services a ON a.service_id=t.service_id
+            LEFT JOIN routes r ON r.route_id=t.route_id
+            {agency_join}
+            LEFT JOIN raw_stops AS destination_stops ON destination_stops.stop_id=t.terminal_stop_id
+            WHERE s.raw_stop_id IN ({placeholders})
+              AND a.service_date BETWEEN ? AND ?
+              AND {absolute_key} >= julianday(?) + ? / 86400.0
+            ORDER BY {absolute_key}, t.trip_id, t.route_id, s.raw_stop_id, s.stop_sequence
+            LIMIT ?
+        """
+        parameters = (*stop_ids, service_from, service_to, lower_date, lower_seconds, requested_limit)
+        with self.lock:
+            rows = self._connection().execute(query, parameters).fetchall()
+
+        result: list[tuple[datetime, dict[str, object]]] = []
+        for (
+            service_date,
+            departure_time,
+            stop_sequence,
+            raw_stop_id,
+            trip_id,
+            route_id,
+            line,
+            destination,
+            direction,
+            platform,
+            floor,
+            parent_station,
+            agency_id,
+            operator,
+            route_type,
+        ) in rows:
+            absolute_departure = self._external_departure_datetime(
+                service_date,
+                departure_time,
+                timezone,
+            )
+            if absolute_departure is None or absolute_departure < lower_bound:
+                continue
+            public_route_id = self._public_identifier_multi(route_id, identifier_prefixes)
+            public_stop_id = self._public_identifier_multi(raw_stop_id, stop_prefixes)
+            route_type_value = str(route_type or "")
+            mode = {
+                "0": "tram", "1": "subway", "2": "train", "3": "bus",
+                "4": "ferry", "5": "cableCar", "6": "gondola", "7": "funicular",
+                "11": "trolleybus", "12": "monorail",
+            }.get(route_type_value)
+            result.append((absolute_departure, {
+                "tripID": self._public_identifier_multi(trip_id, identifier_prefixes),
+                "routeID": public_route_id,
+                "line": line or public_route_id,
+                "destination": destination or None,
+                "directionID": direction or None,
+                "scheduledTime": departure_time or None,
+                "scheduledDeparture": departure_time or None,
+                "operatorID": self._public_identifier_multi(agency_id, identifier_prefixes) if agency_id else None,
+                "operator": operator or None,
+                "stopID": public_stop_id,
+                "parentStation": self._public_identifier_multi(parent_station, stop_prefixes) if parent_station else None,
+                "platform": platform or None,
+                "floor": floor or None,
+                "transportMode": mode or "unknown",
+                "routeType": int(route_type_value) if route_type_value.isdigit() else None,
+                "isRealtime": False,
+                "source": "scheduled-static",
+            }))
+        result.sort(key=lambda entry: (
+            entry[0],
+            str(entry[1].get("tripID") or ""),
+            str(entry[1].get("routeID") or ""),
+            str(entry[1].get("stopID") or ""),
+            int(entry[1].get("stopSequence") or 0),
+        ))
+        return [item for _, item in result[:requested_limit]]
 
     def board(
         self,
@@ -1786,9 +2086,14 @@ def _configure_poland_gateways(database: Database) -> None:
 
 
 if __name__ == "__main__":
-    database = Database(os.environ.get("DEPARTURES_DATABASE", "/data/departures-current.sqlite"))
+    database_path = os.environ.get("DEPARTURES_DATABASE", "/data/departures-current.sqlite")
+    log_memory_stage("before-db-open", database=database_path)
+    database = Database(database_path)
     Handler.database = database
-    Handler.external_static_data = ExternalStaticData(STATIC_DATA_ROOT)
+    Handler.external_static_data = ExternalStaticData(
+        STATIC_DATA_ROOT,
+        database=database,
+    )
     Handler.apple_store_notification_store = AppleStoreNotificationStore(
         os.environ.get(
             "APPLE_NOTIFICATION_STORE_PATH",

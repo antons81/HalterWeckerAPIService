@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -11,7 +12,7 @@ from urllib.request import urlopen
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))
-from static_departures_api import ExternalStaticData, Handler
+from static_departures_api import Database, ExternalStaticData, Handler
 
 
 class IsraelStaticAPITests(unittest.TestCase):
@@ -191,6 +192,174 @@ class IsraelStaticAPITests(unittest.TestCase):
         self.assertEqual(ordinary["departures"][0]["stopID"], "ordinary")
         self.assertEqual(ordinary["departures"][0]["destination"], "Ordinary Destination")
         self.assertEqual(ordinary["departures"][0]["operator"], "Egged")
+
+    def test_sqlite_departures_do_not_load_departure_json(self) -> None:
+        root = Path(self.temp.name) / "sqlite-static"
+        (root / "stops").mkdir(parents=True)
+        (root / "routes").mkdir()
+        (root / "departures").mkdir()
+        stops = [
+            {
+                "id": "12961",
+                "name": "Central Station",
+                "latitude": 32.0,
+                "longitude": 34.8,
+                "locationType": 1,
+            },
+            {
+                "id": "36168",
+                "name": "Platform 627",
+                "latitude": 32.0,
+                "longitude": 34.8,
+                "locationType": 0,
+                "parentStation": "12961",
+                "platform": "627",
+                "floor": "6",
+            },
+            {
+                "id": "36169",
+                "name": "Platform 628",
+                "latitude": 32.0,
+                "longitude": 34.8,
+                "locationType": 0,
+                "parentStation": "12961",
+                "platform": "628",
+                "floor": "6",
+            },
+        ]
+        (root / "stops/israel.json").write_text(json.dumps(stops), encoding="utf-8")
+        (root / "routes/israel.json").write_text("not-json", encoding="utf-8")
+        (root / "departures/israel.json").write_text("not-json", encoding="utf-8")
+
+        database_path = root / "departures.sqlite"
+        connection = sqlite3.connect(database_path)
+        connection.executescript(
+            """
+            CREATE TABLE city_departure_modes (
+                city_id TEXT PRIMARY KEY,
+                mode TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                stop_id_prefix TEXT NOT NULL,
+                identifier_prefix TEXT NOT NULL
+            );
+            CREATE TABLE raw_stops (
+                stop_id TEXT PRIMARY KEY,
+                parent_station TEXT NOT NULL,
+                stop_name TEXT NOT NULL,
+                platform_code TEXT NOT NULL,
+                location_type INTEGER NOT NULL,
+                platform_display TEXT NOT NULL,
+                floor_display TEXT NOT NULL,
+                canonical_stop_id TEXT
+            );
+            CREATE TABLE routes (
+                route_id TEXT PRIMARY KEY,
+                short_name TEXT NOT NULL,
+                long_name TEXT NOT NULL,
+                route_type TEXT NOT NULL,
+                agency_id TEXT NOT NULL
+            );
+            CREATE TABLE agencies (agency_id TEXT PRIMARY KEY, agency_name TEXT NOT NULL);
+            CREATE TABLE trips (
+                trip_id TEXT PRIMARY KEY,
+                service_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                headsign TEXT NOT NULL,
+                direction_id TEXT NOT NULL,
+                terminal_stop_id TEXT NOT NULL
+            );
+            CREATE TABLE active_services (service_id TEXT NOT NULL, service_date TEXT NOT NULL);
+            CREATE TABLE stop_times (
+                trip_id TEXT NOT NULL,
+                raw_stop_id TEXT NOT NULL,
+                departure_time TEXT NOT NULL,
+                departure_seconds INTEGER NOT NULL,
+                stop_sequence INTEGER NOT NULL
+            );
+            CREATE INDEX stop_times_by_stop
+                ON stop_times(raw_stop_id, departure_seconds, trip_id, stop_sequence);
+            INSERT INTO city_departure_modes VALUES
+                ('israel', 'canonical', 'Asia/Jerusalem', 'israel:', 'israel:');
+            INSERT INTO raw_stops VALUES
+                ('israel:12961', '', 'Central Station', '', 1, '', '', 'israel:12961'),
+                ('israel:36168', 'israel:12961', 'Platform 627', '627', 0, '627', '6', 'israel:12961'),
+                ('israel:36169', 'israel:12961', 'Platform 628', '628', 0, '628', '6', 'israel:12961');
+            INSERT INTO routes VALUES
+                ('israel:route-a', 'A1', 'Route A', '3', 'israel:egg');
+            INSERT INTO agencies VALUES ('israel:egg', 'Egged');
+            INSERT INTO trips VALUES
+                ('israel:trip-1205', 'svc', 'israel:route-a', 'Bat Yam', '0', ''),
+                ('israel:trip-1230', 'svc', 'israel:route-a', 'Tel Aviv', '0', ''),
+                ('israel:trip-2405', 'svc', 'israel:route-a', 'Bat Yam', '0', ''),
+                ('israel:trip-2510', 'svc', 'israel:route-a', 'Bat Yam', '0', ''),
+                ('israel:trip-next', 'svc', 'israel:route-a', 'Tel Aviv', '0', '');
+            INSERT INTO active_services VALUES ('svc', '20260906'), ('svc', '20260907');
+            INSERT INTO stop_times VALUES
+                ('israel:trip-1205', 'israel:36168', '12:05:00', 43500, 1),
+                ('israel:trip-1230', 'israel:36169', '12:30:00', 45000, 1),
+                ('israel:trip-2405', 'israel:36168', '24:05:00', 86700, 1),
+                ('israel:trip-2510', 'israel:36168', '25:10:00', 90600, 1),
+                ('israel:trip-next', 'israel:36169', '00:05:00', 300, 1);
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        database = Database(str(database_path), ttl=0)
+        store = ExternalStaticData(
+            str(root),
+            now_provider=lambda: datetime(2026, 9, 6, 12, 0, tzinfo=ZoneInfo("Asia/Jerusalem")),
+            database=database,
+        )
+        handler = type(
+            "SQLiteIsraelTestHandler",
+            (Handler,),
+            {"database": database, "external_static_data": store},
+        )
+        server = ThreadingHTTPServer(("localhost", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with urlopen(
+                f"http://localhost:{server.server_port}/israel/stations/12961/departures?limit=3",
+                timeout=5,
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(
+                [item["scheduledTime"] for item in payload["departures"]],
+                ["24:05:00", "00:05:00", "25:10:00"],
+            )
+            self.assertEqual(
+                [item["stopID"] for item in payload["departures"]],
+                ["36168", "36169", "36168"],
+            )
+            self.assertEqual(payload["departures"][0]["operator"], "Egged")
+            self.assertEqual(payload["departures"][0]["platform"], "627")
+            self.assertEqual(payload["departures"][0]["floor"], "6")
+
+            with urlopen(
+                f"http://localhost:{server.server_port}/israel/stations/12961/departures"
+                "?from=2026-09-06T23:59:00%2B03:00&limit=3",
+                timeout=5,
+            ) as response:
+                overnight_payload = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(
+                [item["scheduledTime"] for item in overnight_payload["departures"]],
+                ["24:05:00", "00:05:00", "25:10:00"],
+            )
+
+            with urlopen(
+                f"http://localhost:{server.server_port}/israel/platforms/36169/departures?limit=1",
+                timeout=5,
+            ) as response:
+                child_payload = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(child_payload["departures"][0]["stopID"], "36169")
+            self.assertEqual(child_payload["departures"][0]["platform"], "628")
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+            database.close()
 
 
 if __name__ == "__main__":
