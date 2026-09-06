@@ -12,10 +12,11 @@ import sqlite3
 import threading
 import time
 import unicodedata
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qs, unquote, urlparse
 from zoneinfo import ZoneInfo
 
@@ -155,11 +156,14 @@ class ExternalStaticData:
         city_id: str = "israel",
         namespace: str = "israel:",
         timezone_name: str = "Asia/Jerusalem",
+        now_provider: Callable[[], datetime] | None = None,
     ) -> None:
         self.root = Path(root) if root else None
         self.city_id = city_id
         self.namespace = namespace
         self.timezone_name = timezone_name
+        self.timezone = ZoneInfo(timezone_name)
+        self.now_provider = now_provider or (lambda: datetime.now(self.timezone))
         self.lock = threading.RLock()
         self.signature = None
         self.stops: dict[str, dict[str, object]] = {}
@@ -347,6 +351,46 @@ class ExternalStaticData:
         except (TypeError, ValueError):
             return 2**31 - 1
 
+    @staticmethod
+    def _item_service_date(item: dict[str, object], fallback: date) -> date:
+        value = str(item.get("serviceDate") or "").strip()
+        if value:
+            for format_string in ("%Y-%m-%d", "%Y%m%d"):
+                try:
+                    return datetime.strptime(value, format_string).date()
+                except ValueError:
+                    continue
+        return fallback
+
+    def _departure_datetime(
+        self,
+        item: dict[str, object],
+        fallback_service_date: date,
+    ) -> datetime | None:
+        parts = str(item.get("p") or "").split(":")
+        if len(parts) != 3:
+            return None
+        try:
+            hour, minute, second = (int(part) for part in parts)
+        except ValueError:
+            return None
+        if hour < 0 or minute not in range(60) or second not in range(60):
+            return None
+        service_date = self._item_service_date(item, fallback_service_date)
+        service_start = datetime(
+            service_date.year,
+            service_date.month,
+            service_date.day,
+            tzinfo=self.timezone,
+        )
+        return service_start + timedelta(hours=hour, minutes=minute, seconds=second)
+
+    def _now(self) -> datetime:
+        value = self.now_provider()
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=self.timezone)
+        return value.astimezone(self.timezone)
+
     def _raw_departures(self, stop_id: str) -> list[dict[str, object]]:
         requested = self._storage_id(stop_id)
         stop = self.stops.get(requested)
@@ -370,15 +414,29 @@ class ExternalStaticData:
                     items.append(item)
         return items
 
-    def departures_for(self, stop_id: str, limit: int) -> list[dict[str, object]]:
+    def departures_for(
+        self,
+        stop_id: str,
+        limit: int,
+        from_datetime: datetime | None = None,
+    ) -> list[dict[str, object]]:
         self._ensure_loaded()
         requested = self._storage_id(stop_id)
         stop = self.stops.get(requested)
         if stop is None:
             return []
-        result = []
+        lower_bound = (
+            from_datetime.astimezone(self.timezone)
+            if from_datetime is not None
+            else self._now()
+        )
+        fallback_service_date = lower_bound.date()
+        result: list[tuple[datetime, dict[str, object]]] = []
         for item in self._raw_departures(requested):
             if not isinstance(item, dict):
+                continue
+            absolute_departure = self._departure_datetime(item, fallback_service_date)
+            if absolute_departure is None or absolute_departure < lower_bound:
                 continue
             route_id = str(item.get("r") or "")
             route = self.routes.get(route_id, {})
@@ -390,7 +448,7 @@ class ExternalStaticData:
                 "4": "ferry", "5": "cableCar", "6": "gondola", "7": "funicular",
                 "11": "trolleybus", "12": "monorail",
             }.get(route_type)
-            result.append({
+            result.append((absolute_departure, {
                 "tripID": self._public_id(str(item.get("t") or "")),
                 "routeID": self._public_id(route_id),
                 "line": route.get("short_name") or route.get("shortName") or self._public_id(route_id),
@@ -408,14 +466,14 @@ class ExternalStaticData:
                 "routeType": int(route_type) if route_type.isdigit() else None,
                 "isRealtime": False,
                 "source": "scheduled-static",
-            })
-        result.sort(key=lambda item: (
-            self._departure_seconds(item.get("scheduledTime")),
-            str(item.get("tripID") or ""),
-            str(item.get("routeID") or ""),
-            str(item.get("stopID") or ""),
+            }))
+        result.sort(key=lambda entry: (
+            entry[0],
+            str(entry[1].get("tripID") or ""),
+            str(entry[1].get("routeID") or ""),
+            str(entry[1].get("stopID") or ""),
         ))
-        return result[:limit]
+        return [item for _, item in result[:limit]]
 
 
 class Database:
@@ -1163,22 +1221,40 @@ class Handler(BaseHTTPRequestHandler):
                 station_id = segments[2]
                 if store.station(station_id) is None:
                     return self.send_json(HTTPStatus.NOT_FOUND, {"error": "unknown station"})
+                raw_boundary = (query.get("from") or query.get("at") or [None])[0]
+                try:
+                    from_datetime = parse_iso_boundary(raw_boundary, store.timezone_name)
+                except ValueError:
+                    return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid from/at"})
                 return self.send_json(HTTPStatus.OK, {
                     "stationID": station_id,
                     "timezone": store.timezone_name,
                     "source": "scheduled-static",
-                    "departures": store.departures_for(station_id, bounded_limit(query.get("limit", [None])[0])),
+                    "departures": store.departures_for(
+                        station_id,
+                        bounded_limit(query.get("limit", [None])[0]),
+                        from_datetime,
+                    ),
                 }, "public, max-age=60")
             if len(segments) == 4 and segments[:2] == ["israel", "platforms"] and segments[3] == "departures":
                 platform_id = segments[2]
                 station = store.station(platform_id)
                 if station is None or int(station.get("locationType") or 0) != 0:
                     return self.send_json(HTTPStatus.NOT_FOUND, {"error": "unknown platform"})
+                raw_boundary = (query.get("from") or query.get("at") or [None])[0]
+                try:
+                    from_datetime = parse_iso_boundary(raw_boundary, store.timezone_name)
+                except ValueError:
+                    return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid from/at"})
                 return self.send_json(HTTPStatus.OK, {
                     "platformID": platform_id,
                     "timezone": store.timezone_name,
                     "source": "scheduled-static",
-                    "departures": store.departures_for(platform_id, bounded_limit(query.get("limit", [None])[0])),
+                    "departures": store.departures_for(
+                        platform_id,
+                        bounded_limit(query.get("limit", [None])[0]),
+                        from_datetime,
+                    ),
                 }, "public, max-age=60")
             return self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
         except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError, KeyError):
