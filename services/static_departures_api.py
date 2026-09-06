@@ -425,48 +425,53 @@ class ExternalStaticData:
         stop = self.stops.get(requested)
         if stop is None:
             return []
+        if from_datetime is not None and from_datetime.tzinfo is None:
+            from_datetime = from_datetime.replace(tzinfo=self.timezone)
         lower_bound = (
             from_datetime.astimezone(self.timezone)
             if from_datetime is not None
             else self._now()
         )
-        fallback_service_date = lower_bound.date()
         result: list[tuple[datetime, dict[str, object]]] = []
         for item in self._raw_departures(requested):
             if not isinstance(item, dict):
                 continue
-            absolute_departure = self._departure_datetime(item, fallback_service_date)
-            if absolute_departure is None or absolute_departure < lower_bound:
-                continue
-            route_id = str(item.get("r") or "")
-            route = self.routes.get(route_id, {})
-            actual_stop_id = str(item.get("s") or requested)
-            actual_stop = self.stops.get(actual_stop_id, stop)
-            route_type = str(item.get("routeType") or route.get("type") or "")
-            mode = {
-                "0": "tram", "1": "subway", "2": "train", "3": "bus",
-                "4": "ferry", "5": "cableCar", "6": "gondola", "7": "funicular",
-                "11": "trolleybus", "12": "monorail",
-            }.get(route_type)
-            result.append((absolute_departure, {
-                "tripID": self._public_id(str(item.get("t") or "")),
-                "routeID": self._public_id(route_id),
-                "line": route.get("short_name") or route.get("shortName") or self._public_id(route_id),
-                "destination": item.get("h") or None,
-                "directionID": item.get("d") or None,
-                "scheduledTime": item.get("p") or None,
-                "scheduledDeparture": item.get("p") or None,
-                "operatorID": item.get("agencyID") or route.get("agency") or None,
-                "operator": item.get("operator") or route.get("agencyName") or None,
-                "stopID": self._public_id(actual_stop_id),
-                "parentStation": self._public_id(str(item.get("parentStation") or actual_stop.get("parentStation") or "")) or None,
-                "platform": item.get("platform") or actual_stop.get("platform") or None,
-                "floor": item.get("floor") or actual_stop.get("floor") or None,
-                "transportMode": mode or "unknown",
-                "routeType": int(route_type) if route_type.isdigit() else None,
-                "isRealtime": False,
-                "source": "scheduled-static",
-            }))
+            service_dates = [lower_bound.date()]
+            if not item.get("serviceDate"):
+                service_dates.append(lower_bound.date() + timedelta(days=1))
+            for service_date in service_dates:
+                absolute_departure = self._departure_datetime(item, service_date)
+                if absolute_departure is None or absolute_departure < lower_bound:
+                    continue
+                route_id = str(item.get("r") or "")
+                route = self.routes.get(route_id, {})
+                actual_stop_id = str(item.get("s") or requested)
+                actual_stop = self.stops.get(actual_stop_id, stop)
+                route_type = str(item.get("routeType") or route.get("type") or "")
+                mode = {
+                    "0": "tram", "1": "subway", "2": "train", "3": "bus",
+                    "4": "ferry", "5": "cableCar", "6": "gondola", "7": "funicular",
+                    "11": "trolleybus", "12": "monorail",
+                }.get(route_type)
+                result.append((absolute_departure, {
+                    "tripID": self._public_id(str(item.get("t") or "")),
+                    "routeID": self._public_id(route_id),
+                    "line": route.get("short_name") or route.get("shortName") or self._public_id(route_id),
+                    "destination": item.get("h") or None,
+                    "directionID": item.get("d") or None,
+                    "scheduledTime": item.get("p") or None,
+                    "scheduledDeparture": item.get("p") or None,
+                    "operatorID": item.get("agencyID") or route.get("agency") or None,
+                    "operator": item.get("operator") or route.get("agencyName") or None,
+                    "stopID": self._public_id(actual_stop_id),
+                    "parentStation": self._public_id(str(item.get("parentStation") or actual_stop.get("parentStation") or "")) or None,
+                    "platform": item.get("platform") or actual_stop.get("platform") or None,
+                    "floor": item.get("floor") or actual_stop.get("floor") or None,
+                    "transportMode": mode or "unknown",
+                    "routeType": int(route_type) if route_type.isdigit() else None,
+                    "isRealtime": False,
+                    "source": "scheduled-static",
+                }))
         result.sort(key=lambda entry: (
             entry[0],
             str(entry[1].get("tripID") or ""),

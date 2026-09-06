@@ -93,7 +93,6 @@ class IsraelStaticAPITests(unittest.TestCase):
         (root / "departures/israel.json").write_text(json.dumps({"timezone": "Asia/Jerusalem", "stops": departures, "platforms": {}}), encoding="utf-8")
         self.now = datetime(2026, 9, 6, 12, 0, tzinfo=ZoneInfo("Asia/Jerusalem"))
         store = ExternalStaticData(str(root), now_provider=lambda: self.now)
-        self.store = store
         handler = type("IsraelTestHandler", (Handler,), {"external_static_data": store})
         self.server = ThreadingHTTPServer(("localhost", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -122,23 +121,20 @@ class IsraelStaticAPITests(unittest.TestCase):
         self.assertEqual(child_details["platform"], "627")
         self.assertEqual(child_details["floor"], "6")
 
-        parent = self.get("/israel/stations/12961/departures?limit=10")
+        parent = self.get("/israel/stations/12961/departures?limit=2")
         self.assertEqual(
             [item["scheduledTime"] for item in parent["departures"]],
-            ["12:05:00", "12:30:00", "24:05:00", "25:10:00"],
+            ["12:05:00", "12:30:00"],
         )
-        self.assertEqual([item["stopID"] for item in parent["departures"]], ["36168", "36169", "36169", "36169"])
+        self.assertEqual([item["stopID"] for item in parent["departures"]], ["36168", "36169"])
         self.assertEqual(parent["departures"][0]["platform"], "627")
         self.assertEqual(parent["departures"][0]["floor"], "6")
         self.assertEqual(parent["departures"][1]["platform"], "628")
         self.assertEqual(parent["timezone"], "Asia/Jerusalem")
         self.assertFalse(parent["departures"][0]["isRealtime"])
 
-        child = self.get("/israel/platforms/36169/departures?limit=10")
-        self.assertEqual(
-            [item["scheduledTime"] for item in child["departures"]],
-            ["12:30:00", "24:05:00", "25:10:00"],
-        )
+        child = self.get("/israel/platforms/36169/departures?limit=1")
+        self.assertEqual([item["scheduledTime"] for item in child["departures"]], ["12:30:00"])
         self.assertEqual({item["stopID"] for item in child["departures"]}, {"36169"})
         self.assertEqual(child["departures"][0]["platform"], "628")
         self.assertEqual(child["departures"][0]["operator"], "Dan")
@@ -152,14 +148,29 @@ class IsraelStaticAPITests(unittest.TestCase):
 
     def test_midnight_service_date_and_gtfs_overflow(self) -> None:
         self.now = datetime(2026, 9, 7, 0, 10, tzinfo=ZoneInfo("Asia/Jerusalem"))
-        payload = self.get("/israel/stations/12961/departures?limit=10")
+        payload = self.get("/israel/stations/12961/departures?limit=3")
         self.assertEqual(
             [item["scheduledTime"] for item in payload["departures"]],
-            ["11:55:00", "12:05:00", "12:30:00", "24:05:00", "25:10:00"],
+            ["11:55:00", "12:05:00", "12:30:00"],
         )
 
-        explicit = self.get("/israel/stations/12961/departures?at=2026-09-06T23:59:00%2B03:00&limit=10")
-        self.assertEqual([item["scheduledTime"] for item in explicit["departures"]], ["24:05:00", "25:10:00"])
+        explicit = self.get("/israel/stations/12961/departures?at=2026-09-06T23:59:00%2B03:00&limit=3")
+        self.assertEqual(
+            [item["scheduledTime"] for item in explicit["departures"]],
+            ["24:05:00", "00:05:00", "25:10:00"],
+        )
+
+    def test_default_crosses_into_next_service_day_when_needed(self) -> None:
+        self.now = datetime(2026, 9, 6, 23, 50, tzinfo=ZoneInfo("Asia/Jerusalem"))
+        payload = self.get("/israel/stations/12961/departures?limit=3")
+        self.assertEqual(
+            [(item["tripID"], item["scheduledTime"]) for item in payload["departures"]],
+            [
+                ("trip-midnight", "24:05:00"),
+                ("trip-midnight-past", "00:05:00"),
+                ("trip-late", "25:10:00"),
+            ],
+        )
 
     def test_nearby_search_and_ordinary_stop_regression(self) -> None:
         nearby = self.get("/israel/stations/nearby?latitude=32&longitude=34.8&radiusMeters=5000&limit=20")
