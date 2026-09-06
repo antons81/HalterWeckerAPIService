@@ -202,36 +202,50 @@ class ExternalStaticData:
         departures_payload = json.loads(departures_path.read_text(encoding="utf-8"))
         if not isinstance(stops_payload, list) or not isinstance(departures_payload, dict):
             raise ValueError("invalid external static package")
-        self.stops = {
-            str(item["id"]): item
-            for item in stops_payload
-            if isinstance(item, dict) and item.get("id")
-        }
+        self.stops = {}
+        for item in stops_payload:
+            if not isinstance(item, dict) or not item.get("id"):
+                continue
+            normalized = dict(item)
+            normalized["id"] = self._storage_id(str(item["id"]))
+            if item.get("parentStation"):
+                normalized["parentStation"] = self._storage_id(str(item["parentStation"]))
+            self.stops[normalized["id"]] = normalized
         self.routes = (
             {str(key): value for key, value in routes_payload.items() if isinstance(value, dict)}
             if isinstance(routes_payload, dict)
             else {}
         )
         raw_departures = departures_payload.get("stops", {})
-        self.departures = (
-            {
-                str(key): value
-                for key, value in raw_departures.items()
-                if isinstance(value, list)
-            }
-            if isinstance(raw_departures, dict)
-            else {}
-        )
+        self.departures = {}
+        if isinstance(raw_departures, dict):
+            for key, value in raw_departures.items():
+                if not isinstance(value, list):
+                    continue
+                normalized_items = []
+                for item in value:
+                    if not isinstance(item, dict):
+                        continue
+                    normalized_item = dict(item)
+                    if item.get("s"):
+                        normalized_item["s"] = self._storage_id(str(item["s"]))
+                    if item.get("parentStation"):
+                        normalized_item["parentStation"] = self._storage_id(str(item["parentStation"]))
+                    normalized_items.append(normalized_item)
+                self.departures[self._storage_id(str(key))] = normalized_items
         raw_platforms = departures_payload.get("platforms", {})
-        self.platforms = (
-            {
-                str(key): [str(child) for child in value if child]
-                for key, value in raw_platforms.items()
-                if isinstance(value, list)
-            }
-            if isinstance(raw_platforms, dict)
-            else {}
-        )
+        self.platforms = {}
+        if isinstance(raw_platforms, dict):
+            for key, value in raw_platforms.items():
+                if not isinstance(value, list):
+                    continue
+                parent_id = self._storage_id(str(key))
+                child_ids = self.platforms.setdefault(parent_id, [])
+                for child in value:
+                    if child:
+                        child_id = self._storage_id(str(child))
+                        if child_id not in child_ids:
+                            child_ids.append(child_id)
         self.signature = signature
 
     def _ensure_loaded(self) -> None:
@@ -340,9 +354,20 @@ class ExternalStaticData:
             return []
         items = list(self.departures.get(requested, []))
         if int(stop.get("locationType") or 0) == 1 and not items:
-            child_ids = self.platforms.get(requested, [])
+            child_ids = list(self.platforms.get(requested, []))
+            indexed_child_ids = {
+                str(child["id"])
+                for child in self.stops.values()
+                if self._parent_id(child) == requested
+                and int(child.get("locationType") or 0) == 0
+            }
+            child_ids.extend(child_id for child_id in sorted(indexed_child_ids) if child_id not in child_ids)
             for child_id in child_ids:
-                items.extend(self.departures.get(child_id, []))
+                for item in self.departures.get(child_id, []):
+                    if isinstance(item, dict) and not item.get("s"):
+                        item = dict(item)
+                        item["s"] = child_id
+                    items.append(item)
         return items
 
     def departures_for(self, stop_id: str, limit: int) -> list[dict[str, object]]:

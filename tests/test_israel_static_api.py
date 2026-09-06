@@ -21,32 +21,32 @@ class IsraelStaticAPITests(unittest.TestCase):
         (root / "departures").mkdir()
         stops = [
             {
-                "id": "israel:hub",
-                "name": "Test Central Hub",
+                "id": "12961",
+                "name": "ת.מרכזית תל אביב קומה 6/רציפים",
                 "latitude": 32.0,
                 "longitude": 34.8,
                 "locationType": 1,
                 "parentStation": None,
             },
             {
-                "id": "israel:platform-a",
-                "name": "Test Central Hub",
+                "id": "36168",
+                "name": "ת.מרכזית תל אביב קומה 6/רציפים",
                 "latitude": 32.0,
                 "longitude": 34.8,
                 "locationType": 0,
-                "parentStation": "israel:hub",
-                "platform": "A",
-                "floor": "2",
+                "parentStation": "12961",
+                "platform": "627",
+                "floor": "6",
             },
             {
-                "id": "israel:platform-b",
-                "name": "Test Central Hub",
+                "id": "36169",
+                "name": "ת.מרכזית תל אביב קומה 6/רציפים",
                 "latitude": 32.0,
                 "longitude": 34.8,
                 "locationType": 0,
-                "parentStation": "israel:hub",
-                "platform": "B",
-                "floor": "3",
+                "parentStation": "12961",
+                "platform": "628",
+                "floor": "6",
             },
             {
                 "id": "israel:ordinary",
@@ -72,23 +72,19 @@ class IsraelStaticAPITests(unittest.TestCase):
             },
         }
         departures = {
-            "israel:hub": [
-                {"t": "israel:trip-late", "r": "israel:route-b", "h": "Late", "d": "0", "p": "25:05:00", "s": "israel:platform-b", "platform": "B", "floor": "3", "agencyID": "dan", "operator": "Dan", "routeType": "0"},
-                {"t": "israel:trip-early", "r": "israel:route-a", "h": "Early", "d": "0", "p": "23:55:00", "s": "israel:platform-a", "platform": "A", "floor": "2", "agencyID": "egg", "operator": "Egged", "routeType": "3"},
+            "36168": [
+                {"t": "israel:trip-early", "r": "israel:route-a", "h": "Early", "d": "0", "p": "23:55:00", "agencyID": "egg", "operator": "Egged", "routeType": "3"},
             ],
-            "israel:platform-a": [
-                {"t": "israel:trip-early", "r": "israel:route-a", "h": "Early", "d": "0", "p": "23:55:00", "platform": "A", "floor": "2", "agencyID": "egg", "operator": "Egged", "routeType": "3"},
+            "36169": [
+                {"t": "israel:trip-late", "r": "israel:route-b", "h": "Late", "d": "0", "p": "25:05:00", "agencyID": "dan", "operator": "Dan", "routeType": "0"},
             ],
-            "israel:platform-b": [
-                {"t": "israel:trip-late", "r": "israel:route-b", "h": "Late", "d": "0", "p": "25:05:00", "platform": "B", "floor": "3", "agencyID": "dan", "operator": "Dan", "routeType": "0"},
-            ],
-            "israel:ordinary": [
+            "ordinary": [
                 {"t": "israel:ordinary-trip", "r": "israel:route-a", "h": "Ordinary Destination", "d": "0", "p": "08:00:00", "platform": "O", "agencyID": "egg", "operator": "Egged", "routeType": "3"},
             ],
         }
         (root / "stops/israel.json").write_text(json.dumps(stops), encoding="utf-8")
         (root / "routes/israel.json").write_text(json.dumps(routes), encoding="utf-8")
-        (root / "departures/israel.json").write_text(json.dumps({"timezone": "Asia/Jerusalem", "stops": departures, "platforms": {"israel:hub": ["israel:platform-a", "israel:platform-b"]}}), encoding="utf-8")
+        (root / "departures/israel.json").write_text(json.dumps({"timezone": "Asia/Jerusalem", "stops": departures, "platforms": {}}), encoding="utf-8")
         store = ExternalStaticData(str(root))
         handler = type("IsraelTestHandler", (Handler,), {"external_static_data": store})
         self.server = ThreadingHTTPServer(("localhost", 0), handler)
@@ -108,31 +104,42 @@ class IsraelStaticAPITests(unittest.TestCase):
             return json.loads(response.read().decode("utf-8"))
 
     def test_parent_aggregation_and_child_platform_query(self) -> None:
-        parent = self.get("/israel/stations/hub/departures?limit=10")
+        parent_details = self.get("/israel/stations/12961")
+        self.assertEqual(parent_details["id"], "12961")
+        self.assertEqual(parent_details["locationType"], 1)
+        self.assertEqual(parent_details["childPlatformCount"], 2)
+        self.assertEqual({item["id"] for item in parent_details["platforms"]}, {"36168", "36169"})
+        child_details = self.get("/israel/stations/36168")
+        self.assertEqual(child_details["id"], "36168")
+        self.assertEqual(child_details["platform"], "627")
+        self.assertEqual(child_details["floor"], "6")
+
+        parent = self.get("/israel/stations/12961/departures?limit=10")
         self.assertEqual([item["scheduledTime"] for item in parent["departures"]], ["23:55:00", "25:05:00"])
-        self.assertEqual([item["stopID"] for item in parent["departures"]], ["platform-a", "platform-b"])
-        self.assertEqual(parent["departures"][0]["platform"], "A")
-        self.assertEqual(parent["departures"][1]["platform"], "B")
+        self.assertEqual([item["stopID"] for item in parent["departures"]], ["36168", "36169"])
+        self.assertEqual(parent["departures"][0]["platform"], "627")
+        self.assertEqual(parent["departures"][0]["floor"], "6")
+        self.assertEqual(parent["departures"][1]["platform"], "628")
         self.assertEqual(parent["timezone"], "Asia/Jerusalem")
         self.assertFalse(parent["departures"][0]["isRealtime"])
 
-        child = self.get("/israel/platforms/platform-b/departures?limit=10")
-        self.assertEqual([item["stopID"] for item in child["departures"]], ["platform-b"])
-        self.assertEqual(child["departures"][0]["platform"], "B")
+        child = self.get("/israel/platforms/36169/departures?limit=10")
+        self.assertEqual([item["stopID"] for item in child["departures"]], ["36169"])
+        self.assertEqual(child["departures"][0]["platform"], "628")
         self.assertEqual(child["departures"][0]["operator"], "Dan")
 
     def test_nearby_search_and_ordinary_stop_regression(self) -> None:
         nearby = self.get("/israel/stations/nearby?latitude=32&longitude=34.8&radiusMeters=5000&limit=20")
         ids = {item["id"] for item in nearby["stations"]}
-        self.assertIn("hub", ids)
-        self.assertNotIn("platform-a", ids)
-        self.assertNotIn("platform-b", ids)
+        self.assertIn("12961", ids)
+        self.assertNotIn("36168", ids)
+        self.assertNotIn("36169", ids)
 
-        search = self.get(f"/israel/stations/search?q={quote('Test Central Hub')}&limit=20")
-        self.assertEqual([item["id"] for item in search["stations"]], ["hub"])
-        details = self.get("/israel/stations/hub")
+        search = self.get(f"/israel/stations/search?q={quote('ת.מרכזית תל אביב')}&limit=20")
+        self.assertEqual([item["id"] for item in search["stations"]], ["12961"])
+        details = self.get("/israel/stations/12961")
         self.assertEqual(details["childPlatformCount"], 2)
-        self.assertEqual({item["id"] for item in details["platforms"]}, {"platform-a", "platform-b"})
+        self.assertEqual({item["id"] for item in details["platforms"]}, {"36168", "36169"})
         self.assertNotIn("stopDescription", details)
 
         ordinary = self.get("/israel/stations/ordinary/departures?limit=10")
