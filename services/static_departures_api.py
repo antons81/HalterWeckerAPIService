@@ -183,6 +183,8 @@ def log_memory_stage(stage: str, **fields: object) -> None:
 class ExternalStaticData:
     """Read-only JSON service for generic external GTFS static packages."""
 
+    NEARBY_GRID_CELL_DEGREES = 0.02
+
     def __init__(
         self,
         root: str,
@@ -205,6 +207,9 @@ class ExternalStaticData:
         self.routes: dict[str, dict[str, object]] = {}
         self.departures: dict[str, list[dict[str, object]]] = {}
         self.platforms: dict[str, list[str]] = {}
+        self.children_by_parent: dict[str, tuple[str, ...]] = {}
+        self.visible_stop_ids: frozenset[str] = frozenset()
+        self.nearby_cells: dict[tuple[int, int], tuple[str, ...]] = {}
 
     def _path(self, directory: str, filename: str) -> Path:
         if self.root is None:
@@ -275,6 +280,45 @@ class ExternalStaticData:
             city=self.city_id,
             stop_records=len(self.stops),
             raw_stop_records=len(stops_payload),
+        )
+        children_by_parent: dict[str, list[str]] = {}
+        nearby_cells: dict[tuple[int, int], list[str]] = {}
+        for stop_id, stop in self.stops.items():
+            if int(stop.get("locationType") or 0) == 0:
+                parent_id = self._parent_id(stop)
+                if parent_id:
+                    children_by_parent.setdefault(parent_id, []).append(stop_id)
+            try:
+                latitude = float(stop["latitude"])
+                longitude = float(stop["longitude"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not math.isfinite(latitude) or not math.isfinite(longitude):
+                continue
+            cell = self._nearby_cell(latitude, longitude)
+            nearby_cells.setdefault(cell, []).append(stop_id)
+        self.children_by_parent = {
+            parent_id: tuple(sorted(child_ids))
+            for parent_id, child_ids in children_by_parent.items()
+        }
+        self.visible_stop_ids = frozenset(
+            stop_id
+            for stop_id, stop in self.stops.items()
+            if int(stop.get("locationType") or 0) != 0
+            or not self._has_valid_parent(stop)
+        )
+        self.nearby_cells = {
+            cell: tuple(stop_ids)
+            for cell, stop_ids in nearby_cells.items()
+        }
+        log_memory_stage(
+            "external-after-station-indexes",
+            city=self.city_id,
+            parent_indexes=len(self.children_by_parent),
+            child_links=sum(len(child_ids) for child_ids in self.children_by_parent.values()),
+            visible_stops=len(self.visible_stop_ids),
+            nearby_cells=len(self.nearby_cells),
+            nearby_indexed_stops=sum(len(stop_ids) for stop_ids in self.nearby_cells.values()),
         )
         self.routes = (
             {str(key): value for key, value in routes_payload.items() if isinstance(value, dict)}
@@ -362,18 +406,17 @@ class ExternalStaticData:
     def _parent_id(self, stop: dict[str, object]) -> str:
         return self._storage_id(str(stop.get("parentStation") or ""))
 
+    def _nearby_cell(self, latitude: float, longitude: float) -> tuple[int, int]:
+        cell_size = self.NEARBY_GRID_CELL_DEGREES
+        return math.floor(latitude / cell_size), math.floor(longitude / cell_size)
+
     def _has_valid_parent(self, stop: dict[str, object]) -> bool:
         parent_id = self._parent_id(stop)
         parent = self.stops.get(parent_id)
         return bool(parent and int(parent.get("locationType") or 0) == 1)
 
     def _visible_stops(self) -> list[dict[str, object]]:
-        return [
-            stop
-            for stop in self.stops.values()
-            if int(stop.get("locationType") or 0) != 0
-            or not self._has_valid_parent(stop)
-        ]
+        return [self.stops[stop_id] for stop_id in self.visible_stop_ids]
 
     def _station_payload(self, stop: dict[str, object], include_children: bool = False) -> dict[str, object]:
         stop_id = str(stop["id"])
@@ -388,9 +431,9 @@ class ExternalStaticData:
             "floor": stop.get("floor"),
         }
         children = [
-            child
-            for child in self.stops.values()
-            if self._parent_id(child) == stop_id and int(child.get("locationType") or 0) == 0
+            self.stops[child_id]
+            for child_id in self.children_by_parent.get(stop_id, ())
+            if child_id in self.stops
         ]
         payload["childPlatformCount"] = len(children)
         if include_children:
@@ -402,8 +445,24 @@ class ExternalStaticData:
 
     def nearby(self, latitude: float, longitude: float, radius_meters: float, limit: int) -> list[dict[str, object]]:
         self._ensure_loaded()
+        radius_meters = max(float(radius_meters), 0.0)
+        cell_size = self.NEARBY_GRID_CELL_DEGREES
+        latitude_delta = radius_meters / 111_000.0
+        longitude_scale = max(math.cos(math.radians(latitude)), 0.01)
+        longitude_delta = radius_meters / (111_000.0 * longitude_scale)
+        min_cell = self._nearby_cell(latitude - latitude_delta, longitude - longitude_delta)
+        max_cell = self._nearby_cell(latitude + latitude_delta, longitude + longitude_delta)
+        candidate_ids = {
+            stop_id
+            for latitude_cell in range(min_cell[0], max_cell[0] + 1)
+            for longitude_cell in range(min_cell[1], max_cell[1] + 1)
+            for stop_id in self.nearby_cells.get((latitude_cell, longitude_cell), ())
+        }
         matches = []
-        for stop in self._visible_stops():
+        for stop_id in candidate_ids:
+            if stop_id not in self.visible_stop_ids:
+                continue
+            stop = self.stops[stop_id]
             try:
                 stop_latitude = float(stop["latitude"])
                 stop_longitude = float(stop["longitude"])
@@ -492,13 +551,11 @@ class ExternalStaticData:
         items = list(self.departures.get(requested, []))
         if int(stop.get("locationType") or 0) == 1 and not items:
             child_ids = list(self.platforms.get(requested, []))
-            indexed_child_ids = {
-                str(child["id"])
-                for child in self.stops.values()
-                if self._parent_id(child) == requested
-                and int(child.get("locationType") or 0) == 0
-            }
-            child_ids.extend(child_id for child_id in sorted(indexed_child_ids) if child_id not in child_ids)
+            child_ids.extend(
+                child_id
+                for child_id in self.children_by_parent.get(requested, ())
+                if child_id not in child_ids
+            )
             for child_id in child_ids:
                 for item in self.departures.get(child_id, []):
                     if isinstance(item, dict) and not item.get("s"):
