@@ -190,6 +190,7 @@ def connect(database_path: Path) -> sqlite3.Connection:
         CREATE TABLE stop_times (
             trip_id TEXT NOT NULL,
             raw_stop_id TEXT NOT NULL,
+            arrival_time TEXT NOT NULL DEFAULT '',
             departure_time TEXT NOT NULL,
             departure_seconds INTEGER NOT NULL,
             stop_sequence INTEGER NOT NULL
@@ -517,11 +518,12 @@ def populate_gtfs(
         )
 
     def import_stop_times() -> int:
-        batch: list[tuple[str, str, str, int, int]] = []
+        batch: list[tuple[str, str, str, str, int, int]] = []
         imported_rows = 0
         for row in gtfs_rows(archive, "stop_times.txt"):
             trip_id = row.get("trip_id", "").strip()
             raw_stop_id = row.get("stop_id", "").strip()
+            arrival_time = row.get("arrival_time", "").strip()
             departure_time = row.get("departure_time", "").strip()
             departure_seconds = parse_gtfs_time(departure_time)
             if not trip_id or not raw_stop_id or departure_seconds is None:
@@ -530,13 +532,13 @@ def populate_gtfs(
                 sequence = int(row.get("stop_sequence", "0") or 0)
             except ValueError:
                 sequence = 0
-            batch.append((identifier_prefix + trip_id, internal_stop_id(raw_stop_id, stop_id_prefix), departure_time, departure_seconds, sequence))
+            batch.append((identifier_prefix + trip_id, internal_stop_id(raw_stop_id, stop_id_prefix), arrival_time, departure_time, departure_seconds, sequence))
             if len(batch) == 20_000:
-                connection.executemany("INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)", batch)
+                connection.executemany("INSERT INTO stop_times VALUES (?, ?, ?, ?, ?, ?)", batch)
                 imported_rows += len(batch)
                 batch.clear()
         if batch:
-            connection.executemany("INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)", batch)
+            connection.executemany("INSERT INTO stop_times VALUES (?, ?, ?, ?, ?, ?)", batch)
             imported_rows += len(batch)
         return imported_rows
 

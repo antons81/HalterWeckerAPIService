@@ -918,6 +918,7 @@ class ExternalDepartureStage:
             CREATE TABLE raw_stop_times (
                 trip_id TEXT NOT NULL,
                 stop_id TEXT NOT NULL,
+                arrival_time TEXT NOT NULL DEFAULT '',
                 departure_time TEXT NOT NULL,
                 sequence INTEGER NOT NULL
             );
@@ -1052,6 +1053,7 @@ class ExternalDepartureStage:
             for row in source_rows("stop_times.txt"):
                 trip_id = str(row.get("trip_id", "")).strip()
                 stop_id = str(row.get("stop_id", "")).strip()
+                arrival_time = str(row.get("arrival_time", "") or "").strip()
                 departure_time = str(row.get("departure_time", "") or "").strip()
                 departure_seconds = row.get("departure_seconds")
                 if not trip_id or not stop_id or not departure_time:
@@ -1059,10 +1061,10 @@ class ExternalDepartureStage:
                 if departure_seconds is None and parse_gtfs_time(departure_time) is None:
                     continue
                 sequence = legacy_int_or_none(row.get("stop_sequence", "0")) or 0
-                yield trip_id, stop_id, departure_time, sequence
+                yield trip_id, stop_id, arrival_time, departure_time, sequence
 
         self.connection.executemany(
-            "INSERT INTO raw_stop_times VALUES (?, ?, ?, ?)",
+            "INSERT INTO raw_stop_times VALUES (?, ?, ?, ?, ?)",
             valid_stop_times(),
         )
         self.connection.commit()

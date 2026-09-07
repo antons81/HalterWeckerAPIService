@@ -147,6 +147,18 @@ IRELAND_REALTIME_ROOT = Path(
     os.environ.get("IRELAND_REALTIME_ROOT", "/data/ireland/realtime")
 )
 DEFAULT_APPLE_NOTIFICATION_STORE_PATH = "/data/apple-store-notifications/events.sqlite3"
+GTFS_ROUTE_TYPE_TO_MODE = {
+    "0": "tram",
+    "1": "subway",
+    "2": "train",
+    "3": "bus",
+    "4": "ferry",
+    "5": "cableCar",
+    "6": "gondola",
+    "7": "funicular",
+    "11": "trolleybus",
+    "12": "monorail",
+}
 
 
 def _rss_kib() -> int:
@@ -607,11 +619,7 @@ class ExternalStaticData:
                 actual_stop_id = str(item.get("s") or requested)
                 actual_stop = self.stops.get(actual_stop_id, stop)
                 route_type = str(item.get("routeType") or route.get("type") or "")
-                mode = {
-                    "0": "tram", "1": "subway", "2": "train", "3": "bus",
-                    "4": "ferry", "5": "cableCar", "6": "gondola", "7": "funicular",
-                    "11": "trolleybus", "12": "monorail",
-                }.get(route_type)
+                mode = GTFS_ROUTE_TYPE_TO_MODE.get(route_type)
                 result.append((absolute_departure, {
                     "tripID": self._public_id(str(item.get("t") or "")),
                     "routeID": self._public_id(route_id),
@@ -1285,11 +1293,7 @@ class Database:
             public_route_id = self._public_identifier_multi(route_id, identifier_prefixes)
             public_stop_id = self._public_identifier_multi(raw_stop_id, stop_prefixes)
             route_type_value = str(route_type or "")
-            mode = {
-                "0": "tram", "1": "subway", "2": "train", "3": "bus",
-                "4": "ferry", "5": "cableCar", "6": "gondola", "7": "funicular",
-                "11": "trolleybus", "12": "monorail",
-            }.get(route_type_value)
+            mode = GTFS_ROUTE_TYPE_TO_MODE.get(route_type_value)
             result.append((absolute_departure, {
                 "tripID": self._public_identifier_multi(trip_id, identifier_prefixes),
                 "routeID": public_route_id,
@@ -1320,6 +1324,70 @@ class Database:
             int(entry[1].get("stopSequence") or 0),
         ))
         return [item for _, item in result[:requested_limit]]
+
+    def trip_details(self, city_id: str, trip_id: str, static_root: str, service_date: str | None = None) -> dict | None:
+        """Read one trip; coordinates come from the existing city stop catalog."""
+        if not city_id or any(part in city_id for part in ("/", "\\", "..")):
+            raise ValueError("invalid cityID")
+        if service_date:
+            service_date = date.fromisoformat(service_date).strftime("%Y%m%d")
+        stop_prefixes, prefixes = self.city_departure_prefixes(city_id)
+        candidates = tuple(dict.fromkeys(
+            trip_id if prefix and trip_id.startswith(prefix) else prefix + trip_id
+            for prefix in prefixes
+        ))
+        if not candidates:
+            return None
+        with self.lock:
+            connection = self._connection()
+            if connection.execute("SELECT 1 FROM city_departure_modes WHERE city_id=?", (city_id,)).fetchone() is None:
+                return None
+            route_columns = self._table_columns("routes")
+            agency_join = "LEFT JOIN agencies ag ON ag.agency_id=r.agency_id" if "agency_id" in route_columns and self._table_columns("agencies") else ""
+            agency_fields = "r.agency_id,ag.agency_name" if agency_join else "NULL,NULL"
+            route_type = "r.route_type" if "route_type" in route_columns else "NULL"
+            arrival_time = "s.arrival_time" if "arrival_time" in self._table_columns("stop_times") else "NULL"
+            row = connection.execute(f"""
+                SELECT t.trip_id,t.route_id,COALESCE(NULLIF(r.short_name,''),NULLIF(r.long_name,''),t.route_id),
+                       t.headsign,t.direction_id,{agency_fields},{route_type},t.service_id
+                FROM trips t LEFT JOIN routes r ON r.route_id=t.route_id {agency_join}
+                WHERE t.trip_id IN ({','.join('?' for _ in candidates)}) ORDER BY t.trip_id LIMIT 1
+            """, candidates).fetchone()
+            if row is None:
+                return None
+            if service_date and connection.execute("SELECT 1 FROM active_services WHERE service_id=? AND service_date=?", (row[8], service_date)).fetchone() is None:
+                return None
+            stops = connection.execute(f"""
+                SELECT s.raw_stop_id,s.stop_sequence,{arrival_time},s.departure_time,rs.stop_name
+                FROM stop_times s JOIN raw_stops rs ON rs.stop_id=s.raw_stop_id
+                WHERE s.trip_id=? ORDER BY s.stop_sequence,s.raw_stop_id
+            """, (row[0],)).fetchall()
+        try:
+            catalog_value = json.loads(
+                (Path(static_root) / "stops" / f"{city_id}.json").read_text(encoding="utf-8")
+            )
+            catalog = catalog_value if isinstance(catalog_value, list) else []
+        except (OSError, json.JSONDecodeError, TypeError):
+            catalog = []
+        wanted = {self._public_identifier_multi(s[0], stop_prefixes) for s in stops}
+        coordinates = {self._public_identifier_multi(str(s["id"]), stop_prefixes): s for s in catalog
+                       if self._public_identifier_multi(str(s.get("id", "")), stop_prefixes) in wanted}
+        ordered = []
+        for stop_id, sequence, arrival, departure, name in stops:
+            public_id = self._public_identifier_multi(stop_id, stop_prefixes)
+            metadata = coordinates.get(public_id, {})
+            ordered.append({"id": public_id, "name": name, "stopSequence": sequence,
+                            "scheduledArrival": arrival or None, "scheduledDeparture": departure or None,
+                            "latitude": metadata.get("latitude"), "longitude": metadata.get("longitude"),
+                            "platform": metadata.get("platform"), "floor": metadata.get("floor")})
+        mode = GTFS_ROUTE_TYPE_TO_MODE.get(str(row[7]), "unknown")
+        return {"tripID": self._public_identifier_multi(row[0], prefixes),
+                "routeID": self._public_identifier_multi(row[1], prefixes), "line": row[2],
+                "destination": row[3] or (ordered[-1]["name"] if ordered else None), "directionID": row[4],
+                "operatorID": self._public_identifier_multi(row[5], prefixes) or None, "operator": row[6],
+                "transportMode": mode, "timezone": self.city_departure_mode(city_id)[1],
+                "serviceDate": datetime.strptime(service_date, "%Y%m%d").date().isoformat() if service_date else None,
+                "stops": ordered, "geometry": None, "source": "scheduled-static", "isRealtime": False}
 
     def board(
         self,
@@ -1777,6 +1845,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(HTTPStatus.OK, {"ok": True, "database": self.database.meta()})
             if parsed.path == "/static-departures/meta":
                 return self.send_json(HTTPStatus.OK, self.database.meta())
+            if parsed.path == "/static-departures/trip":
+                city_id = query.get("cityID", [""])[0]
+                trip_id = query.get("tripID", [""])[0]
+                if not city_id or not trip_id:
+                    return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "cityID and tripID are required"})
+                try:
+                    details = self.database.trip_details(city_id, trip_id, STATIC_DATA_ROOT, query.get("serviceDate", [None])[0])
+                except ValueError:
+                    return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid trip request"})
+                if details is None:
+                    return self.send_json(HTTPStatus.NOT_FOUND, {"error": "unknown trip"})
+                return self.send_json(HTTPStatus.OK, details)
             city, stop = query.get("cityID", [None])[0], query.get("stopID", [None])[0]
             if not city or not stop:
                 return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "cityID and stopID are required"})
