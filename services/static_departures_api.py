@@ -578,6 +578,7 @@ class ExternalStaticData:
                 limit,
                 from_datetime,
                 self.timezone_name,
+                now_provider=self._now,
             )
         requested = self._storage_id(stop_id)
         stop = self.stops.get(requested)
@@ -1297,6 +1298,9 @@ class Database:
                 "directionID": direction or None,
                 "scheduledTime": departure_time or None,
                 "scheduledDeparture": departure_time or None,
+                "serviceDate": datetime.strptime(str(service_date), "%Y%m%d").date().isoformat(),
+                "departureDateTime": absolute_departure.isoformat(),
+                "stopSequence": stop_sequence,
                 "operatorID": self._public_identifier_multi(agency_id, identifier_prefixes) if agency_id else None,
                 "operator": operator or None,
                 "stopID": public_stop_id,

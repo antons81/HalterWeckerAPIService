@@ -327,7 +327,7 @@ class IsraelStaticAPITests(unittest.TestCase):
                 payload = json.loads(response.read().decode("utf-8"))
             self.assertEqual(
                 [item["scheduledTime"] for item in payload["departures"]],
-                ["24:05:00", "00:05:00", "25:10:00"],
+                ["12:05:00", "12:30:00", "24:05:00"],
             )
             self.assertEqual(
                 [item["stopID"] for item in payload["departures"]],
@@ -336,6 +336,8 @@ class IsraelStaticAPITests(unittest.TestCase):
             self.assertEqual(payload["departures"][0]["operator"], "Egged")
             self.assertEqual(payload["departures"][0]["platform"], "627")
             self.assertEqual(payload["departures"][0]["floor"], "6")
+            self.assertEqual(payload["departures"][0]["serviceDate"], "2026-09-06")
+            self.assertEqual(payload["departures"][0]["departureDateTime"], "2026-09-06T12:05:00+03:00")
 
             with urlopen(
                 f"http://localhost:{server.server_port}/israel/stations/12961/departures"
