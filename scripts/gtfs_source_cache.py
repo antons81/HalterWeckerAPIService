@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import fcntl
+import argparse
 import errno
+import fcntl
 import gzip
 import hashlib
 import json
@@ -28,6 +29,9 @@ DEFAULT_CACHE_ROOT = Path("/srv/haltewecker/cache/gtfs")
 REQUIRED_GTFS_FILES = {"stops.txt", "routes.txt", "trips.txt", "stop_times.txt"}
 DEFAULT_REQUEST_HEADERS = {"User-Agent": "HalteWeckerStopPipeline/1.0"}
 SAFE_SOURCE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+HASH_ZIP_NAME = re.compile(r"^[0-9a-f]{64}\.zip$")
+DOWNLOAD_TEMP_NAME = re.compile(r"^\.download-[^/]+\.zip$")
+DEFAULT_ORPHAN_TEMP_MAX_AGE_SECONDS = 24 * 60 * 60
 TRANSIENT_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
 TRANSIENT_ERRNOS = {
     error_number
@@ -51,6 +55,17 @@ class ArtifactResult:
     status: str
     reason: str = ""
     state: dict[str, object] | None = None
+
+
+@dataclass(frozen=True)
+class CacheCleanupResult:
+    source_id: str
+    status: str
+    reason: str = ""
+    kept: tuple[str, ...] = ()
+    removed: tuple[str, ...] = ()
+    orphan_temp_removed: tuple[str, ...] = ()
+    reclaimed_bytes: int = 0
 
 
 def _now() -> str:
@@ -241,6 +256,189 @@ class GTFSArtifactCache:
         self._fsync_directory(artifact.parent)
         self._write_state(state_path, state)
 
+    @staticmethod
+    def _inode(path: Path) -> tuple[int, int]:
+        metadata = path.stat()
+        return metadata.st_dev, metadata.st_ino
+
+    def _cleanup_source_locked(
+        self,
+        source_id: str,
+        artifact: Path,
+        state_path: Path,
+        *,
+        dry_run: bool = False,
+        orphan_temp_max_age_seconds: int = DEFAULT_ORPHAN_TEMP_MAX_AGE_SECONDS,
+    ) -> CacheCleanupResult:
+        directory = artifact.parent
+        if not artifact.is_file() or artifact.is_symlink():
+            return CacheCleanupResult(source_id, "skipped", "current-missing-or-nonregular")
+        if not state_path.is_file() or state_path.is_symlink():
+            return CacheCleanupResult(source_id, "skipped", "state-missing-or-nonregular")
+
+        state = self._read_state(state_path)
+        digest = state.get("sha256") if state else None
+        size = state.get("size") if state else None
+        if (
+            not state
+            or state.get("validated") is not True
+            or state.get("artifact") != "current.zip"
+            or not isinstance(digest, str)
+            or HASH_ZIP_NAME.fullmatch(f"{digest}.zip") is None
+            or not isinstance(size, int)
+            or size <= 0
+        ):
+            return CacheCleanupResult(source_id, "skipped", "state-invalid")
+
+        try:
+            current_metadata = artifact.stat()
+        except OSError:
+            return CacheCleanupResult(source_id, "skipped", "current-stat-failed")
+        if current_metadata.st_size <= 0 or current_metadata.st_size != size:
+            return CacheCleanupResult(source_id, "skipped", "current-state-size-mismatch")
+
+        current_inode = (current_metadata.st_dev, current_metadata.st_ino)
+        expected_hash = directory / f"{digest}.zip"
+        if expected_hash.exists() or expected_hash.is_symlink():
+            if expected_hash.is_symlink() or not expected_hash.is_file():
+                return CacheCleanupResult(source_id, "skipped", "current-hash-nonregular")
+            try:
+                if self._inode(expected_hash) != current_inode:
+                    return CacheCleanupResult(source_id, "skipped", "state-hash-inode-mismatch")
+            except OSError:
+                return CacheCleanupResult(source_id, "skipped", "current-hash-stat-failed")
+
+        kept = ["current.zip", "state.json", ".lock"]
+        removed: list[str] = []
+        orphan_temp_removed: list[str] = []
+        reclaimed_bytes = 0
+        now = time.time()
+        for entry in sorted(directory.iterdir(), key=lambda item: item.name):
+            name = entry.name
+            if name in {"current.zip", "state.json", ".lock"}:
+                continue
+            if entry.is_symlink() or not entry.is_file():
+                continue
+
+            if HASH_ZIP_NAME.fullmatch(name):
+                try:
+                    metadata = entry.stat()
+                except OSError:
+                    continue
+                if (metadata.st_dev, metadata.st_ino) == current_inode:
+                    kept.append(name)
+                    continue
+                bytes_to_reclaim = metadata.st_size if metadata.st_nlink == 1 else 0
+                if not dry_run:
+                    try:
+                        entry.unlink()
+                    except FileNotFoundError:
+                        continue
+                removed.append(name)
+                reclaimed_bytes += bytes_to_reclaim
+                continue
+
+            if DOWNLOAD_TEMP_NAME.fullmatch(name):
+                try:
+                    metadata = entry.stat()
+                except OSError:
+                    continue
+                age_seconds = now - metadata.st_mtime
+                if age_seconds < orphan_temp_max_age_seconds or age_seconds < 0:
+                    continue
+                bytes_to_reclaim = metadata.st_size if metadata.st_nlink == 1 else 0
+                if not dry_run:
+                    try:
+                        entry.unlink()
+                    except FileNotFoundError:
+                        continue
+                orphan_temp_removed.append(name)
+                reclaimed_bytes += bytes_to_reclaim
+
+        return CacheCleanupResult(
+            source_id,
+            "cleaned",
+            kept=tuple(sorted(kept)),
+            removed=tuple(removed),
+            orphan_temp_removed=tuple(orphan_temp_removed),
+            reclaimed_bytes=reclaimed_bytes,
+        )
+
+    def _cleanup_after_activation(
+        self,
+        source_id: str,
+        artifact: Path,
+        state_path: Path,
+    ) -> None:
+        try:
+            self._cleanup_source_locked(
+                source_id,
+                artifact,
+                state_path,
+                orphan_temp_max_age_seconds=0,
+            )
+        except OSError as error:
+            print(
+                f"[GTFSCache] source={source_id} stage=retention "
+                f"status=skipped reason={type(error).__name__}"
+            )
+
+    def cleanup_source(
+        self,
+        source_id: str,
+        *,
+        dry_run: bool = False,
+        orphan_temp_max_age_seconds: int = DEFAULT_ORPHAN_TEMP_MAX_AGE_SECONDS,
+    ) -> CacheCleanupResult:
+        if orphan_temp_max_age_seconds < 0:
+            raise ValueError("orphan_temp_max_age_seconds must not be negative")
+        artifact, state_path, lock_path = self._paths(source_id)
+        if not lock_path.is_file() or lock_path.is_symlink():
+            return CacheCleanupResult(source_id, "skipped", "lock-missing-or-nonregular")
+        try:
+            with lock_path.open("a+") as lock:
+                try:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as error:
+                    if error.errno in {errno.EACCES, errno.EAGAIN}:
+                        return CacheCleanupResult(source_id, "skipped", "lock-held-active-update")
+                    raise
+                return self._cleanup_source_locked(
+                    source_id,
+                    artifact,
+                    state_path,
+                    dry_run=dry_run,
+                    orphan_temp_max_age_seconds=orphan_temp_max_age_seconds,
+                )
+        except OSError as error:
+            return CacheCleanupResult(source_id, "skipped", f"lock-open-failed:{type(error).__name__}")
+
+    def cleanup_root(
+        self,
+        *,
+        dry_run: bool = False,
+        orphan_temp_max_age_seconds: int = DEFAULT_ORPHAN_TEMP_MAX_AGE_SECONDS,
+    ) -> tuple[CacheCleanupResult, ...]:
+        if not self.root.is_dir() or self.root.is_symlink():
+            return ()
+        results: list[CacheCleanupResult] = []
+        for directory in sorted(self.root.iterdir(), key=lambda item: item.name):
+            if not directory.is_dir() or directory.is_symlink():
+                continue
+            if SAFE_SOURCE_ID.fullmatch(directory.name) is None:
+                results.append(
+                    CacheCleanupResult(directory.name, "skipped", "invalid-source-directory")
+                )
+                continue
+            results.append(
+                self.cleanup_source(
+                    directory.name,
+                    dry_run=dry_run,
+                    orphan_temp_max_age_seconds=orphan_temp_max_age_seconds,
+                )
+            )
+        return tuple(results)
+
     def resolve(
         self,
         source_id: str,
@@ -285,7 +483,14 @@ class GTFSArtifactCache:
                     self._activate_candidate(candidate, artifact, state_path, new_state)
                     valid_cache = True
                     state = new_state
+                    self._cleanup_after_activation(
+                        source_id,
+                        artifact,
+                        state_path,
+                    )
                 except Exception:
+                    pass
+                finally:
                     candidate.unlink(missing_ok=True)
 
             if valid_cache and source_version is not None:
@@ -309,12 +514,18 @@ class GTFSArtifactCache:
                     digest, size = validate_gtfs_archive(candidate, validator=validator)
                     new_state = self._state(source_id, _state_url(url, None), source_version, {}, digest, size)
                     self._activate_candidate(candidate, artifact, state_path, new_state)
+                    self._cleanup_after_activation(
+                        source_id,
+                        artifact,
+                        state_path,
+                    )
                     return ArtifactResult(source_id, artifact, "updated", f"local source ({time.monotonic() - started:.2f}s)", new_state)
                 except Exception:
-                    candidate.unlink(missing_ok=True)
                     if valid_cache and allow_stale:
                         return ArtifactResult(source_id, artifact, "preserved-stale", "local artifact validation failed", state)
                     raise
+                finally:
+                    candidate.unlink(missing_ok=True)
 
             if metadata_probe:
                 try:
@@ -345,62 +556,70 @@ class GTFSArtifactCache:
             fd, temporary_name = tempfile.mkstemp(prefix=".download-", suffix=".zip", dir=artifact.parent)
             os.close(fd)
             candidate = Path(temporary_name)
-            last_error: BaseException | None = None
-            for attempt in range(1, retry_attempts + 1):
-                try:
-                    with candidate.open("wb") as output:
-                        request = urllib.request.Request(url, headers=request_headers)
-                        with urllib.request.urlopen(request, timeout=180) as response:
-                            status = int(getattr(response, "status", 200))
-                            if status in TRANSIENT_HTTP_STATUS_CODES:
-                                raise urllib.error.HTTPError(
-                                    url,
-                                    status,
-                                    f"HTTP {status}",
-                                    getattr(response, "headers", {}),
-                                    None,
-                                )
-                            if status >= 400:
-                                raise urllib.error.HTTPError(
-                                    url,
-                                    status,
-                                    f"HTTP {status}",
-                                    getattr(response, "headers", {}),
-                                    None,
-                                )
-                            if status == 304 and valid_cache:
-                                return ArtifactResult(source_id, artifact, "unchanged", "HTTP 304", state)
-                            response_headers = _headers(response)
-                            _copy_http_body(response, output, response_headers)
-                        output.flush()
-                        os.fsync(output.fileno())
-                    digest, size = validate_gtfs_archive(candidate, validator=validator)
-                    if minimum_size is not None and size < max(1024, minimum_size // 2):
-                        raise ValueError(f"GTFS artifact is smaller than expected for {source_id}")
-                    if valid_cache and digest == state.get("sha256") and size == int(state.get("size", -1)):
-                        return ArtifactResult(source_id, artifact, "unchanged", "checksum", state)
-                    new_state = self._state(source_id, _state_url(url, state_url), source_version, response_headers, digest, size)
-                    if candidate.parent != artifact.parent:
-                        raise RuntimeError("GTFS candidate and cache artifact are on different filesystems")
-                    self._activate_candidate(candidate, artifact, state_path, new_state)
-                    return ArtifactResult(source_id, artifact, "updated", "downloaded", new_state)
-                except Exception as error:
-                    last_error = error
-                    candidate.unlink(missing_ok=True)
-                    if not _is_transient_error(error) or attempt == retry_attempts:
-                        break
-                    print(
-                        f"[GTFSCache] source={source_id} attempt={attempt} "
-                        f"failed: {_error_summary(error)}"
-                    )
-                    time.sleep(min(0.5 * attempt, 2.0))
-            candidate.unlink(missing_ok=True)
-            if valid_cache and allow_stale:
-                reason = _error_summary(last_error) if last_error else "download failure"
-                return ArtifactResult(source_id, artifact, "preserved-stale", reason, state)
-            if last_error is not None:
-                raise last_error
-            raise RuntimeError(f"GTFS download failed for {source_id}")
+            try:
+                last_error: BaseException | None = None
+                for attempt in range(1, retry_attempts + 1):
+                    try:
+                        with candidate.open("wb") as output:
+                            request = urllib.request.Request(url, headers=request_headers)
+                            with urllib.request.urlopen(request, timeout=180) as response:
+                                status = int(getattr(response, "status", 200))
+                                if status in TRANSIENT_HTTP_STATUS_CODES:
+                                    raise urllib.error.HTTPError(
+                                        url,
+                                        status,
+                                        f"HTTP {status}",
+                                        getattr(response, "headers", {}),
+                                        None,
+                                    )
+                                if status >= 400:
+                                    raise urllib.error.HTTPError(
+                                        url,
+                                        status,
+                                        f"HTTP {status}",
+                                        getattr(response, "headers", {}),
+                                        None,
+                                    )
+                                if status == 304 and valid_cache:
+                                    return ArtifactResult(source_id, artifact, "unchanged", "HTTP 304", state)
+                                response_headers = _headers(response)
+                                _copy_http_body(response, output, response_headers)
+                            output.flush()
+                            os.fsync(output.fileno())
+                        digest, size = validate_gtfs_archive(candidate, validator=validator)
+                        if minimum_size is not None and size < max(1024, minimum_size // 2):
+                            raise ValueError(f"GTFS artifact is smaller than expected for {source_id}")
+                        if valid_cache and digest == state.get("sha256") and size == int(state.get("size", -1)):
+                            return ArtifactResult(source_id, artifact, "unchanged", "checksum", state)
+                        new_state = self._state(source_id, _state_url(url, state_url), source_version, response_headers, digest, size)
+                        if candidate.parent != artifact.parent:
+                            raise RuntimeError("GTFS candidate and cache artifact are on different filesystems")
+                        self._activate_candidate(candidate, artifact, state_path, new_state)
+                        self._cleanup_after_activation(
+                            source_id,
+                            artifact,
+                            state_path,
+                        )
+                        return ArtifactResult(source_id, artifact, "updated", "downloaded", new_state)
+                    except Exception as error:
+                        last_error = error
+                        candidate.unlink(missing_ok=True)
+                        if not _is_transient_error(error) or attempt == retry_attempts:
+                            break
+                        print(
+                            f"[GTFSCache] source={source_id} attempt={attempt} "
+                            f"failed: {_error_summary(error)}"
+                        )
+                        time.sleep(min(0.5 * attempt, 2.0))
+                if valid_cache and allow_stale:
+                    reason = _error_summary(last_error) if last_error else "download failure"
+                    return ArtifactResult(source_id, artifact, "preserved-stale", reason, state)
+                if last_error is not None:
+                    raise last_error
+                raise RuntimeError(f"GTFS download failed for {source_id}")
+            finally:
+                candidate.unlink(missing_ok=True)
+
     @staticmethod
     def _state(
         source_id: str,
@@ -424,3 +643,71 @@ class GTFSArtifactCache:
             "validated": True,
             "validatedAt": _now(),
         }
+
+
+def _run_cleanup_command(arguments: argparse.Namespace) -> int:
+    cache = GTFSArtifactCache(arguments.cache_root)
+    results = cache.cleanup_root(
+        dry_run=arguments.dry_run,
+        orphan_temp_max_age_seconds=int(arguments.orphan_temp_max_age_hours * 3600),
+    )
+    cleaned_sources = 0
+    skipped_sources = 0
+    removed_files = 0
+    orphan_temp_removed = 0
+    reclaimed_bytes = 0
+    for result in results:
+        if result.status == "skipped":
+            skipped_sources += 1
+            print(
+                f"[GTFSCacheCleanup] source={result.source_id} "
+                f"status=skipped reason={result.reason}"
+            )
+            continue
+        cleaned_sources += 1
+        removed_files += len(result.removed)
+        orphan_temp_removed += len(result.orphan_temp_removed)
+        reclaimed_bytes += result.reclaimed_bytes
+        for name in result.removed:
+            action = "WOULD_DELETE" if arguments.dry_run else "DELETE"
+            print(f"[GTFSCacheCleanup] source={result.source_id} {action} file={name} kind=hash")
+        for name in result.orphan_temp_removed:
+            action = "WOULD_DELETE" if arguments.dry_run else "DELETE"
+            print(f"[GTFSCacheCleanup] source={result.source_id} {action} file={name} kind=orphan-temp")
+        print(
+            f"[GTFSCacheCleanup] source={result.source_id} status=ok "
+            f"kept={len(result.kept)} removed={len(result.removed)} "
+            f"orphan_temp_removed={len(result.orphan_temp_removed)} "
+            f"reclaimed_bytes={result.reclaimed_bytes}"
+        )
+    print(
+        "[GTFSCacheCleanup] summary "
+        f"sources={len(results)} cleaned_sources={cleaned_sources} "
+        f"skipped_sources={skipped_sources} removed={removed_files} "
+        f"orphan_temp_removed={orphan_temp_removed} reclaimed_bytes={reclaimed_bytes}"
+    )
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Inspect and clean persistent GTFS source caches.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    cleanup = subparsers.add_parser("cleanup", help="remove obsolete hash artifacts and orphan downloads")
+    cleanup.add_argument("--cache-root", default=str(DEFAULT_CACHE_ROOT))
+    cleanup.add_argument("--dry-run", action="store_true")
+    cleanup.add_argument(
+        "--orphan-temp-max-age-hours",
+        type=float,
+        default=DEFAULT_ORPHAN_TEMP_MAX_AGE_SECONDS / 3600,
+    )
+    arguments = parser.parse_args()
+    if arguments.orphan_temp_max_age_hours < 0:
+        parser.error("--orphan-temp-max-age-hours must not be negative")
+    if arguments.command == "cleanup":
+        return _run_cleanup_command(arguments)
+    parser.error(f"unsupported command: {arguments.command}")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

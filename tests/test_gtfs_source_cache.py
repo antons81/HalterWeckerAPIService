@@ -1,7 +1,11 @@
 import io
 import gzip
 import json
+import os
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 import zipfile
@@ -437,6 +441,172 @@ class GTFSArtifactCacheTests(unittest.TestCase):
             self.assertEqual(result["status"], "unchanged")
             self.assertEqual(result["year"], 2026)
             self.assertTrue((root / "austria" / "vor-2026.zip").samefile(artifact))
+
+    def test_successful_update_removes_old_hash_and_keeps_new_current_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.zip"
+            write_gtfs(source)
+            cache = GTFSArtifactCache(root / "cache")
+            first = cache.resolve("sweden", str(source), metadata_probe=False)
+            current = root / "cache" / "sweden" / "current.zip"
+            old_hash = current.with_name(f"{first.state['sha256']}.zip")
+            os.link(current, old_hash)
+
+            write_gtfs(source, "new")
+            second = cache.resolve("sweden", str(source), metadata_probe=False)
+            new_hash = current.with_name(f"{second.state['sha256']}.zip")
+            os.link(current, new_hash)
+
+            self.assertNotEqual(first.state["sha256"], second.state["sha256"])
+            self.assertFalse(old_hash.exists())
+            self.assertTrue(current.exists())
+            self.assertTrue(new_hash.samefile(current))
+            self.assertTrue((current.parent / ".lock").exists())
+            self.assertTrue((current.parent / "state.json").exists())
+
+    def test_cleanup_preserves_current_pair_counts_unique_reclaimed_bytes_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.zip"
+            write_gtfs(source)
+            cache = GTFSArtifactCache(root / "cache")
+            first = cache.resolve("sweden", str(source), metadata_probe=False)
+            directory = root / "cache" / "sweden"
+            current = directory / "current.zip"
+            current_hash = directory / f"{first.state['sha256']}.zip"
+            os.link(current, current_hash)
+
+            reclaimable_hash = directory / ("a" * 64 + ".zip")
+            reclaimable_hash.write_bytes(b"reclaimable")
+            shared_hash = directory / ("b" * 64 + ".zip")
+            outside_link = root / "outside.zip"
+            outside_link.write_bytes(b"shared")
+            os.link(outside_link, shared_hash)
+            orphan_temp = directory / ".download-orphan.zip"
+            orphan_temp.write_bytes(b"")
+            old_time = time.time() - 2 * 24 * 60 * 60
+            os.utime(orphan_temp, (old_time, old_time))
+
+            result = cache.cleanup_source(
+                "sweden",
+                orphan_temp_max_age_seconds=60 * 60,
+            )
+
+            self.assertEqual(result.status, "cleaned")
+            self.assertEqual(result.reclaimed_bytes, len(b"reclaimable"))
+            self.assertTrue(current_hash.samefile(current))
+            self.assertFalse(reclaimable_hash.exists())
+            self.assertFalse(shared_hash.exists())
+            self.assertTrue(outside_link.exists())
+            self.assertFalse(orphan_temp.exists())
+            self.assertTrue((directory / ".lock").exists())
+            self.assertTrue((directory / "state.json").exists())
+
+            second = cache.cleanup_source("sweden", orphan_temp_max_age_seconds=60 * 60)
+            self.assertEqual(second.status, "cleaned")
+            self.assertEqual(second.removed, ())
+            self.assertEqual(second.orphan_temp_removed, ())
+            self.assertEqual(second.reclaimed_bytes, 0)
+
+    def test_cleanup_does_not_remove_only_hash_from_incomplete_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp) / "cache" / "incomplete"
+            directory.mkdir(parents=True)
+            (directory / ".lock").touch()
+            only_copy = directory / ("c" * 64 + ".zip")
+            only_copy.write_bytes(b"potential working copy")
+
+            result = GTFSArtifactCache(Path(temp) / "cache").cleanup_source("incomplete")
+
+            self.assertEqual(result.status, "skipped")
+            self.assertEqual(result.reason, "current-missing-or-nonregular")
+            self.assertTrue(only_copy.exists())
+
+    def test_http_304_and_checksum_hit_remove_download_temporary_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.zip"
+            write_gtfs(source)
+            payload = source.read_bytes()
+            cache = GTFSArtifactCache(root / "cache")
+
+            with patch(
+                "gtfs_source_cache.urllib.request.urlopen",
+                return_value=FakeResponse(body=payload),
+            ):
+                first = cache.resolve(
+                    "sweden",
+                    "https://example.test/sweden.zip",
+                    metadata_probe=False,
+                )
+
+            def not_modified(request, timeout=0):
+                return FakeResponse(status=304)
+
+            with patch("gtfs_source_cache.urllib.request.urlopen", side_effect=not_modified):
+                result_304 = cache.resolve(
+                    "sweden",
+                    "https://example.test/sweden.zip",
+                    metadata_probe=False,
+                )
+
+            self.assertEqual(first.status, "updated")
+            self.assertEqual(result_304.status, "unchanged")
+            self.assertEqual(result_304.reason, "HTTP 304")
+            self.assertEqual(list((root / "cache" / "sweden").glob(".download-*.zip")), [])
+
+            with patch(
+                "gtfs_source_cache.urllib.request.urlopen",
+                return_value=FakeResponse(body=payload),
+            ):
+                result_checksum = cache.resolve(
+                    "sweden",
+                    "https://example.test/sweden.zip",
+                    metadata_probe=False,
+                )
+
+            self.assertEqual(result_checksum.status, "unchanged")
+            self.assertEqual(result_checksum.reason, "checksum")
+            self.assertEqual(list((root / "cache" / "sweden").glob(".download-*.zip")), [])
+
+    def test_cleanup_skips_source_when_update_lock_is_held(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.zip"
+            write_gtfs(source)
+            cache = GTFSArtifactCache(root / "cache")
+            first = cache.resolve("sweden", str(source), metadata_probe=False)
+            directory = root / "cache" / "sweden"
+            old_hash = directory / f"{first.state['sha256']}.zip"
+            os.link(directory / "current.zip", old_hash)
+            active_temp = directory / ".download-active.zip"
+            active_temp.write_bytes(b"active")
+            ready = root / "lock-ready"
+            lock_path = directory / ".lock"
+            child_code = (
+                "import fcntl, pathlib, sys, time\n"
+                "lock = open(sys.argv[1], 'a+')\n"
+                "fcntl.flock(lock.fileno(), fcntl.LOCK_EX)\n"
+                "pathlib.Path(sys.argv[2]).touch()\n"
+                "time.sleep(10)\n"
+            )
+            child = subprocess.Popen(
+                [sys.executable, "-c", child_code, str(lock_path), str(ready)]
+            )
+            try:
+                deadline = time.time() + 3
+                while not ready.exists() and time.time() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                result = cache.cleanup_source("sweden", orphan_temp_max_age_seconds=0)
+                self.assertEqual(result.status, "skipped")
+                self.assertEqual(result.reason, "lock-held-active-update")
+                self.assertTrue(old_hash.exists())
+                self.assertTrue(active_temp.exists())
+            finally:
+                child.terminate()
+                child.wait(timeout=5)
 
 
 if __name__ == "__main__":
