@@ -21,8 +21,20 @@ from build_german_departure_index import (
     service_window, update_terminal_stops,
 )
 from build_stop_packages import load_cities, load_gtfs_archive, nl_city_ids
+from artifact_provenance import artifact_provenance
 from austrian_sources import DEFAULT_REGISTRY, load_austrian_sources, public_stop_id
 from gtfs_agency import agency_scoped_archive
+
+from normalized_provider_artifact import (
+    NormalizedArtifactError,
+    load_existing_for_raw_sha,
+    provider_enabled as normalized_artifact_provider_enabled,
+    static_departures_feature_enabled,
+)
+from static_provider_artifact import (
+    feature_enabled as static_provider_artifact_feature_enabled,
+    load_or_build_static_provider_artifacts,
+)
 
 from external_gtfs import (
     authenticated_external_request,
@@ -339,6 +351,15 @@ def populate_provider_city_memberships(
             if preferred_owners:
                 owners = preferred_owners
             if not owners:
+                foreign_prefixed = {
+                    provider_id
+                    for provider_id, prefix in candidate_prefix_by_provider.items()
+                    if provider_id not in prefix_by_provider
+                    and prefix
+                    and any(str(stop_id).startswith(prefix) for stop_id in stop_ids)
+                }
+                if foreign_prefixed:
+                    continue
                 catalog_provider = _supplemental_stop_provider(
                     connection,
                     city_id,
@@ -580,6 +601,15 @@ def _populate_provider_city_memberships_indexed(
             if preferred_owners:
                 owners = preferred_owners
             if not owners:
+                foreign_prefixed = {
+                    provider_id
+                    for provider_id, prefix in candidate_prefix_by_provider.items()
+                    if provider_id not in prefix_by_provider
+                    and prefix
+                    and any(str(stop_id).startswith(prefix) for stop_id in stop_ids)
+                }
+                if foreign_prefixed:
+                    continue
                 if catalog_only:
                     continue
                 catalog_provider = _supplemental_stop_provider(
@@ -769,6 +799,7 @@ def add_external_gtfs(
     }
     source_cities_by_provider: dict[str, list[dict[str, object]]] = {}
     for source_id in sorted(url_by_provider):
+        provider_started = time.monotonic()
         source = sources_by_id[source_id]
         validate_external_gtfs_source(source, repository_root)
         cities = load_external_cities(source, repository_root)
@@ -783,34 +814,116 @@ def add_external_gtfs(
             url_by_provider[source_id],
             environ=environ if environ is not None else os.environ,
         )
-        raw_archive = load_gtfs_archive(request_url, headers=headers)
-        archive = agency_scoped_archive(raw_archive, source.get("agencyID"))
-        try:
-            provider_stage_runner = None
-            if stage_runner is not None:
-                provider_stage_runner = lambda stage, callback, source_id=source_id: stage_runner(
-                    f"{source_id}:{stage}", callback
-                )
-            timed_stage(
-                f"external:{source_id}",
-                "populate_gtfs",
-                lambda: populate_gtfs(
-                    connection,
-                    archive,
-                    identifier_prefix=str(source["identifierPrefix"]),
-                    stop_id_prefix=(
-                        str(source.get("staticStopIDPrefix", (
-                            str(source.get("namespace", "")).strip()
-                            or str(source["identifierPrefix"])
-                        )))
-                    ),
-                    provider_id=source_id,
-                    stage_runner=provider_stage_runner,
-                ),
+        provider_stage_runner = None
+        if stage_runner is not None:
+            provider_stage_runner = lambda stage, callback, source_id=source_id: stage_runner(
+                f"{source_id}:{stage}", callback
             )
-        finally:
-            archive.close()
+        import_kwargs = {
+            "identifier_prefix": str(source["identifierPrefix"]),
+            "stop_id_prefix": str(source.get("staticStopIDPrefix", (
+                str(source.get("namespace", "")).strip()
+                or str(source["identifierPrefix"])
+            ))),
+            "provider_id": source_id,
+            "stage_runner": provider_stage_runner,
+        }
+        persistent_enabled = (
+            static_departures_feature_enabled(environ)
+            and normalized_artifact_provider_enabled(source_id, repository_root)
+        )
+        if persistent_enabled:
+            input_started = time.monotonic()
+            print(
+                f"[StaticDepartures] source={source_id} stage=static-provider-input "
+                "input=normalized status=started",
+                flush=True,
+            )
+            context = None
+            try:
+                input_path = Path(request_url)
+                if not input_path.is_file():
+                    raise NormalizedArtifactError(
+                        "persistent normalized input requires a local validated GTFS artifact"
+                    )
+                raw_sha, _raw_size = artifact_provenance(input_path)
+                context, artifact_use = load_existing_for_raw_sha(
+                    repository_root=repository_root,
+                    provider_id=source_id,
+                    raw_artifact_sha256=raw_sha,
+                    gtfs_cache_root=None,
+                    environ=environ,
+                )
+                print(
+                    f"[StaticDepartures] source={source_id} stage=static-provider-input "
+                    f"input=normalized status=HIT semanticKey={artifact_use.semantic_key[:12]} "
+                    f"rawSHA={raw_sha[:12]} duration={time.monotonic() - input_started:.4f}s",
+                    flush=True,
+                )
+                if static_provider_artifact_feature_enabled(environ):
+                    static_artifacts = load_or_build_static_provider_artifacts(
+                        normalized_context=context,
+                        normalized_artifact=artifact_use,
+                        repository_root=repository_root,
+                        provider_id=source_id,
+                        source=source,
+                        cities=cities,
+                        stop_data=stop_data,
+                        dates=dates,
+                        environ=environ,
+                    )
+                    print(
+                        f"[StaticDepartures] source={source_id} "
+                        "stage=static-provider-assembly status=NOT-APPLIED "
+                        "reason=single-main-sqlite-requires-materialization "
+                        f"structuralKey={static_artifacts.structural.artifact_key[:12]} "
+                        f"temporalKey={static_artifacts.temporal.artifact_key[:12]}",
+                        flush=True,
+                    )
+                timed_stage(
+                    f"external:{source_id}",
+                    "populate_gtfs",
+                    lambda: populate_gtfs(connection, context, **import_kwargs),
+                )
+            except Exception as error:
+                print(
+                    f"[StaticDepartures] source={source_id} stage=static-provider-input "
+                    f"input=normalized status=INVALID reason={type(error).__name__}:{error} "
+                    f"duration={time.monotonic() - input_started:.4f}s",
+                    flush=True,
+                )
+                raise
+            finally:
+                if context is not None:
+                    context.close()
+        else:
+            input_started = time.monotonic()
+            print(
+                f"[StaticDepartures] source={source_id} stage=static-provider-input "
+                "input=zip status=started",
+                flush=True,
+            )
+            raw_archive = load_gtfs_archive(request_url, headers=headers)
+            archive = agency_scoped_archive(raw_archive, source.get("agencyID"))
+            try:
+                print(
+                    f"[StaticDepartures] source={source_id} stage=static-provider-input "
+                    f"input=zip status=completed duration={time.monotonic() - input_started:.4f}s",
+                    flush=True,
+                )
+                timed_stage(
+                    f"external:{source_id}",
+                    "populate_gtfs",
+                    lambda: populate_gtfs(connection, archive, **import_kwargs),
+                )
+            finally:
+                archive.close()
         imported_city_ids.update(str(city["id"]) for city in cities)
+        print(
+            f"[StaticDepartures] source={source_id} stage=static-provider-total "
+            f"status=completed duration={time.monotonic() - provider_started:.4f}s",
+            flush=True,
+        )
 
     if not imported_city_ids:
         return imported_city_ids
@@ -822,7 +935,11 @@ def add_external_gtfs(
 
     provider_scope = (source_id for source_id in url_by_provider) if scoped else None
     if stage_runner is None:
-        resolve_canonical_stops(connection, provider_ids=provider_scope)
+        timed_stage(
+            "external",
+            "canonical-stops",
+            lambda: resolve_canonical_stops(connection, provider_ids=provider_scope),
+        )
     else:
         stage_runner(
             "canonical-stops",
@@ -858,8 +975,16 @@ def add_external_gtfs(
             )
     provider_scope = tuple(url_by_provider) if scoped else None
     if stage_runner is None:
-        populate_active_services(connection, dates, provider_ids=provider_scope)
-        update_terminal_stops(connection, provider_ids=provider_scope)
+        timed_stage(
+            "external",
+            "active-services",
+            lambda: populate_active_services(connection, dates, provider_ids=provider_scope),
+        )
+        timed_stage(
+            "external",
+            "terminal-stops",
+            lambda: update_terminal_stops(connection, provider_ids=provider_scope),
+        )
     else:
         stage_runner(
             "active-services",

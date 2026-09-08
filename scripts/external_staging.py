@@ -31,6 +31,50 @@ def legacy_int_or_none(value: object, default: int = 0) -> int | None:
         return None
 
 
+SOURCE_FILENAMES = (
+    "agency.txt",
+    "stops.txt",
+    "routes.txt",
+    "trips.txt",
+    "stop_times.txt",
+    "calendar.txt",
+    "calendar_dates.txt",
+    "transfers.txt",
+    "pathways.txt",
+)
+
+SOURCE_COLUMNS = {
+    "agency.txt": ("agency_id", "agency_name"),
+    "stops.txt": (
+        "stop_id", "stop_name", "stop_lat", "stop_lon", "stop_code",
+        "parent_station", "location_type", "platform_code", "stop_desc",
+        "platform_display", "floor_display",
+    ),
+    "routes.txt": (
+        "route_id", "route_short_name", "route_long_name", "route_type",
+        "agency_id",
+    ),
+    "trips.txt": ("route_id", "service_id", "trip_id", "trip_headsign", "direction_id"),
+    "stop_times.txt": (
+        "trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence",
+    ),
+    "calendar.txt": (
+        "service_id", "monday", "tuesday", "wednesday", "thursday",
+        "friday", "saturday", "sunday", "start_date", "end_date",
+    ),
+    "calendar_dates.txt": ("service_id", "date", "exception_type"),
+    "transfers.txt": (
+        "from_stop_id", "to_stop_id", "from_trip_id", "to_trip_id",
+        "from_route_id", "to_route_id", "transfer_type", "min_transfer_time",
+    ),
+    "pathways.txt": (
+        "pathway_id", "from_stop_id", "to_stop_id", "pathway_mode",
+        "is_bidirectional", "length", "traversal_time", "stair_count",
+        "max_slope", "min_width", "signposted_as", "reversed_signposted_as",
+    ),
+}
+
+
 class JSONStream:
     """Incrementally decode generated JSON without reading the whole file."""
 
@@ -277,76 +321,111 @@ def log_memory_stage(
 class NormalizedProviderContext:
     """Disk-backed normalized GTFS tables shared by one provider build."""
 
-    def __init__(self) -> None:
-        self._temporary = tempfile.TemporaryDirectory(
-            prefix="haltewecker-external-normalized-"
-        )
-        self.connection = sqlite3.connect(
-            Path(self._temporary.name) / "normalized.sqlite"
-        )
-        self.connection.executescript(
-            """
-            CREATE TABLE routes (
-                route_id TEXT NOT NULL,
-                route_short_name TEXT NOT NULL,
-                route_long_name TEXT NOT NULL,
-                route_type TEXT NOT NULL,
-                agency_id TEXT NOT NULL,
-                agency_name TEXT NOT NULL
-            );
-            CREATE TABLE stops (
-                stop_id TEXT NOT NULL,
-                stop_name TEXT NOT NULL,
-                stop_lat TEXT NOT NULL,
-                stop_lon TEXT NOT NULL,
-                stop_code TEXT NOT NULL,
-                parent_station TEXT NOT NULL,
-                location_type INTEGER NOT NULL,
-                platform_code TEXT NOT NULL,
-                stop_desc TEXT NOT NULL,
-                platform_display TEXT NOT NULL,
-                floor_display TEXT NOT NULL
-            );
-            CREATE TABLE trips (
-                trip_id TEXT NOT NULL,
-                route_id TEXT NOT NULL,
-                service_id TEXT NOT NULL,
-                trip_headsign TEXT NOT NULL,
-                direction_id TEXT NOT NULL
-            );
-            CREATE TABLE stop_times (
-                trip_id TEXT NOT NULL,
-                stop_id TEXT NOT NULL,
-                arrival_time TEXT NOT NULL,
-                departure_time TEXT NOT NULL,
-                arrival_seconds INTEGER,
-                departure_seconds INTEGER,
-                stop_sequence INTEGER NOT NULL
-            );
-            CREATE TABLE calendar (
-                service_id TEXT PRIMARY KEY,
-                start_date TEXT NOT NULL,
-                end_date TEXT NOT NULL,
-                monday INTEGER NOT NULL,
-                tuesday INTEGER NOT NULL,
-                wednesday INTEGER NOT NULL,
-                thursday INTEGER NOT NULL,
-                friday INTEGER NOT NULL,
-                saturday INTEGER NOT NULL,
-                sunday INTEGER NOT NULL
-            ) WITHOUT ROWID;
-            CREATE TABLE calendar_dates (
-                service_id TEXT NOT NULL,
-                service_date TEXT NOT NULL,
-                exception_type INTEGER NOT NULL,
-                PRIMARY KEY (service_id, service_date)
-            ) WITHOUT ROWID;
-            """
-        )
+    def __init__(self, database_path: Path | None = None, *, read_only: bool = False) -> None:
+        self._temporary: tempfile.TemporaryDirectory[str] | None = None
+        if database_path is None:
+            self._temporary = tempfile.TemporaryDirectory(
+                prefix="haltewecker-external-normalized-"
+            )
+            database_path = Path(self._temporary.name) / "normalized.sqlite"
+        if read_only:
+            self.connection = sqlite3.connect(
+                f"file:{database_path}?mode=ro",
+                uri=True,
+            )
+            self.connection.execute("PRAGMA query_only=ON")
+        else:
+            self.connection = sqlite3.connect(database_path)
+        if not read_only:
+            self.connection.executescript(
+                """
+                CREATE TABLE routes (
+                    route_id TEXT NOT NULL,
+                    route_short_name TEXT NOT NULL,
+                    route_long_name TEXT NOT NULL,
+                    route_type TEXT NOT NULL,
+                    agency_id TEXT NOT NULL,
+                    agency_name TEXT NOT NULL
+                );
+                CREATE TABLE agencies (
+                    agency_id TEXT NOT NULL,
+                    agency_name TEXT NOT NULL
+                );
+                CREATE TABLE stops (
+                    stop_id TEXT NOT NULL,
+                    stop_name TEXT NOT NULL,
+                    stop_lat TEXT NOT NULL,
+                    stop_lon TEXT NOT NULL,
+                    stop_code TEXT NOT NULL,
+                    parent_station TEXT NOT NULL,
+                    location_type INTEGER NOT NULL,
+                    platform_code TEXT NOT NULL,
+                    stop_desc TEXT NOT NULL,
+                    platform_display TEXT NOT NULL,
+                    floor_display TEXT NOT NULL
+                );
+                CREATE TABLE trips (
+                    trip_id TEXT NOT NULL,
+                    route_id TEXT NOT NULL,
+                    service_id TEXT NOT NULL,
+                    trip_headsign TEXT NOT NULL,
+                    direction_id TEXT NOT NULL
+                );
+                CREATE TABLE stop_times (
+                    trip_id TEXT NOT NULL,
+                    stop_id TEXT NOT NULL,
+                    arrival_time TEXT NOT NULL,
+                    departure_time TEXT NOT NULL,
+                    arrival_seconds INTEGER,
+                    departure_seconds INTEGER,
+                    stop_sequence INTEGER NOT NULL
+                );
+                CREATE TABLE calendar (
+                    service_id TEXT PRIMARY KEY,
+                    start_date TEXT NOT NULL,
+                    end_date TEXT NOT NULL,
+                    monday INTEGER NOT NULL,
+                    tuesday INTEGER NOT NULL,
+                    wednesday INTEGER NOT NULL,
+                    thursday INTEGER NOT NULL,
+                    friday INTEGER NOT NULL,
+                    saturday INTEGER NOT NULL,
+                    sunday INTEGER NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE calendar_dates (
+                    service_id TEXT NOT NULL,
+                    service_date TEXT NOT NULL,
+                    exception_type INTEGER NOT NULL,
+                    PRIMARY KEY (service_id, service_date)
+                ) WITHOUT ROWID;
+                CREATE TABLE transfers (
+                    from_stop_id TEXT NOT NULL,
+                    to_stop_id TEXT NOT NULL,
+                    from_trip_id TEXT NOT NULL,
+                    to_trip_id TEXT NOT NULL,
+                    from_route_id TEXT NOT NULL,
+                    to_route_id TEXT NOT NULL,
+                    transfer_type INTEGER NOT NULL,
+                    min_transfer_time INTEGER NOT NULL
+                );
+                CREATE TABLE pathways (
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE source_metadata (
+                    filename TEXT PRIMARY KEY,
+                    columns_json TEXT NOT NULL
+                ) WITHOUT ROWID;
+                """
+            )
 
     @classmethod
-    def from_archive(cls, archive) -> "NormalizedProviderContext":
-        context = cls()
+    def from_archive(
+        cls,
+        archive,
+        *,
+        database_path: Path | None = None,
+    ) -> "NormalizedProviderContext":
+        context = cls(database_path=database_path)
         try:
             context._populate(archive)
         except Exception:
@@ -354,9 +433,17 @@ class NormalizedProviderContext:
             raise
         return context
 
+    @classmethod
+    def from_database(cls, database_path: Path) -> "NormalizedProviderContext":
+        if not database_path.is_file():
+            raise FileNotFoundError(database_path)
+        return cls(database_path=database_path, read_only=True)
+
     def close(self) -> None:
         self.connection.close()
-        self._temporary.cleanup()
+        if self._temporary is not None:
+            self._temporary.cleanup()
+            self._temporary = None
 
     def _populate(self, archive) -> None:
         try:
@@ -364,11 +451,25 @@ class NormalizedProviderContext:
         except ImportError:
             from build_german_departure_index import parse_gtfs_time
 
+        archive_names = set(archive.namelist())
+        self.connection.executemany(
+            "INSERT INTO source_metadata(filename, columns_json) VALUES (?, ?)",
+            (
+                (filename, json.dumps(SOURCE_COLUMNS[filename], ensure_ascii=False))
+                for filename in SOURCE_FILENAMES
+                if filename in archive_names
+            ),
+        )
+
         agencies = {
             str(row.get("agency_id", "")).strip(): str(row.get("agency_name", "") or "").strip()
             for row in _iter_table(archive, "agency.txt")
             if str(row.get("agency_id", "")).strip()
         }
+        self.connection.executemany(
+            "INSERT INTO agencies VALUES (?, ?)",
+            agencies.items(),
+        )
         self.connection.executemany(
             "INSERT INTO routes VALUES (?, ?, ?, ?, ?, ?)",
             (
@@ -502,6 +603,31 @@ class NormalizedProviderContext:
             ),
         )
         self.connection.commit()
+
+        self.connection.executemany(
+            "INSERT INTO transfers VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                (
+                    str(row.get("from_stop_id", "") or ""),
+                    str(row.get("to_stop_id", "") or ""),
+                    str(row.get("from_trip_id", "") or ""),
+                    str(row.get("to_trip_id", "") or ""),
+                    str(row.get("from_route_id", "") or ""),
+                    str(row.get("to_route_id", "") or ""),
+                    legacy_int_or_none(row.get("transfer_type", "0")) or 0,
+                    legacy_int_or_none(row.get("min_transfer_time", "0")) or 0,
+                )
+                for row in _iter_table(archive, "transfers.txt")
+            ),
+        )
+        self.connection.executemany(
+            "INSERT INTO pathways(payload) VALUES (?)",
+            (
+                (_serialize_source_row(row),)
+                for row in _iter_table(archive, "pathways.txt")
+            ),
+        )
+        self.connection.commit()
         self.connection.executescript(
             """
             CREATE INDEX stop_times_trip_sequence
@@ -516,6 +642,10 @@ class NormalizedProviderContext:
 
     def iter_table(self, filename: str) -> Iterator[dict[str, object]]:
         definitions = {
+            "agency.txt": (
+                "agencies",
+                ("agency_id", "agency_name"),
+            ),
             "routes.txt": (
                 "routes",
                 (
@@ -559,16 +689,87 @@ class NormalizedProviderContext:
                     "stop_sequence",
                 ),
             ),
+            "calendar.txt": (
+                "calendar",
+                (
+                    "service_id",
+                    "start_date",
+                    "end_date",
+                    "monday",
+                    "tuesday",
+                    "wednesday",
+                    "thursday",
+                    "friday",
+                    "saturday",
+                    "sunday",
+                ),
+            ),
+            "calendar_dates.txt": (
+                "calendar_dates",
+                ("service_id", "service_date", "exception_type"),
+            ),
+            "transfers.txt": (
+                "transfers",
+                (
+                    "from_stop_id",
+                    "to_stop_id",
+                    "from_trip_id",
+                    "to_trip_id",
+                    "from_route_id",
+                    "to_route_id",
+                    "transfer_type",
+                    "min_transfer_time",
+                ),
+            ),
         }
+        if filename == "pathways.txt":
+            for (payload,) in self.connection.execute(
+                "SELECT payload FROM pathways ORDER BY rowid"
+            ):
+                value = _deserialize_source_row(str(payload))
+                if isinstance(value, dict):
+                    yield value
+            return
         definition = definitions.get(filename)
         if definition is None:
             return
         table, columns = definition
         query = f"SELECT {', '.join(columns)} FROM {table}"
-        if table in {"routes", "stops", "trips"}:
+        if table in {"agencies", "routes", "stops", "trips"}:
             query += " ORDER BY rowid"
         for row in self.connection.execute(query):
-            yield dict(zip(columns, row))
+            values = dict(zip(columns, row))
+            source_columns = self._source_columns(filename)
+            if source_columns:
+                if filename == "calendar_dates.txt" and "date" in source_columns:
+                    source_columns = set(source_columns)
+                    source_columns.remove("date")
+                    source_columns.add("service_date")
+                values = {
+                    column: value
+                    for column, value in values.items()
+                    if column in source_columns
+                }
+            if filename == "calendar_dates.txt" and "service_date" in values:
+                values["date"] = values.pop("service_date")
+            yield values
+
+    def namelist(self) -> tuple[str, ...]:
+        return tuple(
+            filename
+            for filename in SOURCE_FILENAMES
+            if self._source_columns(filename) is not None
+        )
+
+    def _source_columns(self, filename: str) -> set[str] | None:
+        row = self.connection.execute(
+            "SELECT columns_json FROM source_metadata WHERE filename=?",
+            (filename,),
+        ).fetchone()
+        if row is None:
+            return None
+        columns = json.loads(str(row[0]))
+        return {str(column) for column in columns}
 
     def load_table(self, filename: str) -> list[dict[str, object]]:
         return list(self.iter_table(filename))
@@ -1242,3 +1443,28 @@ def _iter_table(archive, filename: str) -> Iterator[dict[str, str]]:
         yield from normalized_dict_reader(
             (line.decode("utf-8-sig") for line in raw)
         )
+
+
+def _serialize_source_row(row: dict[object, object]) -> str:
+    return canonical_json(
+        {
+            "columns": ["__extra__" if key is None else str(key) for key in row],
+            "values": list(row.values()),
+        }
+    )
+
+
+def _deserialize_source_row(payload: str) -> dict[object, object]:
+    value = json.loads(payload)
+    if not isinstance(value, dict):
+        raise ValueError("Normalized pathway row payload is not an object")
+    columns = value.get("columns")
+    values = value.get("values")
+    if not isinstance(columns, list) or not isinstance(values, list):
+        raise ValueError("Normalized pathway row payload is malformed")
+    if len(columns) != len(values):
+        raise ValueError("Normalized pathway row payload has mismatched columns")
+    return {
+        (None if column == "__extra__" else str(column)): item
+        for column, item in zip(columns, values)
+    }

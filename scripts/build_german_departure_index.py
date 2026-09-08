@@ -72,7 +72,18 @@ def transfer_ownership_key(
     )
 
 
-def gtfs_rows(archive: zipfile.ZipFile, name: str) -> Iterable[dict[str, str]]:
+def gtfs_rows(archive, name: str) -> Iterable[dict[str, object]]:
+    if hasattr(archive, "iter_table"):
+        for row in archive.iter_table(name):
+            yield {
+                key: (
+                    value
+                    if key is None or isinstance(value, (list, dict))
+                    else str(value)
+                )
+                for key, value in row.items()
+            }
+        return
     if name not in archive.namelist():
         return []
     with archive.open(name) as raw:

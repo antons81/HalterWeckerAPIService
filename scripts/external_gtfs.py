@@ -102,6 +102,26 @@ except ImportError:
     )
 
 try:
+    from .normalized_provider_artifact import (
+        NormalizedArtifactError,
+        feature_enabled as normalized_artifact_feature_enabled,
+        load_or_build as load_or_build_normalized_artifact,
+        provider_enabled as normalized_artifact_provider_enabled,
+    )
+except ImportError:
+    from normalized_provider_artifact import (
+        NormalizedArtifactError,
+        feature_enabled as normalized_artifact_feature_enabled,
+        load_or_build as load_or_build_normalized_artifact,
+        provider_enabled as normalized_artifact_provider_enabled,
+    )
+
+try:
+    from .provider_artifact_capabilities import SUPPORTED_CAPABILITIES
+except ImportError:
+    from provider_artifact_capabilities import SUPPORTED_CAPABILITIES
+
+try:
     from .external_build_cache import (
         CACHEABLE_PROVIDER_CITY_IDS,
         CTA_PROVIDER_ID,
@@ -293,6 +313,21 @@ def validate_external_gtfs_source(
         )
 
     classification = source_classification(source)
+    artifact_capabilities = source.get("artifactCapabilities", {})
+    if not isinstance(artifact_capabilities, dict):
+        raise ValueError(
+            f"External GTFS source {source_id} artifactCapabilities must be an object."
+        )
+    unknown_capabilities = set(artifact_capabilities) - set(SUPPORTED_CAPABILITIES)
+    if unknown_capabilities:
+        raise ValueError(
+            f"External GTFS source {source_id} has unknown artifactCapabilities: "
+            f"{sorted(unknown_capabilities)}"
+        )
+    if any(not isinstance(value, bool) for value in artifact_capabilities.values()):
+        raise ValueError(
+            f"External GTFS source {source_id} artifactCapabilities must be boolean."
+        )
     for url_key in ("url", "scopedURL"):
         configured_url = source.get(url_key)
         if configured_url is not None and (
@@ -1294,7 +1329,7 @@ def build_external_route_index(
 
     agencies = {
         str(row.get("agency_id", "")).strip(): str(row.get("agency_name", "") or "").strip()
-        for row in iter_table(archive, "agency.txt")
+        for row in _source_iter_table(archive, "agency.txt", context)
         if str(row.get("agency_id", "")).strip()
     }
     routes = {
@@ -1597,7 +1632,7 @@ def build_external_departure_index(
 
     agencies = {
         str(row.get("agency_id", "")).strip(): str(row.get("agency_name", "") or "").strip()
-        for row in iter_table(archive, "agency.txt")
+        for row in _source_iter_table(archive, "agency.txt", context)
         if str(row.get("agency_id", "")).strip()
     }
 
@@ -2779,8 +2814,68 @@ def process_external_gtfs_sources(
             )
         ):
             context_started = time.monotonic()
+            normalized_context_status = "completed"
             try:
-                normalized_context = NormalizedProviderContext.from_archive(archive)
+                if normalized_artifact_feature_enabled(environ) and normalized_artifact_provider_enabled(
+                    source_id, repository_root
+                ):
+                    artifact_started = time.monotonic()
+                    try:
+                        normalized_context, artifact_use = load_or_build_normalized_artifact(
+                            archive=archive,
+                            repository_root=repository_root,
+                            provider_id=source_id,
+                            raw_artifact_sha256=raw_artifact_digest,
+                            gtfs_cache_root=(gtfs_cache.root if gtfs_cache is not None else None),
+                            environ=environ,
+                        )
+                    except NormalizedArtifactError as error:
+                        print(
+                            f"[StopData] source={source_id} "
+                            "stage=normalized-provider-artifact status=INVALID "
+                            f"reason={type(error).__name__}:{error}",
+                            flush=True,
+                        )
+                        raise
+                    manifest = artifact_use.manifest
+                    file_fingerprints = manifest.get("fileFingerprints", {})
+                    row_counts = manifest.get("rowCounts", {})
+                    abbreviated_fingerprints = ",".join(
+                        f"{name}={str(file_fingerprints[name])[:12]}"
+                        for name in sorted(file_fingerprints)
+                    )
+                    normalized_sqlite = manifest.get("normalizedSQLite", {})
+                    database_size = (
+                        normalized_sqlite.get("size", 0)
+                        if isinstance(normalized_sqlite, dict)
+                        else 0
+                    )
+                    row_count_text = ",".join(
+                        f"{name}={row_counts[name]}"
+                        for name in sorted(row_counts)
+                    )
+                    print(
+                        f"[StopData] source={source_id} "
+                        "stage=normalized-provider-artifact "
+                        f"status={artifact_use.status} reason={artifact_use.reason} "
+                        f"semanticKey={artifact_use.semantic_key[:12]} "
+                        f"rawSHA={(raw_artifact_digest or 'n/a')[:12]} "
+                        f"builder={str(manifest.get('builderFingerprint', ''))[:12]} "
+                        f"duration={artifact_use.duration_seconds:.4f}s "
+                        f"databaseSize={database_size} "
+                        f"rowCounts={row_count_text} "
+                        f"fileFingerprints={abbreviated_fingerprints}",
+                        flush=True,
+                    )
+                    log_memory_stage(
+                        "normalized-provider-artifact",
+                        source=source_id,
+                        started=artifact_started,
+                        status=artifact_use.status,
+                    )
+                    normalized_context_status = artifact_use.status
+                else:
+                    normalized_context = NormalizedProviderContext.from_archive(archive)
             except Exception:
                 archive.close()
                 raise
@@ -2788,6 +2883,7 @@ def process_external_gtfs_sources(
                 "normalized-provider-context",
                 source=source_id,
                 started=context_started,
+                status=normalized_context_status,
             )
         try:
             package_stops: dict[str, list[dict[str, object]]] = {}

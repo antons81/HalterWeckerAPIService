@@ -16,6 +16,11 @@
     "staticDepartureMode": "canonical",
     "staticIdentifierPrefix": "israel:",
     "staticStopIDPrefix": "israel:",
+    "artifactCapabilities": {
+      "persistentNormalizedArtifactEligible": true,
+      "staticProviderArtifactEligible": true,
+      "shardRuntimeEligible": true
+    },
     "country": "IL",
     "sourceName": "Israel Ministry of Transport",
     "sourceURL": "https://gtfs.mot.gov.il/gtfsfiles/",
@@ -96,6 +101,11 @@
     "buildDepartures": true,
     "buildTripIndex": true,
     "importIntoStaticDepartures": true,
+    "artifactCapabilities": {
+      "persistentNormalizedArtifactEligible": true,
+      "staticProviderArtifactEligible": true,
+      "shardRuntimeEligible": true
+    },
     "country": "CA"
   },
   {
@@ -113,6 +123,11 @@
     "buildDepartures": true,
     "buildTripIndex": true,
     "importIntoStaticDepartures": true,
+    "artifactCapabilities": {
+      "persistentNormalizedArtifactEligible": true,
+      "staticProviderArtifactEligible": true,
+      "shardRuntimeEligible": true
+    },
     "country": "CA"
   },
   {

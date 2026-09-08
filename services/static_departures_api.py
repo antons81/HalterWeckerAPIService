@@ -82,6 +82,7 @@ from stm_gateway import (
     STM_VEHICLE_POSITIONS_PATH,
     STM_NAMESPACE,
 )
+from static_departures_runtime import RuntimeUnavailable, shadow_backend_from_environment
 
 
 DEFAULT_TIMEZONE = "Europe/Berlin"
@@ -2230,6 +2231,16 @@ if __name__ == "__main__":
     database_path = os.environ.get("DEPARTURES_DATABASE", "/data/departures-current.sqlite")
     log_memory_stage("before-db-open", database=database_path)
     database = Database(database_path)
+    try:
+        shadow_database = shadow_backend_from_environment(database)
+    except RuntimeUnavailable as error:
+        LOGGER.error(
+            "event=shard-shadow-runtime status=ERROR reason=%s; legacy path remains authoritative",
+            error,
+        )
+    else:
+        if shadow_database is not None:
+            database = shadow_database
     Handler.database = database
     Handler.external_static_data = ExternalStaticData(
         STATIC_DATA_ROOT,
