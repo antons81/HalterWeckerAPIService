@@ -15,7 +15,10 @@ SUPPORTED_CAPABILITIES = (PERSISTENT_NORMALIZED, STATIC_PROVIDER, SHARD_RUNTIME)
 
 
 def _sources_path(repository_root: Path) -> Path:
-    return repository_root / "config" / "external-gtfs-sources.json"
+    repository_path = repository_root / "config" / "external-gtfs-sources.json"
+    if repository_path.is_file():
+        return repository_path
+    return Path("/app/config/external-gtfs-sources.json")
 
 
 def _source_capabilities(repository_root: Path, provider_id: str) -> Mapping[str, object]:
