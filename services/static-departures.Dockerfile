@@ -27,6 +27,7 @@ COPY scripts/provider_artifact_capabilities.py /app/provider_artifact_capabiliti
 COPY scripts/artifact_trust.py /app/artifact_trust.py
 COPY scripts/dynamic_resource_resolver.py /app/dynamic_resource_resolver.py
 COPY config/apple /app/config/apple
+COPY config/external-gtfs-sources.json /app/config/external-gtfs-sources.json
 COPY config/finland-cities.json /app/config/finland-cities.json
 COPY config/poland-cities.json /app/config/poland-cities.json
 COPY config/poland-sources.json /app/config/poland-sources.json
