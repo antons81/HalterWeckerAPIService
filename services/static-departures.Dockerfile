@@ -3,6 +3,7 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY services/static_departures_api.py /app/static_departures_api.py
+COPY services/static_departures_runtime.py /app/static_departures_runtime.py
 COPY services/apple_store_notifications.py /app/apple_store_notifications.py
 COPY services/apple_store_business_events.py /app/apple_store_business_events.py
 COPY services/apple_store_notification_store.py /app/apple_store_notification_store.py
@@ -22,6 +23,8 @@ COPY services/kyiv_radar_inference.py /app/kyiv_radar_inference.py
 COPY services/stm_gateway.py /app/stm_gateway.py
 COPY services/fintraffic_gateway.py /app/fintraffic_gateway.py
 COPY services/poland_gateway.py /app/poland_gateway.py
+COPY scripts/provider_artifact_capabilities.py /app/provider_artifact_capabilities.py
+COPY scripts/artifact_trust.py /app/artifact_trust.py
 COPY scripts/dynamic_resource_resolver.py /app/dynamic_resource_resolver.py
 COPY config/apple /app/config/apple
 COPY config/finland-cities.json /app/config/finland-cities.json

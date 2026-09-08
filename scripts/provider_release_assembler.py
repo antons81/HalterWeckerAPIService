@@ -6,9 +6,13 @@ import hashlib
 import json
 import os
 import re
+import resource
 import shutil
+import sys
 import tempfile
+import time
 import uuid
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,8 +20,10 @@ from typing import Mapping
 
 try:
     from .artifact_provenance import artifact_provenance
+    from .artifact_trust import trusted_artifact
 except ImportError:
     from artifact_provenance import artifact_provenance
+    from artifact_trust import trusted_artifact
 
 
 RELEASE_FORMAT_VERSION = 2
@@ -36,6 +42,113 @@ class ReleaseAssembly:
     manifest_path: Path
     provider_ids: tuple[str, ...]
     reused_artifacts: int
+
+
+def _rss_bytes() -> int:
+    try:
+        with Path("/proc/self/status").open(encoding="ascii") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    return value if sys.platform == "darwin" else value * 1024
+
+
+def _io_bytes() -> tuple[int, int]:
+    try:
+        values: dict[str, int] = {}
+        for line in Path("/proc/self/io").read_text(encoding="ascii").splitlines():
+            key, value = line.split(":", 1)
+            if key in {"read_bytes", "write_bytes"}:
+                values[key] = int(value.strip())
+        return values.get("read_bytes", 0), values.get("write_bytes", 0)
+    except (OSError, ValueError):
+        return 0, 0
+
+
+class _AssemblyProfiler:
+    def __init__(self) -> None:
+        self.enabled = os.environ.get(
+            "HALTEWECKER_RELEASE_ASSEMBLY_INSTRUMENTATION", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _emit(
+        self,
+        stage: str,
+        *,
+        duration: float,
+        files: int,
+        bytes_scanned: int,
+        bytes_written: int,
+        read_bytes: int,
+        write_bytes: int,
+        status: str = "OK",
+    ) -> None:
+        if not self.enabled:
+            return
+        print(
+            "[ReleaseAssembler] "
+            f"stage={stage} status={status} duration={duration:.6f}s "
+            f"files={files} bytes_scanned={bytes_scanned} bytes_written={bytes_written} "
+            f"rss={_rss_bytes()} read_bytes={read_bytes} write_bytes={write_bytes}",
+            flush=True,
+        )
+
+    @contextmanager
+    def stage(
+        self,
+        name: str,
+        *,
+        files: int = 0,
+        bytes_scanned: int = 0,
+        bytes_written: int = 0,
+    ):
+        started = time.monotonic()
+        before_read, before_write = _io_bytes()
+        try:
+            yield
+        except Exception:
+            after_read, after_write = _io_bytes()
+            self._emit(
+                name,
+                duration=time.monotonic() - started,
+                files=files,
+                bytes_scanned=bytes_scanned,
+                bytes_written=bytes_written,
+                read_bytes=max(0, after_read - before_read),
+                write_bytes=max(0, after_write - before_write),
+                status="ERROR",
+            )
+            raise
+        after_read, after_write = _io_bytes()
+        self._emit(
+            name,
+            duration=time.monotonic() - started,
+            files=files,
+            bytes_scanned=bytes_scanned,
+            bytes_written=bytes_written,
+            read_bytes=max(0, after_read - before_read),
+            write_bytes=max(0, after_write - before_write),
+        )
+
+    def observed(
+        self,
+        stage: str,
+        _path: Path,
+        bytes_scanned: int,
+        duration: float,
+    ) -> None:
+        self._emit(
+            stage,
+            duration=duration,
+            files=1,
+            bytes_scanned=bytes_scanned,
+            bytes_written=0,
+            read_bytes=bytes_scanned,
+            write_bytes=0,
+        )
 
 
 def _canonical(value: object) -> object:
@@ -71,13 +184,31 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _fsync_tree(root: Path) -> None:
-    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
-        if path.is_file() and not path.is_symlink():
-            with path.open("rb") as source:
-                os.fsync(source.fileno())
-        elif path.is_dir() and not path.is_symlink():
-            _fsync_directory(path)
+def _tree_files(root: Path) -> list[Path]:
+    return [
+        path
+        for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    ]
+
+
+def _tree_directories(root: Path) -> list[Path]:
+    return [
+        path
+        for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True)
+        if path.is_dir() and not path.is_symlink()
+    ]
+
+
+def _fsync_files(root: Path) -> None:
+    for path in _tree_files(root):
+        with path.open("rb") as source:
+            os.fsync(source.fileno())
+
+
+def _fsync_directories(root: Path) -> None:
+    for path in _tree_directories(root):
+        _fsync_directory(path)
     _fsync_directory(root)
 
 
@@ -104,7 +235,13 @@ def _validate_release_id(release_id: str) -> None:
         raise ReleaseAssemblyError(f"invalid release ID: {release_id!r}")
 
 
-def _artifact_source(value: object, *, provider_id: str, artifact_type: str) -> tuple[Path, Path, dict[str, object]]:
+def _artifact_source(
+    value: object,
+    *,
+    provider_id: str,
+    artifact_type: str,
+    profiler: _AssemblyProfiler | None = None,
+) -> tuple[Path, Path, dict[str, object]]:
     if isinstance(value, Mapping):
         raw_database = value.get("path") or value.get("databasePath")
         raw_manifest = value.get("manifestPath")
@@ -121,7 +258,13 @@ def _artifact_source(value: object, *, provider_id: str, artifact_type: str) -> 
         raise ReleaseAssemblyError(
             f"provider={provider_id} {artifact_type} source is incomplete: {database}"
         )
-    payload = _read_object(manifest)
+    manifest_stage = (
+        profiler.stage("provider-manifest-validation", files=1)
+        if profiler is not None
+        else nullcontext()
+    )
+    with manifest_stage:
+        payload = _read_object(manifest)
     if payload.get("status") != "complete":
         raise ReleaseAssemblyError(f"provider={provider_id} {artifact_type} is not complete")
     if payload.get("providerID") != provider_id or payload.get("artifactType") != artifact_type:
@@ -134,12 +277,30 @@ def _artifact_source(value: object, *, provider_id: str, artifact_type: str) -> 
     )
     if not isinstance(expected_schema, int):
         raise ReleaseAssemblyError(f"provider={provider_id} {artifact_type} schema version is missing")
-    digest, size = artifact_provenance(database)
     sqlite_payload = payload.get("sqlite")
     if not isinstance(sqlite_payload, Mapping):
         raise ReleaseAssemblyError(f"provider={provider_id} {artifact_type} SQLite provenance is missing")
-    if digest != sqlite_payload.get("sha256") or size != sqlite_payload.get("size"):
-        raise ReleaseAssemblyError(f"provider={provider_id} {artifact_type} SQLite provenance mismatch")
+    if trusted_artifact(
+        database_path=database,
+        manifest_path=manifest,
+        manifest=payload,
+    ):
+        digest = str(sqlite_payload.get("sha256") or "")
+        size = int(sqlite_payload.get("size") or 0)
+    else:
+        hash_stage = (
+            profiler.stage(
+                "provider-file-hash-validation",
+                files=1,
+                bytes_scanned=database.stat().st_size,
+            )
+            if profiler is not None
+            else nullcontext()
+        )
+        with hash_stage:
+            digest, size = artifact_provenance(database)
+        if digest != sqlite_payload.get("sha256") or size != sqlite_payload.get("size"):
+            raise ReleaseAssemblyError(f"provider={provider_id} {artifact_type} SQLite provenance mismatch")
     return database, manifest, {
         "artifactKey": expected_key,
         "sha256": digest,
@@ -213,7 +374,11 @@ def _provider_set_fingerprint(providers: Mapping[str, Mapping[str, object]]) -> 
     )
 
 
-def validate_candidate_release(release_directory: Path | str) -> dict[str, object]:
+def validate_candidate_release(
+    release_directory: Path | str,
+    *,
+    profiler: _AssemblyProfiler | None = None,
+) -> dict[str, object]:
     """Validate a candidate before it can become the authoritative pointer."""
     root = Path(release_directory).resolve()
     manifest_path = root / "release.json"
@@ -305,7 +470,11 @@ def validate_candidate_release(release_directory: Path | str) -> dict[str, objec
     except ImportError:
         from services.static_departures_runtime import load_release_manifest
     try:
-        load_release_manifest(root, provider_ids=provider_ids)
+        load_release_manifest(
+            root,
+            provider_ids=provider_ids,
+            validation_observer=profiler.observed if profiler is not None else None,
+        )
     except Exception as error:
         raise ReleaseAssemblyError(f"runtime release validation failed: {error}") from error
 
@@ -313,10 +482,22 @@ def validate_candidate_release(release_directory: Path | str) -> dict[str, objec
     if common_metadata and common_metadata.get("inputFingerprint") != common.get("catalogFingerprint"):
         raise ReleaseAssemblyError("common catalog fingerprint does not match common metadata")
     stop_root = root / str(stop_data["path"])
-    actual_stop_digest, actual_stop_size = artifact_provenance(stop_root)
+    stop_stage = (
+        profiler.stage("stop-data-validation", bytes_scanned=stop_data["size"])
+        if profiler is not None
+        else nullcontext()
+    )
+    with stop_stage:
+        actual_stop_digest, actual_stop_size = artifact_provenance(stop_root)
     if actual_stop_digest != stop_data["sha256"] or actual_stop_size != stop_data["size"]:
         raise ReleaseAssemblyError("stop-data provenance mismatch")
-    actual_common_digest, actual_common_size = artifact_provenance(common_path)
+    common_stage = (
+        profiler.stage("common-catalog-validation", bytes_scanned=common.get("size", 0))
+        if profiler is not None
+        else nullcontext()
+    )
+    with common_stage:
+        actual_common_digest, actual_common_size = artifact_provenance(common_path)
     if actual_common_digest != common.get("sha256") or actual_common_size != common.get("size"):
         raise ReleaseAssemblyError("common catalog provenance mismatch")
     return payload
@@ -350,12 +531,23 @@ def assemble_release(
         raise ReleaseAssemblyError("release has no providers")
     staging = releases / f".{release_id}.staging-{uuid.uuid4().hex}"
     reused = 0
+    profiler = _AssemblyProfiler()
+    total_started = time.monotonic()
+    total_read, total_write = _io_bytes()
     try:
-        staging.mkdir()
-        shutil.copy2(common_source, staging / "common.sqlite")
-        shutil.copytree(stop_source, staging / "stop-data", symlinks=False)
-        common_digest, common_size = artifact_provenance(staging / "common.sqlite")
-        stop_data = _stop_data_reference(staging / "stop-data")
+        with profiler.stage("release-prepare"):
+            staging.mkdir()
+        with profiler.stage(
+            "common-catalog-build",
+            files=1,
+            bytes_written=common_source.stat().st_size,
+        ):
+            shutil.copy2(common_source, staging / "common.sqlite")
+            common_digest, common_size = artifact_provenance(staging / "common.sqlite")
+        with profiler.stage("release-prepare"):
+            shutil.copytree(stop_source, staging / "stop-data", symlinks=False)
+        with profiler.stage("stop-data-validation"):
+            stop_data = _stop_data_reference(staging / "stop-data")
         common_metadata_path = staging / "common-metadata.json"
         with __import__("sqlite3").connect(staging / "common.sqlite") as connection:
             metadata = dict(connection.execute("SELECT key, value FROM metadata"))
@@ -366,57 +558,82 @@ def assemble_release(
         provider_payload: dict[str, dict[str, object]] = {}
         for provider_id, entry in normalized.items():
             output_entry = dict(entry)
-            for artifact_type in ("structural", "temporal"):
-                source_db, source_manifest, info = _artifact_source(
-                    providers[provider_id].get(artifact_type),
-                    provider_id=provider_id,
-                    artifact_type=artifact_type,
-                )
-                relative_dir = Path("providers") / provider_id / artifact_type
-                destination_db = staging / relative_dir / "provider.sqlite"
-                destination_manifest = staging / relative_dir / "manifest.json"
-                _link_reference(source_db, destination_db)
-                _link_reference(source_manifest, destination_manifest)
-                output_entry[artifact_type] = {
-                    "path": (relative_dir / "provider.sqlite").as_posix(),
-                    "manifestPath": (relative_dir / "manifest.json").as_posix(),
-                    "artifactKey": info["artifactKey"],
-                    "sha256": info["sha256"],
-                    "size": info["size"],
-                    "schemaVersion": info["schemaVersion"],
-                    "validFrom": info["validFrom"],
-                    "validThrough": info["validThrough"],
-                    "storage": "immutable-external-reference",
-                    "sourcePath": str(source_db),
-                }
-                reused += 1
+            with profiler.stage("reference/symlink-assembly"):
+                for artifact_type in ("structural", "temporal"):
+                    source_db, source_manifest, info = _artifact_source(
+                        providers[provider_id].get(artifact_type),
+                        provider_id=provider_id,
+                        artifact_type=artifact_type,
+                        profiler=profiler,
+                    )
+                    relative_dir = Path("providers") / provider_id / artifact_type
+                    destination_db = staging / relative_dir / "provider.sqlite"
+                    destination_manifest = staging / relative_dir / "manifest.json"
+                    _link_reference(source_db, destination_db)
+                    _link_reference(source_manifest, destination_manifest)
+                    output_entry[artifact_type] = {
+                        "path": (relative_dir / "provider.sqlite").as_posix(),
+                        "manifestPath": (relative_dir / "manifest.json").as_posix(),
+                        "artifactKey": info["artifactKey"],
+                        "sha256": info["sha256"],
+                        "size": info["size"],
+                        "schemaVersion": info["schemaVersion"],
+                        "validFrom": info["validFrom"],
+                        "validThrough": info["validThrough"],
+                        "storage": "immutable-external-reference",
+                        "sourcePath": str(source_db),
+                    }
+                    reused += 1
             provider_payload[provider_id] = output_entry
-        created = created_at or datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-        manifest = {
-            "formatVersion": RELEASE_FORMAT_VERSION,
-            "releaseID": release_id,
-            "createdAt": created,
-            "compatibility": {"runtimeSchemaVersion": RUNTIME_SCHEMA_VERSION},
-            "common": {
-                "path": "common.sqlite",
-                "sha256": common_digest,
-                "size": common_size,
-                "schemaVersion": metadata.get("commonSchemaVersion"),
-                "catalogFingerprint": catalog_fingerprint,
-            },
-            "stopData": stop_data,
-            "providerSetFingerprint": _provider_set_fingerprint(provider_payload),
-            "providers": provider_payload,
-        }
-        _write_json_atomic(staging / "release.json", manifest)
-        validate_candidate_release(staging)
-        _fsync_tree(staging)
-        os.replace(staging, final)
-        _fsync_directory(releases)
+        with profiler.stage("release-json-build"):
+            created = created_at or datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+            manifest = {
+                "formatVersion": RELEASE_FORMAT_VERSION,
+                "releaseID": release_id,
+                "createdAt": created,
+                "compatibility": {"runtimeSchemaVersion": RUNTIME_SCHEMA_VERSION},
+                "common": {
+                    "path": "common.sqlite",
+                    "sha256": common_digest,
+                    "size": common_size,
+                    "schemaVersion": metadata.get("commonSchemaVersion"),
+                    "catalogFingerprint": catalog_fingerprint,
+                },
+                "stopData": stop_data,
+                "providerSetFingerprint": _provider_set_fingerprint(provider_payload),
+                "providers": provider_payload,
+            }
+            _write_json_atomic(staging / "release.json", manifest)
+        with profiler.stage("release-json-validation"):
+            validate_candidate_release(staging, profiler=profiler)
+        files = _tree_files(staging)
+        with profiler.stage(
+            "fsync-files",
+            files=len(files),
+            bytes_scanned=sum(path.stat().st_size for path in files),
+        ):
+            _fsync_files(staging)
+        directories = _tree_directories(staging)
+        with profiler.stage("fsync-directories", files=len(directories) + 1):
+            _fsync_directories(staging)
+        with profiler.stage("final-rename"):
+            os.replace(staging, final)
+            _fsync_directory(releases)
     except Exception:
         if staging.exists():
             shutil.rmtree(staging)
         raise
+    finally:
+        after_read, after_write = _io_bytes()
+        profiler._emit(
+            "total",
+            duration=time.monotonic() - total_started,
+            files=0,
+            bytes_scanned=0,
+            bytes_written=0,
+            read_bytes=max(0, after_read - total_read),
+            write_bytes=max(0, after_write - total_write),
+        )
     return ReleaseAssembly(
         release_id=release_id,
         release_directory=final,
@@ -450,6 +667,25 @@ def atomic_switch_current_release(
 
 
 def readiness_probe(
+    release_directory: Path | str,
+    *,
+    provider_ids: tuple[str, ...],
+    israel_case: Mapping[str, object],
+    toronto_case: Mapping[str, object],
+    trip_case: Mapping[str, object],
+) -> dict[str, object]:
+    profiler = _AssemblyProfiler()
+    with profiler.stage("readiness"):
+        return _readiness_probe(
+            release_directory,
+            provider_ids=provider_ids,
+            israel_case=israel_case,
+            toronto_case=toronto_case,
+            trip_case=trip_case,
+        )
+
+
+def _readiness_probe(
     release_directory: Path | str,
     *,
     provider_ids: tuple[str, ...],

@@ -421,6 +421,9 @@ class StaticProviderArtifactTests(unittest.TestCase):
             self.assertEqual(first.temporal.artifact_key, second.temporal.artifact_key)
             self.assertEqual(second.structural.status, "HIT")
             self.assertEqual(second.temporal.status, "HIT")
+            self.assertEqual(second.structural.manifest["validation"]["sqliteQuickCheck"], "ok")
+            self.assertTrue((first.structural.artifact_directory / "trust.json").is_file())
+            self.assertTrue((first.temporal.artifact_directory / "trust.json").is_file())
 
             structural = sqlite3.connect(first.structural.database_path)
             try:

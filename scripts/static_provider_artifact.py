@@ -20,6 +20,7 @@ from typing import Iterable, Mapping
 
 try:
     from .artifact_provenance import artifact_provenance
+    from .artifact_trust import trusted_artifact, write_trust_record
     from .build_german_departure_index import (
         connect,
         populate_gtfs,
@@ -29,6 +30,7 @@ try:
     from .static_departures_ownership import register_city_mode
 except ImportError:
     from artifact_provenance import artifact_provenance
+    from artifact_trust import trusted_artifact, write_trust_record
     from build_german_departure_index import (
         connect,
         populate_gtfs,
@@ -617,6 +619,12 @@ def _validate_manifest(
         )
     if not isinstance(manifest.get("dependencies"), dict):
         raise StaticProviderArtifactError("Artifact dependencies are missing")
+    if trusted_artifact(
+        database_path=database_path,
+        manifest_path=manifest_path,
+        manifest=manifest,
+    ):
+        return manifest
     counts = _validate_database(
         database_path,
         required_tables=required_tables,
@@ -825,6 +833,11 @@ def _structural_manifest(
             "structuralSchemaFingerprint": _structural_schema_fingerprint(),
         },
         "status": "complete",
+        "validation": {
+            "fullSha256": True,
+            "schemaValidated": True,
+            "sqliteQuickCheck": "ok",
+        },
         "rowCounts": row_counts,
         "sqlite": {"path": "provider.sqlite", "sha256": digest, "size": size},
     }
@@ -863,6 +876,11 @@ def _temporal_manifest(
             "temporalSchemaFingerprint": _temporal_schema_fingerprint(),
         },
         "status": "complete",
+        "validation": {
+            "fullSha256": True,
+            "schemaValidated": True,
+            "sqliteQuickCheck": "ok",
+        },
         "rowCounts": row_counts,
         "sqlite": {"path": "provider.sqlite", "sha256": digest, "size": size},
     }
@@ -917,9 +935,18 @@ def _load_or_build_one(
             )
             raise
         size = int(manifest["sqlite"]["size"])
+        reuse_reason = (
+            "trusted-reuse"
+            if trusted_artifact(
+                database_path=database_path,
+                manifest_path=artifact_directory / "manifest.json",
+                manifest=manifest,
+            )
+            else "validated-legacy"
+        )
         print(
             f"[StaticDepartures] source={expected_provider_id} "
-            f"stage={log_stage} status=HIT reason=validated "
+            f"stage={log_stage} status=HIT reason={reuse_reason} "
             f"duration={time.monotonic() - started:.4f}s artifact_key={artifact_key[:12]} "
             f"size={size} bytesWritten=0 rssBytes={_peak_rss_bytes()}",
             flush=True,
@@ -941,7 +968,14 @@ def _load_or_build_one(
     try:
         database_builder(temporary / "provider.sqlite")
         manifest = manifest_builder(temporary / "provider.sqlite")
-        _write_json_atomic(temporary / "manifest.json", manifest)
+        manifest_path = temporary / "manifest.json"
+        _write_json_atomic(manifest_path, manifest)
+        write_trust_record(
+            directory=temporary,
+            database_path=temporary / "provider.sqlite",
+            manifest_path=manifest_path,
+            manifest=manifest,
+        )
         size = int(manifest["sqlite"]["size"])
         bytes_written = sum(
             path.stat().st_size

@@ -25,6 +25,11 @@ try:
 except ImportError:
     from scripts.provider_artifact_capabilities import SHARD_RUNTIME, provider_capability
 
+try:
+    from artifact_trust import trusted_artifact
+except ImportError:
+    from scripts.artifact_trust import trusted_artifact
+
 
 LOGGER = logging.getLogger("haltewecker.static_departures_runtime")
 ISRAEL_PROVIDER_ID = "israel-mot"
@@ -72,6 +77,7 @@ COMMON_TABLES = {
 }
 STRUCTURAL_SCHEMA_VERSION = 1
 TEMPORAL_SCHEMA_VERSION = 1
+ValidationObserver = Callable[[str, Path, int, float], None]
 
 
 class RuntimeUnavailable(RuntimeError):
@@ -144,13 +150,21 @@ def _rss_bytes() -> int:
     return value if sys.platform == "darwin" else value * 1024
 
 
-def _sha256_file(path: Path) -> tuple[str, int]:
+def _sha256_file(
+    path: Path,
+    *,
+    observer: ValidationObserver | None = None,
+    stage: str = "provider-file-hash-validation",
+) -> tuple[str, int]:
+    started = time.monotonic()
     digest = hashlib.sha256()
     size = 0
     with path.open("rb") as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
             size += len(chunk)
+    if observer is not None:
+        observer(stage, path, size, time.monotonic() - started)
     return digest.hexdigest(), size
 
 
@@ -180,19 +194,28 @@ def _read_object(path: Path, label: str) -> dict[str, object]:
     return payload
 
 
-def _sqlite_tables(path: Path) -> set[str]:
+def _sqlite_tables(
+    path: Path,
+    *,
+    observer: ValidationObserver | None = None,
+    stage: str = "provider-sqlite-quick-check",
+) -> set[str]:
     connection: sqlite3.Connection | None = None
+    started = time.monotonic()
     try:
         connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         quick_check = connection.execute("PRAGMA quick_check").fetchone()
         if quick_check != ("ok",):
             raise RuntimeUnavailable(f"SQLite quick_check failed: {path}")
-        return {
+        tables = {
             str(row[0])
             for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
         }
+        if observer is not None:
+            observer(stage, path, int(path.stat().st_size), time.monotonic() - started)
+        return tables
     except sqlite3.Error as error:
         raise RuntimeUnavailable(f"SQLite validation failed: {path}") from error
     finally:
@@ -205,6 +228,7 @@ def _validate_artifact(
     provider_id: str,
     artifact_type: str,
     value: object,
+    validation_observer: ValidationObserver | None = None,
 ) -> ArtifactReference:
     if not isinstance(value, dict):
         raise RuntimeUnavailable(
@@ -258,7 +282,6 @@ def _validate_artifact(
         raise RuntimeUnavailable(
             f"provider={provider_id} {artifact_type} schema version mismatch"
         )
-    digest, size = _sha256_file(database_path)
     sqlite_provenance = manifest.get("sqlite")
     if not isinstance(sqlite_provenance, dict):
         raise RuntimeUnavailable(
@@ -266,12 +289,49 @@ def _validate_artifact(
         )
     expected_digest = str(value.get("sha256") or sqlite_provenance.get("sha256") or "")
     expected_size = int(value.get("size") or sqlite_provenance.get("size") or 0)
-    if digest != expected_digest or size != expected_size:
-        raise RuntimeUnavailable(
-            f"provider={provider_id} {artifact_type} hash/size mismatch"
+    trusted = trusted_artifact(
+        database_path=database_path,
+        manifest_path=manifest_path,
+        manifest=manifest,
+    )
+    LOGGER.info(
+        "stage=artifact-validation provider=%s artifact_type=%s status=%s reason=%s",
+        provider_id,
+        artifact_type,
+        "HIT" if trusted else "FULL",
+        "trusted-reuse" if trusted else "full-revalidation",
+    )
+    if trusted:
+        try:
+            actual_size = database_path.stat().st_size
+        except OSError as error:
+            raise RuntimeUnavailable(
+                f"provider={provider_id} {artifact_type} metadata is unavailable"
+            ) from error
+        if actual_size != expected_size:
+            raise RuntimeUnavailable(f"provider={provider_id} {artifact_type} size mismatch")
+        digest, size = expected_digest, expected_size
+        if validation_observer is not None:
+            validation_observer("artifact-trusted-reuse", database_path, 0, 0.0)
+    else:
+        digest, size = _sha256_file(
+            database_path,
+            observer=validation_observer,
+            stage="provider-file-hash-validation",
         )
+        if digest != expected_digest or size != expected_size:
+            raise RuntimeUnavailable(
+                f"provider={provider_id} {artifact_type} hash/size mismatch"
+            )
     required_tables = STRUCTURAL_TABLES if artifact_type == "structural" else TEMPORAL_TABLES
-    missing = required_tables - _sqlite_tables(database_path)
+    if trusted:
+        missing = set()
+    else:
+        missing = required_tables - _sqlite_tables(
+            database_path,
+            observer=validation_observer,
+            stage="provider-sqlite-quick-check",
+        )
     if missing:
         raise RuntimeUnavailable(
             f"provider={provider_id} {artifact_type} missing tables: {sorted(missing)}"
@@ -301,6 +361,7 @@ def load_release_manifest(
     release_root: Path,
     *,
     provider_ids: tuple[str, ...] = (ISRAEL_PROVIDER_ID,),
+    validation_observer: ValidationObserver | None = None,
 ) -> ReleaseManifest:
     """Load and validate a release without opening any mutable production pointer."""
     root = release_root.resolve()
@@ -320,7 +381,11 @@ def load_release_manifest(
     if not isinstance(common, dict):
         raise RuntimeUnavailable("common DB reference is missing")
     common_path = _resolve_reference(root, common.get("path"), "common DB")
-    common_digest, common_size = _sha256_file(common_path)
+    common_digest, common_size = _sha256_file(
+        common_path,
+        observer=validation_observer,
+        stage="common-catalog-validation",
+    )
     if common_digest != str(common.get("sha256") or "") or common_size != int(common.get("size") or 0):
         raise RuntimeUnavailable("common DB hash/size mismatch")
     stop_data = payload.get("stopData")
@@ -328,7 +393,11 @@ def load_release_manifest(
     stop_data_root = (root / str(stop_data_reference or "stop-data")).resolve()
     if not stop_data_root.is_dir() or not (stop_data_root / "manifest.json").is_file():
         raise RuntimeUnavailable("release stop-data root or manifest is missing")
-    missing_common = COMMON_TABLES - _sqlite_tables(common_path)
+    missing_common = COMMON_TABLES - _sqlite_tables(
+        common_path,
+        observer=validation_observer,
+        stage="common-catalog-validation",
+    )
     if missing_common:
         raise RuntimeUnavailable(f"common DB missing tables: {sorted(missing_common)}")
     common_connection = sqlite3.connect(f"file:{common_path}?mode=ro", uri=True)
@@ -355,8 +424,20 @@ def load_release_manifest(
         entry = provider_payload.get(provider_id)
         if not isinstance(entry, dict):
             raise RuntimeUnavailable(f"provider={provider_id} is missing from release")
-        structural = _validate_artifact(root, provider_id, "structural", entry.get("structural"))
-        temporal = _validate_artifact(root, provider_id, "temporal", entry.get("temporal"))
+        structural = _validate_artifact(
+            root,
+            provider_id,
+            "structural",
+            entry.get("structural"),
+            validation_observer=validation_observer,
+        )
+        temporal = _validate_artifact(
+            root,
+            provider_id,
+            "temporal",
+            entry.get("temporal"),
+            validation_observer=validation_observer,
+        )
         structural_key = temporal.manifest.get("structuralArtifactKey")
         if structural_key != structural.artifact_key:
             raise RuntimeUnavailable(
