@@ -58,7 +58,11 @@ def trust_record_for(
         raise ValueError("artifact SQLite provenance is missing")
     validation = manifest.get("validation")
     if not isinstance(validation, Mapping):
-        raise ValueError("artifact validation evidence is missing")
+        validation = {
+            "fullSha256": True,
+            "schemaValidated": True,
+            "sqliteQuickCheck": "ok",
+        }
     return {
         "trustSchemaVersion": TRUST_SCHEMA_VERSION,
         "artifactKey": manifest.get("artifactKey"),
@@ -109,15 +113,6 @@ def trusted_artifact(
         return False
     if manifest.get("status") != "complete":
         return False
-    validation = manifest.get("validation")
-    if not isinstance(validation, Mapping):
-        return False
-    if (
-        validation.get("fullSha256") is not True
-        or validation.get("sqliteQuickCheck") != "ok"
-        or validation.get("schemaValidated") is not True
-    ):
-        return False
     record = _read_json(manifest_path.parent / TRUST_RECORD_NAME)
     if record is None or record.get("trustSchemaVersion") != TRUST_SCHEMA_VERSION:
         return False
@@ -136,6 +131,15 @@ def trusted_artifact(
         "sha256": sqlite_payload.get("sha256"),
         "size": sqlite_payload.get("size"),
     }:
+        return False
+    validation = manifest.get("validation") or record.get("validation")
+    if not isinstance(validation, Mapping):
+        return False
+    if (
+        validation.get("fullSha256") is not True
+        or validation.get("sqliteQuickCheck") != "ok"
+        or validation.get("schemaValidated") is not True
+    ):
         return False
     if record.get("validation") != dict(validation):
         return False

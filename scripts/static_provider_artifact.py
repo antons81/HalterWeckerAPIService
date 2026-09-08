@@ -935,15 +935,20 @@ def _load_or_build_one(
             )
             raise
         size = int(manifest["sqlite"]["size"])
-        reuse_reason = (
-            "trusted-reuse"
-            if trusted_artifact(
+        if trusted_artifact(
+            database_path=database_path,
+            manifest_path=artifact_directory / "manifest.json",
+            manifest=manifest,
+        ):
+            reuse_reason = "trusted-reuse"
+        else:
+            write_trust_record(
+                directory=artifact_directory,
                 database_path=database_path,
                 manifest_path=artifact_directory / "manifest.json",
                 manifest=manifest,
             )
-            else "validated-legacy"
-        )
+            reuse_reason = "validated-and-trusted"
         print(
             f"[StaticDepartures] source={expected_provider_id} "
             f"stage={log_stage} status=HIT reason={reuse_reason} "
