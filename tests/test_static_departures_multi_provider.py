@@ -19,6 +19,7 @@ from common_catalog import build_common_catalog  # noqa: E402
 from static_departures_api import Database  # noqa: E402
 from static_departures_runtime import (  # noqa: E402
     ISRAEL_PROVIDER_ID,
+    ProviderSnapshot,
     ReleaseSnapshot,
     RuntimeUnavailable,
     ShadowStaticDeparturesBackend,
@@ -27,7 +28,12 @@ import test_static_departures_runtime as runtime_tests  # noqa: E402
 
 
 class StaticDeparturesMultiProviderTests(unittest.TestCase):
-    def _build_fixture(self, root: Path, provider_count: int = 2) -> tuple[Path, Path]:
+    def _build_fixture(
+        self,
+        root: Path,
+        provider_count: int = 2,
+        identifier_prefix: str = "israel:",
+    ) -> tuple[Path, Path]:
         helper = runtime_tests.StaticDeparturesRuntimeTests()
         legacy_path, release, _stop_data = helper._build_fixture(root)
         source = release / "providers" / ISRAEL_PROVIDER_ID
@@ -85,7 +91,14 @@ class StaticDeparturesMultiProviderTests(unittest.TestCase):
                 *( (provider_id, "fixture-israel", "S1") for provider_id in provider_ids ),
             ),
             provider_modes=[
-                {"providerID": provider_id, "cityID": "fixture-israel", "mode": "canonical", "timezone": "Asia/Jerusalem", "stopIDPrefix": "israel:", "identifierPrefix": "israel:"}
+                {
+                    "providerID": provider_id,
+                    "cityID": "fixture-israel",
+                    "mode": "canonical",
+                    "timezone": "Asia/Jerusalem",
+                    "stopIDPrefix": "israel:",
+                    "identifierPrefix": identifier_prefix,
+                }
                 for provider_id in provider_ids
             ],
         )
@@ -146,6 +159,38 @@ class StaticDeparturesMultiProviderTests(unittest.TestCase):
             finally:
                 snapshot.close()
                 legacy.close()
+
+    def test_explicit_namespace_keeps_provider_local_stop_and_public_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _legacy, release = self._build_fixture(Path(temporary), identifier_prefix="")
+            snapshot = ReleaseSnapshot.open(release, provider_ids=(ISRAEL_PROVIDER_ID, "synthetic-2"))
+            now = datetime(2026, 1, 5, 7, 0, tzinfo=ZoneInfo("Asia/Jerusalem"))
+            try:
+                modes = snapshot.provider_modes("fixture-israel")
+                self.assertEqual(
+                    [(mode.stop_id_prefix, mode.identifier_prefix) for mode in modes],
+                    [("israel:", ""), ("israel:", "")],
+                )
+
+                lines = snapshot.lines("fixture-israel", "S1")
+                self.assertTrue(lines)
+                self.assertTrue(all(row["routeID"].startswith("israel:") for row in lines))
+                self.assertFalse(any(row["routeID"].startswith("israel:israel:") for row in lines))
+
+                board = snapshot.board("fixture-israel", "S1", 10, now, now)
+                self.assertTrue(board)
+                self.assertTrue(all(row["tripID"].startswith("israel:") for row in board))
+                self.assertTrue(all(row["routeID"].startswith("israel:") for row in board))
+                self.assertTrue(all(row["agencyID"].startswith("israel:") for row in board))
+
+                for value in (
+                    "ttc-surface:13",
+                    "ttc-subway:50803085",
+                    "ttc-subway:1",
+                ):
+                    self.assertEqual(ProviderSnapshot._public_identifier(value, ("",)), value)
+            finally:
+                snapshot.close()
 
     def test_aliases_and_provider_modes_are_aggregated(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
