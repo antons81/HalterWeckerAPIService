@@ -79,6 +79,69 @@ class StaticTripDetailsTests(unittest.TestCase):
         self.assertIsNone(result["stops"][0]["longitude"])
         self.assertEqual(result["stops"][0]["scheduledArrival"], "24:00:00")
 
+    def test_provider_namespaced_trip_coordinates_do_not_collide(self):
+        catalog = self.root / "stops" / "toronto.json"
+        catalog.write_text(json.dumps([
+            {"id": "ttc-surface:3765", "latitude": 43.70476, "longitude": -79.398499},
+            {"id": "ttc-subway:3765", "latitude": 43.742225, "longitude": -79.567734},
+        ]))
+        path = self.root / "toronto.sqlite"
+        with sqlite3.connect(path) as db:
+            db.executescript("""
+                CREATE TABLE city_departure_modes(city_id,mode,timezone,stop_id_prefix,identifier_prefix);
+                INSERT INTO city_departure_modes VALUES('toronto','canonical','America/Toronto','','');
+                CREATE TABLE provider_city_modes(provider_id,city_id,mode,timezone,stop_id_prefix,identifier_prefix);
+                INSERT INTO provider_city_modes VALUES
+                    ('ttc-surface','toronto','canonical','America/Toronto','ttc-surface:',''),
+                    ('ttc-subway','toronto','canonical','America/Toronto','ttc-subway:','');
+                CREATE TABLE routes(route_id PRIMARY KEY,short_name,long_name,agency_id,route_type);
+                CREATE TABLE agencies(agency_id PRIMARY KEY,agency_name);
+                CREATE TABLE trips(trip_id PRIMARY KEY,route_id,headsign,direction_id,service_id);
+                CREATE TABLE active_services(service_id,service_date,PRIMARY KEY(service_id,service_date));
+                CREATE TABLE raw_stops(stop_id PRIMARY KEY,stop_name);
+                CREATE TABLE stop_times(trip_id,raw_stop_id,stop_sequence,arrival_time,departure_time);
+            """)
+            db.executemany("INSERT INTO agencies VALUES(?,?)", [
+                ("ttc-surface:agency", "Surface"),
+                ("ttc-subway:agency", "Subway"),
+            ])
+            db.executemany("INSERT INTO routes VALUES(?,?,?,?,?)", [
+                ("ttc-surface:route", "Surface", "", "ttc-surface:agency", "3"),
+                ("ttc-subway:route", "Subway", "", "ttc-subway:agency", "1"),
+            ])
+            db.executemany("INSERT INTO trips VALUES(?,?,?,?,?)", [
+                ("ttc-surface:trip", "ttc-surface:route", "Surface", "0", "surface-service"),
+                ("ttc-subway:trip", "ttc-subway:route", "Subway", "0", "subway-service"),
+            ])
+            db.executemany("INSERT INTO active_services VALUES(?,?)", [
+                ("surface-service", "20260909"),
+                ("subway-service", "20260909"),
+            ])
+            db.executemany("INSERT INTO raw_stops VALUES(?,?)", [
+                ("ttc-surface:3765", "Surface 3765"),
+                ("ttc-subway:3765", "Subway 3765"),
+            ])
+            db.executemany("INSERT INTO stop_times VALUES(?,?,?,?,?)", [
+                ("ttc-surface:trip", "ttc-surface:3765", 1, "08:00:00", "08:00:30"),
+                ("ttc-subway:trip", "ttc-subway:3765", 1, "09:00:00", "09:00:30"),
+            ])
+
+        database = api.Database(str(path))
+        try:
+            surface = database.trip_details("toronto", "ttc-surface:trip", str(self.root), "2026-09-09")
+            subway = database.trip_details("toronto", "ttc-subway:trip", str(self.root), "2026-09-09")
+        finally:
+            database.close()
+
+        self.assertEqual(surface["stops"][0]["id"], "3765")
+        self.assertEqual(surface["stops"][0]["name"], "Surface 3765")
+        self.assertEqual(surface["stops"][0]["latitude"], 43.70476)
+        self.assertEqual(surface["stops"][0]["longitude"], -79.398499)
+        self.assertEqual(subway["stops"][0]["id"], "3765")
+        self.assertEqual(subway["stops"][0]["name"], "Subway 3765")
+        self.assertEqual(subway["stops"][0]["latitude"], 43.742225)
+        self.assertEqual(subway["stops"][0]["longitude"], -79.567734)
+
     def test_legacy_database_without_arrival_column_is_supported(self):
         path = self.root / "legacy.sqlite"
         with sqlite3.connect(path) as db:

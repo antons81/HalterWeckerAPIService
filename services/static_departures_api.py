@@ -1484,13 +1484,27 @@ class Database:
             catalog = catalog_value if isinstance(catalog_value, list) else []
         except (OSError, json.JSONDecodeError, TypeError):
             catalog = []
-        wanted = {self._public_identifier_multi(s[0], stop_prefixes) for s in stops}
-        coordinates = {self._public_identifier_multi(str(s["id"]), stop_prefixes): s for s in catalog
-                       if self._public_identifier_multi(str(s.get("id", "")), stop_prefixes) in wanted}
+        coordinates_by_exact_id = {
+            str(item.get("id", "")): item
+            for item in catalog
+            if isinstance(item, dict) and str(item.get("id", ""))
+        }
+        coordinates_by_public_id: dict[str, list[dict]] = {}
+        for item in catalog:
+            if not isinstance(item, dict):
+                continue
+            exact_id = str(item.get("id", ""))
+            if not exact_id:
+                continue
+            public_id = self._public_identifier_multi(exact_id, stop_prefixes)
+            coordinates_by_public_id.setdefault(public_id, []).append(item)
         ordered = []
         for stop_id, sequence, arrival, departure, name in stops:
             public_id = self._public_identifier_multi(stop_id, stop_prefixes)
-            metadata = coordinates.get(public_id, {})
+            metadata = coordinates_by_exact_id.get(str(stop_id))
+            if metadata is None:
+                public_candidates = coordinates_by_public_id.get(public_id, [])
+                metadata = public_candidates[0] if len(public_candidates) == 1 else {}
             ordered.append({"id": public_id, "name": name, "stopSequence": sequence,
                             "scheduledArrival": arrival or None, "scheduledDeparture": departure or None,
                             "latitude": metadata.get("latitude"), "longitude": metadata.get("longitude"),
