@@ -24,7 +24,10 @@ from build_german_departure_index import (  # noqa: E402
     resolve_canonical_stops,
     update_terminal_stops,
 )
-from import_static_departures_database import populate_provider_city_memberships  # noqa: E402
+from import_static_departures_database import (  # noqa: E402
+    CityScopedStopIDPrefixes,
+    populate_provider_city_memberships,
+)
 from static_departures_api import Database  # noqa: E402
 from static_departures_ownership import (  # noqa: E402
     delete_provider_data,
@@ -555,6 +558,102 @@ class ProviderStopIdentityTests(unittest.TestCase):
                 build("legacy.sqlite", indexed=False),
                 build("indexed.sqlite", indexed=True),
             )
+
+    def test_indexed_city_scoped_membership_does_not_cross_assign_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "feed.zip"
+            _feed(feed)
+            stop_data = root / "stop-data"
+            (stop_data / "stops").mkdir(parents=True)
+            (stop_data / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "cities": [
+                            {"id": "israel", "url": "stops/israel.json"},
+                            {"id": "toronto", "url": "stops/toronto.json"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            for city_id in ("israel", "toronto"):
+                (stop_data / "stops" / f"{city_id}.json").write_text(
+                    json.dumps([{"id": "13114"}]),
+                    encoding="utf-8",
+                )
+
+            scoped_prefixes = CityScopedStopIDPrefixes.from_authoritative_provider_cities(
+                {
+                    "israel-mot": [{"id": "israel"}],
+                    "ttc-subway": [{"id": "toronto"}],
+                },
+                {"israel-mot": "israel:", "ttc-subway": "ttc-subway:"},
+            )
+
+            def build(indexed: bool) -> list[tuple[str, str, str]]:
+                connection = connect(root / f"scoped-{indexed}.sqlite")
+                with zipfile.ZipFile(feed) as archive:
+                    populate_gtfs(
+                        connection,
+                        archive,
+                        identifier_prefix="israel:",
+                        stop_id_prefix="israel:",
+                        provider_id="israel-mot",
+                    )
+                with zipfile.ZipFile(feed) as archive:
+                    populate_gtfs(
+                        connection,
+                        archive,
+                        identifier_prefix="ttc-subway:",
+                        stop_id_prefix="ttc-subway:",
+                        provider_id="ttc-subway",
+                    )
+                register_city_mode(
+                    connection,
+                    "israel-mot",
+                    "israel",
+                    "canonical",
+                    "UTC",
+                    "israel:",
+                )
+                register_city_mode(
+                    connection,
+                    "ttc-subway",
+                    "toronto",
+                    "canonical",
+                    "UTC",
+                    "ttc-subway:",
+                )
+                populate_provider_city_memberships(
+                    connection,
+                    stop_data,
+                    {"israel", "toronto"},
+                    stop_id_prefix_by_provider={
+                        "israel-mot": "israel:",
+                        "ttc-subway": "ttc-subway:",
+                    },
+                    indexed_ownership_lookup=indexed,
+                    city_scoped_prefixes=scoped_prefixes,
+                )
+                rows = list(
+                    connection.execute(
+                        "SELECT provider_id, city_id, stop_id FROM provider_city_stops "
+                        "ORDER BY provider_id, city_id, stop_id"
+                    )
+                )
+                connection.close()
+                return rows
+
+            expected_rows = [
+                ("israel-mot", "israel", "13114"),
+                ("israel-mot", "israel", "israel:13114"),
+                ("ttc-subway", "toronto", "13114"),
+                ("ttc-subway", "toronto", "ttc-subway:13114"),
+            ]
+
+            self.assertEqual(build(indexed=True), expected_rows)
+            self.assertEqual(build(indexed=False), expected_rows)
 
     def test_indexed_membership_temp_tables_are_cleaned_between_calls(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

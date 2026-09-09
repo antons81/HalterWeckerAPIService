@@ -310,12 +310,22 @@ def populate_provider_city_memberships(
         package = json.loads(package_path.read_text(encoding="utf-8"))
         if not isinstance(package, list):
             raise ValueError(f"Invalid stop package for {city_id}")
-        prefix_by_provider = dict(stop_id_prefix_by_provider or {})
+        complete_prefix_by_provider = (
+            city_scoped_prefixes.authoritative_prefixes_for_city(city_id)
+            if city_scoped_prefixes is not None
+            else None
+        )
+        prefix_by_provider = (
+            dict(complete_prefix_by_provider)
+            if complete_prefix_by_provider
+            else dict(stop_id_prefix_by_provider or {})
+        )
         candidate_prefix_by_provider = dict(prefix_by_provider)
-        for provider_id, prefix in connection.execute(
-            "SELECT provider_id, stop_id_prefix FROM provider_city_modes"
-        ):
-            candidate_prefix_by_provider.setdefault(str(provider_id), str(prefix))
+        if not complete_prefix_by_provider:
+            for provider_id, prefix in connection.execute(
+                "SELECT provider_id, stop_id_prefix FROM provider_city_modes"
+            ):
+                candidate_prefix_by_provider.setdefault(str(provider_id), str(prefix))
         for provider_id, prefix in connection.execute(
             "SELECT provider_id, stop_id_prefix FROM provider_city_modes WHERE city_id=?",
             (city_id,),
@@ -442,7 +452,11 @@ def _populate_provider_city_memberships_indexed(
             if city_scoped_prefixes is not None
             else None
         )
-        prefix_by_provider = dict(stop_id_prefix_by_provider or {})
+        prefix_by_provider = (
+            dict(complete_prefix_by_provider)
+            if complete_prefix_by_provider
+            else dict(stop_id_prefix_by_provider or {})
+        )
         candidate_prefix_by_provider = (
             dict(complete_prefix_by_provider)
             if complete_prefix_by_provider
