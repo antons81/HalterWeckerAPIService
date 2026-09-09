@@ -1074,21 +1074,11 @@ def add_external_gtfs(
                     city_id,
                     departure_mode(source),
                     str(source["timezone"]),
-                    (
-                        str(source.get("staticStopIDPrefix", (
-                            str(source.get("namespace", "")).strip()
-                            or str(source["identifierPrefix"])
-                        )))
-                        if len(source_ids_by_city[city_id]) == 1
-                        and not str(source.get("namespace", "")).strip()
-                        else ""
-                    ),
-                    (
-                        str(source.get("staticIdentifierPrefix", ""))
-                        if len(source_ids_by_city[city_id]) == 1
-                        and not str(source.get("namespace", "")).strip()
-                        else ""
-                    ),
+                    str(source.get("staticStopIDPrefix", (
+                        str(source.get("namespace", "")).strip()
+                        or str(source["identifierPrefix"])
+                    ))),
+                    str(source.get("staticIdentifierPrefix", "")),
                 )
         return len(imported_city_ids)
 

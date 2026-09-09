@@ -6,16 +6,20 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from unittest import mock
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import static_departures_api
-from import_static_departures_database import populate_german_city_memberships
+from build_german_departure_index import connect
+from import_static_departures_database import add_external_gtfs, populate_german_city_memberships
 from static_departures_api import Database, Handler
 from apple_store_notification_store import AppleStoreNotificationStore
 from swap_static_departures_database import activate_database
@@ -269,6 +273,89 @@ class StaticDeparturesImportTests(unittest.TestCase):
             finally:
                 database.close()
 
+    def test_multi_provider_import_preserves_provider_scoped_prefixes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            database = connect(root / "departures.sqlite")
+            database.execute(
+                """
+                CREATE TABLE city_departure_modes (
+                    city_id TEXT PRIMARY KEY,
+                    mode TEXT NOT NULL,
+                    timezone TEXT NOT NULL,
+                    stop_id_prefix TEXT NOT NULL DEFAULT '',
+                    identifier_prefix TEXT NOT NULL DEFAULT ''
+                ) WITHOUT ROWID
+                """
+            )
+            sources = [
+                {
+                    "id": "ttc-surface",
+                    "cities": "ttc-cities.json",
+                    "identifierPrefix": "ttc-surface:",
+                    "namespace": "ttc-surface:",
+                    "timezone": "America/Toronto",
+                },
+                {
+                    "id": "ttc-subway",
+                    "cities": "ttc-cities.json",
+                    "identifierPrefix": "ttc-subway:",
+                    "namespace": "ttc-subway:",
+                    "timezone": "America/Toronto",
+                },
+            ]
+            city = {"id": "toronto", "packageMode": "external"}
+            try:
+                with (
+                    mock.patch("import_static_departures_database.load_external_gtfs_sources", return_value=sources),
+                    mock.patch("import_static_departures_database.validate_external_gtfs_source"),
+                    mock.patch("import_static_departures_database.load_external_cities", return_value=[city]),
+                    mock.patch(
+                        "import_static_departures_database.authenticated_external_request",
+                        side_effect=[("surface.zip", {}), ("subway.zip", {})],
+                    ),
+                    mock.patch("import_static_departures_database.load_gtfs_archive", return_value=mock.Mock()),
+                    mock.patch("import_static_departures_database.agency_scoped_archive", side_effect=lambda archive, _: archive),
+                    mock.patch("import_static_departures_database.populate_gtfs"),
+                    mock.patch("import_static_departures_database.resolve_canonical_stops"),
+                    mock.patch(
+                        "import_static_departures_database.populate_provider_city_memberships",
+                        return_value={"toronto"},
+                    ),
+                    mock.patch("import_static_departures_database.populate_active_services"),
+                    mock.patch("import_static_departures_database.update_terminal_stops"),
+                ):
+                    add_external_gtfs(
+                        database,
+                        root / "stop-data",
+                        {"ttc-surface": "surface.zip", "ttc-subway": "subway.zip"},
+                        repository_root=root,
+                        sources_path=root / "sources.json",
+                        dates=[date(2026, 7, 28)],
+                    )
+
+                self.assertEqual(
+                    database.execute(
+                        """
+                        SELECT provider_id, city_id, stop_id_prefix
+                        FROM provider_city_modes
+                        ORDER BY provider_id
+                        """
+                    ).fetchall(),
+                    [
+                        ("ttc-subway", "toronto", "ttc-subway:"),
+                        ("ttc-surface", "toronto", "ttc-surface:"),
+                    ],
+                )
+                self.assertEqual(
+                    database.execute(
+                        "SELECT stop_id_prefix FROM city_departure_modes WHERE city_id='toronto'"
+                    ).fetchone(),
+                    ("",),
+                )
+            finally:
+                database.close()
+
 
 class StaticDeparturesEndpointTests(unittest.TestCase):
     def test_server_header_does_not_expose_runtime_version(self) -> None:
@@ -428,6 +515,147 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
             self.assertEqual(len(board["departures"]), 1)
             self.assertEqual(board["departures"][0]["tripID"], "ttc-surface:trip-1")
             self.assertEqual(board["departures"][0]["stopID"], "ttc-surface:100")
+
+    def test_multi_provider_departures_never_fall_back_to_global_raw_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "current.sqlite"
+            write_database(path, "provider-prefix-collision")
+            database = sqlite3.connect(path)
+            try:
+                database.execute(
+                    """
+                    CREATE TABLE city_departure_modes (
+                        city_id TEXT PRIMARY KEY,
+                        mode TEXT NOT NULL,
+                        timezone TEXT NOT NULL,
+                        stop_id_prefix TEXT NOT NULL DEFAULT '',
+                        identifier_prefix TEXT NOT NULL DEFAULT ''
+                    )
+                    """
+                )
+                database.execute(
+                    """
+                    CREATE TABLE provider_city_modes (
+                        provider_id TEXT NOT NULL,
+                        city_id TEXT NOT NULL,
+                        mode TEXT NOT NULL,
+                        timezone TEXT NOT NULL,
+                        stop_id_prefix TEXT NOT NULL DEFAULT '',
+                        identifier_prefix TEXT NOT NULL DEFAULT '',
+                        PRIMARY KEY (provider_id, city_id)
+                    )
+                    """
+                )
+                database.executemany(
+                    "INSERT INTO city_departure_modes VALUES (?, ?, ?, ?, ?)",
+                    [
+                        ("toronto", "canonical", "America/Toronto", "", ""),
+                        ("germany", "canonical", "Europe/Berlin", "", ""),
+                        ("single-provider", "canonical", "UTC", "single:", "single:"),
+                    ],
+                )
+                database.executemany(
+                    "INSERT INTO provider_city_modes VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        ("ttc-surface", "toronto", "canonical", "America/Toronto", "ttc-surface:", ""),
+                        ("ttc-subway", "toronto", "canonical", "America/Toronto", "ttc-subway:", ""),
+                        ("germany", "germany", "canonical", "Europe/Berlin", "", ""),
+                        ("single-provider", "single-provider", "canonical", "UTC", "single:", "single:"),
+                    ],
+                )
+                database.executemany(
+                    "INSERT INTO raw_stops VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        ("100", "", "Eberlestraße", "", 20, "100"),
+                        ("ttc-surface:100", "", "TTC Surface", "", 21, "ttc-surface:100"),
+                        ("ttc-subway:100", "", "TTC Subway", "", 22, "ttc-subway:100"),
+                        ("single:100", "", "Single Provider", "", 23, "single:100"),
+                    ],
+                )
+                database.executemany(
+                    "INSERT INTO city_stops VALUES (?, ?)",
+                    [
+                        ("germany", "100"),
+                        ("toronto", "ttc-surface:100"),
+                        ("toronto", "ttc-subway:100"),
+                        ("single-provider", "single:100"),
+                    ],
+                )
+                database.executemany(
+                    "INSERT INTO routes VALUES (?, ?, ?)",
+                    [
+                        ("germany:134", "134", "Eberlestraße"),
+                        ("ttc-surface:506", "506", "Surface"),
+                        ("ttc-subway:1", "1", "Subway"),
+                        ("single:7", "7", "Single"),
+                    ],
+                )
+                database.executemany(
+                    "INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        ("germany:trip", "germany:service", "germany:134", "Eberlestraße", "0", ""),
+                        ("ttc-surface:trip", "ttc-surface:service", "ttc-surface:506", "Surface", "0", ""),
+                        ("ttc-subway:trip", "ttc-subway:service", "ttc-subway:1", "Subway", "0", ""),
+                        ("single:trip", "single:service", "single:7", "Single", "0", ""),
+                    ],
+                )
+                database.executemany(
+                    "INSERT INTO active_services VALUES (?, ?)",
+                    [
+                        ("germany:service", "20260728"),
+                        ("ttc-surface:service", "20260728"),
+                        ("ttc-subway:service", "20260728"),
+                        ("single:service", "20260728"),
+                    ],
+                )
+                database.executemany(
+                    "INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)",
+                    [
+                        ("germany:trip", "100", "08:00:00", 28_800, 1),
+                        ("ttc-surface:trip", "ttc-surface:100", "08:05:00", 29_100, 1),
+                        ("ttc-subway:trip", "ttc-subway:100", "08:10:00", 29_400, 1),
+                        ("single:trip", "single:100", "08:15:00", 29_700, 1),
+                    ],
+                )
+                database.commit()
+            finally:
+                database.close()
+
+            legacy = Database(str(path))
+            try:
+                toronto_scope = legacy._external_stop_time_ids("toronto", "100")
+                toronto = legacy.external_departures_for(
+                    "toronto",
+                    "100",
+                    10,
+                    datetime(2026, 7, 28, 7, 0, tzinfo=ZoneInfo("America/Toronto")),
+                    "America/Toronto",
+                )
+                germany = legacy.external_departures_for(
+                    "germany",
+                    "100",
+                    10,
+                    datetime(2026, 7, 28, 7, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+                    "Europe/Berlin",
+                )
+                single = legacy.external_departures_for(
+                    "single-provider",
+                    "100",
+                    10,
+                    datetime(2026, 7, 28, 7, 0, tzinfo=ZoneInfo("UTC")),
+                    "UTC",
+                )
+            finally:
+                legacy.close()
+
+            self.assertEqual(
+                [(row["routeID"], row["stopID"]) for row in toronto],
+                [("ttc-surface:506", "100"), ("ttc-subway:1", "100")],
+            )
+            self.assertEqual(toronto_scope, ("ttc-subway:100", "ttc-surface:100"))
+            self.assertNotIn("134", {str(row["routeID"]) for row in toronto})
+            self.assertEqual([(row["routeID"], row["stopID"]) for row in germany], [("germany:134", "100")])
+            self.assertEqual([(row["routeID"], row["stopID"]) for row in single], [("7", "100")])
 
     def test_translink_internal_prefix_is_removed_from_public_board(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

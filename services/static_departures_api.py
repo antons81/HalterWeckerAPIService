@@ -1136,6 +1136,57 @@ class Database:
         ]
 
     def _external_stop_time_ids(self, city_id: str, stop_id: str) -> tuple[str, ...]:
+        with self.lock:
+            try:
+                provider_modes = self._connection().execute(
+                    """
+                    SELECT mode, stop_id_prefix
+                    FROM provider_city_modes
+                    WHERE city_id=?
+                    ORDER BY provider_id
+                    """,
+                    (city_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                provider_modes = []
+
+        if len(provider_modes) > 1:
+            # A merged city must resolve every namespaced provider independently.
+            # An empty provider prefix is ambiguous in the shared legacy database,
+            # so it must not fall back to a global raw stop ID.
+            scoped_ids: list[str] = []
+            with self.lock:
+                connection = self._connection()
+                raw_stop_columns = self._table_columns("raw_stops")
+                parent_expression = "parent_station" if "parent_station" in raw_stop_columns else "''"
+                location_type_expression = "location_type" if "location_type" in raw_stop_columns else "0"
+                for mode, prefix_value in provider_modes:
+                    prefix = str(prefix_value or "")
+                    if not prefix:
+                        continue
+                    internal_stop_id = stop_id if stop_id.startswith(prefix) else f"{prefix}{stop_id}"
+                    row = connection.execute(
+                        f"SELECT stop_id, {location_type_expression} FROM raw_stops WHERE stop_id=?",
+                        (internal_stop_id,),
+                    ).fetchone()
+                    if row is None or int(row[1] or 0) != 1:
+                        scoped_ids.append(internal_stop_id)
+                        continue
+                    if str(mode) != "exact-stop-with-parent-fallback":
+                        scoped_ids.append(internal_stop_id)
+                        continue
+                    children = connection.execute(
+                        f"""
+                        SELECT stop_id
+                        FROM raw_stops
+                        WHERE {parent_expression}=? AND {location_type_expression}=0
+                        ORDER BY stop_id
+                        """,
+                        (internal_stop_id,),
+                    ).fetchall()
+                    scoped_ids.extend([internal_stop_id, *(str(child[0]) for child in children)])
+            return tuple(dict.fromkeys(scoped_ids))
+
         _, _, stop_id_prefix, _ = self.city_departure_mode(city_id)
         internal_stop_id = (
             stop_id
