@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -266,6 +267,84 @@ class ProviderReleaseAssemblerTests(unittest.TestCase):
                 thread.join()
             manager.close()
             self.assertEqual(errors, [])
+
+    def test_release_manager_survives_100_bounded_atomic_switch_cycles(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _legacy, common, stop_data, providers = self._fixture(root / "fixture")
+            releases = root / "releases"
+            release_a = assemble_release(
+                releases,
+                "release-a",
+                common_database=self._common_for_release(common, root / "common-a.sqlite", "release-a"),
+                stop_data_root=stop_data,
+                providers=providers,
+            )
+            release_b = assemble_release(
+                releases,
+                "release-b",
+                common_database=self._common_for_release(common, root / "common-b.sqlite", "release-b"),
+                stop_data_root=stop_data,
+                providers=providers,
+            )
+            pointer = root / "current-release"
+            atomic_switch_current_release(pointer, release_a.release_directory)
+            manager = ReleaseManager(
+                pointer,
+                provider_ids=("israel-mot", "synthetic-2"),
+                max_provider_connections=2,
+            )
+            try:
+                for cycle in range(100):
+                    target = release_a if cycle % 2 == 0 else release_b
+                    self.assertTrue(manager.reload_if_changed() or manager.active_release_id == target.release_id)
+                    self.assertEqual(manager.active_release_id, target.release_id)
+                    entered = threading.Event()
+                    release_readers = threading.Event()
+                    state_lock = threading.Lock()
+                    entered_count = 0
+                    errors: list[BaseException] = []
+
+                    def reader() -> None:
+                        nonlocal entered_count
+                        try:
+                            with manager.acquire_snapshot() as lease:
+                                snapshot = lease.snapshot
+                                self.assertEqual(snapshot.release_id, target.release_id)
+                                snapshot.lines("fixture-israel", "S1")
+                                with state_lock:
+                                    entered_count += 1
+                                    if entered_count == 4:
+                                        entered.set()
+                                if not release_readers.wait(timeout=5):
+                                    raise AssertionError("reader release gate timed out")
+                                self.assertFalse(snapshot._closed)
+                        except BaseException as error:
+                            errors.append(error)
+
+                    with ThreadPoolExecutor(max_workers=4) as executor:
+                        futures = [executor.submit(reader) for _ in range(4)]
+                        self.assertTrue(entered.wait(timeout=5))
+                        next_release = release_b if target is release_a else release_a
+                        atomic_switch_current_release(pointer, next_release.release_directory)
+                        self.assertTrue(manager.reload_if_changed())
+                        self.assertEqual(manager.active_release_id, next_release.release_id)
+                        self.assertEqual(len(manager._old), 1)
+                        old_generation = manager._old[0]
+                        self.assertEqual(old_generation.references, 4)
+                        self.assertFalse(old_generation.snapshot._closed)
+                        self.assertGreater(old_generation.snapshot.connection_count, 1)
+                        release_readers.set()
+                        for future in futures:
+                            future.result(timeout=5)
+
+                    self.assertEqual(errors, [])
+                    self.assertIn(manager.drain_old_snapshots(), (0, 1))
+                    self.assertEqual(manager._old, [])
+                    self.assertTrue(old_generation.snapshot._closed)
+                    self.assertEqual(old_generation.snapshot._providers, {})
+            finally:
+                manager.close()
 
 
 if __name__ == "__main__":

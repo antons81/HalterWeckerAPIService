@@ -2243,6 +2243,14 @@ def _configure_poland_gateways(database: Database) -> None:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=getattr(
+            logging,
+            os.environ.get("HALTEWECKER_LOG_LEVEL", "INFO").strip().upper(),
+            logging.INFO,
+        ),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     database_path = os.environ.get("DEPARTURES_DATABASE", "/data/departures-current.sqlite")
     log_memory_stage("before-db-open", database=database_path)
     database = Database(database_path)

@@ -48,7 +48,7 @@ except ImportError:
 ISRAEL_PROVIDER_ID = "israel-mot"
 EXPERIMENTAL_FEATURE_GATE = "HALTEWECKER_STATIC_PROVIDER_ARTIFACT_EXPERIMENTAL"
 ARTIFACT_ROOT_ENV = "HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT"
-STRUCTURAL_SCHEMA_VERSION = 1
+STRUCTURAL_SCHEMA_VERSION = 2
 TEMPORAL_SCHEMA_VERSION = 1
 
 STRUCTURAL_TABLES = (
@@ -69,6 +69,7 @@ STRUCTURAL_TABLES = (
 TEMPORAL_TABLES = ("active_services",)
 
 STRUCTURAL_INDEXES = (
+    "raw_stops_by_canonical",
     "stop_times_by_trip",
     "stop_times_by_stop_departure",
     "provider_entities_by_provider",
@@ -689,6 +690,10 @@ def _build_structural_database(
         )
         resolve_canonical_stops(connection, provider_ids=(provider_id,))
         update_terminal_stops(connection, provider_ids=(provider_id,))
+        connection.execute(
+            "CREATE INDEX raw_stops_by_canonical "
+            "ON raw_stops(canonical_stop_id, stop_id)"
+        )
 
         from import_static_departures_database import (
             CityScopedStopIDPrefixes,

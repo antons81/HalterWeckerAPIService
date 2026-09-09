@@ -110,6 +110,12 @@ def write_database(path: Path, version: str, valid: bool = True) -> None:
     db.close()
 
 
+class _DeterministicThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+    request_queue_size = 128
+
+
 class StaticDeparturesHTTPServer:
     def __init__(self, database_path: Path, ttl: float = 0.0) -> None:
         self.database = Database(str(database_path), ttl=ttl)
@@ -124,7 +130,7 @@ class StaticDeparturesHTTPServer:
                 "apple_store_notification_store": self.notification_store,
             },
         )
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.server = _DeterministicThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
 

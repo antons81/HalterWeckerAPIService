@@ -89,7 +89,7 @@ COMMON_TABLES = {
     "provider_city_stops",
     "provider_city_modes",
 }
-STRUCTURAL_SCHEMA_VERSION = 1
+STRUCTURAL_SCHEMA_VERSION = 2
 TEMPORAL_SCHEMA_VERSION = 1
 ValidationObserver = Callable[[str, Path, int, float], None]
 
@@ -619,6 +619,12 @@ class ProviderSnapshot:
         self._connections: dict[int, sqlite3.Connection] = {}
         self.lock = threading.RLock()
         self.query_count = 0
+        LOGGER.info(
+            "event=provider-open provider=%s release_id=%s connection_count=%s",
+            provider_id,
+            snapshot.release_id,
+            snapshot.connection_count,
+        )
 
     def _connection(self) -> sqlite3.Connection:
         thread_id = threading.get_ident()
@@ -1114,6 +1120,12 @@ class ProviderSnapshot:
             self._connections.clear()
             for connection in connections:
                 connection.close()
+            LOGGER.info(
+                "event=provider-close provider=%s release_id=%s connection_count=%s",
+                self.provider_id,
+                self.snapshot.release_id,
+                len(connections),
+            )
 
 
 class ReleaseSnapshot:
@@ -1147,6 +1159,13 @@ class ReleaseSnapshot:
         self._lock = threading.RLock()
         self._closed = False
         self.last_fanout_metrics: FanoutMetrics | None = None
+        LOGGER.info(
+            "event=snapshot-open release_id=%s providers=%s path=%s connection_count=%s",
+            self.release_id,
+            ",".join(manifest.providers),
+            manifest.release_root,
+            self.connection_count,
+        )
 
     @classmethod
     def open(
@@ -1203,6 +1222,13 @@ class ReleaseSnapshot:
             raise RuntimeUnavailable(f"query={query} requested unvalidated providers")
         parallelism = min(self.max_parallel_provider_queries, len(provider_ids))
         fanout_started = time.perf_counter()
+        LOGGER.info(
+            "event=fanout-start query=%s city=%s providers=%s connection_count=%s",
+            query,
+            city_id,
+            ",".join(provider_ids),
+            self.connection_count,
+        )
         values: dict[str, list[object]] = {}
         errors: dict[str, Exception] = {}
         def run_provider(provider_id: str) -> list[object]:
@@ -1229,8 +1255,25 @@ class ReleaseSnapshot:
         fanout_duration = time.perf_counter() - fanout_started
         if errors:
             details = ", ".join(f"{provider}={type(error).__name__}" for provider, error in sorted(errors.items()))
+            LOGGER.info(
+                "event=fanout-done query=%s city=%s providers=%s status=ERROR duration=%.6f rows=0 connection_count=%s",
+                query,
+                city_id,
+                ",".join(provider_ids),
+                fanout_duration,
+                self.connection_count,
+            )
             raise RuntimeUnavailable(f"query={query} required provider failure: {details}") from next(iter(errors.values()))
         rows_fetched = sum(len(values[provider_id]) for provider_id in provider_ids)
+        LOGGER.info(
+            "event=fanout-done query=%s city=%s providers=%s status=OK duration=%.6f rows=%s connection_count=%s",
+            query,
+            city_id,
+            ",".join(provider_ids),
+            fanout_duration,
+            rows_fetched,
+            self.connection_count,
+        )
         self.last_fanout_metrics = FanoutMetrics(
             query=query,
             city_id=city_id,
@@ -1333,6 +1376,15 @@ class ReleaseSnapshot:
             rows_fetched=rows_fetched,
             fanout_duration=metrics.fanout_duration,
             merge_duration=time.perf_counter() - started - metrics.fanout_duration,
+        )
+        LOGGER.info(
+            "event=merge-done query=%s city=%s providers=%s status=OK duration=%.6f rows=%s connection_count=%s",
+            query,
+            city_id,
+            ",".join(providers),
+            self.last_fanout_metrics.merge_duration,
+            rows_fetched,
+            self.connection_count,
         )
 
     def external_departures_for(
@@ -1529,6 +1581,12 @@ class ReleaseManager:
                 previous.snapshot.close()
             else:
                 self._old.append(previous)
+        LOGGER.info(
+            "event=snapshot-switch status=OK previous_release_id=%s release_id=%s old_references=%s",
+            previous.snapshot.release_id if previous is not None else "",
+            candidate.snapshot.release_id,
+            previous.references if previous is not None else 0,
+        )
         self.drain_old_snapshots()
         return True
 
@@ -1571,6 +1629,12 @@ class ReleaseManager:
                 else:
                     remaining.append(generation)
             self._old = remaining
+            LOGGER.info(
+                "event=snapshot-drain status=OK closed=%s remaining=%s connection_count=%s",
+                closed,
+                len(remaining),
+                self._active.snapshot.connection_count if self._active is not None else 0,
+            )
             return closed
 
     def close(self) -> None:
@@ -1910,24 +1974,48 @@ class HybridStaticDeparturesBackend:
         provider: str = "",
     ) -> object:
         shard_started = time.perf_counter()
+        connection_count = int(getattr(snapshot, "connection_count", 0))
         try:
             shard_value = shard_call(snapshot)
         except Exception:
             shard_duration = time.perf_counter() - shard_started
-            LOGGER.error(
-                "event=hybrid-authoritative-query status=ERROR query=%s city=%s "
-                "provider=%s providers=%s shard_duration=%.6f legacy_compare_duration=0 "
-                "release_id=%s",
+            LOGGER.info(
+                "event=provider-query status=ERROR query=%s city=%s provider=%s providers=%s duration=%.6f rows=0 connection_count=%s release_id=%s",
                 query,
                 scope.city_id or "",
                 provider,
                 ",".join(scope.providers),
                 shard_duration,
+                connection_count,
+                release_id,
+            )
+            LOGGER.error(
+                "event=hybrid-authoritative-query status=ERROR query=%s city=%s "
+                "provider=%s providers=%s shard_duration=%.6f legacy_compare_duration=0 "
+                "rows=0 connection_count=%s release_id=%s",
+                query,
+                scope.city_id or "",
+                provider,
+                ",".join(scope.providers),
+                shard_duration,
+                connection_count,
                 release_id,
                 exc_info=True,
             )
             raise
         shard_duration = time.perf_counter() - shard_started
+        shard_count = _result_count(shard_value)
+        LOGGER.info(
+            "event=provider-query status=OK query=%s city=%s provider=%s providers=%s duration=%.6f rows=%s connection_count=%s release_id=%s",
+            query,
+            scope.city_id or "",
+            provider,
+            ",".join(scope.providers),
+            shard_duration,
+            shard_count,
+            connection_count,
+            release_id,
+        )
         status = "OK"
         legacy_duration = 0.0
         diagnostic: str | None = None
@@ -1946,7 +2034,7 @@ class HybridStaticDeparturesBackend:
                 diagnostic = comparison.diagnostic
         LOGGER.info(
             "event=hybrid-authoritative-query status=%s query=%s city=%s provider=%s "
-            "providers=%s shard_duration=%.6f legacy_compare_duration=%.6f release_id=%s",
+            "providers=%s shard_duration=%.6f legacy_compare_duration=%.6f rows=%s connection_count=%s release_id=%s",
             status,
             query,
             scope.city_id or "",
@@ -1954,6 +2042,8 @@ class HybridStaticDeparturesBackend:
             ",".join(scope.providers),
             shard_duration,
             legacy_duration,
+            shard_count,
+            connection_count,
             release_id,
         )
         if diagnostic:

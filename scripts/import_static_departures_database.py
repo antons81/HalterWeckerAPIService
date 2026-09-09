@@ -311,6 +311,11 @@ def populate_provider_city_memberships(
         if not isinstance(package, list):
             raise ValueError(f"Invalid stop package for {city_id}")
         prefix_by_provider = dict(stop_id_prefix_by_provider or {})
+        candidate_prefix_by_provider = dict(prefix_by_provider)
+        for provider_id, prefix in connection.execute(
+            "SELECT provider_id, stop_id_prefix FROM provider_city_modes"
+        ):
+            candidate_prefix_by_provider.setdefault(str(provider_id), str(prefix))
         for provider_id, prefix in connection.execute(
             "SELECT provider_id, stop_id_prefix FROM provider_city_modes WHERE city_id=?",
             (city_id,),
