@@ -19,7 +19,8 @@
     "artifactCapabilities": {
       "persistentNormalizedArtifactEligible": true,
       "staticProviderArtifactEligible": true,
-      "shardRuntimeEligible": true
+      "shardRuntimeEligible": true,
+      "authoritativeHybridRuntimeEligible": true
     },
     "country": "IL",
     "sourceName": "Israel Ministry of Transport",
@@ -104,7 +105,8 @@
     "artifactCapabilities": {
       "persistentNormalizedArtifactEligible": true,
       "staticProviderArtifactEligible": true,
-      "shardRuntimeEligible": true
+      "shardRuntimeEligible": true,
+      "authoritativeHybridRuntimeEligible": true
     },
     "country": "CA"
   },
@@ -126,7 +128,8 @@
     "artifactCapabilities": {
       "persistentNormalizedArtifactEligible": true,
       "staticProviderArtifactEligible": true,
-      "shardRuntimeEligible": true
+      "shardRuntimeEligible": true,
+      "authoritativeHybridRuntimeEligible": true
     },
     "country": "CA"
   },

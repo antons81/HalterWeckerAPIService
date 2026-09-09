@@ -82,7 +82,12 @@ from stm_gateway import (
     STM_VEHICLE_POSITIONS_PATH,
     STM_NAMESPACE,
 )
-from static_departures_runtime import RuntimeUnavailable, shadow_backend_from_environment
+from static_departures_runtime import (
+    RuntimeUnavailable,
+    hybrid_backend_from_environment,
+    hybrid_runtime_enabled,
+    shadow_backend_from_environment,
+)
 
 
 DEFAULT_TIMEZONE = "Europe/Berlin"
@@ -1886,6 +1891,16 @@ class Handler(BaseHTTPRequestHandler):
                     payload["requestedCityID"] = city
                 return self.send_json(HTTPStatus.OK, payload)
             return self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        except RuntimeUnavailable as error:
+            LOGGER.error(
+                "event=static-departures-runtime status=ERROR path=%s reason=%s",
+                parsed.path,
+                error,
+            )
+            self.send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "static departures runtime unavailable"},
+            )
         except Exception:
             LOGGER.exception("Unhandled GET request path=%s", parsed.path)
             self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "service temporarily unavailable"})
@@ -2231,16 +2246,19 @@ if __name__ == "__main__":
     database_path = os.environ.get("DEPARTURES_DATABASE", "/data/departures-current.sqlite")
     log_memory_stage("before-db-open", database=database_path)
     database = Database(database_path)
-    try:
-        shadow_database = shadow_backend_from_environment(database)
-    except RuntimeUnavailable as error:
-        LOGGER.error(
-            "event=shard-shadow-runtime status=ERROR reason=%s; legacy path remains authoritative",
-            error,
-        )
+    if hybrid_runtime_enabled():
+        database = hybrid_backend_from_environment(database)
     else:
-        if shadow_database is not None:
-            database = shadow_database
+        try:
+            shadow_database = shadow_backend_from_environment(database)
+        except RuntimeUnavailable as error:
+            LOGGER.error(
+                "event=shard-shadow-runtime status=ERROR reason=%s; legacy path remains authoritative",
+                error,
+            )
+        else:
+            if shadow_database is not None:
+                database = shadow_database
     Handler.database = database
     Handler.external_static_data = ExternalStaticData(
         STATIC_DATA_ROOT,

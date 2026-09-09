@@ -18,14 +18,177 @@ sys.path.insert(0, str(TESTS_ROOT))
 
 from static_departures_api import Database  # noqa: E402
 from static_departures_runtime import (  # noqa: E402
+    HYBRID_ENV,
+    HYBRID_RELEASE_POINTER_ENV,
     ISRAEL_PROVIDER_ID,
+    HybridStaticDeparturesBackend,
     ReleaseSnapshot,
+    ReleaseManager,
     RuntimeUnavailable,
     ShadowStaticDeparturesBackend,
     compare_results,
+    hybrid_backend_from_environment,
     shadow_backend_from_environment,
 )
 import test_static_provider_artifact as static_provider_tests  # noqa: E402
+
+
+class _HybridFakeCatalog:
+    def __init__(self, providers_by_city: dict[str, tuple[str, ...]], providers_by_stop: dict[tuple[str, str], tuple[str, ...]]):
+        self.providers_by_city = providers_by_city
+        self.providers_by_stop = providers_by_stop
+
+    def resolve_city(self, city_id: str) -> str:
+        return city_id
+
+    def providers_for_city(self, city_id: str) -> tuple[str, ...]:
+        return self.providers_by_city.get(city_id, ())
+
+    def providers_for_stop(self, city_id: str, stop_id: str) -> tuple[str, ...]:
+        return self.providers_by_stop.get((city_id, stop_id), self.providers_for_city(city_id))
+
+    def provider_mode(self, city_id: str, provider_id: str):
+        return type("Mode", (), {
+            "mode": "canonical",
+            "timezone": "UTC",
+            "stop_id_prefix": f"{provider_id}:",
+            "identifier_prefix": f"{provider_id}:",
+        })()
+
+
+class _HybridFakeProvider:
+    def __init__(self, provider_id: str):
+        self.provider_id = provider_id
+
+    def trip_details(self, city_id: str, trip_id: str, static_root: str, service_date: str | None = None):
+        return {"backend": "shard", "provider": self.provider_id, "tripID": trip_id}
+
+    def trip_registry(self):
+        return {f"{self.provider_id}:trip"}, {}
+
+    def realtime_metadata(self):
+        return {f"{self.provider_id}:trip"}, {f"{self.provider_id}:route"}, {}, {}
+
+    def route_type_registry(self):
+        return {}
+
+    def route_metadata(self):
+        return {}
+
+    def stop_registry(self):
+        return set()
+
+    def trip_stop_registry(self, trip_ids: set[str]):
+        return {}
+
+
+class _HybridFakeSnapshot:
+    def __init__(self, release_id: str, providers_by_city: dict[str, tuple[str, ...]], providers_by_stop: dict[tuple[str, str], tuple[str, ...]], *, fail_lines: bool = False):
+        self.release_id = release_id
+        self.catalog = _HybridFakeCatalog(providers_by_city, providers_by_stop)
+        self.fail_lines = fail_lines
+
+    def city_has_stop(self, city_id: str, stop_id: str) -> bool:
+        return True
+
+    def provider_modes(self, city_id: str):
+        return tuple(self.catalog.provider_mode(city_id, provider_id) for provider_id in self.catalog.providers_for_city(city_id))
+
+    def lines(self, city_id: str, stop_id: str):
+        if self.fail_lines:
+            raise RuntimeUnavailable("synthetic shard failure")
+        return [{"backend": "shard", "cityID": city_id, "stopID": stop_id}]
+
+    def external_departures_for(self, city_id: str, stop_id: str, limit: int, from_datetime, timezone_name: str, now_provider=None):
+        return [{"backend": "shard", "stopID": stop_id}]
+
+    def board(self, city_id: str, stop_id: str, limit: int, from_date=None, to_date=None):
+        return [{"backend": "shard", "stopID": stop_id}]
+
+    def provider(self, provider_id: str):
+        return _HybridFakeProvider(provider_id)
+
+
+class _HybridFakeLease:
+    def __init__(self, snapshot: _HybridFakeSnapshot):
+        self.snapshot = snapshot
+        self.release_id = snapshot.release_id
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _type, _value, _traceback):
+        return None
+
+
+class _HybridFakeManager:
+    def __init__(self, snapshot: _HybridFakeSnapshot):
+        self.snapshot = snapshot
+        self.closed = False
+
+    def acquire_snapshot(self):
+        return _HybridFakeLease(self.snapshot)
+
+    def switch(self, snapshot: _HybridFakeSnapshot):
+        self.snapshot = snapshot
+
+    def close(self):
+        self.closed = True
+
+
+class _HybridFakeLegacy:
+    def __init__(self):
+        self.lines_calls = 0
+        self.closed = False
+
+    def resolve_city(self, city_id: str) -> str:
+        return city_id
+
+    def city_has_stop(self, city_id: str, stop_id: str) -> bool:
+        return False
+
+    def city_departure_mode(self, city_id: str):
+        return "legacy", "UTC", "", ""
+
+    def city_departure_prefixes(self, city_id: str):
+        return (), ()
+
+    def lines(self, city_id: str, stop_id: str):
+        self.lines_calls += 1
+        return [{"backend": "legacy", "cityID": city_id, "stopID": stop_id}]
+
+    def external_departures_for(self, *args, **kwargs):
+        return [{"backend": "legacy"}]
+
+    def board(self, *args, **kwargs):
+        return [{"backend": "legacy"}]
+
+    def trip_details(self, *args, **kwargs):
+        return {"backend": "legacy"}
+
+    def provider_trip_registry(self, provider_id: str):
+        return {"legacy:trip"}, {}
+
+    def provider_realtime_metadata(self, provider_id: str):
+        return set(), set(), {}, {}
+
+    def provider_realtime_registry(self, provider_id: str):
+        return set(), set(), {}
+
+    def provider_route_type_registry(self, provider_id: str):
+        return {}
+
+    def provider_route_metadata(self, provider_id: str):
+        return {}
+
+    def provider_stop_registry(self, provider_id: str):
+        return set()
+
+    def provider_trip_stop_registry(self, provider_id: str, trip_ids: set[str]):
+        return {}
+
+    def close(self):
+        self.closed = True
 
 
 class StaticDeparturesRuntimeTests(unittest.TestCase):
@@ -348,6 +511,186 @@ class StaticDeparturesRuntimeTests(unittest.TestCase):
 
     def test_shadow_flag_is_default_off(self) -> None:
         self.assertIsNone(shadow_backend_from_environment(object(), environ={}))
+
+    def test_hybrid_flag_is_default_off(self) -> None:
+        self.assertIsNone(hybrid_backend_from_environment(object(), environ={}))
+
+    def test_hybrid_requires_an_atomic_release_pointer(self) -> None:
+        with self.assertRaisesRegex(RuntimeUnavailable, HYBRID_RELEASE_POINTER_ENV):
+            hybrid_backend_from_environment(object(), environ={HYBRID_ENV: "1"})
+
+    def test_hybrid_factory_opens_real_release_manager_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            legacy_path, release, _stop_data = self._build_fixture(root)
+            pointer = root / "current-release"
+            pointer.symlink_to(release, target_is_directory=True)
+            legacy = Database(str(legacy_path))
+            backend = hybrid_backend_from_environment(
+                legacy,
+                environ={
+                    HYBRID_ENV: "1",
+                    "HALTEWECKER_STATIC_DEPARTURES_HYBRID_PROVIDERS": ISRAEL_PROVIDER_ID,
+                    HYBRID_RELEASE_POINTER_ENV: str(pointer),
+                },
+            )
+            self.assertIsInstance(backend, HybridStaticDeparturesBackend)
+            self.assertEqual(backend.manager.active_release_id, "release-x")
+            backend.close()
+
+    def test_hybrid_routes_pilot_nonpilot_and_mixed_scopes(self) -> None:
+        legacy = _HybridFakeLegacy()
+        snapshot = _HybridFakeSnapshot(
+            "release-a",
+            {
+                "israel": ("israel-mot",),
+                "legacy-city": ("legacy-provider",),
+                "mixed-city": ("israel-mot", "legacy-provider"),
+                "toronto": ("ttc-surface", "ttc-subway"),
+            },
+            {
+                ("israel", "stop"): ("israel-mot",),
+                ("legacy-city", "stop"): ("legacy-provider",),
+                ("mixed-city", "stop"): ("israel-mot", "legacy-provider"),
+                ("toronto", "stop"): ("ttc-surface", "ttc-subway"),
+            },
+        )
+        backend = HybridStaticDeparturesBackend(
+            legacy,
+            _HybridFakeManager(snapshot),
+            ("israel-mot", "ttc-surface", "ttc-subway"),
+        )
+        try:
+            self.assertEqual(backend.lines("israel", "stop")[0]["backend"], "shard")
+            self.assertEqual(backend.lines("toronto", "stop")[0]["backend"], "shard")
+            self.assertEqual(backend.lines("legacy-city", "stop")[0]["backend"], "legacy")
+            self.assertEqual(backend.lines("mixed-city", "stop")[0]["backend"], "legacy")
+            self.assertEqual(legacy.lines_calls, 2)
+        finally:
+            backend.close()
+
+    def test_hybrid_shard_failure_is_fail_closed_without_legacy_fallback(self) -> None:
+        legacy = _HybridFakeLegacy()
+        snapshot = _HybridFakeSnapshot(
+            "release-a",
+            {"israel": ("israel-mot",)},
+            {("israel", "stop"): ("israel-mot",)},
+            fail_lines=True,
+        )
+        backend = HybridStaticDeparturesBackend(
+            legacy,
+            _HybridFakeManager(snapshot),
+            ("israel-mot",),
+        )
+        try:
+            with self.assertRaises(RuntimeUnavailable):
+                backend.lines("israel", "stop")
+            self.assertEqual(legacy.lines_calls, 0)
+        finally:
+            backend.close()
+
+    def test_hybrid_mismatch_keeps_authoritative_shard_result(self) -> None:
+        legacy = _HybridFakeLegacy()
+        snapshot = _HybridFakeSnapshot(
+            "release-a",
+            {"israel": ("israel-mot",)},
+            {("israel", "stop"): ("israel-mot",)},
+        )
+        backend = HybridStaticDeparturesBackend(
+            legacy,
+            _HybridFakeManager(snapshot),
+            ("israel-mot",),
+            compare_legacy=True,
+        )
+        try:
+            with self.assertLogs("haltewecker.static_departures_runtime", level="INFO") as logs:
+                value = backend.lines("israel", "stop")
+            self.assertEqual(value[0]["backend"], "shard")
+            self.assertTrue(any("status=MISMATCH" in entry for entry in logs.output))
+        finally:
+            backend.close()
+
+    def test_hybrid_provider_registry_and_trip_use_shard(self) -> None:
+        legacy = _HybridFakeLegacy()
+        snapshot = _HybridFakeSnapshot(
+            "release-a",
+            {"israel": ("israel-mot",)},
+            {},
+        )
+        backend = HybridStaticDeparturesBackend(
+            legacy,
+            _HybridFakeManager(snapshot),
+            ("israel-mot",),
+        )
+        try:
+            self.assertEqual(backend.provider_trip_registry("israel-mot")[0], {"israel-mot:trip"})
+            self.assertEqual(
+                backend.trip_details("israel", "israel-mot:trip", "/tmp"),
+                {"backend": "shard", "provider": "israel-mot", "tripID": "israel-mot:trip"},
+            )
+        finally:
+            backend.close()
+
+    def test_hybrid_release_switch_changes_authoritative_snapshot(self) -> None:
+        legacy = _HybridFakeLegacy()
+        manager = _HybridFakeManager(
+            _HybridFakeSnapshot(
+                "release-a",
+                {"israel": ("israel-mot",)},
+                {("israel", "stop"): ("israel-mot",)},
+            )
+        )
+        backend = HybridStaticDeparturesBackend(legacy, manager, ("israel-mot",))
+        try:
+            self.assertEqual(backend.lines("israel", "stop")[0]["backend"], "shard")
+            manager.switch(
+                _HybridFakeSnapshot(
+                    "release-b",
+                    {"israel": ("israel-mot",)},
+                    {("israel", "stop"): ("israel-mot",)},
+                )
+            )
+            with self.assertLogs("haltewecker.static_departures_runtime", level="INFO") as logs:
+                backend.lines("israel", "stop")
+            self.assertTrue(any("release_id=release-b" in entry for entry in logs.output))
+        finally:
+            backend.close()
+
+    def test_hybrid_israel_query_families_match_legacy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            legacy_path, release, stop_data = self._build_fixture(root)
+            pointer = root / "current-release"
+            pointer.symlink_to(release, target_is_directory=True)
+            legacy = Database(str(legacy_path))
+            manager = ReleaseManager(pointer, provider_ids=(ISRAEL_PROVIDER_ID,))
+            backend = HybridStaticDeparturesBackend(
+                legacy,
+                manager,
+                (ISRAEL_PROVIDER_ID,),
+                compare_legacy=True,
+            )
+            now = datetime(2026, 1, 5, 7, 0, tzinfo=ZoneInfo("Asia/Jerusalem"))
+            try:
+                self.assertEqual(backend.lines("fixture-israel", "S1"), legacy.lines("fixture-israel", "S1"))
+                self.assertEqual(
+                    backend.external_departures_for(
+                        "fixture-israel", "S1", 10, now, "Asia/Jerusalem", now_provider=lambda: now
+                    ),
+                    legacy.external_departures_for(
+                        "fixture-israel", "S1", 10, now, "Asia/Jerusalem", now_provider=lambda: now
+                    ),
+                )
+                self.assertEqual(
+                    backend.board("fixture-israel", "S1", 10, now, now),
+                    legacy.board("fixture-israel", "S1", 10, now, now),
+                )
+                self.assertEqual(
+                    backend.trip_details("fixture-israel", "T1", str(stop_data), "2026-01-05"),
+                    legacy.trip_details("fixture-israel", "T1", str(stop_data), "2026-01-05"),
+                )
+            finally:
+                backend.close()
 
 
 if __name__ == "__main__":

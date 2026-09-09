@@ -11,7 +11,13 @@ CAPABILITIES_FIELD = "artifactCapabilities"
 PERSISTENT_NORMALIZED = "persistentNormalizedArtifactEligible"
 STATIC_PROVIDER = "staticProviderArtifactEligible"
 SHARD_RUNTIME = "shardRuntimeEligible"
-SUPPORTED_CAPABILITIES = (PERSISTENT_NORMALIZED, STATIC_PROVIDER, SHARD_RUNTIME)
+HYBRID_RUNTIME = "authoritativeHybridRuntimeEligible"
+SUPPORTED_CAPABILITIES = (
+    PERSISTENT_NORMALIZED,
+    STATIC_PROVIDER,
+    SHARD_RUNTIME,
+    HYBRID_RUNTIME,
+)
 
 
 def _sources_path(repository_root: Path) -> Path:

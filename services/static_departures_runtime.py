@@ -21,9 +21,17 @@ from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
 try:
-    from provider_artifact_capabilities import SHARD_RUNTIME, provider_capability
+    from provider_artifact_capabilities import (
+        HYBRID_RUNTIME,
+        SHARD_RUNTIME,
+        provider_capability,
+    )
 except ImportError:
-    from scripts.provider_artifact_capabilities import SHARD_RUNTIME, provider_capability
+    from scripts.provider_artifact_capabilities import (
+        HYBRID_RUNTIME,
+        SHARD_RUNTIME,
+        provider_capability,
+    )
 
 try:
     from artifact_trust import trusted_artifact
@@ -37,6 +45,12 @@ SHADOW_ENV = "HALTEWECKER_STATIC_DEPARTURES_SHADOW_PROVIDER_RUNTIME"
 SHADOW_RELEASE_ENV = "HALTEWECKER_STATIC_DEPARTURES_SHADOW_RELEASE"
 SHADOW_PROVIDER_ENV = "HALTEWECKER_STATIC_DEPARTURES_SHADOW_PROVIDER"
 SHADOW_MAX_PARALLEL_ENV = "HALTEWECKER_STATIC_DEPARTURES_SHADOW_MAX_PARALLEL_PROVIDER_QUERIES"
+HYBRID_ENV = "HALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME"
+HYBRID_PROVIDER_ENV = "HALTEWECKER_STATIC_DEPARTURES_HYBRID_PROVIDERS"
+HYBRID_RELEASE_POINTER_ENV = "HALTEWECKER_STATIC_DEPARTURES_HYBRID_RELEASE_POINTER"
+HYBRID_MAX_PARALLEL_ENV = "HALTEWECKER_STATIC_DEPARTURES_HYBRID_MAX_PARALLEL_PROVIDER_QUERIES"
+HYBRID_COMPARE_ENV = "HALTEWECKER_STATIC_DEPARTURES_HYBRID_COMPARE_LEGACY"
+DEFAULT_HYBRID_PROVIDERS = ("israel-mot", "ttc-surface", "ttc-subway")
 
 GTFS_ROUTE_TYPE_TO_MODE = {
     "0": "tram",
@@ -1809,6 +1823,475 @@ class ShadowStaticDeparturesBackend:
         if callable(close):
             close()
         self.snapshot.close()
+
+
+@dataclass(frozen=True)
+class _HybridScope:
+    backend: str
+    reason: str
+    city_id: str | None
+    providers: tuple[str, ...]
+
+
+class HybridStaticDeparturesBackend:
+    """Authoritative shard proxy for configured providers with legacy routing fallback."""
+
+    def __init__(
+        self,
+        legacy: object,
+        manager: ReleaseManager,
+        provider_ids: tuple[str, ...],
+        *,
+        compare_legacy: bool = False,
+    ) -> None:
+        self.legacy = legacy
+        self.manager = manager
+        self.provider_ids = tuple(dict.fromkeys(value.strip() for value in provider_ids if value.strip()))
+        if not self.provider_ids:
+            raise RuntimeUnavailable("hybrid provider runtime requires at least one provider")
+        self.eligible_provider_ids = frozenset(self.provider_ids)
+        self.compare_legacy = compare_legacy
+
+    @staticmethod
+    def _scope(
+        snapshot: ReleaseSnapshot,
+        city_id: str,
+        stop_id: str | None,
+        eligible_provider_ids: frozenset[str],
+        *,
+        allow_multi_provider: bool = True,
+    ) -> _HybridScope:
+        resolved_city = snapshot.catalog.resolve_city(city_id)
+        providers = (
+            snapshot.catalog.providers_for_stop(resolved_city, stop_id)
+            if stop_id is not None
+            else snapshot.catalog.providers_for_city(resolved_city)
+        )
+        if not providers:
+            return _HybridScope("legacy", "no-routed-providers", resolved_city, ())
+        if any(provider_id not in eligible_provider_ids for provider_id in providers):
+            reason = "mixed-provider-scope" if any(
+                provider_id in eligible_provider_ids for provider_id in providers
+            ) else "non-pilot-provider"
+            return _HybridScope("legacy", reason, resolved_city, providers)
+        if not allow_multi_provider and len(providers) > 1:
+            return _HybridScope("legacy", "multi-provider-metadata", resolved_city, providers)
+        return _HybridScope("shard", "pilot-provider-scope", resolved_city, providers)
+
+    def _log_routing(
+        self,
+        query: str,
+        scope: _HybridScope,
+        *,
+        provider: str = "",
+        release_id: str = "",
+    ) -> None:
+        LOGGER.info(
+            "event=hybrid-routing query=%s city=%s provider=%s providers=%s "
+            "backend=%s reason=%s release_id=%s",
+            query,
+            scope.city_id or "",
+            provider,
+            ",".join(scope.providers),
+            scope.backend,
+            scope.reason,
+            release_id,
+        )
+
+    def _run_shard(
+        self,
+        snapshot: ReleaseSnapshot,
+        query: str,
+        scope: _HybridScope,
+        release_id: str,
+        shard_call: Callable[[ReleaseSnapshot], object],
+        legacy_call: Callable[[], object],
+        *,
+        provider: str = "",
+    ) -> object:
+        shard_started = time.perf_counter()
+        try:
+            shard_value = shard_call(snapshot)
+        except Exception:
+            shard_duration = time.perf_counter() - shard_started
+            LOGGER.error(
+                "event=hybrid-authoritative-query status=ERROR query=%s city=%s "
+                "provider=%s providers=%s shard_duration=%.6f legacy_compare_duration=0 "
+                "release_id=%s",
+                query,
+                scope.city_id or "",
+                provider,
+                ",".join(scope.providers),
+                shard_duration,
+                release_id,
+                exc_info=True,
+            )
+            raise
+        shard_duration = time.perf_counter() - shard_started
+        status = "OK"
+        legacy_duration = 0.0
+        diagnostic: str | None = None
+        if self.compare_legacy:
+            legacy_started = time.perf_counter()
+            try:
+                legacy_value = legacy_call()
+            except Exception as error:
+                legacy_duration = time.perf_counter() - legacy_started
+                status = "ERROR"
+                diagnostic = f"legacy={type(error).__name__}"
+            else:
+                legacy_duration = time.perf_counter() - legacy_started
+                comparison = compare_results(legacy_value, shard_value)
+                status = comparison.status
+                diagnostic = comparison.diagnostic
+        LOGGER.info(
+            "event=hybrid-authoritative-query status=%s query=%s city=%s provider=%s "
+            "providers=%s shard_duration=%.6f legacy_compare_duration=%.6f release_id=%s",
+            status,
+            query,
+            scope.city_id or "",
+            provider,
+            ",".join(scope.providers),
+            shard_duration,
+            legacy_duration,
+            release_id,
+        )
+        if diagnostic:
+            LOGGER.warning(
+                "event=hybrid-pilot-failure status=%s query=%s city=%s providers=%s "
+                "release_id=%s",
+                status,
+                query,
+                scope.city_id or "",
+                ",".join(scope.providers),
+                release_id,
+            )
+            LOGGER.warning(
+                "event=hybrid-authoritative-diagnostic query=%s city=%s providers=%s "
+                "release_id=%s diagnostic=%s",
+                query,
+                scope.city_id or "",
+                ",".join(scope.providers),
+                release_id,
+                diagnostic,
+            )
+        return shard_value
+
+    def _run_city(
+        self,
+        query: str,
+        city_id: str,
+        stop_id: str | None,
+        legacy_call: Callable[[], object],
+        shard_call: Callable[[ReleaseSnapshot], object],
+        *,
+        allow_multi_provider: bool = True,
+    ) -> object:
+        with self.manager.acquire_snapshot() as lease:
+            scope = self._scope(
+                lease.snapshot,
+                city_id,
+                stop_id,
+                self.eligible_provider_ids,
+                allow_multi_provider=allow_multi_provider,
+            )
+            self._log_routing(query, scope, release_id=lease.release_id)
+            if scope.backend == "legacy":
+                return legacy_call()
+            return self._run_shard(
+                lease.snapshot,
+                query,
+                scope,
+                lease.release_id,
+                shard_call,
+                legacy_call,
+            )
+
+    def _run_provider(
+        self,
+        query: str,
+        provider_id: str,
+        legacy_call: Callable[[], object],
+        shard_call: Callable[[ReleaseSnapshot], object],
+    ) -> object:
+        scope = _HybridScope(
+            "shard" if provider_id in self.eligible_provider_ids else "legacy",
+            "pilot-provider-scope" if provider_id in self.eligible_provider_ids else "non-pilot-provider",
+            None,
+            (provider_id,),
+        )
+        if scope.backend == "legacy":
+            self._log_routing(query, scope, provider=provider_id)
+            return legacy_call()
+        with self.manager.acquire_snapshot() as lease:
+            self._log_routing(query, scope, provider=provider_id, release_id=lease.release_id)
+            return self._run_shard(
+                lease.snapshot,
+                query,
+                scope,
+                lease.release_id,
+                shard_call,
+                legacy_call,
+                provider=provider_id,
+            )
+
+    def resolve_city(self, city_id: str) -> str:
+        return self.legacy.resolve_city(city_id)
+
+    def city_has_stop(self, city_id: str, stop_id: str) -> bool:
+        return bool(self._run_city(
+            "city-stop-validation",
+            city_id,
+            stop_id,
+            lambda: self.legacy.city_has_stop(city_id, stop_id),
+            lambda snapshot: snapshot.city_has_stop(city_id, stop_id),
+        ))
+
+    def city_departure_mode(self, city_id: str) -> tuple[str, str, str, str]:
+        return self._run_city(
+            "provider-city-mode",
+            city_id,
+            None,
+            lambda: self.legacy.city_departure_mode(city_id),
+            lambda snapshot: self._provider_mode(snapshot, city_id),
+            allow_multi_provider=False,
+        )  # type: ignore[return-value]
+
+    @staticmethod
+    def _provider_mode(snapshot: ReleaseSnapshot, city_id: str) -> tuple[str, str, str, str]:
+        resolved_city = snapshot.catalog.resolve_city(city_id)
+        providers = snapshot.catalog.providers_for_city(resolved_city)
+        mode = snapshot.catalog.provider_mode(resolved_city, providers[0])
+        return mode.mode, mode.timezone, mode.stop_id_prefix, mode.identifier_prefix
+
+    def city_departure_prefixes(self, city_id: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        return self._run_city(
+            "provider-city-prefixes",
+            city_id,
+            None,
+            lambda: self.legacy.city_departure_prefixes(city_id),
+            lambda snapshot: (
+                tuple(mode.stop_id_prefix for mode in snapshot.provider_modes(city_id)),
+                tuple(mode.identifier_prefix for mode in snapshot.provider_modes(city_id)),
+            ),
+            allow_multi_provider=False,
+        )  # type: ignore[return-value]
+
+    def lines(self, city_id: str, stop_id: str) -> list[dict[str, str | None]]:
+        return self._run_city(
+            "lines",
+            city_id,
+            stop_id,
+            lambda: self.legacy.lines(city_id, stop_id),
+            lambda snapshot: snapshot.lines(city_id, stop_id),
+        )  # type: ignore[return-value]
+
+    def external_departures_for(
+        self,
+        city_id: str,
+        stop_id: str,
+        limit: int,
+        from_datetime: datetime | None,
+        timezone_name: str,
+        now_provider: Callable[[], datetime] | None = None,
+    ) -> list[dict[str, object]]:
+        return self._run_city(
+            "departures",
+            city_id,
+            stop_id,
+            lambda: self.legacy.external_departures_for(
+                city_id, stop_id, limit, from_datetime, timezone_name, now_provider=now_provider
+            ),
+            lambda snapshot: snapshot.external_departures_for(
+                city_id, stop_id, limit, from_datetime, timezone_name, now_provider=now_provider
+            ),
+        )  # type: ignore[return-value]
+
+    def board(
+        self,
+        city_id: str,
+        stop_id: str,
+        limit: int,
+        from_date: datetime | None = None,
+        to_date: datetime | None = None,
+    ) -> list[dict[str, object]]:
+        return self._run_city(
+            "board",
+            city_id,
+            stop_id,
+            lambda: self.legacy.board(city_id, stop_id, limit, from_date, to_date),
+            lambda snapshot: snapshot.board(city_id, stop_id, limit, from_date, to_date),
+        )  # type: ignore[return-value]
+
+    def _trip_provider(self, snapshot: ReleaseSnapshot, city_id: str, trip_id: str) -> str | None:
+        for provider_id in self.provider_ids:
+            if trip_id.startswith(f"{provider_id}:"):
+                return provider_id
+        providers = snapshot.catalog.providers_for_city(snapshot.catalog.resolve_city(city_id))
+        return providers[0] if len(providers) == 1 else None
+
+    def trip_details(
+        self,
+        city_id: str,
+        trip_id: str,
+        static_root: str,
+        service_date: str | None = None,
+    ) -> dict[str, object] | None:
+        with self.manager.acquire_snapshot() as lease:
+            provider_id = self._trip_provider(lease.snapshot, city_id, trip_id)
+            if provider_id not in self.eligible_provider_ids:
+                scope = _HybridScope("legacy", "non-pilot-provider", city_id, (provider_id,) if provider_id else ())
+                self._log_routing("trip-details", scope, provider=provider_id or "", release_id=lease.release_id)
+                return self.legacy.trip_details(city_id, trip_id, static_root, service_date)
+            scope = _HybridScope("shard", "pilot-provider-scope", city_id, (provider_id,))
+            self._log_routing("trip-details", scope, provider=provider_id, release_id=lease.release_id)
+            return self._run_shard(
+                lease.snapshot,
+                "trip-details",
+                scope,
+                lease.release_id,
+                lambda snapshot: snapshot.provider(provider_id).trip_details(city_id, trip_id, static_root, service_date),
+                lambda: self.legacy.trip_details(city_id, trip_id, static_root, service_date),
+                provider=provider_id,
+            )  # type: ignore[return-value]
+
+    def provider_trip_registry(self, provider_id: str) -> tuple[set[str], dict[str, str]]:
+        return self._run_provider(
+            "trip-registry",
+            provider_id,
+            lambda: self.legacy.provider_trip_registry(provider_id),
+            lambda snapshot: snapshot.provider(provider_id).trip_registry(),
+        )  # type: ignore[return-value]
+
+    def provider_realtime_metadata(self, provider_id: str) -> tuple[set[str], set[str], dict[str, str], dict[str, str]]:
+        return self._run_provider(
+            "realtime-metadata",
+            provider_id,
+            lambda: self.legacy.provider_realtime_metadata(provider_id),
+            lambda snapshot: snapshot.provider(provider_id).realtime_metadata(),
+        )  # type: ignore[return-value]
+
+    def provider_realtime_registry(self, provider_id: str) -> tuple[set[str], set[str], dict[str, str]]:
+        return self._run_provider(
+            "realtime-registry",
+            provider_id,
+            lambda: self.legacy.provider_realtime_registry(provider_id),
+            lambda snapshot: snapshot.provider(provider_id).realtime_metadata()[:3],
+        )  # type: ignore[return-value]
+
+    def provider_route_type_registry(self, provider_id: str) -> dict[str, str]:
+        return self._run_provider(
+            "route-registry",
+            provider_id,
+            lambda: self.legacy.provider_route_type_registry(provider_id),
+            lambda snapshot: snapshot.provider(provider_id).route_type_registry(),
+        )  # type: ignore[return-value]
+
+    def provider_route_metadata(self, provider_id: str) -> dict[str, tuple[str, str]]:
+        return self._run_provider(
+            "route-metadata",
+            provider_id,
+            lambda: self.legacy.provider_route_metadata(provider_id),
+            lambda snapshot: snapshot.provider(provider_id).route_metadata(),
+        )  # type: ignore[return-value]
+
+    def provider_stop_registry(self, provider_id: str) -> set[str]:
+        return self._run_provider(
+            "stop-registry",
+            provider_id,
+            lambda: self.legacy.provider_stop_registry(provider_id),
+            lambda snapshot: snapshot.provider(provider_id).stop_registry(),
+        )  # type: ignore[return-value]
+
+    def provider_trip_stop_registry(self, provider_id: str, trip_ids: set[str]) -> dict[tuple[str, int], str]:
+        return self._run_provider(
+            "trip-stop-registry",
+            provider_id,
+            lambda: self.legacy.provider_trip_stop_registry(provider_id, trip_ids),
+            lambda snapshot: snapshot.provider(provider_id).trip_stop_registry(trip_ids),
+        )  # type: ignore[return-value]
+
+    def close(self) -> None:
+        try:
+            self.manager.close()
+        finally:
+            close = getattr(self.legacy, "close", None)
+            if callable(close):
+                close()
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.legacy, name)
+
+
+def _environment_flag(values: Mapping[str, str], name: str) -> bool:
+    return str(values.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def hybrid_runtime_enabled(*, environ: Mapping[str, str] | None = None) -> bool:
+    values = os.environ if environ is None else environ
+    return _environment_flag(values, HYBRID_ENV)
+
+
+def _configured_provider_ids(values: Mapping[str, str]) -> tuple[str, ...]:
+    configured = str(values.get(HYBRID_PROVIDER_ENV, ",".join(DEFAULT_HYBRID_PROVIDERS)))
+    return tuple(dict.fromkeys(value.strip() for value in configured.split(",") if value.strip()))
+
+
+def hybrid_backend_from_environment(
+    legacy: object,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> HybridStaticDeparturesBackend | None:
+    values = os.environ if environ is None else environ
+    if not _environment_flag(values, HYBRID_ENV):
+        return None
+    provider_ids = _configured_provider_ids(values)
+    if not provider_ids:
+        raise RuntimeUnavailable(f"{HYBRID_PROVIDER_ENV} requires at least one provider")
+    repository_root = Path(__file__).resolve().parents[1]
+    ineligible = tuple(
+        provider_id
+        for provider_id in provider_ids
+        if not provider_capability(repository_root, provider_id, SHARD_RUNTIME)
+        or not provider_capability(repository_root, provider_id, HYBRID_RUNTIME)
+    )
+    if ineligible:
+        raise RuntimeUnavailable(
+            f"authoritative hybrid runtime is not enabled for: {', '.join(ineligible)}"
+        )
+    pointer = str(values.get(HYBRID_RELEASE_POINTER_ENV, "")).strip()
+    if not pointer:
+        raise RuntimeUnavailable(f"{HYBRID_RELEASE_POINTER_ENV} is required when hybrid mode is enabled")
+    try:
+        max_parallel = max(1, int(values.get(HYBRID_MAX_PARALLEL_ENV, "4")))
+    except (TypeError, ValueError) as error:
+        raise RuntimeUnavailable(f"{HYBRID_MAX_PARALLEL_ENV} must be a positive integer") from error
+    compare_legacy = _environment_flag(values, HYBRID_COMPARE_ENV)
+    manager = ReleaseManager(
+        pointer,
+        provider_ids=provider_ids,
+        max_provider_connections=max_parallel,
+        max_parallel_provider_queries=max_parallel,
+    )
+    try:
+        with manager.acquire_snapshot() as lease:
+            release_id = lease.release_id
+    except Exception:
+        manager.close()
+        raise
+    LOGGER.info(
+        "event=hybrid-runtime status=READY providers=%s release_id=%s compare_legacy=%s rss_bytes=%d",
+        ",".join(provider_ids),
+        release_id,
+        str(compare_legacy).lower(),
+        _rss_bytes(),
+    )
+    return HybridStaticDeparturesBackend(
+        legacy,
+        manager,
+        provider_ids,
+        compare_legacy=compare_legacy,
+    )
 
 
 def shadow_backend_from_environment(legacy: object, *, environ: Mapping[str, str] | None = None) -> ShadowStaticDeparturesBackend | None:
