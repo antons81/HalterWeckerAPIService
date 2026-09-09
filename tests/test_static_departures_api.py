@@ -645,6 +645,18 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                     datetime(2026, 7, 28, 7, 0, tzinfo=ZoneInfo("UTC")),
                     "UTC",
                 )
+                board_from = datetime(2026, 7, 28, 7, 0, tzinfo=ZoneInfo("America/Toronto"))
+                toronto_lines = legacy.lines("toronto", "100")
+                surface_lines = legacy.lines("toronto", "ttc-surface:100")
+                subway_lines = legacy.lines("toronto", "ttc-subway:100")
+                germany_lines = legacy.lines("germany", "100")
+                single_lines = legacy.lines("single-provider", "single:100")
+                toronto_board = legacy.board("toronto", "100", 10, board_from, board_from)
+                surface_board = legacy.board("toronto", "ttc-surface:100", 10, board_from, board_from)
+                subway_board = legacy.board("toronto", "ttc-subway:100", 10, board_from, board_from)
+                germany_board = legacy.board("germany", "100", 10, board_from, board_from)
+                foreign_lines = legacy.lines("toronto", "foreign:100")
+                foreign_board = legacy.board("toronto", "foreign:100", 10, board_from, board_from)
             finally:
                 legacy.close()
 
@@ -656,6 +668,20 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
             self.assertNotIn("134", {str(row["routeID"]) for row in toronto})
             self.assertEqual([(row["routeID"], row["stopID"]) for row in germany], [("germany:134", "100")])
             self.assertEqual([(row["routeID"], row["stopID"]) for row in single], [("7", "100")])
+            self.assertEqual(
+                {row["routeID"] for row in toronto_lines},
+                {"ttc-surface:506", "ttc-subway:1"},
+            )
+            self.assertEqual([row["routeID"] for row in surface_lines], ["ttc-surface:506"])
+            self.assertEqual([row["routeID"] for row in subway_lines], ["ttc-subway:1"])
+            self.assertEqual([row["routeID"] for row in germany_lines], ["germany:134"])
+            self.assertEqual([row["routeID"] for row in single_lines], ["7"])
+            self.assertEqual({row["routeID"] for row in toronto_board}, {"ttc-surface:506", "ttc-subway:1"})
+            self.assertEqual([row["routeID"] for row in surface_board], ["ttc-surface:506"])
+            self.assertEqual([row["routeID"] for row in subway_board], ["ttc-subway:1"])
+            self.assertEqual([row["routeID"] for row in germany_board], ["germany:134"])
+            self.assertEqual(foreign_lines, [])
+            self.assertEqual(foreign_board, [])
 
     def test_translink_internal_prefix_is_removed_from_public_board(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

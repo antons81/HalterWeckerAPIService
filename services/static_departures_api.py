@@ -1034,6 +1034,49 @@ class Database:
         identifier_prefixes = tuple(dict.fromkeys(str(row[1] or "") for row in rows))
         return stop_prefixes, identifier_prefixes
 
+    def _explicit_provider_stop_ids(self, city_id: str, stop_id: str) -> tuple[str, ...] | None:
+        """Resolve an already namespaced stop without falling back to a raw ID."""
+        if ":" not in stop_id:
+            return None
+
+        with self.lock:
+            try:
+                rows = self._connection().execute(
+                    """
+                    SELECT stop_id_prefix
+                    FROM provider_city_modes
+                    WHERE city_id=?
+                    ORDER BY provider_id
+                    """,
+                    (city_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+
+        provider_prefixes = tuple(
+            dict.fromkeys(
+                str(row[0] or "")
+                for row in rows
+                if str(row[0] or "")
+            )
+        )
+        if not provider_prefixes:
+            _, _, city_prefix, _ = self.city_departure_mode(city_id)
+            provider_prefixes = (city_prefix,) if city_prefix else ()
+
+        if any(stop_id.startswith(prefix) for prefix in provider_prefixes if prefix):
+            return (stop_id,)
+
+        with self.lock:
+            try:
+                row = self._connection().execute(
+                    "SELECT 1 FROM city_stops WHERE city_id=? AND stop_id=? LIMIT 1",
+                    (city_id, stop_id),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                row = None
+        return (stop_id,) if row is not None and not provider_prefixes else ()
+
     @staticmethod
     def _public_identifier_multi(identifier: str | None, prefixes: tuple[str, ...]) -> str:
         value = str(identifier or "")
@@ -1046,6 +1089,9 @@ class Database:
         return self._public_identifier_multi(identifier, (prefix,))
 
     def _canonical_stop_candidates(self, city_id: str, stop_id: str) -> tuple[str, ...]:
+        explicit_ids = self._explicit_provider_stop_ids(city_id, stop_id)
+        if explicit_ids is not None:
+            return explicit_ids
         stop_prefixes, _ = self.city_departure_prefixes(city_id)
         return tuple(dict.fromkeys(
             f"{prefix}{stop_id}" if prefix else stop_id
@@ -1067,8 +1113,17 @@ class Database:
     def _query_stop_id(self, city_id: str, stop_id: str) -> str:
         mode, _, stop_id_prefix, _ = self.city_departure_mode(city_id)
         if mode != "exact-stop-with-parent-fallback":
+            explicit_ids = self._explicit_provider_stop_ids(city_id, stop_id)
+            if explicit_ids is not None:
+                return explicit_ids[0] if explicit_ids else ""
             return f"{stop_id_prefix}{stop_id}"
-        internal_stop_id = f"{stop_id_prefix}{stop_id}" if stop_id_prefix else stop_id
+        explicit_ids = self._explicit_provider_stop_ids(city_id, stop_id)
+        if explicit_ids is not None:
+            internal_stop_id = explicit_ids[0] if explicit_ids else ""
+        elif stop_id_prefix:
+            internal_stop_id = f"{stop_id_prefix}{stop_id}"
+        else:
+            internal_stop_id = stop_id
         with self.lock:
             cursor = self._connection().execute(
                 "SELECT 1 FROM stop_times WHERE raw_stop_id=? LIMIT 1", (internal_stop_id,)
@@ -1090,6 +1145,9 @@ class Database:
     def lines(self, city_id: str, stop_id: str) -> list[dict[str, str | None]]:
         mode, _, stop_id_prefix, identifier_prefix = self.city_departure_mode(city_id)
         stop_prefixes, identifier_prefixes = self.city_departure_prefixes(city_id)
+        explicit_ids = self._explicit_provider_stop_ids(city_id, stop_id)
+        if explicit_ids == ():
+            return []
         query_stop_id = self._query_stop_id(city_id, stop_id)
         if mode == "exact-stop-with-parent-fallback":
             stop_predicate = "s.raw_stop_id=?"
@@ -1458,6 +1516,9 @@ class Database:
         service_to = to_date.date().strftime("%Y%m%d") if to_date else "99999999"
         mode, _, stop_id_prefix, identifier_prefix = self.city_departure_mode(city_id)
         stop_prefixes, identifier_prefixes = self.city_departure_prefixes(city_id)
+        explicit_ids = self._explicit_provider_stop_ids(city_id, stop_id)
+        if explicit_ids == ():
+            return []
         query_stop_id = self._query_stop_id(city_id, stop_id)
         if mode == "exact-stop-with-parent-fallback":
             stop_predicate = "s.raw_stop_id=?"
