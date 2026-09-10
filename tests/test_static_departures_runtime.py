@@ -16,7 +16,7 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "services"))
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 sys.path.insert(0, str(TESTS_ROOT))
 
-from static_departures_api import Database  # noqa: E402
+from static_departures_api import Database, city_has_requested_stop  # noqa: E402
 from static_departures_runtime import (  # noqa: E402
     HYBRID_ENV,
     HYBRID_RELEASE_POINTER_ENV,
@@ -83,12 +83,23 @@ class _HybridFakeProvider:
 
 
 class _HybridFakeSnapshot:
-    def __init__(self, release_id: str, providers_by_city: dict[str, tuple[str, ...]], providers_by_stop: dict[tuple[str, str], tuple[str, ...]], *, fail_lines: bool = False):
+    def __init__(
+        self,
+        release_id: str,
+        providers_by_city: dict[str, tuple[str, ...]],
+        providers_by_stop: dict[tuple[str, str], tuple[str, ...]],
+        *,
+        valid_stops: dict[str, tuple[str, ...]] | None = None,
+        fail_lines: bool = False,
+    ):
         self.release_id = release_id
         self.catalog = _HybridFakeCatalog(providers_by_city, providers_by_stop)
+        self.valid_stops = valid_stops or {}
         self.fail_lines = fail_lines
 
     def city_has_stop(self, city_id: str, stop_id: str) -> bool:
+        if self.valid_stops:
+            return stop_id in self.valid_stops.get(city_id, ())
         return True
 
     def provider_modes(self, city_id: str):
@@ -566,6 +577,52 @@ class StaticDeparturesRuntimeTests(unittest.TestCase):
             self.assertEqual(backend.lines("legacy-city", "stop")[0]["backend"], "legacy")
             self.assertEqual(backend.lines("mixed-city", "stop")[0]["backend"], "legacy")
             self.assertEqual(legacy.lines_calls, 2)
+        finally:
+            backend.close()
+
+    def test_hybrid_raw_multi_provider_validation_uses_shard_prefix_metadata(self) -> None:
+        legacy = _HybridFakeLegacy()
+        snapshot = _HybridFakeSnapshot(
+            "release-a",
+            {
+                "toronto": ("ttc-surface", "ttc-subway"),
+                "mixed-city": ("ttc-surface", "legacy-provider"),
+                "germany": ("germany",),
+            },
+            {},
+            valid_stops={"toronto": ("ttc-surface:100", "ttc-subway:100")},
+        )
+        backend = HybridStaticDeparturesBackend(
+            legacy,
+            _HybridFakeManager(snapshot),
+            ("ttc-surface", "ttc-subway"),
+        )
+        try:
+            with self.assertLogs("haltewecker.static_departures_runtime", level="INFO") as logs:
+                self.assertTrue(city_has_requested_stop(backend, "toronto", "100"))
+                self.assertTrue(city_has_requested_stop(backend, "toronto", "ttc-surface:100"))
+                self.assertTrue(city_has_requested_stop(backend, "toronto", "ttc-subway:100"))
+                self.assertFalse(city_has_requested_stop(backend, "toronto", "foreign:100"))
+                self.assertEqual(backend.city_departure_mode("toronto")[0], "canonical")
+                self.assertEqual(backend.city_departure_prefixes("mixed-city"), ((), ()))
+                self.assertEqual(backend.city_departure_prefixes("germany"), ((), ()))
+            self.assertTrue(
+                any(
+                    "query=provider-city-prefixes" in entry
+                    and "backend=shard" in entry
+                    and "metadata_backend=shard" in entry
+                    for entry in logs.output
+                )
+            )
+            self.assertTrue(
+                any(
+                    "query=provider-city-prefixes" in entry
+                    and "backend=legacy" in entry
+                    and "metadata_backend=legacy" in entry
+                    for entry in logs.output
+                )
+            )
+            self.assertEqual(legacy.city_departure_prefixes("toronto"), ((), ()))
         finally:
             backend.close()
 

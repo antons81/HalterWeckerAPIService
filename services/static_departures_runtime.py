@@ -1950,14 +1950,20 @@ class HybridStaticDeparturesBackend:
         provider: str = "",
         release_id: str = "",
     ) -> None:
+        metadata_backend = (
+            scope.backend
+            if query in {"city-stop-validation", "provider-city-mode", "provider-city-prefixes"}
+            else ""
+        )
         LOGGER.info(
             "event=hybrid-routing query=%s city=%s provider=%s providers=%s "
-            "backend=%s reason=%s release_id=%s",
+            "backend=%s metadata_backend=%s reason=%s release_id=%s",
             query,
             scope.city_id or "",
             provider,
             ",".join(scope.providers),
             scope.backend,
+            metadata_backend,
             scope.reason,
             release_id,
         )
@@ -2144,7 +2150,6 @@ class HybridStaticDeparturesBackend:
             None,
             lambda: self.legacy.city_departure_mode(city_id),
             lambda snapshot: self._provider_mode(snapshot, city_id),
-            allow_multi_provider=False,
         )  # type: ignore[return-value]
 
     @staticmethod
@@ -2164,7 +2169,6 @@ class HybridStaticDeparturesBackend:
                 tuple(mode.stop_id_prefix for mode in snapshot.provider_modes(city_id)),
                 tuple(mode.identifier_prefix for mode in snapshot.provider_modes(city_id)),
             ),
-            allow_multi_provider=False,
         )  # type: ignore[return-value]
 
     def lines(self, city_id: str, stop_id: str) -> list[dict[str, str | None]]:
