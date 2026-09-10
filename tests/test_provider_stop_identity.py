@@ -119,6 +119,45 @@ def _feed(
         )
 
 
+def _provider_ownership_feed(path: Path) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "stops.txt",
+            "stop_id,stop_name,stop_lat,stop_lon,parent_station\n"
+            "100,Surface stop,43.70,-79.39,\n"
+            "11259,Subway stop,43.72,-79.32,\n",
+        )
+        archive.writestr(
+            "routes.txt",
+            "route_id,route_short_name,route_long_name,route_type\n"
+            "route,1,Route,3\n",
+        )
+        archive.writestr(
+            "trips.txt",
+            "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+            "route,service,trip,Destination,0\n",
+        )
+        archive.writestr(
+            "calendar.txt",
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
+            "service,1,1,1,1,1,1,1,20200101,20301231\n",
+        )
+        archive.writestr(
+            "stop_times.txt",
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "trip,08:00:00,08:00:00,100,1\n"
+            "trip,08:10:00,08:10:00,11259,2\n",
+        )
+        archive.writestr(
+            "transfers.txt",
+            "from_stop_id,to_stop_id,from_route_id,to_route_id,from_trip_id,to_trip_id,transfer_type,min_transfer_time\n",
+        )
+        archive.writestr(
+            "pathways.txt",
+            "pathway_id,from_stop_id,to_stop_id,pathway_mode,is_bidirectional\n",
+        )
+
+
 class ProviderStopIdentityTests(unittest.TestCase):
     def test_colliding_native_stops_are_separate_and_queryable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -654,6 +693,102 @@ class ProviderStopIdentityTests(unittest.TestCase):
 
             self.assertEqual(build(indexed=True), expected_rows)
             self.assertEqual(build(indexed=False), expected_rows)
+
+    def test_provider_local_build_skips_known_foreign_namespace_and_fails_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "feed.zip"
+            _provider_ownership_feed(feed)
+            scoped_prefixes = CityScopedStopIDPrefixes.from_authoritative_provider_cities(
+                {
+                    "ttc-surface": [{"id": "toronto"}],
+                    "ttc-subway": [{"id": "toronto"}],
+                },
+                {
+                    "ttc-surface": "ttc-surface:",
+                    "ttc-subway": "ttc-subway:",
+                },
+            )
+
+            def build(target_provider: str, indexed: bool, package: list[dict[str, str]]) -> list[tuple]:
+                database_path = root / f"{target_provider}-{indexed}-{len(package)}.sqlite"
+                connection = connect(database_path)
+                with zipfile.ZipFile(feed) as archive:
+                    populate_gtfs(
+                        connection,
+                        archive,
+                        identifier_prefix=f"{target_provider}:",
+                        stop_id_prefix=f"{target_provider}:",
+                        provider_id=target_provider,
+                    )
+                other_provider = (
+                    "ttc-subway" if target_provider == "ttc-surface" else "ttc-surface"
+                )
+                with zipfile.ZipFile(feed) as archive:
+                    populate_gtfs(
+                        connection,
+                        archive,
+                        identifier_prefix=f"{other_provider}:",
+                        stop_id_prefix=f"{other_provider}:",
+                        provider_id=other_provider,
+                    )
+                register_city_mode(
+                    connection,
+                    target_provider,
+                    "toronto",
+                    "canonical",
+                    "America/Toronto",
+                    f"{target_provider}:",
+                )
+                stop_data = root / f"stop-data-{target_provider}-{indexed}-{len(package)}"
+                (stop_data / "stops").mkdir(parents=True)
+                (stop_data / "manifest.json").write_text(
+                    json.dumps({"cities": [{"id": "toronto", "url": "stops/toronto.json"}]}),
+                    encoding="utf-8",
+                )
+                (stop_data / "stops" / "toronto.json").write_text(
+                    json.dumps(package),
+                    encoding="utf-8",
+                )
+                populate_provider_city_memberships(
+                    connection,
+                    stop_data,
+                    {"toronto"},
+                    stop_id_prefix_by_provider={target_provider: f"{target_provider}:"},
+                    indexed_ownership_lookup=indexed,
+                    city_scoped_prefixes=scoped_prefixes,
+                )
+                rows = connection.execute(
+                    "SELECT provider_id, city_id, stop_id FROM provider_city_stops "
+                    "ORDER BY provider_id, city_id, stop_id"
+                ).fetchall()
+                connection.close()
+                return rows
+
+            known_foreign_package = [
+                {"id": "ttc-surface:100"},
+                {"id": "ttc-subway:11259"},
+            ]
+            for indexed in (False, True):
+                surface_rows = build("ttc-surface", indexed, known_foreign_package)
+                subway_rows = build("ttc-subway", indexed, known_foreign_package)
+                self.assertEqual(
+                    surface_rows,
+                    [("ttc-surface", "toronto", "ttc-surface:100")],
+                )
+                self.assertEqual(
+                    subway_rows,
+                    [("ttc-subway", "toronto", "ttc-subway:11259")],
+                )
+
+            unresolved_package = known_foreign_package + [{"id": "unknown:999"}]
+            for indexed in (False, True):
+                with self.assertRaisesRegex(ValueError, "toronto/unknown:999"):
+                    build("ttc-surface", indexed, unresolved_package)
+
+            for indexed in (False, True):
+                with self.assertRaisesRegex(ValueError, "Ambiguous.*toronto/100"):
+                    build("ttc-surface", indexed, [{"id": "100"}])
 
     def test_indexed_membership_temp_tables_are_cleaned_between_calls(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -299,6 +299,12 @@ def populate_provider_city_memberships(
             city_scoped_prefixes,
         )
 
+    target_provider_ids = (
+        frozenset(str(provider_id) for provider_id in stop_id_prefix_by_provider)
+        if stop_id_prefix_by_provider is not None
+        else None
+    )
+
     city_ids: set[str] = set()
     for city in cities:
         if not isinstance(city, dict) or not isinstance(city.get("id"), str):
@@ -326,6 +332,10 @@ def populate_provider_city_memberships(
                 "SELECT provider_id, stop_id_prefix FROM provider_city_modes"
             ):
                 candidate_prefix_by_provider.setdefault(str(provider_id), str(prefix))
+        provider_local_scope = (
+            target_provider_ids is not None
+            and target_provider_ids < frozenset(candidate_prefix_by_provider)
+        )
         for provider_id, prefix in connection.execute(
             "SELECT provider_id, stop_id_prefix FROM provider_city_modes WHERE city_id=?",
             (city_id,),
@@ -365,11 +375,23 @@ def populate_provider_city_memberships(
             ]
             if preferred_owners:
                 owners = preferred_owners
+            if provider_local_scope and len({provider for provider, _ in owners}) > 1:
+                raise ValueError(
+                    f"Ambiguous provider ownership for package stop "
+                    f"{city_id}/{stop.get('id')}"
+                )
+            if target_provider_ids is not None:
+                owners = [
+                    owner
+                    for owner in owners
+                    if owner[0] in target_provider_ids
+                ]
             if not owners:
                 foreign_prefixed = {
                     provider_id
                     for provider_id, prefix in candidate_prefix_by_provider.items()
-                    if provider_id not in prefix_by_provider
+                    if target_provider_ids is not None
+                    and provider_id not in target_provider_ids
                     and prefix
                     and any(str(stop_id).startswith(prefix) for stop_id in stop_ids)
                 }
@@ -382,6 +404,11 @@ def populate_provider_city_memberships(
                     prefix_by_provider,
                 )
                 if catalog_provider:
+                    if (
+                        target_provider_ids is not None
+                        and catalog_provider not in target_provider_ids
+                    ):
+                        continue
                     owned_ids.setdefault(catalog_provider, set()).add(
                         str(stop["id"])
                     )
@@ -422,6 +449,11 @@ def _populate_provider_city_memberships_indexed(
     city_scoped_prefixes: CityScopedStopIDPrefixes | None = None,
 ) -> set[str]:
     """Resolve scoped package ownership through one indexed TEMP set."""
+    target_provider_ids = (
+        frozenset(str(provider_id) for provider_id in stop_id_prefix_by_provider)
+        if stop_id_prefix_by_provider is not None
+        else None
+    )
     manifest = json.loads((stop_data / "manifest.json").read_text(encoding="utf-8"))
     cities = manifest.get("cities")
     if not isinstance(cities, list):
@@ -468,6 +500,10 @@ def _populate_provider_city_memberships_indexed(
         ):
             prefix_by_provider.setdefault(str(provider_id), str(prefix))
             candidate_prefix_by_provider.setdefault(str(provider_id), str(prefix))
+        provider_local_scope = (
+            target_provider_ids is not None
+            and target_provider_ids < frozenset(candidate_prefix_by_provider)
+        )
         typed_package = [stop for stop in package if isinstance(stop, dict)]
         catalog_only = city_id in catalog_only_city_ids or city.get("catalogOnly") is True
         city_packages.append(
@@ -619,11 +655,23 @@ def _populate_provider_city_memberships_indexed(
             ]
             if preferred_owners:
                 owners = preferred_owners
+            if provider_local_scope and len({provider for provider, _ in owners}) > 1:
+                raise ValueError(
+                    f"Ambiguous provider ownership for package stop "
+                    f"{city_id}/{stop.get('id')}"
+                )
+            if target_provider_ids is not None:
+                owners = [
+                    owner
+                    for owner in owners
+                    if owner[0] in target_provider_ids
+                ]
             if not owners:
                 foreign_prefixed = {
                     provider_id
                     for provider_id, prefix in candidate_prefix_by_provider.items()
-                    if provider_id not in prefix_by_provider
+                    if target_provider_ids is not None
+                    and provider_id not in target_provider_ids
                     and prefix
                     and any(str(stop_id).startswith(prefix) for stop_id in stop_ids)
                 }
@@ -638,6 +686,11 @@ def _populate_provider_city_memberships_indexed(
                     prefix_by_provider,
                 )
                 if catalog_provider:
+                    if (
+                        target_provider_ids is not None
+                        and catalog_provider not in target_provider_ids
+                    ):
+                        continue
                     owned_ids.setdefault(catalog_provider, set()).add(
                         str(stop["id"])
                     )
