@@ -4,6 +4,16 @@ export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
 RUN_MODE="normal"
 RESUME_RELEASE_ID=""
+NO_ACTIVATE="${HALTEWECKER_NIGHTLY_NO_ACTIVATE:-0}"
+
+cleanup_failed_no_activate() {
+  local status="$?"
+  if [[ "$status" -ne 0 && "$NO_ACTIVATE" == "1" && -n "${RELEASE_DIR:-}" ]]; then
+    rm -rf -- "$RELEASE_DIR"
+    echo "[Nightly] stage=cleanup status=PASS release=$RELEASE_ID reason=failure" >&2
+  fi
+  exit "$status"
+}
 if [[ "${1:-}" == "--resume" ]]; then
   if [[ "$#" -ne 2 ]]; then
     echo "usage: $0 [--resume RELEASE_ID]" >&2
@@ -11,8 +21,10 @@ if [[ "${1:-}" == "--resume" ]]; then
   fi
   RUN_MODE="resume"
   RESUME_RELEASE_ID="$2"
+elif [[ "${1:-}" == "--no-activate" && "$#" -eq 1 ]]; then
+  NO_ACTIVATE=1
 elif [[ "$#" -ne 0 ]]; then
-  echo "usage: $0 [--resume RELEASE_ID]" >&2
+  echo "usage: $0 [--resume RELEASE_ID|--no-activate]" >&2
   exit 64
 fi
 
@@ -83,6 +95,10 @@ STATIC_DEPARTURES_PIPELINE="${STATIC_DEPARTURES_PIPELINE:-$REPO/scripts/run_stat
 RELEASE_STATE_SCRIPT="$REPO/scripts/release_state.py"
 CUSTOM_ARTIFACTS_JSON="$RELEASE_DIR/custom-gtfs-artifacts.json"
 
+if [[ "$NO_ACTIVATE" == "1" ]]; then
+  trap cleanup_failed_no_activate EXIT
+fi
+
 mkdir -p "$(dirname "$STOP_DATA_LOCK")"
 exec 9>"$STOP_DATA_LOCK"
 if ! "$FLOCK_BIN" -n 9; then
@@ -100,7 +116,7 @@ fi
 # stop-data build. A failed build must never leave the previous release eligible
 # for the downstream nightly static-departures timer. Resume preserves the
 # existing handoff until activation-state inspection has completed.
-if [[ "$RUN_MODE" == "normal" ]]; then
+if [[ "$RUN_MODE" == "normal" && "$NO_ACTIVATE" != "1" ]]; then
   rm -f "$STATIC_DEPARTURES_RELEASE"
 fi
 
@@ -661,11 +677,17 @@ fi
 }
 
 if [[ "$RUN_MODE" == "normal" ]]; then
+  echo "[Nightly] stage=stop-data-build status=started release=$RELEASE_ID"
   run_build_stage
+  echo "[Nightly] stage=stop-data-build status=PASS release=$RELEASE_ID"
   persist_release_stage "build"
+  echo "[Nightly] stage=validation status=started release=$RELEASE_ID"
   run_candidate_validation
+  echo "[Nightly] stage=validation status=PASS release=$RELEASE_ID"
   persist_release_stage "candidate-validation"
+  echo "[Nightly] stage=legacy-import status=started release=$RELEASE_ID"
   run_static_departures_stage
+  echo "[Nightly] stage=legacy-import status=PASS release=$RELEASE_ID"
   persist_release_stage "static-departures"
 else
   inspect_resume
@@ -706,6 +728,26 @@ else
       exit 1
       ;;
   esac
+fi
+
+if [[ "$NO_ACTIVATE" == "1" ]]; then
+  NORMALIZED_CACHE_ROOT="${HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT:-${DATA_ROOT}/provider-artifacts/normalized}"
+  STATIC_ARTIFACT_ROOT="${HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT:-${DATA_ROOT}/provider-artifacts/static}"
+  INCREMENTAL_RELEASES_ROOT="${HALTEWECKER_INCREMENTAL_RELEASES_ROOT:-$DATA_ROOT/releases/incremental}"
+  INCREMENTAL_STARTED=$SECONDS
+  echo "[Nightly] stage=incremental-provider status=started release=$RELEASE_ID"
+  python3 "$REPO/scripts/run_incremental_provider_pipeline.py" \
+    --repository-root "$REPO" \
+    --release-id "$RELEASE_ID" \
+    --releases-root "$INCREMENTAL_RELEASES_ROOT" \
+    --stop-data "$BUILD_DIR" \
+    --gtfs-artifacts "$ARTIFACTS_JSON" \
+    --normalized-cache-root "$NORMALIZED_CACHE_ROOT" \
+    --static-artifact-root "$STATIC_ARTIFACT_ROOT"
+  echo "[Nightly] stage=incremental-provider status=PASS release=$RELEASE_ID duration=$((SECONDS - INCREMENTAL_STARTED))s"
+  echo "[Nightly] stage=readiness status=PASS release=$RELEASE_ID no_activate=true"
+  echo "[Nightly] stage=nightly-complete status=PASS release=$RELEASE_ID no_activate=true"
+  exit 0
 fi
 
 OLD_RELEASE_TARGET=""
