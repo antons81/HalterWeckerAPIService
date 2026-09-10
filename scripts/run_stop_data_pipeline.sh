@@ -5,6 +5,12 @@ export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 RUN_MODE="normal"
 RESUME_RELEASE_ID=""
 NO_ACTIVATE="${HALTEWECKER_NIGHTLY_NO_ACTIVATE:-0}"
+EXPLICIT_NO_ACTIVATE=0
+REUSE_STOP_DATA=0
+REUSED_STOP_DATA_SOURCE=""
+REUSED_STOP_DATA_RELEASE_ID=""
+REUSED_STOP_DATA_MANIFEST_SHA256=""
+REUSED_STOP_DATA_METADATA_SHA256=""
 
 cleanup_failed_no_activate() {
   local status="$?"
@@ -28,8 +34,18 @@ if [[ "${1:-}" == "--resume" ]]; then
   RESUME_RELEASE_ID="$2"
 elif [[ "${1:-}" == "--no-activate" && "$#" -eq 1 ]]; then
   NO_ACTIVATE=1
+  EXPLICIT_NO_ACTIVATE=1
+elif [[ "${1:-}" == "--no-activate" && "${2:-}" == "--reuse-stop-data" && "$#" -eq 2 ]]; then
+  NO_ACTIVATE=1
+  EXPLICIT_NO_ACTIVATE=1
+  REUSE_STOP_DATA=1
 elif [[ "$#" -ne 0 ]]; then
-  echo "usage: $0 [--resume RELEASE_ID|--no-activate]" >&2
+  echo "usage: $0 [--resume RELEASE_ID|--no-activate [--reuse-stop-data]]" >&2
+  exit 64
+fi
+
+if [[ "$REUSE_STOP_DATA" == "1" && "$EXPLICIT_NO_ACTIVATE" != "1" ]]; then
+  echo "[StopData] ERROR: --reuse-stop-data requires explicit --no-activate" >&2
   exit 64
 fi
 
@@ -104,6 +120,144 @@ CUSTOM_ARTIFACTS_JSON="$RELEASE_DIR/custom-gtfs-artifacts.json"
 
 if [[ "$NO_ACTIVATE" == "1" ]]; then
   trap cleanup_failed_no_activate EXIT
+fi
+
+resolve_reused_stop_data() {
+  local resolved_source
+  local resolved_releases_root
+  local relative_source
+  local source_release_dir
+  local source_metadata
+
+  if [[ "$RUN_MODE" != "normal" ]]; then
+    echo "[StopData] ERROR: --reuse-stop-data is only supported for a new no-activate run" >&2
+    return 1
+  fi
+  if [[ ! -L "$CURRENT" ]]; then
+    echo "[StopData] ERROR: reuse source must be an explicit current release symlink: $CURRENT" >&2
+    return 1
+  fi
+  resolved_source="$(readlink -f "$CURRENT" || true)"
+  if [[ ! -d "$resolved_source" ]]; then
+    echo "[StopData] ERROR: reuse source is missing or broken: $CURRENT" >&2
+    return 1
+  fi
+  resolved_releases_root="$(readlink -f "$RELEASES")"
+  relative_source="${resolved_source#"$resolved_releases_root/"}"
+  if [[ "$relative_source" == "$resolved_source" || "$relative_source" != */stop-data || "${relative_source%/stop-data}" == */* ]]; then
+    echo "[StopData] ERROR: reuse source is not a direct published release stop-data path: $resolved_source" >&2
+    return 1
+  fi
+  REUSED_STOP_DATA_RELEASE_ID="${relative_source%/stop-data}"
+  source_release_dir="$RELEASES/$REUSED_STOP_DATA_RELEASE_ID"
+  if [[ "$(readlink -f "$source_release_dir/stop-data")" != "$resolved_source" ]]; then
+    echo "[StopData] ERROR: current release target does not match its published release path" >&2
+    return 1
+  fi
+  source_metadata="$source_release_dir/release-metadata.json"
+  if [[ ! -f "$source_metadata" ]]; then
+    echo "[StopData] ERROR: reuse source metadata is missing: $source_metadata" >&2
+    return 1
+  fi
+
+  BUILD_FINGERPRINT="$(python3 "$REPO/scripts/build_fingerprint.py" --repository "$REPO")"
+  if ! python3 - "$resolved_source" "$REUSED_STOP_DATA_RELEASE_ID" "$source_metadata" "$BUILD_FINGERPRINT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+stop_data = Path(sys.argv[1])
+release_id = sys.argv[2]
+metadata_path = Path(sys.argv[3])
+build_fingerprint = sys.argv[4]
+required_directories = (
+    "stops", "routes", "departures", "trips", "transit", "radar",
+    "swiss-static", "provenance",
+)
+required_files = (
+    "manifest.json", "transit-radar-cities.json",
+    "swiss-static/manifest.json", "provenance/input-artifacts.json",
+)
+for relative in required_directories:
+    if not (stop_data / relative).is_dir():
+        raise SystemExit(f"reuse stop-data directory is missing: {stop_data / relative}")
+for relative in required_files:
+    path = stop_data / relative
+    if not path.is_file() or path.stat().st_size == 0:
+        raise SystemExit(f"reuse stop-data artifact is missing or empty: {path}")
+
+def read_object(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"reuse stop-data JSON is invalid: {path}: {type(error).__name__}") from error
+    if not isinstance(payload, dict):
+        raise SystemExit(f"reuse stop-data JSON is not an object: {path}")
+    return payload
+
+manifest = read_object(stop_data / "manifest.json")
+if manifest.get("releaseID") != release_id:
+    raise SystemExit(
+        f"reuse stop-data release mismatch: expected {release_id}, got {manifest.get('releaseID', '<missing>')}"
+    )
+cities = manifest.get("cities")
+if not isinstance(cities, list) or not cities:
+    raise SystemExit("reuse stop-data manifest has no cities")
+for city in cities:
+    if not isinstance(city, dict) or not isinstance(city.get("url"), str):
+        raise SystemExit("reuse stop-data manifest contains an invalid city entry")
+    package = stop_data / str(city["url"])
+    if not package.is_file() or package.stat().st_size == 0:
+        raise SystemExit(f"reuse stop-data city package is missing or empty: {package}")
+
+metadata = read_object(metadata_path)
+if metadata.get("releaseID") != release_id:
+    raise SystemExit("reuse stop-data release metadata ID does not match source generation")
+if metadata.get("buildFingerprint") != build_fingerprint:
+    raise SystemExit("reuse stop-data build fingerprint is incompatible with current pipeline")
+if not isinstance(manifest.get("sourceArtifacts"), dict):
+    raise SystemExit("reuse stop-data manifest has no sourceArtifacts provenance")
+PY
+  then
+    return 1
+  fi
+
+  REUSED_STOP_DATA_SOURCE="$source_release_dir/stop-data"
+  REUSED_STOP_DATA_MANIFEST_SHA256="$(sha256sum "$REUSED_STOP_DATA_SOURCE/manifest.json" | awk '{print $1}')"
+  REUSED_STOP_DATA_METADATA_SHA256="$(sha256sum "$source_metadata" | awk '{print $1}')"
+
+  RELEASE_ID="$REUSED_STOP_DATA_RELEASE_ID"
+  RELEASE_DIR="$RELEASES/.no-activate-${RELEASE_ID}-$$"
+  INCREMENTAL_RELEASES_ROOT="${HALTEWECKER_INCREMENTAL_RELEASES_ROOT:-$DATA_ROOT/releases/incremental}/reuse-$$"
+  INCREMENTAL_RELEASE_DIR="$INCREMENTAL_RELEASES_ROOT/$RELEASE_ID"
+  BUILD_DIR="$REUSED_STOP_DATA_SOURCE"
+  ARTIFACTS_JSON="$RELEASE_DIR/gtfs-artifacts.json"
+  CUSTOM_ARTIFACTS_JSON="$RELEASE_DIR/custom-gtfs-artifacts.json"
+  mkdir -p "$RELEASE_DIR"
+  cp -p "$source_release_dir/gtfs-artifacts.json" "$ARTIFACTS_JSON"
+  cp -p "$source_release_dir/custom-gtfs-artifacts.json" "$CUSTOM_ARTIFACTS_JSON"
+  if [[ -f "$source_release_dir/austrian-artifacts.json" ]]; then
+    cp -p "$source_release_dir/austrian-artifacts.json" "$RELEASE_DIR/austrian-artifacts.json"
+  fi
+  echo "[Nightly] stage=stop-data-reuse status=PASS release=$RELEASE_ID source=$REUSED_STOP_DATA_SOURCE manifest_sha256=$REUSED_STOP_DATA_MANIFEST_SHA256"
+}
+
+verify_reused_stop_data_unchanged() {
+  local current_source
+  local current_manifest_sha256
+  local current_metadata_sha256
+  current_source="$(readlink -f "$CURRENT")"
+  current_manifest_sha256="$(sha256sum "$REUSED_STOP_DATA_SOURCE/manifest.json" | awk '{print $1}')"
+  current_metadata_sha256="$(sha256sum "${REUSED_STOP_DATA_SOURCE%/stop-data}/release-metadata.json" | awk '{print $1}')"
+  if [[ "$current_source" != "$(readlink -f "$REUSED_STOP_DATA_SOURCE")" || "$current_manifest_sha256" != "$REUSED_STOP_DATA_MANIFEST_SHA256" || "$current_metadata_sha256" != "$REUSED_STOP_DATA_METADATA_SHA256" ]]; then
+    echo "[StopData] ERROR: reused stop-data generation changed during run" >&2
+    return 1
+  fi
+  echo "[Nightly] stage=stop-data-reuse status=UNCHANGED release=$RELEASE_ID source=$REUSED_STOP_DATA_SOURCE"
+}
+
+if [[ "$REUSE_STOP_DATA" == "1" ]]; then
+  resolve_reused_stop_data
 fi
 
 mkdir -p "$(dirname "$STOP_DATA_LOCK")"
@@ -258,7 +412,7 @@ proof_disk_preflight() {
   local minimum_free_kb
 
   free_kb="$(disk_free_kb)"
-  if [[ -d "$CURRENT" || -L "$CURRENT" ]]; then
+  if [[ "$REUSE_STOP_DATA" != "1" && ( -d "$CURRENT" || -L "$CURRENT" ) ]]; then
     current_stop_data_kb="$(du -skL "$CURRENT" 2>/dev/null | awk '{ print $1; exit }' || true)"
     current_stop_data_kb="${current_stop_data_kb:-0}"
   fi
@@ -267,7 +421,7 @@ proof_disk_preflight() {
   estimated_free_kb=$((free_kb - estimated_additional_kb))
   minimum_free_kb=$(( ${HALTEWECKER_MIN_FREE_GB:-45} * 1024 * 1024 ))
   log_disk_state "before"
-  echo "[Nightly] disk estimated_additional_gb=$((estimated_additional_kb / 1024 / 1024)) estimated_peak_free_gb=$((estimated_free_kb / 1024 / 1024))"
+  echo "[Nightly] disk estimated_additional_gb=$((estimated_additional_kb / 1024 / 1024)) estimated_peak_free_gb=$((estimated_free_kb / 1024 / 1024)) reuse_stop_data=$REUSE_STOP_DATA"
   if (( free_kb < minimum_free_kb || estimated_free_kb < minimum_free_kb )); then
     echo "[Nightly] ERROR: insufficient disk for incremental proof mode" >&2
     return 1
@@ -433,7 +587,7 @@ run_candidate_validation() {
 if [[ -f "$MVO_ENV_FILE" ]]; then
   test -f "$RELEASE_DIR/austrian-artifacts.json"
 fi
-python3 - "$BUILD_DIR/manifest.json" "$RELEASE_ID" "$RELEASE_DIR/release-metadata.json" "$BUILD_FINGERPRINT" "$ARTIFACTS_JSON" "$CURRENT_RELEASE" "$REPO" <<'PY'
+python3 - "$BUILD_DIR/manifest.json" "$RELEASE_ID" "$RELEASE_DIR/release-metadata.json" "$BUILD_FINGERPRINT" "$ARTIFACTS_JSON" "$CURRENT_RELEASE" "$REPO" "$REUSE_STOP_DATA" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -445,6 +599,8 @@ build_fingerprint = sys.argv[4]
 artifacts_path = Path(sys.argv[5])
 previous_release_link = Path(sys.argv[6])
 repository_root = Path(sys.argv[7])
+reuse_stop_data = sys.argv[8] == "1"
+candidate_root = manifest_path.parent.parent
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 if not isinstance(manifest.get("cities"), list) or not manifest["cities"]:
     raise SystemExit("staged stop manifest has no cities")
@@ -465,7 +621,7 @@ for group in ("sources", "external"):
             from ireland_artifact_snapshot import validate_ireland_release_snapshot
 
             try:
-                validate_ireland_release_snapshot(entry, artifacts_path.parent)
+                validate_ireland_release_snapshot(entry, candidate_root)
             except ValueError as error:
                 raise SystemExit(str(error)) from error
         if not artifact_path.exists():
@@ -530,7 +686,7 @@ for source in registry:
             )
 
 supplemental = {}
-custom_path = artifacts_path.parent / "custom-gtfs-artifacts.json"
+custom_path = candidate_root / "custom-gtfs-artifacts.json"
 if custom_path.is_file():
     custom = json.loads(custom_path.read_text(encoding="utf-8"))
     for source_id, entry in (custom.get("sources") or {}).items():
@@ -539,13 +695,13 @@ if custom_path.is_file():
         supplemental[str(source_id)] = entry
         try:
             validate_artifact_entry(
-                str(source_id), entry, base_dir=artifacts_path.parent
+                str(source_id), entry, base_dir=candidate_root
             )
         except ValueError as error:
             raise SystemExit(str(error)) from error
     if set(custom.get("sources") or {}) != {"vbb", "rnv"}:
         raise SystemExit("Custom GTFS provenance must contain exactly vbb and rnv")
-austria_path = artifacts_path.parent / "austrian-artifacts.json"
+austria_path = candidate_root / "austrian-artifacts.json"
 if austria_path.is_file():
     austria = json.loads(austria_path.read_text(encoding="utf-8"))
     expected_austria = {
@@ -560,7 +716,7 @@ if austria_path.is_file():
                 raise SystemExit(f"Austrian provenance is incomplete for {source_id}")
             try:
                 validate_artifact_entry(
-                    source_id, entry, base_dir=artifacts_path.parent
+                    source_id, entry, base_dir=candidate_root
                 )
             except ValueError as error:
                 raise SystemExit(str(error)) from error
@@ -568,7 +724,7 @@ if austria_path.is_file():
     if set(actual_austria) != expected_austria:
         raise SystemExit("Austrian provenance does not contain all eight configured sources")
     supplemental.update(actual_austria)
-input_path = artifacts_path.parent / "stop-data" / "provenance" / "input-artifacts.json"
+input_path = candidate_root / "stop-data" / "provenance" / "input-artifacts.json"
 if input_path.is_file():
     inputs = json.loads(input_path.read_text(encoding="utf-8"))
     for source_id, entry in (inputs.get("sources") or {}).items():
@@ -579,7 +735,7 @@ if input_path.is_file():
         ):
             raise SystemExit(f"Input provenance is incomplete for {source_id}")
         supplemental[str(source_id)] = entry
-systems_path = artifacts_path.parent / "stop-data" / "transit" / "kyiv-systems.json"
+systems_path = candidate_root / "stop-data" / "transit" / "kyiv-systems.json"
 if systems_path.is_file():
     systems = json.loads(systems_path.read_text(encoding="utf-8"))
     systems_source = systems.get("source") or {}
@@ -643,7 +799,7 @@ if old_manifest_path.is_file():
                 candidate_artifacts=artifacts,
                 registry=registry,
                 repository_root=repository_root,
-                candidate_artifacts_root=artifacts_path.parent,
+                candidate_artifacts_root=candidate_root,
             )
             if retirements:
                 print(
@@ -654,11 +810,17 @@ if old_manifest_path.is_file():
             validate_previous_release_cities(old_city_ids, manifest_city_ids)
     except ValueError as error:
         raise SystemExit(str(error)) from error
-manifest["sourceArtifacts"] = source_artifacts
-manifest["inputProvenance"] = supplemental
-manifest_path.write_text(
-    json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-)
+if reuse_stop_data:
+    if manifest.get("sourceArtifacts") != source_artifacts:
+        raise SystemExit("reused stop-data source provenance differs from candidate artifacts")
+    if not isinstance(manifest.get("inputProvenance"), dict):
+        raise SystemExit("reused stop-data source has no inputProvenance")
+else:
+    manifest["sourceArtifacts"] = source_artifacts
+    manifest["inputProvenance"] = supplemental
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 metadata_path.write_text(
     json.dumps(
         {
@@ -741,14 +903,24 @@ fi
 }
 
 if [[ "$RUN_MODE" == "normal" ]]; then
-  echo "[Nightly] stage=stop-data-build status=started release=$RELEASE_ID"
-  run_build_stage
-  echo "[Nightly] stage=stop-data-build status=PASS release=$RELEASE_ID"
-  persist_release_stage "build"
+  if [[ "$REUSE_STOP_DATA" == "1" ]]; then
+    echo "[Nightly] stage=stop-data-build status=SKIPPED release=$RELEASE_ID reason=reuse-stop-data"
+  else
+    echo "[Nightly] stage=stop-data-build status=started release=$RELEASE_ID"
+    run_build_stage
+    echo "[Nightly] stage=stop-data-build status=PASS release=$RELEASE_ID"
+  fi
+  if [[ "$REUSE_STOP_DATA" != "1" ]]; then
+    persist_release_stage "build"
+  else
+    echo "[StopData] release=$RELEASE_ID state persistence skipped for read-only reused stop-data"
+  fi
   echo "[Nightly] stage=validation status=started release=$RELEASE_ID"
   run_candidate_validation
   echo "[Nightly] stage=validation status=PASS release=$RELEASE_ID"
-  persist_release_stage "candidate-validation"
+  if [[ "$REUSE_STOP_DATA" != "1" ]]; then
+    persist_release_stage "candidate-validation"
+  fi
   log_disk_state "after-stop-data"
   if [[ "$NO_ACTIVATE" == "1" ]]; then
     echo "[Nightly] stage=legacy-import status=SKIPPED release=$RELEASE_ID reason=no-activate-proof"
@@ -812,6 +984,9 @@ if [[ "$NO_ACTIVATE" == "1" ]]; then
     --gtfs-artifacts "$ARTIFACTS_JSON" \
     --normalized-cache-root "$NORMALIZED_CACHE_ROOT" \
     --static-artifact-root "$STATIC_ARTIFACT_ROOT"
+  if [[ "$REUSE_STOP_DATA" == "1" ]]; then
+    verify_reused_stop_data_unchanged
+  fi
   echo "[Nightly] stage=incremental-provider status=PASS release=$RELEASE_ID duration=$((SECONDS - INCREMENTAL_STARTED))s"
   echo "[Nightly] stage=readiness status=PASS release=$RELEASE_ID no_activate=true"
   echo "[Nightly] stage=nightly-complete status=PASS release=$RELEASE_ID no_activate=true"

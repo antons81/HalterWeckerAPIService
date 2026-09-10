@@ -75,17 +75,25 @@ case \"${1:-}\" in
     printf '%s\n' "$*" >> "$INCREMENTAL_CALLS_LOG"
     release_root=""
     release_id=""
+    stop_data=""
     previous=""
     for argument in "$@"; do
       if [ "$previous" = "--releases-root" ]; then
         release_root="$argument"
       elif [ "$previous" = "--release-id" ]; then
         release_id="$argument"
+      elif [ "$previous" = "--stop-data" ]; then
+        stop_data="$argument"
       fi
       previous="$argument"
     done
-    if [ "${INCREMENTAL_FAIL:-0}" = "1" ]; then
+    if [ "${REUSE_STOP_DATA:-0}" = "1" ] || [ "${INCREMENTAL_FAIL:-0}" = "1" ]; then
       mkdir -p "$release_root/$release_id"
+    fi
+    if [ "${REUSE_STOP_DATA:-0}" = "1" ]; then
+      ln -s "$stop_data" "$release_root/$release_id/stop-data"
+    fi
+    if [ "${INCREMENTAL_FAIL:-0}" = "1" ]; then
       exit 1
     fi
     exit 0
@@ -423,6 +431,17 @@ PY
         self.assertEqual(len(releases), 1)
         return releases[0].name
 
+    def prepare_reusable_current_release(self) -> tuple[Path, str]:
+        initial = self.run_pipeline()
+        self.assertEqual(initial.returncode, 0, initial.stderr)
+        current_target = Path(os.path.realpath(self.data_root / "current"))
+        release_id = current_target.parent.name
+        self.assertEqual(
+            json.loads((current_target / "manifest.json").read_text(encoding="utf-8"))["releaseID"],
+            release_id,
+        )
+        return current_target, release_id
+
     def test_successful_publication_waits_for_static_departures_service(self) -> None:
         result = self.run_pipeline()
 
@@ -573,6 +592,90 @@ PY
         )
         self.assertIn("kyiv", json.loads((output / "manifest.json").read_text())["cities"][0]["id"])
         self.assertTrue((output / "transit" / "city-lines" / "kyiv.json").is_file())
+
+    def test_reuse_stop_data_skips_build_and_legacy_import_without_mutating_source(self) -> None:
+        source, release_id = self.prepare_reusable_current_release()
+        source_manifest = (source / "manifest.json").read_bytes()
+        source_metadata = (source.parent / "release-metadata.json").read_bytes()
+        static_calls_before = (self.root / "static-calls.log").read_text(encoding="utf-8").splitlines()
+
+        result = self.run_pipeline(
+            "--no-activate",
+            "--reuse-stop-data",
+            STATIC_IMPORT_FAIL="1",
+            REUSE_STOP_DATA="1",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stage=stop-data-build status=SKIPPED", result.stdout)
+        self.assertIn("stage=validation status=PASS", result.stdout)
+        self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)
+        self.assertIn("stage=stop-data-reuse status=UNCHANGED", result.stdout)
+        self.assertIn("reuse_stop_data=1", result.stdout)
+        self.assertEqual(
+            (self.root / "build-calls.log").read_text(encoding="utf-8").splitlines(),
+            ["build"],
+        )
+        self.assertEqual(
+            (self.root / "static-calls.log").read_text(encoding="utf-8").splitlines(),
+            static_calls_before,
+        )
+        self.assertEqual((source / "manifest.json").read_bytes(), source_manifest)
+        self.assertEqual((source.parent / "release-metadata.json").read_bytes(), source_metadata)
+        self.assertEqual(os.path.realpath(self.data_root / "current"), str(source))
+
+        reuse_candidates = list((self.data_root / "releases" / "incremental").glob("reuse-*"))
+        self.assertEqual(len(reuse_candidates), 1)
+        stop_data_reference = reuse_candidates[0] / release_id / "stop-data"
+        self.assertTrue(stop_data_reference.is_symlink())
+        self.assertEqual(os.path.realpath(stop_data_reference), str(source))
+
+    def test_reuse_stop_data_requires_explicit_published_current_symlink(self) -> None:
+        current = self.data_root / "current"
+        current_marker = current / "release-marker"
+        current_marker.unlink()
+        current.rmdir()
+        current.symlink_to(self.data_root / "releases" / "missing" / "stop-data")
+
+        result = self.run_pipeline("--no-activate", "--reuse-stop-data", REUSE_STOP_DATA="1")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("reuse source is missing or broken", result.stderr)
+
+    def test_reuse_stop_data_rejects_incompatible_source(self) -> None:
+        source, _ = self.prepare_reusable_current_release()
+        metadata_path = source.parent / "release-metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["buildFingerprint"] = "stale-build"
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+        result = self.run_pipeline("--no-activate", "--reuse-stop-data")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("build fingerprint is incompatible", result.stderr)
+        self.assertEqual(
+            (self.root / "build-calls.log").read_text(encoding="utf-8").splitlines(),
+            ["build"],
+        )
+
+    def test_reuse_failure_does_not_delete_reused_source(self) -> None:
+        source, _ = self.prepare_reusable_current_release()
+        source_manifest = (source / "manifest.json").read_bytes()
+        result = self.run_pipeline(
+            "--no-activate",
+            "--reuse-stop-data",
+            INCREMENTAL_FAIL="1",
+            REUSE_STOP_DATA="1",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("stage=cleanup status=PASS", result.stderr)
+        self.assertTrue(source.is_dir())
+        self.assertEqual((source / "manifest.json").read_bytes(), source_manifest)
+        self.assertEqual(os.path.realpath(self.data_root / "current"), str(source))
+        reuse_candidates = list((self.data_root / "releases" / "incremental").glob("reuse-*"))
+        self.assertEqual(len(reuse_candidates), 1)
+        self.assertFalse(list(reuse_candidates[0].iterdir()))
 
     def test_validation_failure_does_not_trigger_static_departures(self) -> None:
         result = self.run_pipeline(BUILD_INVALID="1")
