@@ -683,6 +683,58 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
             self.assertEqual(foreign_lines, [])
             self.assertEqual(foreign_board, [])
 
+            path_database = path
+
+            def http_status(path: str) -> int:
+                try:
+                    with StaticDeparturesHTTPServer(path_database) as server:
+                        server.get(path)
+                    return HTTPStatus.OK
+                except HTTPError as error:
+                    return error.code
+
+            with StaticDeparturesHTTPServer(path_database) as server:
+                raw_lines_response = server.get(
+                    "/static-departures/lines?cityID=toronto&stopID=100"
+                )
+                raw_board_response = server.get(
+                    "/static-departures/board?cityID=toronto&stopID=100&limit=10"
+                    "&from=2026-07-28T07:00:00-04:00&to=2026-07-28T09:00:00-04:00"
+                )
+                surface_response = server.get(
+                    "/static-departures/lines?cityID=toronto&stopID=ttc-surface:100"
+                )
+                subway_response = server.get(
+                    "/static-departures/lines?cityID=toronto&stopID=ttc-subway:100"
+                )
+                germany_response = server.get(
+                    "/static-departures/lines?cityID=germany&stopID=100"
+                )
+                single_response = server.get(
+                    "/static-departures/lines?cityID=single-provider&stopID=single:100"
+                )
+
+            self.assertEqual(
+                {row["routeID"] for row in raw_lines_response["lines"]},
+                {"ttc-surface:506", "ttc-subway:1"},
+            )
+            self.assertEqual(
+                {row["routeID"] for row in raw_board_response["departures"]},
+                {"ttc-surface:506", "ttc-subway:1"},
+            )
+            self.assertEqual([row["routeID"] for row in surface_response["lines"]], ["ttc-surface:506"])
+            self.assertEqual([row["routeID"] for row in subway_response["lines"]], ["ttc-subway:1"])
+            self.assertEqual([row["routeID"] for row in germany_response["lines"]], ["germany:134"])
+            self.assertEqual([row["routeID"] for row in single_response["lines"]], ["7"])
+            self.assertEqual(
+                http_status("/static-departures/lines?cityID=toronto&stopID=foreign:100"),
+                HTTPStatus.NOT_FOUND,
+            )
+            self.assertEqual(
+                http_status("/static-departures/lines?cityID=single-provider&stopID=100"),
+                HTTPStatus.NOT_FOUND,
+            )
+
     def test_translink_internal_prefix_is_removed_from_public_board(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "current.sqlite"

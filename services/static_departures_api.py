@@ -1639,6 +1639,24 @@ def bounded_limit(raw: str | None) -> int:
     return min(max(limit, 1), 100)
 
 
+def city_has_requested_stop(database: object, city_id: str, stop_id: str) -> bool:
+    """Validate public stop IDs without collapsing provider namespaces."""
+    city_has_stop = getattr(database, "city_has_stop")
+    if city_has_stop(city_id, stop_id):
+        return True
+    if ":" in stop_id:
+        return False
+
+    prefixes_for_city = getattr(database, "city_departure_prefixes", None)
+    if not callable(prefixes_for_city):
+        return False
+    stop_prefixes, _ = prefixes_for_city(city_id)
+    if len(stop_prefixes) < 2:
+        return False
+    provider_prefixes = tuple(dict.fromkeys(prefix for prefix in stop_prefixes if prefix))
+    return any(city_has_stop(city_id, f"{prefix}{stop_id}") for prefix in provider_prefixes)
+
+
 class Handler(BaseHTTPRequestHandler):
     apple_store_notification_verifier = None
     apple_store_notification_store: AppleStoreNotificationStore | None = None
@@ -1993,7 +2011,7 @@ class Handler(BaseHTTPRequestHandler):
             if not city or not stop:
                 return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "cityID and stopID are required"})
             resolved_city = self.database.resolve_city(city)
-            if not self.database.city_has_stop(resolved_city, stop):
+            if not city_has_requested_stop(self.database, resolved_city, stop):
                 return self.send_json(HTTPStatus.NOT_FOUND, {"error": "unknown cityID/stopID"})
             if parsed.path == "/static-departures/lines":
                 payload = {"cityID": resolved_city, "stopID": stop, "lines": self.database.lines(resolved_city, stop)}
