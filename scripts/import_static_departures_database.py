@@ -800,6 +800,10 @@ def add_external_gtfs(
         "CREATE INDEX IF NOT EXISTS stop_times_by_stop_departure "
         "ON stop_times(raw_stop_id, departure_seconds, trip_id, stop_sequence)"
     )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS raw_stops_by_canonical "
+        "ON raw_stops(canonical_stop_id, stop_id)"
+    )
     sources = load_external_gtfs_sources(sources_path)
     sources_by_id = {str(source["id"]): source for source in sources}
     unknown = sorted(set(url_by_provider) - set(sources_by_id))
