@@ -544,9 +544,8 @@ def assemble_release(
         ):
             shutil.copy2(common_source, staging / "common.sqlite")
             common_digest, common_size = artifact_provenance(staging / "common.sqlite")
-        with profiler.stage("release-prepare"):
-            shutil.copytree(stop_source, staging / "stop-data", symlinks=False)
-        with profiler.stage("stop-data-validation"):
+        with profiler.stage("stop-data-reference"):
+            _link_reference(stop_source, staging / "stop-data")
             stop_data = _stop_data_reference(staging / "stop-data")
         common_metadata_path = staging / "common-metadata.json"
         with __import__("sqlite3").connect(staging / "common.sqlite") as connection:

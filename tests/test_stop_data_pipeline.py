@@ -71,6 +71,25 @@ case \"${1:-}\" in
     fi
     exit 0
     ;;
+  *run_incremental_provider_pipeline.py)
+    printf '%s\n' "$*" >> "$INCREMENTAL_CALLS_LOG"
+    release_root=""
+    release_id=""
+    previous=""
+    for argument in "$@"; do
+      if [ "$previous" = "--releases-root" ]; then
+        release_root="$argument"
+      elif [ "$previous" = "--release-id" ]; then
+        release_id="$argument"
+      fi
+      previous="$argument"
+    done
+    if [ "${INCREMENTAL_FAIL:-0}" = "1" ]; then
+      mkdir -p "$release_root/$release_id"
+      exit 1
+    fi
+    exit 0
+    ;;
   *prepare_gtfs_artifacts.py)
     output=\"\"
     while [ \"$#\" -gt 0 ]; do
@@ -353,6 +372,7 @@ PY
             "BUILD_CALLS_LOG": str(self.root / "build-calls.log"),
             "LINK_CALLS_LOG": str(self.root / "link-calls.log"),
             "STATE_WRITE_CALLS_LOG": str(self.root / "state-write-calls.log"),
+            "INCREMENTAL_CALLS_LOG": str(self.root / "incremental-calls.log"),
             "STATIC_CALLS_LOG": str(self.root / "static-calls.log"),
             "STAGED_STOP_DATA_LOG": str(self.root / "staged-stop-data.log"),
             "STATIC_DEPARTURES_PIPELINE": str(self.bin_directory / "static-departures-pipeline"),
@@ -432,6 +452,41 @@ PY
         self.assertNotEqual(
             (self.data_root / "previous" / "stop-data" / "release-marker").read_text(),
             "new",
+        )
+
+    def test_no_activate_proof_skips_legacy_database_and_runs_incremental_first(self) -> None:
+        result = self.run_pipeline("--no-activate", STATIC_IMPORT_FAIL="1")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)
+        self.assertIn("stage=incremental-provider status=PASS", result.stdout)
+        self.assertIn("disk phase=before", result.stdout)
+        self.assertIn("disk phase=after", result.stdout)
+        self.assertIn("disk phase=peak", result.stdout)
+        self.assertFalse((self.root / "static-calls.log").exists())
+        self.assertTrue((self.root / "incremental-calls.log").is_file())
+        release_id = self.candidate_release_id()
+        release_dir = self.data_root / "releases" / release_id
+        self.assertFalse((release_dir / "departures.sqlite").exists())
+        self.assertEqual(
+            (self.data_root / "current" / "release-marker").read_text(),
+            "old",
+        )
+        self.assertFalse((self.data_root / "current-release").exists())
+
+    def test_no_activate_failure_cleans_source_and_incremental_generations(self) -> None:
+        result = self.run_pipeline("--no-activate", INCREMENTAL_FAIL="1")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)
+        releases_root = self.data_root / "releases"
+        incremental_root = self.data_root / "releases" / "incremental"
+        self.assertFalse([path for path in releases_root.iterdir() if path != incremental_root])
+        self.assertTrue(incremental_root.is_dir())
+        self.assertFalse(list(incremental_root.glob("*")))
+        self.assertEqual(
+            (self.data_root / "current" / "release-marker").read_text(),
+            "old",
         )
 
     def test_external_sources_do_not_require_a_norway_cli_override(self) -> None:

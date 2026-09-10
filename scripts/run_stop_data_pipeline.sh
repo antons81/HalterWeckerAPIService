@@ -10,7 +10,12 @@ cleanup_failed_no_activate() {
   local status="$?"
   if [[ "$status" -ne 0 && "$NO_ACTIVATE" == "1" && -n "${RELEASE_DIR:-}" ]]; then
     rm -rf -- "$RELEASE_DIR"
+    rm -rf -- "${INCREMENTAL_RELEASE_DIR:-}"
     echo "[Nightly] stage=cleanup status=PASS release=$RELEASE_ID reason=failure" >&2
+  fi
+  if [[ "$NO_ACTIVATE" == "1" ]] && type log_disk_state >/dev/null 2>&1; then
+    log_disk_state "after"
+    log_disk_peak
   fi
   exit "$status"
 }
@@ -41,6 +46,8 @@ else
   RELEASE_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 fi
 RELEASE_DIR="$RELEASES/$RELEASE_ID"
+INCREMENTAL_RELEASES_ROOT="${HALTEWECKER_INCREMENTAL_RELEASES_ROOT:-$DATA_ROOT/releases/incremental}"
+INCREMENTAL_RELEASE_DIR="$INCREMENTAL_RELEASES_ROOT/$RELEASE_ID"
 BUILD_DIR="$RELEASE_DIR/stop-data"
 ARTIFACTS_JSON="$RELEASE_DIR/gtfs-artifacts.json"
 CURRENT="$DATA_ROOT/current"
@@ -214,6 +221,63 @@ activate_runtime() {
 
 cd "$REPO"
 TOTAL_STARTED=$SECONDS
+PEAK_USED_KB=0
+PEAK_FREE_KB=0
+
+disk_free_kb() {
+  df -Pk "$DATA_ROOT" | awk 'NR == 2 { print $4; exit }'
+}
+
+disk_used_kb() {
+  df -Pk "$DATA_ROOT" | awk 'NR == 2 { print $3; exit }'
+}
+
+log_disk_state() {
+  local phase="$1"
+  local free_kb
+  local used_kb
+  free_kb="$(disk_free_kb)"
+  used_kb="$(disk_used_kb)"
+  if (( used_kb > PEAK_USED_KB )); then
+    PEAK_USED_KB="$used_kb"
+    PEAK_FREE_KB="$free_kb"
+  fi
+  echo "[Nightly] disk phase=$phase used_kb=$used_kb free_kb=$free_kb free_gb=$((free_kb / 1024 / 1024))"
+}
+
+log_disk_peak() {
+  echo "[Nightly] disk phase=peak used_kb=$PEAK_USED_KB free_kb=$PEAK_FREE_KB free_gb=$((PEAK_FREE_KB / 1024 / 1024))"
+}
+
+proof_disk_preflight() {
+  local free_kb
+  local current_stop_data_kb=0
+  local margin_kb
+  local estimated_additional_kb
+  local estimated_free_kb
+  local minimum_free_kb
+
+  free_kb="$(disk_free_kb)"
+  if [[ -d "$CURRENT" || -L "$CURRENT" ]]; then
+    current_stop_data_kb="$(du -skL "$CURRENT" 2>/dev/null | awk '{ print $1; exit }' || true)"
+    current_stop_data_kb="${current_stop_data_kb:-0}"
+  fi
+  margin_kb=$(( ${HALTEWECKER_PROOF_ESTIMATE_MARGIN_GB:-5} * 1024 * 1024 ))
+  estimated_additional_kb=$((current_stop_data_kb + margin_kb))
+  estimated_free_kb=$((free_kb - estimated_additional_kb))
+  minimum_free_kb=$(( ${HALTEWECKER_MIN_FREE_GB:-45} * 1024 * 1024 ))
+  log_disk_state "before"
+  echo "[Nightly] disk estimated_additional_gb=$((estimated_additional_kb / 1024 / 1024)) estimated_peak_free_gb=$((estimated_free_kb / 1024 / 1024))"
+  if (( free_kb < minimum_free_kb || estimated_free_kb < minimum_free_kb )); then
+    echo "[Nightly] ERROR: insufficient disk for incremental proof mode" >&2
+    return 1
+  fi
+}
+
+if [[ "$NO_ACTIVATE" == "1" && "$RUN_MODE" == "normal" ]]; then
+  proof_disk_preflight
+fi
+
 run_build_stage() {
   echo "[StopData] release=$RELEASE_ID stage=build started"
 
@@ -685,10 +749,15 @@ if [[ "$RUN_MODE" == "normal" ]]; then
   run_candidate_validation
   echo "[Nightly] stage=validation status=PASS release=$RELEASE_ID"
   persist_release_stage "candidate-validation"
-  echo "[Nightly] stage=legacy-import status=started release=$RELEASE_ID"
-  run_static_departures_stage
-  echo "[Nightly] stage=legacy-import status=PASS release=$RELEASE_ID"
-  persist_release_stage "static-departures"
+  log_disk_state "after-stop-data"
+  if [[ "$NO_ACTIVATE" == "1" ]]; then
+    echo "[Nightly] stage=legacy-import status=SKIPPED release=$RELEASE_ID reason=no-activate-proof"
+  else
+    echo "[Nightly] stage=legacy-import status=started release=$RELEASE_ID"
+    run_static_departures_stage
+    echo "[Nightly] stage=legacy-import status=PASS release=$RELEASE_ID"
+    persist_release_stage "static-departures"
+  fi
 else
   inspect_resume
   if [[ "$RESUME_STATUS" == "already-active" ]]; then
@@ -733,7 +802,6 @@ fi
 if [[ "$NO_ACTIVATE" == "1" ]]; then
   NORMALIZED_CACHE_ROOT="${HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT:-${DATA_ROOT}/provider-artifacts/normalized}"
   STATIC_ARTIFACT_ROOT="${HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT:-${DATA_ROOT}/provider-artifacts/static}"
-  INCREMENTAL_RELEASES_ROOT="${HALTEWECKER_INCREMENTAL_RELEASES_ROOT:-$DATA_ROOT/releases/incremental}"
   INCREMENTAL_STARTED=$SECONDS
   echo "[Nightly] stage=incremental-provider status=started release=$RELEASE_ID"
   python3 "$REPO/scripts/run_incremental_provider_pipeline.py" \
@@ -747,6 +815,8 @@ if [[ "$NO_ACTIVATE" == "1" ]]; then
   echo "[Nightly] stage=incremental-provider status=PASS release=$RELEASE_ID duration=$((SECONDS - INCREMENTAL_STARTED))s"
   echo "[Nightly] stage=readiness status=PASS release=$RELEASE_ID no_activate=true"
   echo "[Nightly] stage=nightly-complete status=PASS release=$RELEASE_ID no_activate=true"
+  log_disk_state "after"
+  log_disk_peak
   exit 0
 fi
 

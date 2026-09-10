@@ -79,6 +79,9 @@ class ProviderReleaseAssemblerTests(unittest.TestCase):
             self.assertTrue(
                 (assembly.release_directory / "providers/israel-mot/structural/provider.sqlite").is_symlink()
             )
+            stop_data_reference = assembly.release_directory / "stop-data"
+            self.assertTrue(stop_data_reference.is_symlink())
+            self.assertEqual(stop_data_reference.resolve(), stop_data.resolve())
             self.assertEqual(
                 payload["compatibility"]["runtimeSchemaVersion"],
                 1,
