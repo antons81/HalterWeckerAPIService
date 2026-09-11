@@ -612,6 +612,15 @@ PY
             json.loads((release_dir / "release-state.json").read_text(encoding="utf-8"))["completedStage"],
             "candidate-validation",
         )
+        reports = sorted((self.data_root / "pipeline-diagnostics").glob("*.report"))
+        self.assertEqual(len(reports), 1)
+        report = reports[0].read_text(encoding="utf-8")
+        self.assertIn("status=PASS", report)
+        self.assertIn("fingerprint_version=2", report)
+        self.assertIn("build_fingerprint=test-build-fingerprint", report)
+        self.assertIn(f"release_id={release_id}", report)
+        self.assertTrue((self.data_root / "pipeline-diagnostics" / f"{release_id}.log").is_file())
+        self.assertTrue((self.data_root / "pipeline-diagnostics" / f"{release_id}.stderr.log").is_file())
 
     def test_explicit_stop_data_generation_can_be_reused_without_current_pointer(self) -> None:
         fresh = self.run_pipeline("--stop-data-only")
@@ -650,6 +659,16 @@ PY
             "old",
         )
         self.assertEqual(list((self.data_root / "releases").iterdir()), [])
+        reports = sorted((self.data_root / "pipeline-diagnostics").glob("*.report"))
+        self.assertEqual(len(reports), 1)
+        report = reports[0].read_text(encoding="utf-8")
+        self.assertIn("status=FAIL", report)
+        self.assertIn("exit_code=1", report)
+        self.assertIn("fingerprint_version=2", report)
+        self.assertIn("current_stage=stop-data-build", report)
+        self.assertIn("cleanup_actions=removed release_dir=", report)
+        stderr_log = next((self.data_root / "pipeline-diagnostics").glob("*.stderr.log"))
+        self.assertIn("stage=cleanup status=PASS", stderr_log.read_text(encoding="utf-8"))
 
     def test_no_activate_proof_skips_legacy_database_and_runs_incremental_first(self) -> None:
         result = self.run_pipeline("--no-activate", STATIC_IMPORT_FAIL="1")

@@ -19,11 +19,15 @@ cleanup_failed_no_activate() {
   if [[ "$status" -ne 0 && "$NO_ACTIVATE" == "1" && -n "${RELEASE_DIR:-}" ]]; then
     rm -rf -- "$RELEASE_DIR"
     rm -rf -- "${INCREMENTAL_RELEASE_DIR:-}"
+    DIAGNOSTICS_CLEANUP_ACTIONS="removed release_dir=$RELEASE_DIR;removed incremental_release_dir=${INCREMENTAL_RELEASE_DIR:-none}"
     echo "[Nightly] stage=cleanup status=PASS release=$RELEASE_ID reason=failure" >&2
   fi
   if [[ "$NO_ACTIVATE" == "1" ]] && type log_disk_state >/dev/null 2>&1; then
     log_disk_state "after"
     log_disk_peak
+  fi
+  if [[ "$NO_ACTIVATE" == "1" ]]; then
+    diagnostics_write_report "$status"
   fi
   exit "$status"
 }
@@ -129,8 +133,89 @@ STATIC_DEPARTURES_PIPELINE="${STATIC_DEPARTURES_PIPELINE:-$REPO/scripts/run_stat
 RELEASE_STATE_SCRIPT="$REPO/scripts/release_state.py"
 CUSTOM_ARTIFACTS_JSON="$RELEASE_DIR/custom-gtfs-artifacts.json"
 
+DIAGNOSTICS_ROOT="${HALTEWECKER_PIPELINE_DIAGNOSTICS_ROOT:-$DATA_ROOT/pipeline-diagnostics}"
+DIAGNOSTICS_LOG="$DIAGNOSTICS_ROOT/$RELEASE_ID.log"
+DIAGNOSTICS_STDERR_LOG="$DIAGNOSTICS_ROOT/$RELEASE_ID.stderr.log"
+DIAGNOSTICS_REPORT="$DIAGNOSTICS_ROOT/$RELEASE_ID.report"
+DIAGNOSTICS_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+DIAGNOSTICS_SIGNAL=""
+DIAGNOSTICS_CURRENT_STAGE="initialization"
+DIAGNOSTICS_CLEANUP_ACTIONS="none"
+DIAGNOSTICS_BUILD_FINGERPRINT=""
+DIAGNOSTICS_FINGERPRINT_VERSION="unknown"
+DIAGNOSTICS_DISK_BEFORE_KB=""
+DIAGNOSTICS_DISK_AFTER_KB=""
+DIAGNOSTICS_MIN_FREE_KB=""
+BUILD_FINGERPRINT=""
+
+if [[ "$NO_ACTIVATE" == "1" ]]; then
+  mkdir -p "$DIAGNOSTICS_ROOT"
+  exec > >(tee -a "$DIAGNOSTICS_LOG")
+  exec 2> >(tee -a "$DIAGNOSTICS_STDERR_LOG" >&2)
+fi
+
+diagnostics_set_stage() {
+  DIAGNOSTICS_CURRENT_STAGE="$1"
+}
+
+diagnostics_refresh_fingerprint() {
+  DIAGNOSTICS_FINGERPRINT_VERSION="$(sed -n 's/^STOP_DATA_BUILD_FINGERPRINT_VERSION = //p' "$REPO/scripts/build_fingerprint.py" | tr -d '[:space:]' || true)"
+  DIAGNOSTICS_FINGERPRINT_VERSION="${DIAGNOSTICS_FINGERPRINT_VERSION:-unknown}"
+  DIAGNOSTICS_BUILD_FINGERPRINT="$(python3 "$REPO/scripts/build_fingerprint.py" --repository "$REPO" 2>/dev/null || true)"
+  BUILD_FINGERPRINT="$DIAGNOSTICS_BUILD_FINGERPRINT"
+}
+
+diagnostics_write_report() {
+  local status="$1"
+  local result="PASS"
+  local ended_at
+  local disk_after_kb
+  local generation_size_kb
+  local last_stage_line
+  local last_provider
+  local last_provider_stage
+
+  if [[ "$status" -ne 0 ]]; then
+    result="FAIL"
+  fi
+  ended_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  disk_after_kb="$(df -Pk "$DATA_ROOT" 2>/dev/null | awk 'NR == 2 { print $4; exit }' || true)"
+  DIAGNOSTICS_DISK_AFTER_KB="${disk_after_kb:-}"
+  generation_size_kb="$(du -skL "${RELEASE_DIR:-}" 2>/dev/null | awk '{ print $1; exit }' || true)"
+  generation_size_kb="${generation_size_kb:-0}"
+  last_stage_line="$(grep -E 'stage=[^ ]+' "$DIAGNOSTICS_LOG" 2>/dev/null | tail -n 1 || true)"
+  last_provider="$(printf '%s\n' "$last_stage_line" | sed -n 's/.*source=\([^ ]*\).*/\1/p')"
+  last_provider_stage="$(printf '%s\n' "$last_stage_line" | sed -n 's/.*stage=\([^ ]*\).*/\1/p')"
+
+  {
+    printf 'status=%s\n' "$result"
+    printf 'exit_code=%s\n' "$status"
+    printf 'signal=%s\n' "${DIAGNOSTICS_SIGNAL:-none}"
+    printf 'release_id=%s\n' "${RELEASE_ID:-unknown}"
+    printf 'git_sha=%s\n' "$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
+    printf 'fingerprint_version=%s\n' "$DIAGNOSTICS_FINGERPRINT_VERSION"
+    printf 'build_fingerprint=%s\n' "${DIAGNOSTICS_BUILD_FINGERPRINT:-unknown}"
+    printf 'started_at=%s\n' "$DIAGNOSTICS_STARTED_AT"
+    printf 'ended_at=%s\n' "$ended_at"
+    printf 'current_stage=%s\n' "$DIAGNOSTICS_CURRENT_STAGE"
+    printf 'last_provider=%s\n' "${last_provider:-unknown}"
+    printf 'last_provider_stage=%s\n' "${last_provider_stage:-unknown}"
+    printf 'disk_before_free_kb=%s\n' "${DIAGNOSTICS_DISK_BEFORE_KB:-unknown}"
+    printf 'disk_min_free_kb=%s\n' "${DIAGNOSTICS_MIN_FREE_KB:-unknown}"
+    printf 'disk_after_free_kb=%s\n' "${DIAGNOSTICS_DISK_AFTER_KB:-unknown}"
+    printf 'generation_size_at_exit_kb=%s\n' "$generation_size_kb"
+    printf 'cleanup_actions=%s\n' "$DIAGNOSTICS_CLEANUP_ACTIONS"
+    printf 'stdout_log=%s\n' "$DIAGNOSTICS_LOG"
+    printf 'stderr_log=%s\n' "$DIAGNOSTICS_STDERR_LOG"
+    printf 'last_stage_line=%s\n' "$last_stage_line"
+  } > "$DIAGNOSTICS_REPORT"
+}
+
 if [[ "$NO_ACTIVATE" == "1" ]]; then
   trap cleanup_failed_no_activate EXIT
+  trap 'DIAGNOSTICS_SIGNAL=SIGINT; exit 130' INT
+  trap 'DIAGNOSTICS_SIGNAL=SIGTERM; exit 143' TERM
+  trap 'DIAGNOSTICS_SIGNAL=SIGHUP; exit 129' HUP
 fi
 
 resolve_reused_stop_data() {
@@ -405,6 +490,9 @@ cd "$REPO"
 TOTAL_STARTED=$SECONDS
 PEAK_USED_KB=0
 PEAK_FREE_KB=0
+if [[ "$NO_ACTIVATE" == "1" ]]; then
+  diagnostics_refresh_fingerprint
+fi
 
 disk_free_kb() {
   df -Pk "$DATA_ROOT" | awk 'NR == 2 { print $4; exit }'
@@ -424,6 +512,12 @@ log_disk_state() {
     PEAK_USED_KB="$used_kb"
     PEAK_FREE_KB="$free_kb"
   fi
+  if [[ -z "$DIAGNOSTICS_DISK_BEFORE_KB" ]]; then
+    DIAGNOSTICS_DISK_BEFORE_KB="$free_kb"
+  fi
+  if [[ -z "$DIAGNOSTICS_MIN_FREE_KB" || "$free_kb" -lt "$DIAGNOSTICS_MIN_FREE_KB" ]]; then
+    DIAGNOSTICS_MIN_FREE_KB="$free_kb"
+  fi
   echo "[Nightly] disk phase=$phase used_kb=$used_kb free_kb=$free_kb free_gb=$((free_kb / 1024 / 1024))"
 }
 
@@ -432,6 +526,7 @@ log_disk_peak() {
 }
 
 proof_disk_preflight() {
+  diagnostics_set_stage "disk-preflight"
   local free_kb
   local current_stop_data_kb=0
   local margin_kb
@@ -461,6 +556,7 @@ if [[ "$NO_ACTIVATE" == "1" && "$RUN_MODE" == "normal" ]]; then
 fi
 
 run_build_stage() {
+  diagnostics_set_stage "stop-data-build"
   echo "[StopData] release=$RELEASE_ID stage=build started"
 
 mkdir -p "$BUILD_DIR" "$RELEASES"
@@ -610,6 +706,7 @@ fi
 echo "[StopData] release=$RELEASE_ID stage=build duration=$(elapsed_seconds "$TOTAL_STARTED")"
 }
 run_candidate_validation() {
+  diagnostics_set_stage "stop-data-validation"
   VALIDATION_STARTED=$SECONDS
   test -f "$CUSTOM_ARTIFACTS_JSON"
 if [[ -f "$MVO_ENV_FILE" ]]; then
@@ -867,6 +964,7 @@ PY
 }
 
 run_static_departures_stage() {
+  diagnostics_set_stage "legacy-import"
   STATIC_STARTED=$SECONDS
   EXTERNAL_GTFS_ARTIFACTS_JSON="$ARTIFACTS_JSON" \
 STOP_DATA_PATH="$BUILD_DIR" \
@@ -951,6 +1049,7 @@ if [[ "$RUN_MODE" == "normal" ]]; then
   fi
   log_disk_state "after-stop-data"
   if [[ "$STOP_DATA_ONLY" == "1" ]]; then
+    diagnostics_set_stage "stop-data-only"
     echo "[Nightly] stage=stop-data-validation status=PASS release=$RELEASE_ID"
     echo "[Nightly] stage=legacy-import status=SKIPPED release=$RELEASE_ID reason=stop-data-only"
     STOP_DATA_SIZE_BYTES="$(du -skL "$BUILD_DIR" | awk '{print $1 * 1024; exit}')"
@@ -1008,6 +1107,7 @@ else
 fi
 
 if [[ "$NO_ACTIVATE" == "1" ]]; then
+  diagnostics_set_stage "incremental-provider"
   NORMALIZED_CACHE_ROOT="${HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT:-${DATA_ROOT}/provider-artifacts/normalized}"
   STATIC_ARTIFACT_ROOT="${HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT:-${DATA_ROOT}/provider-artifacts/static}"
   INCREMENTAL_STARTED=$SECONDS
