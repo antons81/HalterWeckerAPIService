@@ -10,6 +10,7 @@ from unittest import mock
 import json
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import build_fingerprint
 import build_stop_packages as stop_package_builder
 from kyiv_open_data import KyivOpenDataError
 
@@ -361,6 +362,117 @@ PY
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
+
+    def test_stop_data_fingerprint_is_deterministic_and_exposes_components(self) -> None:
+        first = build_fingerprint.compute(REPOSITORY_ROOT)
+        second = build_fingerprint.compute(REPOSITORY_ROOT)
+        manifest = build_fingerprint.component_manifest(REPOSITORY_ROOT)
+
+        self.assertEqual(first, second)
+        self.assertEqual(manifest["version"], 2)
+        self.assertEqual(manifest["orchestrationVersion"], 1)
+        self.assertTrue(manifest["components"])
+        self.assertTrue(
+            all("path" in item and "sha256" in item for item in manifest["components"])
+        )
+
+    def test_unrelated_validator_change_does_not_change_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "builder.py").write_text("builder-v1", encoding="utf-8")
+            validator = root / "run_incremental_provider_pipeline.py"
+            validator.write_text("validator-v1", encoding="utf-8")
+
+            first = build_fingerprint.compute(root, ("builder.py",))
+            validator.write_text("validator-v2", encoding="utf-8")
+            second = build_fingerprint.compute(root, ("builder.py",))
+
+            self.assertEqual(first, second)
+            self.assertNotIn(
+                "scripts/run_incremental_provider_pipeline.py",
+                build_fingerprint.STOP_DATA_INPUTS,
+            )
+
+    def test_git_head_change_does_not_change_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+            (root / "builder.py").write_text("builder-v1", encoding="utf-8")
+            unrelated = root / "validator.py"
+            unrelated.write_text("validator-v1", encoding="utf-8")
+            subprocess.run(["git", "add", "builder.py", "validator.py"], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "first",
+                ],
+                cwd=root,
+                check=True,
+            )
+            first_revision = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=root, text=True
+            ).strip()
+            first = build_fingerprint.compute(root, ("builder.py",))
+
+            unrelated.write_text("validator-v2", encoding="utf-8")
+            subprocess.run(["git", "add", "validator.py"], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "unrelated",
+                ],
+                cwd=root,
+                check=True,
+            )
+            second_revision = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=root, text=True
+            ).strip()
+            second = build_fingerprint.compute(root, ("builder.py",))
+
+            self.assertNotEqual(first_revision, second_revision)
+            self.assertEqual(first, second)
+
+    def test_relevant_builder_and_config_changes_change_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            builder = root / "builder.py"
+            config = root / "config.json"
+            builder.write_text("builder-v1", encoding="utf-8")
+            config.write_text("config-v1", encoding="utf-8")
+            inputs = ("builder.py", "config.json")
+
+            baseline = build_fingerprint.compute(root, inputs)
+            builder.write_text("builder-v2", encoding="utf-8")
+            builder_changed = build_fingerprint.compute(root, inputs)
+            config.write_text("config-v2", encoding="utf-8")
+            config_changed = build_fingerprint.compute(root, inputs)
+
+            self.assertNotEqual(baseline, builder_changed)
+            self.assertNotEqual(builder_changed, config_changed)
+
+    def test_fingerprint_algorithm_version_changes_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "builder.py").write_text("builder", encoding="utf-8")
+
+            version_one = build_fingerprint.compute(root, ("builder.py",), version=1)
+            version_two = build_fingerprint.compute(root, ("builder.py",), version=2)
+
+            self.assertNotEqual(version_one, version_two)
 
     def write_mock(self, name: str, content: str) -> None:
         path = self.bin_directory / name
