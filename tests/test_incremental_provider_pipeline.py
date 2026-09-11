@@ -29,6 +29,53 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
         self.assertEqual(dates[-1], date(2026, 9, 24))
         self.assertEqual(len(dates), 15)
 
+    def test_structural_manifest_does_not_require_temporal_window(self) -> None:
+        structural_manifest = {
+            "artifactType": "structural",
+            "dependencies": {
+                "stopDataFingerprint": "stop-data-key",
+                "structuralSchemaFingerprint": "schema-key",
+            },
+        }
+        temporal_manifest = {
+            "artifactType": "temporal",
+            "dependencies": {
+                "validFrom": "2026-09-11",
+                "validThrough": "2026-09-25",
+            },
+        }
+
+        self.assertNotIn("validFrom", structural_manifest["dependencies"])
+        self.assertNotIn("validThrough", structural_manifest["dependencies"])
+        incremental._validate_temporal_window(
+            provider_id="israel-mot",
+            temporal_manifest=temporal_manifest,
+            dates=[date(2026, 9, 11), date(2026, 9, 25)],
+        )
+
+    def test_temporal_window_mismatch_fails_closed(self) -> None:
+        temporal_manifest = {
+            "dependencies": {
+                "validFrom": "2026-09-12",
+                "validThrough": "2026-09-25",
+            }
+        }
+        with self.assertRaisesRegex(ValueError, "temporal validFrom mismatch"):
+            incremental._validate_temporal_window(
+                provider_id="israel-mot",
+                temporal_manifest=temporal_manifest,
+                dates=[date(2026, 9, 11), date(2026, 9, 25)],
+            )
+
+    def test_temporal_window_missing_fields_fails_closed(self) -> None:
+        temporal_manifest = {"dependencies": {"validFrom": "2026-09-11"}}
+        with self.assertRaisesRegex(ValueError, "temporal validThrough mismatch"):
+            incremental._validate_temporal_window(
+                provider_id="israel-mot",
+                temporal_manifest=temporal_manifest,
+                dates=[date(2026, 9, 11), date(2026, 9, 25)],
+            )
+
     def test_raw_artifact_provenance_mismatch_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

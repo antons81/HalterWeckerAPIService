@@ -104,6 +104,21 @@ def _read_json(path: Path) -> dict[str, object]:
     return payload
 
 
+def _validate_temporal_window(
+    *,
+    provider_id: str,
+    temporal_manifest: Mapping[str, object],
+    dates: list[date],
+) -> None:
+    dependencies = temporal_manifest.get("dependencies")
+    if not isinstance(dependencies, Mapping):
+        raise ValueError(f"provider={provider_id} temporal dependencies are missing")
+    if dependencies.get("validFrom") != dates[0].isoformat():
+        raise ValueError(f"provider={provider_id} temporal validFrom mismatch")
+    if dependencies.get("validThrough") != dates[-1].isoformat():
+        raise ValueError(f"provider={provider_id} temporal validThrough mismatch")
+
+
 def _source_map(repository_root: Path) -> dict[str, dict[str, object]]:
     sources = load_external_gtfs_sources(
         repository_root / "config" / "external-gtfs-sources.json"
@@ -372,12 +387,11 @@ def build_incremental_candidate(
                 f"validThrough={temporal.manifest['dependencies']['validThrough']}",
                 flush=True,
             )
-            for artifact_use in (structural, temporal):
-                dependencies = artifact_use.manifest.get("dependencies", {})
-                if dependencies.get("validFrom") != dates[0].isoformat():
-                    raise ValueError(f"provider={provider_id} temporal validFrom mismatch")
-                if dependencies.get("validThrough") != dates[-1].isoformat():
-                    raise ValueError(f"provider={provider_id} temporal validThrough mismatch")
+            _validate_temporal_window(
+                provider_id=provider_id,
+                temporal_manifest=temporal.manifest,
+                dates=dates,
+            )
             provider_builds.append(
                 ProviderBuild(
                     provider_id=provider_id,
