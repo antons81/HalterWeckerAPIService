@@ -473,6 +473,72 @@ PY
             "new",
         )
 
+    def test_stop_data_only_persists_validated_source_without_downstream_stages(self) -> None:
+        result = self.run_pipeline("--stop-data-only")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stage=stop-data-only status=PASS", result.stdout)
+        self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)
+        self.assertNotIn("stage=incremental-provider", result.stdout)
+        self.assertEqual(
+            (self.root / "build-calls.log").read_text(encoding="utf-8").splitlines(),
+            ["build"],
+        )
+        self.assertFalse((self.root / "static-calls.log").exists())
+        self.assertFalse((self.root / "incremental-calls.log").exists())
+        self.assertFalse((self.data_root / "current-release").exists())
+        self.assertFalse((self.data_root / "departures-current.sqlite").exists())
+
+        release_id = self.candidate_release_id()
+        release_dir = self.data_root / "releases" / release_id
+        manifest = json.loads((release_dir / "stop-data" / "manifest.json").read_text(encoding="utf-8"))
+        metadata = json.loads((release_dir / "release-metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["releaseID"], release_id)
+        self.assertEqual(metadata["releaseID"], release_id)
+        self.assertEqual(metadata["buildFingerprint"], "test-build-fingerprint")
+        self.assertEqual(
+            json.loads((release_dir / "release-state.json").read_text(encoding="utf-8"))["completedStage"],
+            "candidate-validation",
+        )
+
+    def test_explicit_stop_data_generation_can_be_reused_without_current_pointer(self) -> None:
+        fresh = self.run_pipeline("--stop-data-only")
+        self.assertEqual(fresh.returncode, 0, fresh.stderr)
+        release_id = self.candidate_release_id()
+        source = self.data_root / "releases" / release_id / "stop-data"
+        source_manifest = (source / "manifest.json").read_bytes()
+        source_metadata = (source.parent / "release-metadata.json").read_bytes()
+
+        reused = self.run_pipeline(
+            "--no-activate",
+            "--reuse-stop-data",
+            release_id,
+            REUSE_STOP_DATA="1",
+        )
+
+        self.assertEqual(reused.returncode, 0, reused.stderr)
+        self.assertIn(f"stage=stop-data-reuse status=PASS release={release_id}", reused.stdout)
+        self.assertIn("stage=stop-data-build status=SKIPPED", reused.stdout)
+        self.assertIn("stage=incremental-provider status=PASS", reused.stdout)
+        self.assertEqual(
+            (self.root / "build-calls.log").read_text(encoding="utf-8").splitlines(),
+            ["build"],
+        )
+        self.assertEqual((source / "manifest.json").read_bytes(), source_manifest)
+        self.assertEqual((source.parent / "release-metadata.json").read_bytes(), source_metadata)
+        self.assertFalse((self.data_root / "current").is_symlink())
+
+    def test_stop_data_only_failure_cleans_new_generation_only(self) -> None:
+        result = self.run_pipeline("--stop-data-only", BUILD_FAIL="1")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("stage=cleanup status=PASS", result.stderr)
+        self.assertEqual(
+            (self.data_root / "current" / "release-marker").read_text(encoding="utf-8"),
+            "old",
+        )
+        self.assertEqual(list((self.data_root / "releases").iterdir()), [])
+
     def test_no_activate_proof_skips_legacy_database_and_runs_incremental_first(self) -> None:
         result = self.run_pipeline("--no-activate", STATIC_IMPORT_FAIL="1")
 

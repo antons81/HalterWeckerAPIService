@@ -7,6 +7,8 @@ RESUME_RELEASE_ID=""
 NO_ACTIVATE="${HALTEWECKER_NIGHTLY_NO_ACTIVATE:-0}"
 EXPLICIT_NO_ACTIVATE=0
 REUSE_STOP_DATA=0
+STOP_DATA_ONLY=0
+REUSE_STOP_DATA_REFERENCE=""
 REUSED_STOP_DATA_SOURCE=""
 REUSED_STOP_DATA_RELEASE_ID=""
 REUSED_STOP_DATA_MANIFEST_SHA256=""
@@ -39,8 +41,17 @@ elif [[ "${1:-}" == "--no-activate" && "${2:-}" == "--reuse-stop-data" && "$#" -
   NO_ACTIVATE=1
   EXPLICIT_NO_ACTIVATE=1
   REUSE_STOP_DATA=1
+elif [[ "${1:-}" == "--no-activate" && "${2:-}" == "--reuse-stop-data" && "$#" -eq 3 ]]; then
+  NO_ACTIVATE=1
+  EXPLICIT_NO_ACTIVATE=1
+  REUSE_STOP_DATA=1
+  REUSE_STOP_DATA_REFERENCE="$3"
+elif [[ "${1:-}" == "--stop-data-only" && "$#" -eq 1 ]]; then
+  NO_ACTIVATE=1
+  EXPLICIT_NO_ACTIVATE=1
+  STOP_DATA_ONLY=1
 elif [[ "$#" -ne 0 ]]; then
-  echo "usage: $0 [--resume RELEASE_ID|--no-activate [--reuse-stop-data]]" >&2
+  echo "usage: $0 [--resume RELEASE_ID|--stop-data-only|--no-activate [--reuse-stop-data [RELEASE_ID]]]" >&2
   exit 64
 fi
 
@@ -133,14 +144,27 @@ resolve_reused_stop_data() {
     echo "[StopData] ERROR: --reuse-stop-data is only supported for a new no-activate run" >&2
     return 1
   fi
-  if [[ ! -L "$CURRENT" ]]; then
-    echo "[StopData] ERROR: reuse source must be an explicit current release symlink: $CURRENT" >&2
-    return 1
-  fi
-  resolved_source="$(readlink -f "$CURRENT" || true)"
-  if [[ ! -d "$resolved_source" ]]; then
-    echo "[StopData] ERROR: reuse source is missing or broken: $CURRENT" >&2
-    return 1
+  if [[ -n "$REUSE_STOP_DATA_REFERENCE" ]]; then
+    if ! [[ "$REUSE_STOP_DATA_REFERENCE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+      echo "[StopData] ERROR: invalid reuse generation ID: $REUSE_STOP_DATA_REFERENCE" >&2
+      return 1
+    fi
+    source_release_dir="$RELEASES/$REUSE_STOP_DATA_REFERENCE"
+    resolved_source="$(readlink -f "$source_release_dir/stop-data" || true)"
+    if [[ ! -d "$resolved_source" ]]; then
+      echo "[StopData] ERROR: reuse generation is missing or broken: $REUSE_STOP_DATA_REFERENCE" >&2
+      return 1
+    fi
+  else
+    if [[ ! -L "$CURRENT" ]]; then
+      echo "[StopData] ERROR: reuse source must be an explicit current release symlink: $CURRENT" >&2
+      return 1
+    fi
+    resolved_source="$(readlink -f "$CURRENT" || true)"
+    if [[ ! -d "$resolved_source" ]]; then
+      echo "[StopData] ERROR: reuse source is missing or broken: $CURRENT" >&2
+      return 1
+    fi
   fi
   resolved_releases_root="$(readlink -f "$RELEASES")"
   relative_source="${resolved_source#"$resolved_releases_root/"}"
@@ -151,7 +175,7 @@ resolve_reused_stop_data() {
   REUSED_STOP_DATA_RELEASE_ID="${relative_source%/stop-data}"
   source_release_dir="$RELEASES/$REUSED_STOP_DATA_RELEASE_ID"
   if [[ "$(readlink -f "$source_release_dir/stop-data")" != "$resolved_source" ]]; then
-    echo "[StopData] ERROR: current release target does not match its published release path" >&2
+    echo "[StopData] ERROR: reuse source does not match its published release path" >&2
     return 1
   fi
   source_metadata="$source_release_dir/release-metadata.json"
@@ -246,9 +270,13 @@ verify_reused_stop_data_unchanged() {
   local current_source
   local current_manifest_sha256
   local current_metadata_sha256
-  current_source="$(readlink -f "$CURRENT")"
   current_manifest_sha256="$(sha256sum "$REUSED_STOP_DATA_SOURCE/manifest.json" | awk '{print $1}')"
   current_metadata_sha256="$(sha256sum "${REUSED_STOP_DATA_SOURCE%/stop-data}/release-metadata.json" | awk '{print $1}')"
+  if [[ -z "$REUSE_STOP_DATA_REFERENCE" ]]; then
+    current_source="$(readlink -f "$CURRENT")"
+  else
+    current_source="$(readlink -f "$REUSED_STOP_DATA_SOURCE")"
+  fi
   if [[ "$current_source" != "$(readlink -f "$REUSED_STOP_DATA_SOURCE")" || "$current_manifest_sha256" != "$REUSED_STOP_DATA_MANIFEST_SHA256" || "$current_metadata_sha256" != "$REUSED_STOP_DATA_METADATA_SHA256" ]]; then
     echo "[StopData] ERROR: reused stop-data generation changed during run" >&2
     return 1
@@ -922,6 +950,14 @@ if [[ "$RUN_MODE" == "normal" ]]; then
     persist_release_stage "candidate-validation"
   fi
   log_disk_state "after-stop-data"
+  if [[ "$STOP_DATA_ONLY" == "1" ]]; then
+    echo "[Nightly] stage=stop-data-validation status=PASS release=$RELEASE_ID"
+    echo "[Nightly] stage=legacy-import status=SKIPPED release=$RELEASE_ID reason=stop-data-only"
+    STOP_DATA_SIZE_BYTES="$(du -skL "$BUILD_DIR" | awk '{print $1 * 1024; exit}')"
+    echo "[Nightly] stage=stop-data-only status=PASS release=$RELEASE_ID path=$BUILD_DIR size_bytes=$STOP_DATA_SIZE_BYTES buildFingerprint=$BUILD_FINGERPRINT"
+    log_disk_peak
+    exit 0
+  fi
   if [[ "$NO_ACTIVATE" == "1" ]]; then
     echo "[Nightly] stage=legacy-import status=SKIPPED release=$RELEASE_ID reason=no-activate-proof"
   else
