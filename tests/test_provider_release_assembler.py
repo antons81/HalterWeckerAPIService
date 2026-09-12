@@ -1,7 +1,9 @@
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -30,6 +32,49 @@ from test_static_departures_multi_provider import (  # noqa: E402
 
 
 class ProviderReleaseAssemblerTests(unittest.TestCase):
+    def test_assembler_runtime_imports_from_repository_root(self) -> None:
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import scripts.provider_release_assembler as assembler; "
+                    "from services.static_departures_runtime import ReleaseSnapshot; "
+                    "assert assembler.ReleaseSnapshot is ReleaseSnapshot"
+                ),
+            ],
+            cwd=REPOSITORY_ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_assembler_runtime_imports_from_other_cwd(self) -> None:
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(REPOSITORY_ROOT / "scripts")
+        with tempfile.TemporaryDirectory() as temporary:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import provider_release_assembler as assembler; "
+                        "from services.static_departures_runtime import ReleaseSnapshot; "
+                        "assert assembler.ReleaseSnapshot is ReleaseSnapshot"
+                    ),
+                ],
+                cwd=temporary,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def _fixture(self, root: Path) -> tuple[Path, Path, Path, dict[str, dict[str, object]]]:
         helper = StaticDeparturesMultiProviderTests()
         root.mkdir(parents=True, exist_ok=True)

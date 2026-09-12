@@ -18,6 +18,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
 
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
+
+from services.static_departures_runtime import (  # noqa: E402
+    ReleaseSnapshot,
+    load_release_manifest,
+)
+
 try:
     from .artifact_provenance import artifact_provenance
     from .artifact_trust import trusted_artifact
@@ -466,10 +476,6 @@ def validate_candidate_release(
         raise ReleaseAssemblyError(f"release is missing required providers: {missing_required}")
 
     try:
-        from static_departures_runtime import load_release_manifest
-    except ImportError:
-        from services.static_departures_runtime import load_release_manifest
-    try:
         load_release_manifest(
             root,
             provider_ids=provider_ids,
@@ -693,11 +699,6 @@ def _readiness_probe(
     trip_case: Mapping[str, object],
 ) -> dict[str, object]:
     """Run the local candidate probe through the same runtime abstraction."""
-    try:
-        from static_departures_runtime import ReleaseSnapshot
-    except ImportError:
-        from services.static_departures_runtime import ReleaseSnapshot
-
     def case_datetime(case: Mapping[str, object], key: str) -> datetime | None:
         value = case.get(key)
         if isinstance(value, datetime):
