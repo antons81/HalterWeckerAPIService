@@ -488,7 +488,10 @@ def build_incremental_candidate(
         israel = next(item for item in provider_builds if item.provider_id == "israel-mot")
         israel_city = str(israel.cities[0]["id"])
         israel_stop = _first_stop(
-            _provider_rows(israel.structural.database_path)[0],
+            _provider_rows(
+                israel.provider_id,
+                israel.structural.database_path,
+            )[0],
             israel_city,
         )
         timezone_name = str(israel.source.get("timezone", "UTC"))

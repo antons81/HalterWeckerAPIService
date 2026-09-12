@@ -1,4 +1,5 @@
 import sys
+import sqlite3
 import shutil
 import tempfile
 import unittest
@@ -15,6 +16,42 @@ from test_static_provider_artifact import StaticProviderArtifactTests  # noqa: E
 
 
 class IncrementalProviderPipelineTests(unittest.TestCase):
+    def test_readiness_provider_rows_use_explicit_provider_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            structural_database = Path(temporary) / "structural.sqlite"
+            with sqlite3.connect(structural_database) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE provider_city_stops(
+                        provider_id TEXT NOT NULL,
+                        city_id TEXT NOT NULL,
+                        stop_id TEXT NOT NULL
+                    );
+                    CREATE TABLE provider_city_modes(
+                        provider_id TEXT NOT NULL,
+                        city_id TEXT NOT NULL,
+                        mode TEXT NOT NULL,
+                        timezone TEXT NOT NULL,
+                        stop_id_prefix TEXT NOT NULL,
+                        identifier_prefix TEXT NOT NULL
+                    );
+                    INSERT INTO provider_city_stops VALUES
+                        ('israel-mot', 'israel', '100');
+                    INSERT INTO provider_city_modes VALUES
+                        ('israel-mot', 'israel', 'bus', 'Asia/Jerusalem', '', '');
+                    """
+                )
+
+            stop_rows, mode_rows = incremental._provider_rows(
+                "israel-mot",
+                structural_database,
+            )
+            self.assertEqual(incremental._first_stop(stop_rows, "israel"), "100")
+            self.assertEqual(mode_rows[0][0], "israel-mot")
+
+            with self.assertRaisesRegex(ValueError, "provider=unknown-provider"):
+                incremental._provider_rows("unknown-provider", structural_database)
+
     def test_temporal_window_requires_next_day(self) -> None:
         with self.assertRaises(ValueError):
             incremental.service_dates(
