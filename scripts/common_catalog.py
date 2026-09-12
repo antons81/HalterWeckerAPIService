@@ -45,6 +45,12 @@ def _provider_row(provider_id: str, value: Mapping[str, object]) -> tuple[object
     temporal = value.get("temporal")
     if not isinstance(structural, Mapping) or not isinstance(temporal, Mapping):
         raise ValueError(f"provider={provider_id} needs structural and temporal manifest data")
+    valid_from = temporal.get("validFrom")
+    valid_through = temporal.get("validThrough")
+    if not isinstance(valid_from, str) or not valid_from.strip():
+        raise ValueError(f"provider={provider_id} temporal validFrom is missing")
+    if not isinstance(valid_through, str) or not valid_through.strip():
+        raise ValueError(f"provider={provider_id} temporal validThrough is missing")
     return (
         provider_id,
         str(value.get("status", "active")),
@@ -55,8 +61,8 @@ def _provider_row(provider_id: str, value: Mapping[str, object]) -> tuple[object
         int(structural.get("schemaVersion", structural.get("structuralSchemaVersion", 0))),
         str(temporal.get("artifactKey", "")),
         int(temporal.get("schemaVersion", temporal.get("temporalSchemaVersion", 0))),
-        str(value.get("validFrom", "")),
-        str(value.get("validThrough", "")),
+        valid_from,
+        valid_through,
     )
 
 

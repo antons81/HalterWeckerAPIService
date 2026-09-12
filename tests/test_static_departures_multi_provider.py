@@ -74,9 +74,9 @@ class StaticDeparturesMultiProviderTests(unittest.TestCase):
                 "temporal": {
                     "artifactKey": temporal["artifactKey"],
                     "schemaVersion": temporal["temporalSchemaVersion"],
+                    "validFrom": temporal["dependencies"]["validFrom"],
+                    "validThrough": temporal["dependencies"]["validThrough"],
                 },
-                "validFrom": temporal["dependencies"]["validFrom"],
-                "validThrough": temporal["dependencies"]["validThrough"],
                 "mergeGroup": "synthetic-merged",
             }
             provider_refs[provider_id] = {"structural": structural_ref, "temporal": temporal_ref}

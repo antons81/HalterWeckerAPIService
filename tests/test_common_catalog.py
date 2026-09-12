@@ -17,33 +17,93 @@ def _providers() -> dict[str, dict[str, object]]:
             "providerOrder": 0,
             "releaseID": "release-a",
             "structural": {"artifactKey": "israel-structural", "schemaVersion": 2},
-            "temporal": {"artifactKey": "israel-temporal", "schemaVersion": 2},
+            "temporal": {
+                "artifactKey": "israel-temporal",
+                "schemaVersion": 2,
+                "validFrom": "2026-09-12",
+                "validThrough": "2026-09-26",
+            },
         },
         "ttc-surface": {
             "status": "active",
             "providerOrder": 1,
             "releaseID": "release-a",
             "structural": {"artifactKey": "surface-structural", "schemaVersion": 2},
-            "temporal": {"artifactKey": "surface-temporal", "schemaVersion": 2},
+            "temporal": {
+                "artifactKey": "surface-temporal",
+                "schemaVersion": 2,
+                "validFrom": "2026-09-13",
+                "validThrough": "2026-09-27",
+            },
         },
         "ttc-subway": {
             "status": "active",
             "providerOrder": 2,
             "releaseID": "release-a",
             "structural": {"artifactKey": "subway-structural", "schemaVersion": 2},
-            "temporal": {"artifactKey": "subway-temporal", "schemaVersion": 2},
+            "temporal": {
+                "artifactKey": "subway-temporal",
+                "schemaVersion": 2,
+                "validFrom": "2026-09-14",
+                "validThrough": "2026-09-28",
+            },
         },
     }
 
 
 class CommonCatalogTests(unittest.TestCase):
-    def _build(self, output: Path, aliases: list[tuple[str, str]]):
+    def _build(
+        self,
+        output: Path,
+        aliases: list[tuple[str, str]],
+        providers: dict[str, dict[str, object]] | None = None,
+    ):
         return build_common_catalog(
             output,
             release_id="release-a",
-            providers=_providers(),
+            providers=providers or _providers(),
             aliases=aliases,
         )
+
+    def test_nested_temporal_metadata_is_written_to_provider_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "common.sqlite"
+            self._build(output, [])
+
+            with sqlite3.connect(output) as connection:
+                rows = connection.execute(
+                    "SELECT provider_id, valid_from, valid_through "
+                    "FROM provider_registry ORDER BY provider_id"
+                ).fetchall()
+            self.assertEqual(
+                rows,
+                [
+                    ("israel-mot", "2026-09-12", "2026-09-26"),
+                    ("ttc-subway", "2026-09-14", "2026-09-28"),
+                    ("ttc-surface", "2026-09-13", "2026-09-27"),
+                ],
+            )
+
+    def test_missing_temporal_block_fails_closed(self) -> None:
+        providers = _providers()
+        del providers["israel-mot"]["temporal"]
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ValueError, "provider=israel-mot needs structural"):
+                self._build(Path(temporary) / "common.sqlite", [], providers)
+
+    def test_missing_temporal_valid_from_fails_closed(self) -> None:
+        providers = _providers()
+        del providers["israel-mot"]["temporal"]["validFrom"]
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ValueError, "provider=israel-mot temporal validFrom is missing"):
+                self._build(Path(temporary) / "common.sqlite", [], providers)
+
+    def test_missing_temporal_valid_through_fails_closed(self) -> None:
+        providers = _providers()
+        del providers["israel-mot"]["temporal"]["validThrough"]
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ValueError, "provider=israel-mot temporal validThrough is missing"):
+                self._build(Path(temporary) / "common.sqlite", [], providers)
 
     def test_identical_duplicate_is_deduplicated(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
