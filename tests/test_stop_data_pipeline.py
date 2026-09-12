@@ -692,6 +692,19 @@ PY
         self.assertIn("run_kind=incremental-no-activate", report)
         self.assertIn(f"release_id={release_id}", report)
 
+    def test_manual_incremental_proof_override_is_explicit_and_scoped(self) -> None:
+        result = self.run_pipeline(
+            "--incremental-no-activate",
+            HALTEWECKER_INCREMENTAL_PROOF_OVERRIDE="1",
+            HALTEWECKER_MIN_FREE_GB="45",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("mode=manual-production-shaped-proof", result.stdout)
+        self.assertIn("warning_free_gb=40", result.stdout)
+        self.assertIn("minimum_free_gb=35", result.stdout)
+        self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)
+
     def test_production_shaped_incremental_failure_cleans_candidate_and_keeps_pointers(self) -> None:
         result = self.run_pipeline(
             "--incremental-no-activate",

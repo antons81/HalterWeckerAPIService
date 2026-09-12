@@ -7,6 +7,7 @@ RESUME_RELEASE_ID=""
 NO_ACTIVATE="${HALTEWECKER_NIGHTLY_NO_ACTIVATE:-0}"
 EXPLICIT_NO_ACTIVATE=0
 INCREMENTAL_NO_ACTIVATE=0
+INCREMENTAL_PROOF_OVERRIDE="${HALTEWECKER_INCREMENTAL_PROOF_OVERRIDE:-0}"
 REUSE_STOP_DATA=0
 STOP_DATA_ONLY=0
 REUSE_STOP_DATA_REFERENCE=""
@@ -73,6 +74,14 @@ fi
 
 if [[ "$REUSE_STOP_DATA" == "1" && "$EXPLICIT_NO_ACTIVATE" != "1" ]]; then
   echo "[StopData] ERROR: --reuse-stop-data requires explicit --no-activate" >&2
+  exit 64
+fi
+if [[ "$INCREMENTAL_PROOF_OVERRIDE" != "0" && "$INCREMENTAL_PROOF_OVERRIDE" != "1" ]]; then
+  echo "[StopData] ERROR: HALTEWECKER_INCREMENTAL_PROOF_OVERRIDE must be 0 or 1" >&2
+  exit 64
+fi
+if [[ "$INCREMENTAL_PROOF_OVERRIDE" == "1" && "$INCREMENTAL_NO_ACTIVATE" != "1" ]]; then
+  echo "[StopData] ERROR: incremental proof override requires --incremental-no-activate" >&2
   exit 64
 fi
 
@@ -583,14 +592,25 @@ proof_disk_preflight() {
   estimated_additional_kb=$((current_stop_data_kb + margin_kb))
   estimated_free_kb=$((free_kb - estimated_additional_kb))
   if [[ "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
-    minimum_free_kb=$((45 * 1024 * 1024))
-    disk_mode="production-shaped-no-activate"
+    if [[ "$INCREMENTAL_PROOF_OVERRIDE" == "1" ]]; then
+      minimum_free_kb=$((35 * 1024 * 1024))
+      warning_free_kb=$((40 * 1024 * 1024))
+      disk_mode="manual-production-shaped-proof"
+    else
+      minimum_free_kb=$((45 * 1024 * 1024))
+      warning_free_kb=$((45 * 1024 * 1024))
+      disk_mode="production-shaped-no-activate"
+    fi
   else
     minimum_free_kb=$(( ${HALTEWECKER_MIN_FREE_GB:-45} * 1024 * 1024 ))
+    warning_free_kb="$minimum_free_kb"
     disk_mode="proof-or-legacy"
   fi
   log_disk_state "before"
-  echo "[Nightly] disk estimated_additional_gb=$((estimated_additional_kb / 1024 / 1024)) estimated_peak_free_gb=$((estimated_free_kb / 1024 / 1024)) minimum_free_gb=$((minimum_free_kb / 1024 / 1024)) mode=$disk_mode reuse_stop_data=$REUSE_STOP_DATA"
+  echo "[Nightly] disk estimated_additional_gb=$((estimated_additional_kb / 1024 / 1024)) estimated_peak_free_gb=$((estimated_free_kb / 1024 / 1024)) warning_free_gb=$((warning_free_kb / 1024 / 1024)) minimum_free_gb=$((minimum_free_kb / 1024 / 1024)) mode=$disk_mode reuse_stop_data=$REUSE_STOP_DATA"
+  if (( free_kb <= warning_free_kb )); then
+    echo "[Nightly] WARNING: disk free is at or below warning threshold for $disk_mode" >&2
+  fi
   if (( free_kb < minimum_free_kb || estimated_free_kb < minimum_free_kb )); then
     echo "[Nightly] ERROR: insufficient disk for $disk_mode" >&2
     return 1
