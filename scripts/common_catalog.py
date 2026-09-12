@@ -60,6 +60,26 @@ def _provider_row(provider_id: str, value: Mapping[str, object]) -> tuple[object
     )
 
 
+def _normalized_alias_rows(aliases: Iterable[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Normalize aliases while rejecting ambiguous canonical mappings."""
+    canonical_targets: dict[str, set[str]] = {}
+    for alias, canonical in aliases:
+        alias_id = str(alias)
+        canonical_id = str(canonical)
+        canonical_targets.setdefault(alias_id, set()).add(canonical_id)
+
+    rows: list[tuple[str, str]] = []
+    for alias_id in sorted(canonical_targets):
+        targets = sorted(canonical_targets[alias_id])
+        if len(targets) != 1:
+            raise ValueError(
+                "conflicting city alias mapping: "
+                f"alias_city_id={alias_id!r} canonical_city_ids={targets!r}"
+            )
+        rows.append((alias_id, targets[0]))
+    return rows
+
+
 def build_common_catalog(
     output_path: Path | str,
     *,
@@ -90,7 +110,7 @@ def build_common_catalog(
         for row in provider_modes
     ]
     provider_rows = [_provider_row(provider_id, providers[provider_id]) for provider_id in sorted(providers)]
-    alias_rows = sorted((str(alias), str(canonical)) for alias, canonical in aliases)
+    alias_rows = _normalized_alias_rows(aliases)
     city_stop_rows = sorted((str(city), str(stop)) for city, stop in city_stops)
     provider_city_stop_rows = sorted(
         (str(provider), str(city), str(stop))
@@ -196,4 +216,9 @@ def build_common_catalog(
     )
 
 
-__all__ = ["COMMON_BUILDER_VERSION", "COMMON_SCHEMA_VERSION", "CommonCatalogBuild", "build_common_catalog"]
+__all__ = [
+    "COMMON_BUILDER_VERSION",
+    "COMMON_SCHEMA_VERSION",
+    "CommonCatalogBuild",
+    "build_common_catalog",
+]
