@@ -141,6 +141,19 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
                     staging_directory=staging,
                 )
 
+    def test_staging_parent_is_created_before_incremental_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            releases_root = Path(temporary) / "releases" / "incremental" / "run-1"
+
+            staging = incremental._create_incremental_staging_directory(
+                releases_root,
+                "release-a",
+            )
+
+            self.assertTrue(staging.is_dir())
+            self.assertEqual(staging.parent, releases_root.parent)
+            self.assertTrue(releases_root.parent.is_dir())
+
     def test_provider_layers_reuse_immutable_artifacts_and_roll_temporal_only(self) -> None:
         helper = StaticProviderArtifactTests()
         with tempfile.TemporaryDirectory() as temporary:

@@ -95,6 +95,20 @@ def _published_release_directory(
     return published
 
 
+def _create_incremental_staging_directory(
+    releases_root: Path,
+    release_id: str,
+) -> Path:
+    """Create staging beside the final root, including a missing parent safely."""
+    releases_root.parent.mkdir(parents=True, exist_ok=True)
+    return Path(
+        tempfile.mkdtemp(
+            prefix=f".{release_id}.incremental-",
+            dir=releases_root.parent,
+        )
+    )
+
+
 def service_dates(
     *,
     valid_from: date | None = None,
@@ -422,9 +436,7 @@ def build_incremental_candidate(
             normalized_context.close()
             archive.close()
 
-    work_root = Path(
-        tempfile.mkdtemp(prefix=f".{release_id}.incremental-", dir=releases_root.parent)
-    )
+    work_root = _create_incremental_staging_directory(releases_root, release_id)
     try:
         common_path = work_root / "common.sqlite"
         _stage(
