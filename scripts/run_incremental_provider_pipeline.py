@@ -232,6 +232,80 @@ def _first_stop(stop_rows: Iterable[tuple[str, str, str]], city_id: str) -> str:
     return stops[0]
 
 
+def _active_service_dates(
+    *,
+    provider_id: str,
+    temporal_database: Path,
+    dates: Iterable[date],
+) -> list[date]:
+    window = sorted(set(dates))
+    if not window:
+        raise ValueError(f"provider={provider_id} has an empty temporal window")
+    with sqlite3.connect(f"file:{temporal_database}?mode=ro", uri=True) as temporal:
+        rows = temporal.execute(
+            """
+            SELECT DISTINCT service_date
+            FROM active_services
+            WHERE service_date BETWEEN ? AND ?
+            ORDER BY service_date
+            """,
+            (window[0].isoformat(), window[-1].isoformat()),
+        ).fetchall()
+    return [date.fromisoformat(str(row[0])) for row in rows]
+
+
+def _select_probe_date(
+    *,
+    provider_id: str,
+    temporal_database: Path,
+    dates: Iterable[date],
+) -> date:
+    window = sorted(set(dates))
+    active_dates = _active_service_dates(
+        provider_id=provider_id,
+        temporal_database=temporal_database,
+        dates=window,
+    )
+    if not active_dates:
+        raise ValueError(
+            f"provider={provider_id} has no active service within "
+            f"{window[0].isoformat()}..{window[-1].isoformat()}"
+        )
+    return active_dates[0]
+
+
+def _select_common_probe_date(
+    *,
+    provider_temporal_databases: Mapping[str, Path],
+    dates: Iterable[date],
+) -> date:
+    window = sorted(set(dates))
+    if not window:
+        raise ValueError("merged readiness has an empty temporal window")
+    active_by_provider = {
+        provider_id: set(
+            _active_service_dates(
+                provider_id=provider_id,
+                temporal_database=temporal_database,
+                dates=window,
+            )
+        )
+        for provider_id, temporal_database in provider_temporal_databases.items()
+    }
+    common_dates = (
+        set.intersection(*active_by_provider.values())
+        if active_by_provider
+        else set()
+    )
+    if not common_dates:
+        providers = ",".join(sorted(active_by_provider))
+        raise ValueError(
+            f"providers={providers} have no common active service within "
+            f"{window[0].isoformat()}..{window[-1].isoformat()}"
+        )
+    return min(common_dates)
+
+
 def _first_trip_case(
     *,
     structural_database: Path,
@@ -487,6 +561,11 @@ def build_incremental_candidate(
         )
         israel = next(item for item in provider_builds if item.provider_id == "israel-mot")
         israel_city = str(israel.cities[0]["id"])
+        israel_probe_date = _select_probe_date(
+            provider_id=israel.provider_id,
+            temporal_database=israel.temporal.database_path,
+            dates=dates,
+        )
         israel_stop = _first_stop(
             _provider_rows(
                 israel.provider_id,
@@ -497,6 +576,35 @@ def build_incremental_candidate(
         timezone_name = str(israel.source.get("timezone", "UTC"))
         toronto = next(item for item in provider_builds if item.provider_id == "ttc-surface")
         toronto_timezone_name = str(toronto.source.get("timezone", "UTC"))
+        subway = next(item for item in provider_builds if item.provider_id == "ttc-subway")
+        toronto_surface_probe_date = _select_probe_date(
+            provider_id=toronto.provider_id,
+            temporal_database=toronto.temporal.database_path,
+            dates=dates,
+        )
+        toronto_subway_probe_date = _select_probe_date(
+            provider_id=subway.provider_id,
+            temporal_database=subway.temporal.database_path,
+            dates=dates,
+        )
+        toronto_probe_date = _select_common_probe_date(
+            provider_temporal_databases={
+                "ttc-surface": toronto.temporal.database_path,
+                "ttc-subway": subway.temporal.database_path,
+            },
+            dates=dates,
+        )
+        probe_dates = {
+            "israel-mot": israel_probe_date.isoformat(),
+            "ttc-surface": toronto_surface_probe_date.isoformat(),
+            "ttc-subway": toronto_subway_probe_date.isoformat(),
+            "toronto-common": toronto_probe_date.isoformat(),
+        }
+        print(
+            "[NightlyIncremental] stage=readiness-probe-dates status=PASS "
+            + " ".join(f"{key}={value}" for key, value in probe_dates.items()),
+            flush=True,
+        )
         try:
             from zoneinfo import ZoneInfo
 
@@ -505,19 +613,19 @@ def build_incremental_candidate(
         except Exception:
             timezone = None
             toronto_timezone = None
-        from_datetime = datetime.combine(dates[0], datetime.min.time()).replace(tzinfo=timezone)
-        to_datetime = datetime.combine(dates[0], datetime.max.time()).replace(tzinfo=timezone)
+        from_datetime = datetime.combine(israel_probe_date, datetime.min.time()).replace(tzinfo=timezone)
+        to_datetime = datetime.combine(israel_probe_date, datetime.max.time()).replace(tzinfo=timezone)
         toronto_from_datetime = datetime.combine(
-            dates[0], datetime.min.time()
+            toronto_probe_date, datetime.min.time()
         ).replace(tzinfo=toronto_timezone)
         toronto_to_datetime = datetime.combine(
-            dates[0], datetime.max.time()
+            toronto_probe_date, datetime.max.time()
         ).replace(tzinfo=toronto_timezone)
         trip_case = _first_trip_case(
             structural_database=israel.structural.database_path,
             temporal_database=israel.temporal.database_path,
             city_id=israel_city,
-            service_date=dates[0],
+            service_date=israel_probe_date,
             static_root=published_release_directory / "stop-data",
         )
         readiness = _stage(
@@ -548,6 +656,7 @@ def build_incremental_candidate(
             "releaseDirectory": str(published_release_directory),
             "providerIDs": list(provider_ids),
             "dates": {"validFrom": dates[0].isoformat(), "validThrough": dates[-1].isoformat()},
+            "readinessProbeDates": probe_dates,
             "providers": {
                 item.provider_id: {
                     "normalized": item.normalized.status,

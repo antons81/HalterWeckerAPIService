@@ -16,6 +16,17 @@ from test_static_provider_artifact import StaticProviderArtifactTests  # noqa: E
 
 
 class IncrementalProviderPipelineTests(unittest.TestCase):
+    @staticmethod
+    def _write_active_services(path: Path, service_dates: list[str]) -> None:
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                "CREATE TABLE active_services(service_id TEXT, service_date TEXT)"
+            )
+            connection.executemany(
+                "INSERT INTO active_services VALUES (?, ?)",
+                [(f"service-{index}", value) for index, value in enumerate(service_dates)],
+            )
+
     def test_readiness_provider_rows_use_explicit_provider_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             structural_database = Path(temporary) / "structural.sqlite"
@@ -51,6 +62,88 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "provider=unknown-provider"):
                 incremental._provider_rows("unknown-provider", structural_database)
+
+    def test_probe_date_skips_window_start_without_active_service(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "temporal.sqlite"
+            self._write_active_services(database, ["2026-09-13"])
+            self.assertEqual(
+                incremental._select_probe_date(
+                    provider_id="israel-mot",
+                    temporal_database=database,
+                    dates=[date(2026, 9, 12), date(2026, 9, 13)],
+                ),
+                date(2026, 9, 13),
+            )
+
+    def test_probe_date_prefers_window_start_and_is_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "temporal.sqlite"
+            self._write_active_services(database, ["2026-09-12", "2026-09-14"])
+            kwargs = {
+                "provider_id": "israel-mot",
+                "temporal_database": database,
+                "dates": [date(2026, 9, 12), date(2026, 9, 14)],
+            }
+            self.assertEqual(incremental._select_probe_date(**kwargs), date(2026, 9, 12))
+            self.assertEqual(incremental._select_probe_date(**kwargs), date(2026, 9, 12))
+
+    def test_probe_date_fails_closed_when_window_has_no_active_service(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "temporal.sqlite"
+            self._write_active_services(database, ["2026-09-11", "2026-09-16"])
+            with self.assertRaisesRegex(
+                ValueError,
+                "provider=israel-mot has no active service within 2026-09-12..2026-09-15",
+            ):
+                incremental._select_probe_date(
+                    provider_id="israel-mot",
+                    temporal_database=database,
+                    dates=[date(2026, 9, 12), date(2026, 9, 15)],
+                )
+
+    def test_probe_date_rejects_active_service_outside_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "temporal.sqlite"
+            self._write_active_services(database, ["2026-09-16"])
+            with self.assertRaises(ValueError):
+                incremental._select_probe_date(
+                    provider_id="israel-mot",
+                    temporal_database=database,
+                    dates=[date(2026, 9, 12), date(2026, 9, 15)],
+                )
+
+    def test_merged_probe_date_uses_earliest_common_active_service(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            surface = Path(temporary) / "surface.sqlite"
+            subway = Path(temporary) / "subway.sqlite"
+            self._write_active_services(surface, ["2026-09-12", "2026-09-14"])
+            self._write_active_services(subway, ["2026-09-13", "2026-09-14"])
+            self.assertEqual(
+                incremental._select_common_probe_date(
+                    provider_temporal_databases={
+                        "ttc-surface": surface,
+                        "ttc-subway": subway,
+                    },
+                    dates=[date(2026, 9, 12), date(2026, 9, 15)],
+                ),
+                date(2026, 9, 14),
+            )
+
+    def test_merged_probe_date_fails_closed_without_intersection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            surface = Path(temporary) / "surface.sqlite"
+            subway = Path(temporary) / "subway.sqlite"
+            self._write_active_services(surface, ["2026-09-12"])
+            self._write_active_services(subway, ["2026-09-13"])
+            with self.assertRaisesRegex(ValueError, "no common active service"):
+                incremental._select_common_probe_date(
+                    provider_temporal_databases={
+                        "ttc-surface": surface,
+                        "ttc-subway": subway,
+                    },
+                    dates=[date(2026, 9, 12), date(2026, 9, 13)],
+                )
 
     def test_temporal_window_requires_next_day(self) -> None:
         with self.assertRaises(ValueError):
