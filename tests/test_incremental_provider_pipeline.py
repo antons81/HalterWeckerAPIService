@@ -24,7 +24,10 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
             )
             connection.executemany(
                 "INSERT INTO active_services VALUES (?, ?)",
-                [(f"service-{index}", value) for index, value in enumerate(service_dates)],
+                [
+                    (f"service-{index}", date.fromisoformat(value).strftime("%Y%m%d"))
+                    for index, value in enumerate(service_dates)
+                ],
             )
 
     def test_readiness_provider_rows_use_explicit_provider_scope(self) -> None:

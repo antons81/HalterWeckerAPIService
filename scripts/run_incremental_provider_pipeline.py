@@ -249,9 +249,9 @@ def _active_service_dates(
             WHERE service_date BETWEEN ? AND ?
             ORDER BY service_date
             """,
-            (window[0].isoformat(), window[-1].isoformat()),
+            (window[0].strftime("%Y%m%d"), window[-1].strftime("%Y%m%d")),
         ).fetchall()
-    return [date.fromisoformat(str(row[0])) for row in rows]
+    return [datetime.strptime(str(row[0]), "%Y%m%d").date() for row in rows]
 
 
 def _select_probe_date(
@@ -319,7 +319,7 @@ def _first_trip_case(
             str(row[0])
             for row in temporal.execute(
                 "SELECT service_id FROM active_services WHERE service_date=? ORDER BY service_id LIMIT 20",
-                (service_date.isoformat(),),
+                (service_date.strftime("%Y%m%d"),),
             )
         ]
     if not service_ids:
