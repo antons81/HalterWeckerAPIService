@@ -80,6 +80,21 @@ def _stage(name: str, callback):
     return result
 
 
+def _published_release_directory(
+    assembly: ReleaseAssembly,
+    *,
+    staging_directory: Path,
+) -> Path:
+    """Return only the immutable directory after the assembler's atomic publish."""
+    published = assembly.release_directory.resolve()
+    if published == staging_directory.resolve() or not published.is_dir():
+        raise FileNotFoundError(
+            "published incremental candidate is unavailable after atomic publish: "
+            f"{published}"
+        )
+    return published
+
+
 def service_dates(
     *,
     valid_from: date | None = None,
@@ -432,6 +447,7 @@ def build_incremental_candidate(
             }
             for index, item in enumerate(provider_builds)
         }
+        publication_started = time.monotonic()
         assembly = _stage(
             "release-assembly",
             lambda: assemble_release(
@@ -442,9 +458,20 @@ def build_incremental_candidate(
                 providers=provider_inputs,
             ),
         )
+        published_release_directory = _published_release_directory(
+            assembly,
+            staging_directory=work_root,
+        )
+        print(
+            "[NightlyIncremental] stage=release-publication status=PASS "
+            f"staging_path={work_root} "
+            f"published_path={published_release_directory} "
+            f"transition_ms={(time.monotonic() - publication_started) * 1000:.1f}",
+            flush=True,
+        )
         _stage(
             "validation",
-            lambda: validate_candidate_release(assembly.release_directory),
+            lambda: validate_candidate_release(published_release_directory),
         )
         israel = next(item for item in provider_builds if item.provider_id == "israel-mot")
         israel_city = str(israel.cities[0]["id"])
@@ -476,12 +503,12 @@ def build_incremental_candidate(
             temporal_database=israel.temporal.database_path,
             city_id=israel_city,
             service_date=dates[0],
-            static_root=assembly.release_directory / "stop-data",
+            static_root=published_release_directory / "stop-data",
         )
         readiness = _stage(
             "readiness",
             lambda: readiness_probe(
-                assembly.release_directory,
+                published_release_directory,
                 provider_ids=provider_ids,
                 israel_case={
                     "providerID": "israel-mot",
@@ -503,7 +530,7 @@ def build_incremental_candidate(
         )
         return {
             "releaseID": release_id,
-            "releaseDirectory": str(assembly.release_directory),
+            "releaseDirectory": str(published_release_directory),
             "providerIDs": list(provider_ids),
             "dates": {"validFrom": dates[0].isoformat(), "validThrough": dates[-1].isoformat()},
             "providers": {

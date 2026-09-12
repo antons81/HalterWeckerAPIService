@@ -1,8 +1,10 @@
 import sys
+import shutil
 import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
@@ -108,6 +110,36 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
             candidate_root.mkdir(parents=True)
             self.assertNotEqual(source_generation, candidate_root / "release-a")
             self.assertFalse((candidate_root / "release-a").exists())
+
+    def test_published_directory_is_used_after_staging_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            staging = root / ".release-a.incremental-test"
+            published = root / "candidate" / "release-a"
+            staging.mkdir(parents=True)
+            published.mkdir(parents=True)
+            assembly = SimpleNamespace(release_directory=published)
+
+            resolved = incremental._published_release_directory(
+                assembly,
+                staging_directory=staging,
+            )
+            shutil.rmtree(staging)
+
+            self.assertEqual(resolved, published.resolve())
+            self.assertTrue(resolved.is_dir())
+            self.assertNotIn(".release-a.incremental", str(resolved))
+
+    def test_staging_path_is_rejected_if_atomic_publish_did_not_happen(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            staging = Path(temporary) / ".release-a.incremental-test"
+            staging.mkdir()
+
+            with self.assertRaisesRegex(FileNotFoundError, "published incremental candidate"):
+                incremental._published_release_directory(
+                    SimpleNamespace(release_directory=staging),
+                    staging_directory=staging,
+                )
 
     def test_provider_layers_reuse_immutable_artifacts_and_roll_temporal_only(self) -> None:
         helper = StaticProviderArtifactTests()

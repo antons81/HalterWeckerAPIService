@@ -18,8 +18,15 @@ cleanup_failed_no_activate() {
   local status="$?"
   if [[ "$status" -ne 0 && "$NO_ACTIVATE" == "1" && -n "${RELEASE_DIR:-}" ]]; then
     rm -rf -- "$RELEASE_DIR"
-    rm -rf -- "${INCREMENTAL_RELEASE_DIR:-}"
-    DIAGNOSTICS_CLEANUP_ACTIONS="removed release_dir=$RELEASE_DIR;removed incremental_release_dir=${INCREMENTAL_RELEASE_DIR:-none}"
+    DIAGNOSTICS_CLEANUP_ACTIONS="removed release_dir=$RELEASE_DIR"
+    if [[ -n "${INCREMENTAL_RELEASE_DIR:-}" && -d "$INCREMENTAL_RELEASE_DIR" ]]; then
+      if [[ -f "$INCREMENTAL_RELEASE_DIR/release.json" ]]; then
+        DIAGNOSTICS_CLEANUP_ACTIONS+=";preserved published_incremental_release=$INCREMENTAL_RELEASE_DIR"
+      else
+        rm -rf -- "$INCREMENTAL_RELEASE_DIR"
+        DIAGNOSTICS_CLEANUP_ACTIONS+=";removed incremental_release_dir=$INCREMENTAL_RELEASE_DIR"
+      fi
+    fi
     echo "[Nightly] stage=cleanup status=PASS release=$RELEASE_ID reason=failure" >&2
   fi
   if [[ "$NO_ACTIVATE" == "1" ]] && type log_disk_state >/dev/null 2>&1; then
@@ -134,9 +141,22 @@ RELEASE_STATE_SCRIPT="$REPO/scripts/release_state.py"
 CUSTOM_ARTIFACTS_JSON="$RELEASE_DIR/custom-gtfs-artifacts.json"
 
 DIAGNOSTICS_ROOT="${HALTEWECKER_PIPELINE_DIAGNOSTICS_ROOT:-$DATA_ROOT/pipeline-diagnostics}"
-DIAGNOSTICS_LOG="$DIAGNOSTICS_ROOT/$RELEASE_ID.log"
-DIAGNOSTICS_STDERR_LOG="$DIAGNOSTICS_ROOT/$RELEASE_ID.stderr.log"
-DIAGNOSTICS_REPORT="$DIAGNOSTICS_ROOT/$RELEASE_ID.report"
+if [[ -n "${HALTEWECKER_DIAGNOSTICS_RUN_KIND:-}" ]]; then
+  DIAGNOSTICS_RUN_KIND="$HALTEWECKER_DIAGNOSTICS_RUN_KIND"
+elif [[ "$STOP_DATA_ONLY" == "1" ]]; then
+  DIAGNOSTICS_RUN_KIND="stop-data-only"
+elif [[ "$REUSE_STOP_DATA" == "1" ]]; then
+  DIAGNOSTICS_RUN_KIND="cold-reuse"
+elif [[ "$NO_ACTIVATE" == "1" ]]; then
+  DIAGNOSTICS_RUN_KIND="no-activate"
+else
+  DIAGNOSTICS_RUN_KIND="production"
+fi
+DIAGNOSTICS_INVOCATION_TOKEN="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+DIAGNOSTICS_RUN_ID="${HALTEWECKER_RUN_ID:-${DIAGNOSTICS_RUN_KIND}-${DIAGNOSTICS_INVOCATION_TOKEN}}"
+DIAGNOSTICS_LOG="$DIAGNOSTICS_ROOT/$DIAGNOSTICS_RUN_ID.log"
+DIAGNOSTICS_STDERR_LOG="$DIAGNOSTICS_ROOT/$DIAGNOSTICS_RUN_ID.stderr.log"
+DIAGNOSTICS_REPORT="$DIAGNOSTICS_ROOT/$DIAGNOSTICS_RUN_ID.report"
 DIAGNOSTICS_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 DIAGNOSTICS_SIGNAL=""
 DIAGNOSTICS_CURRENT_STAGE="initialization"
@@ -146,6 +166,9 @@ DIAGNOSTICS_FINGERPRINT_VERSION="unknown"
 DIAGNOSTICS_DISK_BEFORE_KB=""
 DIAGNOSTICS_DISK_AFTER_KB=""
 DIAGNOSTICS_MIN_FREE_KB=""
+DIAGNOSTICS_STAGING_PATH=""
+DIAGNOSTICS_PUBLISHED_PATH=""
+DIAGNOSTICS_PUBLICATION_TRANSITION_MS=""
 BUILD_FINGERPRINT=""
 
 if [[ "$NO_ACTIVATE" == "1" ]]; then
@@ -174,6 +197,7 @@ diagnostics_write_report() {
   local last_stage_line
   local last_provider
   local last_provider_stage
+  local publication_line
 
   if [[ "$status" -ne 0 ]]; then
     result="FAIL"
@@ -186,11 +210,17 @@ diagnostics_write_report() {
   last_stage_line="$(grep -E 'stage=[^ ]+' "$DIAGNOSTICS_LOG" 2>/dev/null | tail -n 1 || true)"
   last_provider="$(printf '%s\n' "$last_stage_line" | sed -n 's/.*source=\([^ ]*\).*/\1/p')"
   last_provider_stage="$(printf '%s\n' "$last_stage_line" | sed -n 's/.*stage=\([^ ]*\).*/\1/p')"
+  publication_line="$(grep -E 'stage=release-publication status=PASS' "$DIAGNOSTICS_LOG" 2>/dev/null | tail -n 1 || true)"
+  DIAGNOSTICS_STAGING_PATH="$(printf '%s\n' "$publication_line" | sed -n 's/.*staging_path=\([^ ]*\).*/\1/p')"
+  DIAGNOSTICS_PUBLISHED_PATH="$(printf '%s\n' "$publication_line" | sed -n 's/.*published_path=\([^ ]*\) transition_ms=.*/\1/p')"
+  DIAGNOSTICS_PUBLICATION_TRANSITION_MS="$(printf '%s\n' "$publication_line" | sed -n 's/.*transition_ms=\([^ ]*\).*/\1/p')"
 
   {
     printf 'status=%s\n' "$result"
     printf 'exit_code=%s\n' "$status"
     printf 'signal=%s\n' "${DIAGNOSTICS_SIGNAL:-none}"
+    printf 'run_id=%s\n' "$DIAGNOSTICS_RUN_ID"
+    printf 'run_kind=%s\n' "$DIAGNOSTICS_RUN_KIND"
     printf 'release_id=%s\n' "${RELEASE_ID:-unknown}"
     printf 'git_sha=%s\n' "$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
     printf 'fingerprint_version=%s\n' "$DIAGNOSTICS_FINGERPRINT_VERSION"
@@ -200,6 +230,9 @@ diagnostics_write_report() {
     printf 'current_stage=%s\n' "$DIAGNOSTICS_CURRENT_STAGE"
     printf 'last_provider=%s\n' "${last_provider:-unknown}"
     printf 'last_provider_stage=%s\n' "${last_provider_stage:-unknown}"
+    printf 'staging_path=%s\n' "${DIAGNOSTICS_STAGING_PATH:-unknown}"
+    printf 'published_path=%s\n' "${DIAGNOSTICS_PUBLISHED_PATH:-unknown}"
+    printf 'publication_transition_ms=%s\n' "${DIAGNOSTICS_PUBLICATION_TRANSITION_MS:-unknown}"
     printf 'disk_before_free_kb=%s\n' "${DIAGNOSTICS_DISK_BEFORE_KB:-unknown}"
     printf 'disk_min_free_kb=%s\n' "${DIAGNOSTICS_MIN_FREE_KB:-unknown}"
     printf 'disk_after_free_kb=%s\n' "${DIAGNOSTICS_DISK_AFTER_KB:-unknown}"

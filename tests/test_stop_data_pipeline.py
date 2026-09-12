@@ -88,13 +88,16 @@ case \"${1:-}\" in
       fi
       previous="$argument"
     done
-    if [ "${REUSE_STOP_DATA:-0}" = "1" ] || [ "${INCREMENTAL_FAIL:-0}" = "1" ]; then
+    if [ "${REUSE_STOP_DATA:-0}" = "1" ] || [ "${INCREMENTAL_FAIL:-0}" = "1" ] || [ "${INCREMENTAL_PUBLISHED:-0}" = "1" ]; then
       mkdir -p "$release_root/$release_id"
     fi
     if [ "${REUSE_STOP_DATA:-0}" = "1" ]; then
       ln -s "$stop_data" "$release_root/$release_id/stop-data"
     fi
     if [ "${INCREMENTAL_FAIL:-0}" = "1" ]; then
+      if [ "${INCREMENTAL_PUBLISHED:-0}" = "1" ]; then
+        printf '{"releaseID":"%s"}\n' "$release_id" > "$release_root/$release_id/release.json"
+      fi
       exit 1
     fi
     exit 0
@@ -614,13 +617,15 @@ PY
         )
         reports = sorted((self.data_root / "pipeline-diagnostics").glob("*.report"))
         self.assertEqual(len(reports), 1)
-        report = reports[0].read_text(encoding="utf-8")
+        report_path = reports[0]
+        report = report_path.read_text(encoding="utf-8")
         self.assertIn("status=PASS", report)
+        self.assertIn("run_id=stop-data-only-", report)
         self.assertIn("fingerprint_version=2", report)
         self.assertIn("build_fingerprint=test-build-fingerprint", report)
         self.assertIn(f"release_id={release_id}", report)
-        self.assertTrue((self.data_root / "pipeline-diagnostics" / f"{release_id}.log").is_file())
-        self.assertTrue((self.data_root / "pipeline-diagnostics" / f"{release_id}.stderr.log").is_file())
+        self.assertTrue(report_path.with_suffix(".log").is_file())
+        self.assertTrue(report_path.with_suffix(".stderr.log").is_file())
 
     def test_explicit_stop_data_generation_can_be_reused_without_current_pointer(self) -> None:
         fresh = self.run_pipeline("--stop-data-only")
@@ -648,6 +653,28 @@ PY
         self.assertEqual((source / "manifest.json").read_bytes(), source_manifest)
         self.assertEqual((source.parent / "release-metadata.json").read_bytes(), source_metadata)
         self.assertFalse((self.data_root / "current").is_symlink())
+        reports = sorted((self.data_root / "pipeline-diagnostics").glob("*.report"))
+        self.assertEqual(len(reports), 2)
+        self.assertNotEqual(reports[0].stem, reports[1].stem)
+        self.assertTrue(all("run_id=" in report.read_text(encoding="utf-8") for report in reports))
+
+    def test_failure_preserves_already_published_incremental_candidate(self) -> None:
+        result = self.run_pipeline(
+            "--no-activate",
+            INCREMENTAL_FAIL="1",
+            INCREMENTAL_PUBLISHED="1",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        incremental_root = self.data_root / "releases" / "incremental"
+        published = list(incremental_root.glob("*/release.json"))
+        self.assertEqual(len(published), 1)
+        reports = sorted((self.data_root / "pipeline-diagnostics").glob("*.report"))
+        self.assertEqual(len(reports), 1)
+        self.assertIn(
+            "preserved published_incremental_release=",
+            reports[0].read_text(encoding="utf-8"),
+        )
 
     def test_stop_data_only_failure_cleans_new_generation_only(self) -> None:
         result = self.run_pipeline("--stop-data-only", BUILD_FAIL="1")
