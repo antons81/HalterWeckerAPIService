@@ -6,6 +6,7 @@ RUN_MODE="normal"
 RESUME_RELEASE_ID=""
 NO_ACTIVATE="${HALTEWECKER_NIGHTLY_NO_ACTIVATE:-0}"
 EXPLICIT_NO_ACTIVATE=0
+INCREMENTAL_NO_ACTIVATE=0
 REUSE_STOP_DATA=0
 STOP_DATA_ONLY=0
 REUSE_STOP_DATA_REFERENCE=""
@@ -57,12 +58,16 @@ elif [[ "${1:-}" == "--no-activate" && "${2:-}" == "--reuse-stop-data" && "$#" -
   EXPLICIT_NO_ACTIVATE=1
   REUSE_STOP_DATA=1
   REUSE_STOP_DATA_REFERENCE="$3"
+elif [[ "${1:-}" == "--incremental-no-activate" && "$#" -eq 1 ]]; then
+  NO_ACTIVATE=1
+  EXPLICIT_NO_ACTIVATE=1
+  INCREMENTAL_NO_ACTIVATE=1
 elif [[ "${1:-}" == "--stop-data-only" && "$#" -eq 1 ]]; then
   NO_ACTIVATE=1
   EXPLICIT_NO_ACTIVATE=1
   STOP_DATA_ONLY=1
 elif [[ "$#" -ne 0 ]]; then
-  echo "usage: $0 [--resume RELEASE_ID|--stop-data-only|--no-activate [--reuse-stop-data [RELEASE_ID]]]" >&2
+  echo "usage: $0 [--resume RELEASE_ID|--stop-data-only|--incremental-no-activate|--no-activate [--reuse-stop-data [RELEASE_ID]]]" >&2
   exit 64
 fi
 
@@ -147,6 +152,8 @@ elif [[ "$STOP_DATA_ONLY" == "1" ]]; then
   DIAGNOSTICS_RUN_KIND="stop-data-only"
 elif [[ "$REUSE_STOP_DATA" == "1" ]]; then
   DIAGNOSTICS_RUN_KIND="cold-reuse"
+elif [[ "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
+  DIAGNOSTICS_RUN_KIND="incremental-no-activate"
 elif [[ "$NO_ACTIVATE" == "1" ]]; then
   DIAGNOSTICS_RUN_KIND="no-activate"
 else
@@ -575,11 +582,17 @@ proof_disk_preflight() {
   margin_kb=$(( ${HALTEWECKER_PROOF_ESTIMATE_MARGIN_GB:-5} * 1024 * 1024 ))
   estimated_additional_kb=$((current_stop_data_kb + margin_kb))
   estimated_free_kb=$((free_kb - estimated_additional_kb))
-  minimum_free_kb=$(( ${HALTEWECKER_MIN_FREE_GB:-45} * 1024 * 1024 ))
+  if [[ "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
+    minimum_free_kb=$((45 * 1024 * 1024))
+    disk_mode="production-shaped-no-activate"
+  else
+    minimum_free_kb=$(( ${HALTEWECKER_MIN_FREE_GB:-45} * 1024 * 1024 ))
+    disk_mode="proof-or-legacy"
+  fi
   log_disk_state "before"
-  echo "[Nightly] disk estimated_additional_gb=$((estimated_additional_kb / 1024 / 1024)) estimated_peak_free_gb=$((estimated_free_kb / 1024 / 1024)) reuse_stop_data=$REUSE_STOP_DATA"
+  echo "[Nightly] disk estimated_additional_gb=$((estimated_additional_kb / 1024 / 1024)) estimated_peak_free_gb=$((estimated_free_kb / 1024 / 1024)) minimum_free_gb=$((minimum_free_kb / 1024 / 1024)) mode=$disk_mode reuse_stop_data=$REUSE_STOP_DATA"
   if (( free_kb < minimum_free_kb || estimated_free_kb < minimum_free_kb )); then
-    echo "[Nightly] ERROR: insufficient disk for incremental proof mode" >&2
+    echo "[Nightly] ERROR: insufficient disk for $disk_mode" >&2
     return 1
   fi
 }
@@ -1091,7 +1104,11 @@ if [[ "$RUN_MODE" == "normal" ]]; then
     exit 0
   fi
   if [[ "$NO_ACTIVATE" == "1" ]]; then
-    echo "[Nightly] stage=legacy-import status=SKIPPED release=$RELEASE_ID reason=no-activate-proof"
+    if [[ "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
+      echo "[Nightly] stage=legacy-import status=SKIPPED release=$RELEASE_ID reason=production-shaped-no-activate"
+    else
+      echo "[Nightly] stage=legacy-import status=SKIPPED release=$RELEASE_ID reason=no-activate-proof"
+    fi
   else
     echo "[Nightly] stage=legacy-import status=started release=$RELEASE_ID"
     run_static_departures_stage
@@ -1145,20 +1162,61 @@ if [[ "$NO_ACTIVATE" == "1" ]]; then
   STATIC_ARTIFACT_ROOT="${HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT:-${DATA_ROOT}/provider-artifacts/static}"
   INCREMENTAL_STARTED=$SECONDS
   echo "[Nightly] stage=incremental-provider status=started release=$RELEASE_ID"
-  python3 "$REPO/scripts/run_incremental_provider_pipeline.py" \
-    --repository-root "$REPO" \
-    --release-id "$RELEASE_ID" \
-    --releases-root "$INCREMENTAL_RELEASES_ROOT" \
-    --stop-data "$BUILD_DIR" \
-    --gtfs-artifacts "$ARTIFACTS_JSON" \
-    --normalized-cache-root "$NORMALIZED_CACHE_ROOT" \
+  INCREMENTAL_ARGS=(
+    --repository-root "$REPO"
+    --release-id "$RELEASE_ID"
+    --releases-root "$INCREMENTAL_RELEASES_ROOT"
+    --stop-data "$BUILD_DIR"
+    --gtfs-artifacts "$ARTIFACTS_JSON"
+    --normalized-cache-root "$NORMALIZED_CACHE_ROOT"
     --static-artifact-root "$STATIC_ARTIFACT_ROOT"
+  )
+  if [[ "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
+    INCREMENTAL_ARGS+=(--result-json "$RELEASE_DIR/incremental-result.json")
+  fi
+  python3 "$REPO/scripts/run_incremental_provider_pipeline.py" \
+    "${INCREMENTAL_ARGS[@]}"
+  if [[ "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
+    python3 - "$RELEASE_DIR/incremental-result.json" "$RELEASE_ID" "$BUILD_DIR" "$BUILD_FINGERPRINT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+result_path = Path(sys.argv[1])
+release_id = sys.argv[2]
+stop_data_path = Path(sys.argv[3]).resolve()
+expected_fingerprint = sys.argv[4]
+result = json.loads(result_path.read_text(encoding="utf-8"))
+if result.get("releaseID") != release_id:
+    raise SystemExit("incremental result releaseID does not match stop-data releaseID")
+stop_data = result.get("stopData")
+if not isinstance(stop_data, dict):
+    raise SystemExit("incremental result has no stopData metadata")
+if stop_data.get("releaseID") != release_id:
+    raise SystemExit("incremental result stop-data generation does not match releaseID")
+if stop_data.get("buildFingerprint") != expected_fingerprint:
+    raise SystemExit("incremental result stop-data fingerprint does not match current build")
+if Path(str(stop_data.get("path", ""))).resolve() != stop_data_path:
+    raise SystemExit("incremental result stop-data path does not match fresh generation")
+candidate = Path(str(result.get("releaseDirectory", ""))).resolve()
+if not candidate.is_dir() or not (candidate / "release.json").is_file():
+    raise SystemExit("incremental result candidate is not a published release")
+print(
+    "[Nightly] stage=incremental-metadata status=PASS "
+    f"release={release_id} candidate={candidate} fingerprint={expected_fingerprint}"
+)
+PY
+  fi
   if [[ "$REUSE_STOP_DATA" == "1" ]]; then
     verify_reused_stop_data_unchanged
   fi
   echo "[Nightly] stage=incremental-provider status=PASS release=$RELEASE_ID duration=$((SECONDS - INCREMENTAL_STARTED))s"
   echo "[Nightly] stage=readiness status=PASS release=$RELEASE_ID no_activate=true"
-  echo "[Nightly] stage=nightly-complete status=PASS release=$RELEASE_ID no_activate=true"
+  if [[ "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
+    echo "[Nightly] stage=nightly-complete status=PASS release=$RELEASE_ID mode=production-shaped-no-activate activation=NOT_RUN"
+  else
+    echo "[Nightly] stage=nightly-complete status=PASS release=$RELEASE_ID no_activate=true"
+  fi
   log_disk_state "after"
   log_disk_peak
   exit 0

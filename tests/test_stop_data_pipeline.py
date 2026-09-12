@@ -42,6 +42,14 @@ exec \"$@\"
 [ "${FLOCK_FAIL:-0}" != "1" ] || exit 1
 exit 0
 """)
+        self.write_mock("df", """#!/usr/bin/env bash
+if [ -n "${DF_FREE_KB:-}" ]; then
+  printf '%s\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on'
+  printf 'mock 1 %s %s 0%% %s\n' "$((DF_FREE_KB + 1))" "$DF_FREE_KB" "$PWD"
+else
+  exec /bin/df "$@"
+fi
+""")
         self.write_mock("ln", """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$LINK_CALLS_LOG"
 exec /bin/ln "$@"
@@ -77,6 +85,7 @@ case \"${1:-}\" in
     release_root=""
     release_id=""
     stop_data=""
+    result_json=""
     previous=""
     for argument in "$@"; do
       if [ "$previous" = "--releases-root" ]; then
@@ -85,16 +94,25 @@ case \"${1:-}\" in
         release_id="$argument"
       elif [ "$previous" = "--stop-data" ]; then
         stop_data="$argument"
+      elif [ "$previous" = "--result-json" ]; then
+        result_json="$argument"
       fi
       previous="$argument"
     done
-    if [ "${REUSE_STOP_DATA:-0}" = "1" ] || [ "${INCREMENTAL_FAIL:-0}" = "1" ] || [ "${INCREMENTAL_PUBLISHED:-0}" = "1" ]; then
+    if [ -n "$result_json" ] || [ "${REUSE_STOP_DATA:-0}" = "1" ] || [ "${INCREMENTAL_FAIL:-0}" = "1" ] || [ "${INCREMENTAL_PUBLISHED:-0}" = "1" ]; then
       mkdir -p "$release_root/$release_id"
+    fi
+    if [ -n "$result_json" ]; then
+      printf '{"releaseID":"%s","releaseDirectory":"%s","stopData":{"releaseID":"%s","path":"%s","buildFingerprint":"test-build-fingerprint"},"providers":{}}\n' \
+        "$release_id" "$release_root/$release_id" "$release_id" "$stop_data" > "$result_json"
+      if [ "${INCREMENTAL_FAIL:-0}" != "1" ] && [ "${INCREMENTAL_READINESS_FAIL:-0}" != "1" ]; then
+        printf '{"releaseID":"%s"}\n' "$release_id" > "$release_root/$release_id/release.json"
+      fi
     fi
     if [ "${REUSE_STOP_DATA:-0}" = "1" ]; then
       ln -s "$stop_data" "$release_root/$release_id/stop-data"
     fi
-    if [ "${INCREMENTAL_FAIL:-0}" = "1" ]; then
+    if [ "${INCREMENTAL_FAIL:-0}" = "1" ] || [ "${INCREMENTAL_READINESS_FAIL:-0}" = "1" ]; then
       if [ "${INCREMENTAL_PUBLISHED:-0}" = "1" ]; then
         printf '{"releaseID":"%s"}\n' "$release_id" > "$release_root/$release_id/release.json"
       fi
@@ -626,6 +644,104 @@ PY
         self.assertIn(f"release_id={release_id}", report)
         self.assertTrue(report_path.with_suffix(".log").is_file())
         self.assertTrue(report_path.with_suffix(".stderr.log").is_file())
+
+    def test_production_shaped_incremental_mode_is_fresh_and_non_activating(self) -> None:
+        result = self.run_pipeline(
+            "--incremental-no-activate",
+            HALTEWECKER_MIN_FREE_GB="35",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("mode=production-shaped-no-activate", result.stdout)
+        self.assertIn("minimum_free_gb=45", result.stdout)
+        self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)
+        self.assertIn("reason=production-shaped-no-activate", result.stdout)
+        self.assertIn("stage=incremental-metadata status=PASS", result.stdout)
+        self.assertIn("activation=NOT_RUN", result.stdout)
+        self.assertEqual(
+            (self.data_root / "current" / "release-marker").read_text(encoding="utf-8"),
+            "old",
+        )
+        self.assertFalse((self.data_root / "current-release").exists())
+        self.assertFalse((self.data_root / "departures-current.sqlite").exists())
+        self.assertFalse((self.root / "static-calls.log").exists())
+
+        calls = (self.root / "incremental-calls.log").read_text(encoding="utf-8")
+        self.assertIn("--result-json", calls)
+        release_id = next(
+            path.name
+            for path in (self.data_root / "releases").iterdir()
+            if (path / "stop-data" / "manifest.json").is_file()
+        )
+        release_dir = self.data_root / "releases" / release_id
+        result_metadata = json.loads(
+            (release_dir / "incremental-result.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(result_metadata["releaseID"], release_id)
+        self.assertEqual(result_metadata["stopData"]["releaseID"], release_id)
+        self.assertEqual(
+            result_metadata["stopData"]["buildFingerprint"],
+            "test-build-fingerprint",
+        )
+        candidate = Path(result_metadata["releaseDirectory"])
+        self.assertTrue((candidate / "release.json").is_file())
+
+        reports = sorted((self.data_root / "pipeline-diagnostics").glob("*.report"))
+        self.assertEqual(len(reports), 1)
+        report = reports[0].read_text(encoding="utf-8")
+        self.assertIn("run_kind=incremental-no-activate", report)
+        self.assertIn(f"release_id={release_id}", report)
+
+    def test_production_shaped_incremental_failure_cleans_candidate_and_keeps_pointers(self) -> None:
+        result = self.run_pipeline(
+            "--incremental-no-activate",
+            INCREMENTAL_FAIL="1",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            (self.data_root / "current" / "release-marker").read_text(encoding="utf-8"),
+            "old",
+        )
+        self.assertFalse((self.data_root / "current-release").exists())
+        self.assertFalse((self.data_root / "departures-current.sqlite").exists())
+        self.assertFalse(
+            list((self.data_root / "releases" / "incremental").glob("**/release.json"))
+        )
+        reports = sorted((self.data_root / "pipeline-diagnostics").glob("*.report"))
+        self.assertEqual(len(reports), 1)
+        report = reports[0].read_text(encoding="utf-8")
+        self.assertIn("status=FAIL", report)
+        self.assertIn("run_kind=incremental-no-activate", report)
+
+    def test_production_shaped_readiness_failure_keeps_pointers_unchanged(self) -> None:
+        result = self.run_pipeline(
+            "--incremental-no-activate",
+            INCREMENTAL_READINESS_FAIL="1",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            (self.data_root / "current" / "release-marker").read_text(encoding="utf-8"),
+            "old",
+        )
+        self.assertFalse((self.data_root / "current-release").exists())
+        self.assertFalse((self.data_root / "departures-current.sqlite").exists())
+        report = next((self.data_root / "pipeline-diagnostics").glob("*.report"))
+        self.assertIn("status=FAIL", report.read_text(encoding="utf-8"))
+
+    def test_production_shaped_mode_uses_production_disk_floor(self) -> None:
+        result = self.run_pipeline(
+            "--incremental-no-activate",
+            HALTEWECKER_MIN_FREE_GB="35",
+            DF_FREE_KB=str(44 * 1024 * 1024),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("minimum_free_gb=45", result.stdout)
+        self.assertIn("insufficient disk for production-shaped-no-activate", result.stderr)
+        self.assertFalse((self.root / "build-calls.log").exists())
+        self.assertFalse((self.root / "incremental-calls.log").exists())
 
     def test_explicit_stop_data_generation_can_be_reused_without_current_pointer(self) -> None:
         fresh = self.run_pipeline("--stop-data-only")

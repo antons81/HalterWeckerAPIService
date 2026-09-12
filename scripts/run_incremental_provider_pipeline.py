@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -678,9 +679,19 @@ def build_incremental_candidate(
                 trip_case=trip_case,
             ),
         )
+        stop_metadata_path = stop_data_root.parent / "release-metadata.json"
+        stop_metadata = _read_json(stop_metadata_path) if stop_metadata_path.is_file() else {}
+        stop_manifest_path = stop_data_root / "manifest.json"
+        stop_manifest_sha256 = hashlib.sha256(stop_manifest_path.read_bytes()).hexdigest()
         return {
             "releaseID": release_id,
             "releaseDirectory": str(published_release_directory),
+            "stopData": {
+                "releaseID": str(stop_manifest.get("releaseID")),
+                "path": str(stop_data_root),
+                "buildFingerprint": stop_metadata.get("buildFingerprint"),
+                "manifestSha256": stop_manifest_sha256,
+            },
             "providerIDs": list(provider_ids),
             "dates": {"validFrom": dates[0].isoformat(), "validThrough": dates[-1].isoformat()},
             "readinessProbeDates": probe_dates,
@@ -713,6 +724,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--valid-from", type=date.fromisoformat)
     parser.add_argument("--valid-through", type=date.fromisoformat)
     parser.add_argument("--window-days", type=int, default=DEFAULT_WINDOW_DAYS)
+    parser.add_argument("--result-json", type=Path)
     return parser.parse_args(argv)
 
 
@@ -748,6 +760,18 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
         return 1
+    if args.result_json is not None:
+        args.result_json.parent.mkdir(parents=True, exist_ok=True)
+        temporary = args.result_json.with_name(f".{args.result_json.name}.tmp")
+        temporary.write_text(
+            json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, args.result_json)
+        print(
+            f"[NightlyIncremental] stage=result-metadata status=PASS path={args.result_json}",
+            flush=True,
+        )
     print(
         f"[NightlyIncremental] stage=nightly-complete status=PASS "
         f"duration_ms={(time.monotonic() - started) * 1000:.1f} "
