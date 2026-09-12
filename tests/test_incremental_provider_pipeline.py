@@ -30,6 +30,31 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
                 ],
             )
 
+    @staticmethod
+    def _write_trip_databases(
+        structural: Path,
+        temporal: Path,
+        *,
+        active_service_ids: list[str],
+        trips: list[tuple[str, str]],
+        service_date: str = "2026-09-12",
+    ) -> None:
+        with sqlite3.connect(temporal) as connection:
+            connection.execute(
+                "CREATE TABLE active_services(service_id TEXT, service_date TEXT)"
+            )
+            connection.executemany(
+                "INSERT INTO active_services VALUES (?, ?)",
+                [
+                    (service_id, date.fromisoformat(service_date).strftime("%Y%m%d"))
+                    for service_id in active_service_ids
+                ],
+            )
+        with sqlite3.connect(structural) as connection:
+            connection.execute("CREATE TABLE trips(service_id TEXT, trip_id TEXT)")
+            connection.executemany("INSERT INTO trips VALUES (?, ?)", trips)
+
+
     def test_readiness_provider_rows_use_explicit_provider_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             structural_database = Path(temporary) / "structural.sqlite"
@@ -103,6 +128,103 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
                     provider_id="israel-mot",
                     temporal_database=database,
                     dates=[date(2026, 9, 12), date(2026, 9, 15)],
+                )
+
+    def test_first_trip_uses_intersection_after_first_twenty_active_services(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            structural = Path(temporary) / "structural.sqlite"
+            temporal = Path(temporary) / "temporal.sqlite"
+            active_ids = [f"israel:{index:03d}" for index in range(25)]
+            self._write_trip_databases(
+                structural,
+                temporal,
+                active_service_ids=active_ids,
+                trips=[(active_ids[20], "trip-21")],
+            )
+            case = incremental._first_trip_case(
+                provider_id="israel-mot",
+                structural_database=structural,
+                temporal_database=temporal,
+                city_id="israel",
+                service_date=date(2026, 9, 12),
+                static_root=Path(temporary) / "stop-data",
+            )
+            self.assertEqual(case["tripID"], "trip-21")
+
+    def test_first_trip_selection_is_deterministic_with_many_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            structural = Path(temporary) / "structural.sqlite"
+            temporal = Path(temporary) / "temporal.sqlite"
+            active_ids = [f"israel:{index:04d}" for index in range(300)]
+            self._write_trip_databases(
+                structural,
+                temporal,
+                active_service_ids=active_ids,
+                trips=[
+                    (active_ids[250], "trip-z"),
+                    (active_ids[20], "trip-b"),
+                    (active_ids[20], "trip-a"),
+                ],
+            )
+            case = incremental._first_trip_case(
+                provider_id="israel-mot",
+                structural_database=structural,
+                temporal_database=temporal,
+                city_id="israel",
+                service_date=date(2026, 9, 12),
+                static_root=Path(temporary) / "stop-data",
+            )
+            self.assertEqual(case["tripID"], "trip-a")
+
+    def test_first_trip_fails_closed_without_structural_intersection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            structural = Path(temporary) / "structural.sqlite"
+            temporal = Path(temporary) / "temporal.sqlite"
+            self._write_trip_databases(
+                structural,
+                temporal,
+                active_service_ids=["israel:001", "israel:002"],
+                trips=[("israel:foreign", "trip-foreign")],
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "provider=israel-mot date=2026-09-12 active_service_count=2 "
+                "matching_structural_service_count=0",
+            ):
+                incremental._first_trip_case(
+                    provider_id="israel-mot",
+                    structural_database=structural,
+                    temporal_database=temporal,
+                    city_id="israel",
+                    service_date=date(2026, 9, 12),
+                    static_root=Path(temporary) / "stop-data",
+                )
+
+    def test_first_trip_is_scoped_to_the_supplied_provider_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            structural = Path(temporary) / "structural.sqlite"
+            foreign_structural = Path(temporary) / "foreign-structural.sqlite"
+            temporal = Path(temporary) / "temporal.sqlite"
+            self._write_trip_databases(
+                structural,
+                temporal,
+                active_service_ids=["israel:001", "ttc-subway:001"],
+                trips=[],
+            )
+            self._write_trip_databases(
+                foreign_structural,
+                Path(temporary) / "foreign-temporal.sqlite",
+                active_service_ids=["ttc-subway:001"],
+                trips=[("ttc-subway:001", "foreign-trip")],
+            )
+            with self.assertRaisesRegex(ValueError, "matching_structural_service_count=0"):
+                incremental._first_trip_case(
+                    provider_id="israel-mot",
+                    structural_database=structural,
+                    temporal_database=temporal,
+                    city_id="israel",
+                    service_date=date(2026, 9, 12),
+                    static_root=Path(temporary) / "stop-data",
                 )
 
     def test_probe_date_rejects_active_service_outside_window(self) -> None:

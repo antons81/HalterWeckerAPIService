@@ -308,36 +308,62 @@ def _select_common_probe_date(
 
 def _first_trip_case(
     *,
+    provider_id: str,
     structural_database: Path,
     temporal_database: Path,
     city_id: str,
     service_date: date,
     static_root: Path,
 ) -> dict[str, object]:
-    with sqlite3.connect(f"file:{temporal_database}?mode=ro", uri=True) as temporal:
-        service_ids = [
-            str(row[0])
-            for row in temporal.execute(
-                "SELECT service_id FROM active_services WHERE service_date=? ORDER BY service_id LIMIT 20",
-                (service_date.strftime("%Y%m%d"),),
-            )
-        ]
-    if not service_ids:
-        raise ValueError(
-            f"provider=israel-mot has no active service on {service_date.isoformat()}"
-        )
-    placeholders = ",".join("?" for _ in service_ids)
     with sqlite3.connect(f"file:{structural_database}?mode=ro", uri=True) as structural:
+        structural.execute("ATTACH DATABASE ? AS temporal", (str(temporal_database),))
+        compact_date = service_date.strftime("%Y%m%d")
+        active_service_count = structural.execute(
+            "SELECT COUNT(DISTINCT service_id) FROM temporal.active_services "
+            "WHERE service_date=?",
+            (compact_date,),
+        ).fetchone()[0]
+        matching_service_count = structural.execute(
+            """
+            SELECT COUNT(DISTINCT active.service_id)
+            FROM temporal.active_services AS active
+            JOIN main.trips AS trip ON trip.service_id=active.service_id
+            WHERE active.service_date=?
+            """,
+            (compact_date,),
+        ).fetchone()[0]
         row = structural.execute(
-            f"SELECT trip_id FROM trips WHERE service_id IN ({placeholders}) ORDER BY trip_id LIMIT 1",
-            service_ids,
+            """
+            SELECT trip.service_id, trip.trip_id
+            FROM temporal.active_services AS active
+            JOIN main.trips AS trip ON trip.service_id=active.service_id
+            WHERE active.service_date=?
+            ORDER BY trip.service_id, trip.trip_id
+            LIMIT 1
+            """,
+            (compact_date,),
         ).fetchone()
     if row is None:
-        raise ValueError("no trip is available for the selected Israel service date")
+        raise ValueError(
+            f"provider={provider_id} date={service_date.isoformat()} "
+            f"active_service_count={active_service_count} "
+            f"matching_structural_service_count={matching_service_count} "
+            "has no readiness trip in the temporal/structural intersection"
+        )
+    selected_service_id, selected_trip_id = (str(row[0]), str(row[1]))
+    print(
+        "[NightlyIncremental] stage=readiness-trip status=PASS "
+        f"provider={provider_id} service_date={service_date.isoformat()} "
+        f"selected_service_id={selected_service_id} "
+        f"selected_trip_id={selected_trip_id} "
+        f"active_service_count={active_service_count} "
+        f"matching_service_count={matching_service_count}",
+        flush=True,
+    )
     return {
-        "providerID": "israel-mot",
+        "providerID": provider_id,
         "cityID": city_id,
-        "tripID": str(row[0]),
+        "tripID": selected_trip_id,
         "serviceDate": service_date.isoformat(),
         "staticRoot": str(static_root),
     }
@@ -622,6 +648,7 @@ def build_incremental_candidate(
             toronto_probe_date, datetime.max.time()
         ).replace(tzinfo=toronto_timezone)
         trip_case = _first_trip_case(
+            provider_id=israel.provider_id,
             structural_database=israel.structural.database_path,
             temporal_database=israel.temporal.database_path,
             city_id=israel_city,
