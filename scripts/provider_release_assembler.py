@@ -325,8 +325,9 @@ def _link_reference(source: Path, destination: Path, *, publish_root: Path) -> N
     source = source.resolve(strict=True)
     publish_root = publish_root.resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
+    symlink_namespace = publish_root.parent if source.is_dir() else publish_root
     try:
-        source.relative_to(publish_root)
+        source.relative_to(symlink_namespace)
         relative_source = os.path.relpath(source, destination.parent)
         os.symlink(relative_source, destination)
         return
