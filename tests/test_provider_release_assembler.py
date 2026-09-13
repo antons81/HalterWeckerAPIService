@@ -79,6 +79,8 @@ class ProviderReleaseAssemblerTests(unittest.TestCase):
         helper = StaticDeparturesMultiProviderTests()
         root.mkdir(parents=True, exist_ok=True)
         legacy, release = helper._build_fixture(root, provider_count=2)
+        stop_data = root.parent / "releases" / "source-stop-data"
+        shutil.copytree(release / "stop-data", stop_data)
         providers = {
             "israel-mot": {
                 "cities": ["fixture-israel"],
@@ -95,7 +97,7 @@ class ProviderReleaseAssemblerTests(unittest.TestCase):
                 "temporal": release / "providers" / "synthetic-2" / "temporal",
             },
         }
-        return legacy, release / "common.sqlite", release / "stop-data", providers
+        return legacy, release / "common.sqlite", stop_data, providers
 
     @staticmethod
     def _common_for_release(source: Path, destination: Path, release_id: str) -> Path:
@@ -121,12 +123,16 @@ class ProviderReleaseAssemblerTests(unittest.TestCase):
             payload = validate_candidate_release(assembly.release_directory)
             self.assertEqual(payload["releaseID"], "release-a")
             self.assertEqual(assembly.reused_artifacts, 4)
-            self.assertTrue(
-                (assembly.release_directory / "providers/israel-mot/structural/provider.sqlite").is_symlink()
-            )
+            provider_database = assembly.release_directory / "providers/israel-mot/structural/provider.sqlite"
+            source_database = providers["israel-mot"]["structural"] / "provider.sqlite"
+            self.assertFalse(provider_database.is_symlink())
+            self.assertEqual(provider_database.stat().st_ino, source_database.stat().st_ino)
             stop_data_reference = assembly.release_directory / "stop-data"
             self.assertTrue(stop_data_reference.is_symlink())
+            self.assertFalse(os.readlink(stop_data_reference).startswith("/"))
             self.assertEqual(stop_data_reference.resolve(), stop_data.resolve())
+            manifest_text = (assembly.release_directory / "release.json").read_text(encoding="utf-8")
+            self.assertNotIn(str(source_database.parent.parent.parent), manifest_text)
             self.assertEqual(
                 payload["compatibility"]["runtimeSchemaVersion"],
                 1,

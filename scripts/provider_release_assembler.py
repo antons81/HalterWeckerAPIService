@@ -321,9 +321,30 @@ def _artifact_source(
     }
 
 
-def _link_reference(source: Path, destination: Path) -> None:
+def _link_reference(source: Path, destination: Path, *, publish_root: Path) -> None:
+    source = source.resolve(strict=True)
+    publish_root = publish_root.resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    os.symlink(str(source), destination)
+    try:
+        source.relative_to(publish_root)
+        relative_source = os.path.relpath(source, destination.parent)
+        os.symlink(relative_source, destination)
+        return
+    except ValueError:
+        pass
+
+    # External immutable files must remain visible inside the container namespace.
+    # A host-absolute symlink would resolve outside the published release mount.
+    if source.is_dir():
+        raise ReleaseAssemblyError(
+            f"directory reference is outside the publish tree: {source}"
+        )
+    try:
+        os.link(source, destination)
+    except OSError as error:
+        raise ReleaseAssemblyError(
+            f"cannot materialize relocatable file reference: {source}"
+        ) from error
 
 
 def _provider_entry(provider_id: str, value: Mapping[str, object]) -> dict[str, object]:
@@ -551,7 +572,7 @@ def assemble_release(
             shutil.copy2(common_source, staging / "common.sqlite")
             common_digest, common_size = artifact_provenance(staging / "common.sqlite")
         with profiler.stage("stop-data-reference"):
-            _link_reference(stop_source, staging / "stop-data")
+            _link_reference(stop_source, staging / "stop-data", publish_root=releases)
             stop_data = _stop_data_reference(staging / "stop-data")
         common_metadata_path = staging / "common-metadata.json"
         with __import__("sqlite3").connect(staging / "common.sqlite") as connection:
@@ -574,8 +595,8 @@ def assemble_release(
                     relative_dir = Path("providers") / provider_id / artifact_type
                     destination_db = staging / relative_dir / "provider.sqlite"
                     destination_manifest = staging / relative_dir / "manifest.json"
-                    _link_reference(source_db, destination_db)
-                    _link_reference(source_manifest, destination_manifest)
+                    _link_reference(source_db, destination_db, publish_root=releases)
+                    _link_reference(source_manifest, destination_manifest, publish_root=releases)
                     output_entry[artifact_type] = {
                         "path": (relative_dir / "provider.sqlite").as_posix(),
                         "manifestPath": (relative_dir / "manifest.json").as_posix(),
@@ -586,7 +607,6 @@ def assemble_release(
                         "validFrom": info["validFrom"],
                         "validThrough": info["validThrough"],
                         "storage": "immutable-external-reference",
-                        "sourcePath": str(source_db),
                     }
                     reused += 1
             provider_payload[provider_id] = output_entry
