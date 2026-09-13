@@ -1,6 +1,7 @@
-import sys
-import sqlite3
+import hashlib
 import shutil
+import sqlite3
+import sys
 import tempfile
 import unittest
 from datetime import date
@@ -90,6 +91,123 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "provider=unknown-provider"):
                 incremental._provider_rows("unknown-provider", structural_database)
+
+    def test_common_catalog_restores_provider_stop_prefix_from_source_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            provider_builds = []
+            for provider_id in ("ttc-surface", "ttc-subway"):
+                structural_database = root / f"{provider_id}-structural.sqlite"
+                with sqlite3.connect(structural_database) as connection:
+                    connection.executescript(
+                        """
+                        CREATE TABLE provider_city_stops(
+                            provider_id TEXT NOT NULL,
+                            city_id TEXT NOT NULL,
+                            stop_id TEXT NOT NULL
+                        );
+                        CREATE TABLE provider_city_modes(
+                            provider_id TEXT NOT NULL,
+                            city_id TEXT NOT NULL,
+                            mode TEXT NOT NULL,
+                            timezone TEXT NOT NULL,
+                            stop_id_prefix TEXT NOT NULL,
+                            identifier_prefix TEXT NOT NULL
+                        );
+                        """
+                    )
+                    connection.execute(
+                        "INSERT INTO provider_city_stops VALUES (?, 'toronto', ?)",
+                        (provider_id, f"{provider_id}:100"),
+                    )
+                    connection.execute(
+                        "INSERT INTO provider_city_modes VALUES (?, 'toronto', 'canonical', 'America/Toronto', '', '')",
+                        (provider_id,),
+                    )
+
+                temporal_database = root / f"{provider_id}-temporal.sqlite"
+                temporal_database.touch()
+
+                def artifact_use(
+                    database: Path,
+                    key: str,
+                    schema_key: str,
+                    schema_version: int,
+                    dependencies=None,
+                ):
+                    return SimpleNamespace(
+                        database_path=database,
+                        artifact_directory=database.parent,
+                        artifact_key=key,
+                        manifest={
+                            "sqlite": {
+                                "sha256": hashlib.sha256(database.read_bytes()).hexdigest(),
+                                "size": database.stat().st_size,
+                            },
+                            schema_key: schema_version,
+                            "dependencies": dependencies or {},
+                        },
+                    )
+
+                provider_builds.append(
+                    incremental.ProviderBuild(
+                        provider_id=provider_id,
+                        source={
+                            "namespace": f"{provider_id}:",
+                            "identifierPrefix": f"{provider_id}:",
+                            "timezone": "America/Toronto",
+                            "mergeGroup": "toronto",
+                        },
+                        cities=[{"id": "toronto"}],
+                        normalized=object(),
+                        structural=artifact_use(
+                            structural_database,
+                            f"{provider_id}-structural",
+                            "structuralSchemaVersion",
+                            2,
+                        ),
+                        temporal=artifact_use(
+                            temporal_database,
+                            f"{provider_id}-temporal",
+                            "temporalSchemaVersion",
+                            1,
+                            {"validFrom": "2026-09-13", "validThrough": "2026-09-27"},
+                        ),
+                        provider_release_entry={},
+                    )
+                )
+
+            output = root / "common.sqlite"
+            incremental._build_common_catalog(
+                output=output,
+                release_id="release-x",
+                provider_builds=provider_builds,
+            )
+            with sqlite3.connect(output) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT provider_id, city_id, stop_id_prefix, identifier_prefix
+                    FROM provider_city_modes
+                    ORDER BY provider_id
+                    """
+                ).fetchall()
+
+            self.assertEqual(
+                rows,
+                [
+                    ("ttc-subway", "toronto", "ttc-subway:", ""),
+                    ("ttc-surface", "toronto", "ttc-surface:", ""),
+                ],
+            )
+            self.assertFalse(any(row[0] == "" or row[1] == "" for row in rows))
+
+    def test_configured_prefix_does_not_infer_ambiguous_global_prefix(self) -> None:
+        self.assertEqual(
+            incremental._configured_stop_id_prefix(
+                {"namespace": "", "identifierPrefix": ""}
+            ),
+            "",
+        )
 
     def test_probe_date_skips_window_start_without_active_service(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

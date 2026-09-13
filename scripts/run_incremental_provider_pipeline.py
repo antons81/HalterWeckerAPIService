@@ -156,6 +156,14 @@ def _source_map(repository_root: Path) -> dict[str, dict[str, object]]:
     return {str(source["id"]): source for source in sources}
 
 
+def _configured_stop_id_prefix(source: Mapping[str, object]) -> str:
+    for key in ("staticStopIDPrefix", "namespace", "identifierPrefix"):
+        value = str(source.get(key, "")).strip()
+        if value:
+            return value
+    return ""
+
+
 def _raw_entry(
     artifacts: Mapping[str, object],
     provider_id: str,
@@ -401,17 +409,28 @@ def _build_common_catalog(
         )
         provider_city_stops.extend(stop_rows)
         city_stops.update((city_id, stop_id) for _provider, city_id, stop_id in stop_rows)
-        provider_modes.extend(
-            {
-                "providerID": row[0],
-                "cityID": row[1],
-                "mode": row[2],
-                "timezone": row[3],
-                "stopIDPrefix": row[4],
-                "identifierPrefix": row[5],
-            }
-            for row in mode_rows
-        )
+        configured_stop_prefix = _configured_stop_id_prefix(item.source)
+        for row in mode_rows:
+            artifact_stop_prefix = row[4].strip()
+            if (
+                configured_stop_prefix
+                and artifact_stop_prefix
+                and configured_stop_prefix != artifact_stop_prefix
+            ):
+                raise ValueError(
+                    f"provider={item.provider_id} stop ID prefix mismatch: "
+                    f"config={configured_stop_prefix!r} artifact={artifact_stop_prefix!r}"
+                )
+            provider_modes.append(
+                {
+                    "providerID": row[0],
+                    "cityID": row[1],
+                    "mode": row[2],
+                    "timezone": row[3],
+                    "stopIDPrefix": configured_stop_prefix or artifact_stop_prefix,
+                    "identifierPrefix": row[5],
+                }
+            )
         for city in item.cities:
             city_id = str(city["id"])
             for alias in city.get("aliases", ()) or ():
