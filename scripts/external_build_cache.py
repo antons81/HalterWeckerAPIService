@@ -40,12 +40,31 @@ TRANSFORMED_CACHE_PROVIDER_IDS = frozenset(
         "sweden",
         "mta-ny-nyct-bus",
         "ttc-surface",
+        "ttc-subway",
+        "israel-mot",
         "australia-transport-nsw",
     }
 )
 TRANSFORMED_CACHE_LAYER = "external-transformed-provider-v1"
 TRANSFORMED_FEATURE_GATE = "HALTEWECKER_EXTERNAL_TRANSFORMED_BUILD_CACHE"
 BUILDER_FAMILY = "external-standard-immutable-v1"
+# These are the source fields that can change the immutable stop/route/trip/
+# line projection stored by ExternalBuildCache. Departure-window settings are
+# deliberately excluded: departures are rebuilt separately because they are
+# date-dependent.
+IMMUTABLE_OUTPUT_CONFIG_KEYS = (
+    "agencyID",
+    "buildRoutes",
+    "buildStops",
+    "buildTripIndex",
+    "exclusiveCityPartition",
+    "filterCitiesByProvider",
+    "mergeGroup",
+    "namespace",
+    "publishPassengerStopIDs",
+    "stopIDMode",
+    "supplementalStopCatalog",
+)
 BUILDER_INPUTS = (
     "scripts/external_gtfs.py",
     "scripts/external_staging.py",
@@ -121,6 +140,8 @@ class CacheKey:
     city_id: str = ""
     projection_fingerprint: str = ""
     city_ids: tuple[str, ...] = ()
+    legacy_value: str = ""
+    legacy_provider_config_fingerprint: str = ""
 
 
 @dataclass(frozen=True)
@@ -227,6 +248,17 @@ def _safe_config_value(key: str, value: object) -> object:
 
 
 def provider_config_fingerprint(source: Mapping[str, object]) -> str:
+    """Fingerprint only configuration consumed by immutable output builders."""
+    payload = {
+        key: _safe_config_value(key, source.get(key))
+        for key in IMMUTABLE_OUTPUT_CONFIG_KEYS
+        if key in source
+    }
+    return _sha256_json(payload)
+
+
+def legacy_provider_config_fingerprint(source: Mapping[str, object]) -> str:
+    """Return the pre-boundary config fingerprint for cache migration."""
     payload = {
         str(key): _safe_config_value(str(key), value)
         for key, value in sorted(source.items(), key=lambda item: str(item[0]))
@@ -288,6 +320,7 @@ def cache_key(
     if not raw_sha256 or len(raw_sha256) != 64:
         raise CacheKeyUnavailable("raw GTFS SHA256 is unavailable")
     provider_fingerprint = provider_config_fingerprint(source)
+    legacy_provider_fingerprint = legacy_provider_config_fingerprint(source)
     cities_fingerprint = city_config_fingerprint(repository_root, source)
     build_fingerprint = builder_fingerprint(repository_root)
     normalized_city_ids = tuple(city_ids or ((city_id,) if city_id else ()))
@@ -303,22 +336,24 @@ def cache_key(
     supplemental_fingerprint = _supplemental_inputs_fingerprint(
         supplemental_input_digests
     )
-    payload = {
-        "cacheSchemaVersion": CACHE_SCHEMA_VERSION,
-        "builderFamily": BUILDER_FAMILY,
-        "cacheLayer": TRANSFORMED_CACHE_LAYER,
-        "providerID": provider_id,
-        "cityID": city_id,
-        "cityIDs": list(normalized_city_ids),
-        "rawGTFSsha256": raw_sha256,
-        "providerConfigFingerprint": provider_fingerprint,
-        "cityConfigFingerprint": cities_fingerprint,
-        "builderFingerprint": build_fingerprint,
-        "projectionFingerprint": projection,
-        "supplementalInputsFingerprint": supplemental_fingerprint,
-    }
+    def payload_for(provider_config: str) -> dict[str, object]:
+        return {
+            "cacheSchemaVersion": CACHE_SCHEMA_VERSION,
+            "builderFamily": BUILDER_FAMILY,
+            "cacheLayer": TRANSFORMED_CACHE_LAYER,
+            "providerID": provider_id,
+            "cityID": city_id,
+            "cityIDs": list(normalized_city_ids),
+            "rawGTFSsha256": raw_sha256,
+            "providerConfigFingerprint": provider_config,
+            "cityConfigFingerprint": cities_fingerprint,
+            "builderFingerprint": build_fingerprint,
+            "projectionFingerprint": projection,
+            "supplementalInputsFingerprint": supplemental_fingerprint,
+        }
+
     return CacheKey(
-        value=_sha256_json(payload),
+        value=_sha256_json(payload_for(provider_fingerprint)),
         raw_sha256=raw_sha256,
         provider_config_fingerprint=provider_fingerprint,
         city_config_fingerprint=cities_fingerprint,
@@ -328,6 +363,8 @@ def cache_key(
         city_id=city_id,
         projection_fingerprint=projection,
         city_ids=normalized_city_ids,
+        legacy_value=_sha256_json(payload_for(legacy_provider_fingerprint)),
+        legacy_provider_config_fingerprint=legacy_provider_fingerprint,
     )
 
 
@@ -467,6 +504,26 @@ class ExternalBuildCache:
 
     def lookup(self, key: CacheKey) -> CacheLookup:
         directory = self._directory(key)
+        validation_key = key
+        migration = False
+        if not directory.exists() and key.legacy_value:
+            legacy_key = CacheKey(
+                value=key.legacy_value,
+                raw_sha256=key.raw_sha256,
+                provider_config_fingerprint=key.legacy_provider_config_fingerprint,
+                city_config_fingerprint=key.city_config_fingerprint,
+                builder_fingerprint=key.builder_fingerprint,
+                supplemental_inputs_fingerprint=key.supplemental_inputs_fingerprint,
+                provider_id=key.provider_id,
+                city_id=key.city_id,
+                projection_fingerprint=key.projection_fingerprint,
+                city_ids=key.city_ids,
+            )
+            legacy_directory = self._directory(legacy_key)
+            if legacy_directory.exists():
+                directory = legacy_directory
+                validation_key = legacy_key
+                migration = True
         if not directory.exists():
             return CacheLookup("MISS", "cache key not found", key)
         manifest_path = directory / "manifest.json"
@@ -477,7 +534,7 @@ class ExternalBuildCache:
             return CacheLookup("INVALID", "manifest is unreadable", key)
         valid, reason = _manifest_matches(
             manifest,
-            key,
+            validation_key,
             directory,
             self.provider_id,
             self.artifacts,
@@ -485,7 +542,9 @@ class ExternalBuildCache:
         if not valid:
             shutil.rmtree(directory, ignore_errors=True)
             return CacheLookup("INVALID", reason, key)
-        return CacheLookup("HIT", reason, key, directory, manifest)
+        if migration:
+            reason = "validated legacy manifest after fingerprint boundary change"
+        return CacheLookup("HIT", reason, validation_key, directory, manifest)
 
     def restore(self, lookup: CacheLookup, output: Path) -> CacheRestore:
         if lookup.status != "HIT" or lookup.directory is None:
@@ -528,7 +587,12 @@ class ExternalBuildCache:
             destination.parent.mkdir(parents=True, exist_ok=True)
             temporary = destination.with_name(f".{destination.name}.cache-tmp")
             try:
-                shutil.copyfile(source, temporary)
+                try:
+                    os.link(source, temporary)
+                except OSError as error:
+                    if error.errno != errno.EXDEV:
+                        raise
+                    shutil.copyfile(source, temporary)
                 os.replace(temporary, destination)
             finally:
                 temporary.unlink(missing_ok=True)

@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -21,6 +22,7 @@ from external_build_cache import (
     CacheKeyUnavailable,
     ExternalBuildCache,
     projection_fingerprint,
+    legacy_provider_config_fingerprint,
 )
 from external_staging import ExternalDepartureStage, NormalizedProviderContext
 from external_gtfs import load_external_gtfs_sources, process_external_gtfs_sources
@@ -552,6 +554,11 @@ class ExternalBuildCacheTests(unittest.TestCase):
                 (first_output / "routes/chicago.json").read_bytes(),
                 (second_output / "routes/chicago.json").read_bytes(),
             )
+            cache_stops = self._cache_directory(root) / "stops/chicago.json"
+            self.assertEqual(
+                os.stat(second_output / "stops/chicago.json").st_ino,
+                os.stat(cache_stops).st_ino,
+            )
             first_departures = json.loads(
                 (first_output / "departures/chicago.json").read_text()
             )
@@ -842,6 +849,49 @@ class ExternalBuildCacheTests(unittest.TestCase):
                 self.assertEqual(
                     (first_output / relative).read_bytes(),
                     (second_output / relative).read_bytes(),
+                )
+
+    def test_pilot_provider_cache_can_restore_namespaced_and_plain_sources(self) -> None:
+        for provider_id, city_id in (("ttc-subway", "toronto"), ("israel-mot", "israel")):
+            with self.subTest(provider_id=provider_id), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                feed = root / f"{provider_id}.zip"
+                source = self._source_with_test_city(
+                    feed, provider_id=provider_id, city_id=city_id
+                )
+                latitude, longitude = self._city_coordinates(source, city_id)
+                timezone_name = str(source["timezone"])
+                active_date = datetime.now(ZoneInfo(timezone_name)).date().strftime("%Y%m%d")
+                _write_feed(
+                    feed,
+                    active_date=active_date,
+                    stop_lat=latitude,
+                    stop_lon=longitude,
+                )
+                self._run(
+                    root,
+                    feed,
+                    source,
+                    allowlist=provider_id,
+                    transformed_gate=True,
+                    output_name="first",
+                )
+                with mock.patch(
+                    "external_gtfs.build_external_stop_packages",
+                    wraps=external_gtfs.build_external_stop_packages,
+                ) as stops:
+                    _output, logs = self._run(
+                        root,
+                        feed,
+                        source,
+                        allowlist=provider_id,
+                        transformed_gate=True,
+                        output_name="second",
+                    )
+                self.assertEqual(stops.call_count, 0)
+                self.assertIn(
+                    f"source={provider_id} stage=build-cache status=HIT",
+                    logs,
                 )
 
     def test_agency_scoped_provider_cache_has_full_immutable_parity(self) -> None:
@@ -1409,7 +1459,7 @@ class ExternalBuildCacheTests(unittest.TestCase):
             self.assertEqual(stops.call_count, 1)
             self.assertIn("stage=build-cache status=MISS", logs)
 
-    def test_provider_config_change_is_a_miss(self) -> None:
+    def test_departure_only_config_change_reuses_immutable_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             feed = root / "cta.zip"
@@ -1423,6 +1473,45 @@ class ExternalBuildCacheTests(unittest.TestCase):
             ) as stops:
                 _output, logs = self._run(
                     root, feed, changed_source, output_name="config-change"
+                )
+            self.assertEqual(stops.call_count, 0)
+            self.assertIn("stage=build-cache status=HIT", logs)
+
+    def test_legacy_full_config_cache_key_is_reused_after_boundary_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "cta.zip"
+            _write_feed(feed)
+            with mock.patch(
+                "external_build_cache.provider_config_fingerprint",
+                side_effect=legacy_provider_config_fingerprint,
+            ):
+                self._build_once(root, feed)
+            with mock.patch(
+                "external_gtfs.build_external_stop_packages",
+                wraps=external_gtfs.build_external_stop_packages,
+            ) as stops:
+                _output, logs = self._run(root, feed, self._source(feed), output_name="migrated")
+            self.assertEqual(stops.call_count, 0)
+            self.assertIn(
+                "validated legacy manifest after fingerprint boundary change",
+                logs,
+            )
+
+    def test_immutable_projection_config_change_is_a_miss(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "cta.zip"
+            _write_feed(feed)
+            self._build_once(root, feed)
+            changed_source = self._source(feed)
+            changed_source["publishPassengerStopIDs"] = False
+            with mock.patch(
+                "external_gtfs.build_external_stop_packages",
+                wraps=external_gtfs.build_external_stop_packages,
+            ) as stops:
+                _output, logs = self._run(
+                    root, feed, changed_source, output_name="projection-change"
                 )
             self.assertEqual(stops.call_count, 1)
             self.assertIn("stage=build-cache status=MISS", logs)
