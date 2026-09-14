@@ -395,14 +395,37 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
                 valid_through=date(2026, 9, 10),
             )
 
-    def test_temporal_window_is_coherent_and_rolling(self) -> None:
-        dates = incremental.service_dates(
-            valid_from=date(2026, 9, 10),
-            window_days=15,
-        )
-        self.assertEqual(dates[0], date(2026, 9, 10))
-        self.assertEqual(dates[-1], date(2026, 9, 24))
-        self.assertEqual(len(dates), 15)
+    def test_temporal_window_is_anchored_to_iso_week(self) -> None:
+        monday = incremental.service_dates(valid_from=date(2026, 9, 7))
+        tuesday = incremental.service_dates(valid_from=date(2026, 9, 8))
+        sunday = incremental.service_dates(valid_from=date(2026, 9, 13))
+        next_monday = incremental.service_dates(valid_from=date(2026, 9, 14))
+
+        self.assertEqual(monday, tuesday)
+        self.assertEqual(tuesday, sunday)
+        self.assertEqual(monday[0], date(2026, 9, 7))
+        self.assertEqual(monday[-1], date(2026, 9, 27))
+        self.assertEqual(len(monday), 21)
+        self.assertNotEqual(monday, next_monday)
+        self.assertEqual(next_monday[0], date(2026, 9, 14))
+        self.assertEqual(next_monday[-1], date(2026, 10, 4))
+
+    def test_temporal_window_handles_iso_year_boundary(self) -> None:
+        end_of_year = incremental.service_dates(valid_from=date(2026, 12, 31))
+        new_year = incremental.service_dates(valid_from=date(2027, 1, 1))
+        next_week = incremental.service_dates(valid_from=date(2027, 1, 4))
+
+        self.assertEqual(end_of_year, new_year)
+        self.assertEqual(end_of_year[0], date(2026, 12, 28))
+        self.assertEqual(end_of_year[-1], date(2027, 1, 17))
+        self.assertNotEqual(end_of_year, next_week)
+
+    def test_temporal_window_rejects_non_anchored_endpoint(self) -> None:
+        with self.assertRaisesRegex(ValueError, "validThrough"):
+            incremental.service_dates(
+                valid_from=date(2026, 9, 10),
+                valid_through=date(2026, 9, 25),
+            )
 
     def test_structural_manifest_does_not_require_temporal_window(self) -> None:
         structural_manifest = {

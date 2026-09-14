@@ -551,12 +551,42 @@ disk_used_kb() {
   df -Pk "$DATA_ROOT" | awk 'NR == 2 { print $3; exit }'
 }
 
+directory_size_kb() {
+  local path="$1"
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    echo 0
+    return
+  fi
+  du -skL "$path" 2>/dev/null | awk '{ print $1; exit }' || echo 0
+}
+
+temporary_workspace_kb() {
+  local total=0 path size
+  for path in /tmp/haltewecker-* /private/tmp/haltewecker-*; do
+    if [[ -e "$path" || -L "$path" ]]; then
+      size="$(directory_size_kb "$path")"
+      total=$((total + size))
+    fi
+  done
+  echo "$total"
+}
+
 log_disk_state() {
   local phase="$1"
   local free_kb
   local used_kb
+  local generation_kb artifact_kb temp_kb
   free_kb="$(disk_free_kb)"
   used_kb="$(disk_used_kb)"
+  generation_kb=$((
+    $(directory_size_kb "${RELEASE_DIR:-}")
+    + $(directory_size_kb "${INCREMENTAL_RELEASE_DIR:-}")
+  ))
+  artifact_kb=$((
+    $(directory_size_kb "${HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT:-$DATA_ROOT/provider-artifacts/normalized}")
+    + $(directory_size_kb "${HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT:-$DATA_ROOT/provider-artifacts/static}")
+  ))
+  temp_kb="$(temporary_workspace_kb)"
   if (( used_kb > PEAK_USED_KB )); then
     PEAK_USED_KB="$used_kb"
     PEAK_FREE_KB="$free_kb"
@@ -568,6 +598,7 @@ log_disk_state() {
     DIAGNOSTICS_MIN_FREE_KB="$free_kb"
   fi
   echo "[Nightly] disk phase=$phase used_kb=$used_kb free_kb=$free_kb free_gb=$((free_kb / 1024 / 1024))"
+  echo "[Nightly] disk components phase=$phase generation_kb=$generation_kb artifact_kb=$artifact_kb temp_kb=$temp_kb"
 }
 
 log_disk_peak() {
@@ -582,6 +613,8 @@ proof_disk_preflight() {
   local estimated_additional_kb
   local estimated_free_kb
   local minimum_free_kb
+  local expected_artifact_miss_kb
+  local transient_workspace_kb
 
   free_kb="$(disk_free_kb)"
   if [[ "$REUSE_STOP_DATA" != "1" && ( -d "$CURRENT" || -L "$CURRENT" ) ]]; then
@@ -589,7 +622,13 @@ proof_disk_preflight() {
     current_stop_data_kb="${current_stop_data_kb:-0}"
   fi
   margin_kb=$(( ${HALTEWECKER_PROOF_ESTIMATE_MARGIN_GB:-5} * 1024 * 1024 ))
-  estimated_additional_kb=$((current_stop_data_kb + margin_kb))
+  expected_artifact_miss_kb="${HALTEWECKER_EXPECTED_ARTIFACT_MISS_KB:-0}"
+  if ! [[ "$expected_artifact_miss_kb" =~ ^[0-9]+$ ]]; then
+    echo "[Nightly] ERROR: HALTEWECKER_EXPECTED_ARTIFACT_MISS_KB must be a non-negative integer in KiB" >&2
+    return 1
+  fi
+  transient_workspace_kb="$(temporary_workspace_kb)"
+  estimated_additional_kb=$((current_stop_data_kb + expected_artifact_miss_kb + transient_workspace_kb + margin_kb))
   estimated_free_kb=$((free_kb - estimated_additional_kb))
   if [[ "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
     if [[ "$INCREMENTAL_PROOF_OVERRIDE" == "1" ]]; then
@@ -607,6 +646,7 @@ proof_disk_preflight() {
     disk_mode="proof-or-legacy"
   fi
   log_disk_state "before"
+  echo "[Nightly] disk model unavoidable_stop_data_kb=$current_stop_data_kb expected_artifact_miss_kb=$expected_artifact_miss_kb transient_workspace_kb=$transient_workspace_kb safety_reserve_kb=$margin_kb"
   echo "[Nightly] disk estimated_additional_gb=$((estimated_additional_kb / 1024 / 1024)) estimated_peak_free_gb=$((estimated_free_kb / 1024 / 1024)) warning_free_gb=$((warning_free_kb / 1024 / 1024)) minimum_free_gb=$((minimum_free_kb / 1024 / 1024)) mode=$disk_mode reuse_stop_data=$REUSE_STOP_DATA"
   if (( free_kb <= warning_free_kb )); then
     echo "[Nightly] WARNING: disk free is at or below warning threshold for $disk_mode" >&2
@@ -618,6 +658,7 @@ proof_disk_preflight() {
 }
 
 if [[ "$NO_ACTIVATE" == "1" && "$RUN_MODE" == "normal" ]]; then
+  log_disk_state "run-start"
   proof_disk_preflight
 fi
 
@@ -651,9 +692,11 @@ if [[ ${#EXTERNAL_URL_OVERRIDES[@]} -gt 0 ]]; then
 fi
 PREPARE_ARGS+=(--output "$ARTIFACTS_JSON")
 PREPARE_ARGS+=(--release-root "$RELEASE_DIR")
+log_disk_state "raw-download"
 python3 "$REPO/scripts/prepare_gtfs_artifacts.py" "${PREPARE_ARGS[@]}"
 VBB_INPUT_URL="${VBB_GTFS_URL:-https://unternehmen.vbb.de/fileadmin/user_upload/VBB/Dokumente/API-Datensaetze/gtfs-mastscharf/GTFS.zip}"
 RNV_INPUT_URL="${RNV_GTFS_URL:-https://gtfs-sandbox-dds.rnv-online.de/latest/gtfs.zip}"
+log_disk_state "raw-extract"
 python3 "$REPO/scripts/prepare_custom_gtfs_artifacts.py" \
   --cache-root "${GTFS_CACHE_ROOT:-/srv/haltewecker/cache/gtfs}" \
   --vbb-url "$VBB_INPUT_URL" \
@@ -769,6 +812,7 @@ if [[ -f "$MVO_ENV_FILE" ]]; then
     --registry "$REPO/config/austrian-sources.json"
 fi
 
+log_disk_state "stop-data-build"
 echo "[StopData] release=$RELEASE_ID stage=build duration=$(elapsed_seconds "$TOTAL_STARTED")"
 }
 run_candidate_validation() {
@@ -1109,6 +1153,7 @@ if [[ "$RUN_MODE" == "normal" ]]; then
   fi
   echo "[Nightly] stage=validation status=started release=$RELEASE_ID"
   run_candidate_validation
+  log_disk_state "stop-data-validation"
   echo "[Nightly] stage=validation status=PASS release=$RELEASE_ID"
   if [[ "$REUSE_STOP_DATA" != "1" ]]; then
     persist_release_stage "candidate-validation"
@@ -1177,6 +1222,7 @@ else
 fi
 
 if [[ "$NO_ACTIVATE" == "1" ]]; then
+  log_disk_state "incremental-start"
   diagnostics_set_stage "incremental-provider"
   NORMALIZED_CACHE_ROOT="${HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT:-${DATA_ROOT}/provider-artifacts/normalized}"
   STATIC_ARTIFACT_ROOT="${HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT:-${DATA_ROOT}/provider-artifacts/static}"
@@ -1231,6 +1277,7 @@ PY
     verify_reused_stop_data_unchanged
   fi
   echo "[Nightly] stage=incremental-provider status=PASS release=$RELEASE_ID duration=$((SECONDS - INCREMENTAL_STARTED))s"
+  log_disk_state "incremental-complete"
   echo "[Nightly] stage=readiness status=PASS release=$RELEASE_ID no_activate=true"
   if [[ "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
     echo "[Nightly] stage=nightly-complete status=PASS release=$RELEASE_ID mode=production-shaped-no-activate activation=NOT_RUN"

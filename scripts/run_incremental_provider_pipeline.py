@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import hashlib
 import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -46,7 +48,8 @@ except ImportError:
 
 
 PILOT_PROVIDER_IDS = ("israel-mot", "ttc-surface", "ttc-subway")
-DEFAULT_WINDOW_DAYS = 15
+DEFAULT_WINDOW_DAYS = 21
+ANCHORED_WINDOW_DAYS = DEFAULT_WINDOW_DAYS
 
 
 @dataclass(frozen=True)
@@ -110,21 +113,71 @@ def _create_incremental_staging_directory(
     )
 
 
+def iso_week_anchor(reference_date: date) -> date:
+    """Return the Monday that starts reference_date's ISO week."""
+    return reference_date - timedelta(days=reference_date.weekday())
+
+
 def service_dates(
     *,
     valid_from: date | None = None,
     valid_through: date | None = None,
     window_days: int = DEFAULT_WINDOW_DAYS,
 ) -> list[date]:
-    if window_days < 2:
-        raise ValueError("temporal window must cover at least today and tomorrow")
-    start = valid_from or date.today()
-    end = valid_through or (start + timedelta(days=window_days - 1))
-    if end <= start:
-        raise ValueError("temporal window must include a date after validFrom")
-    if valid_through is None and (end - start).days + 1 != window_days:
-        raise ValueError("temporal window has an invalid length")
+    if window_days != ANCHORED_WINDOW_DAYS:
+        raise ValueError(
+            f"anchored temporal window must contain exactly {ANCHORED_WINDOW_DAYS} days"
+        )
+    reference = valid_from or valid_through or date.today()
+    start = iso_week_anchor(reference)
+    end = start + timedelta(days=window_days - 1)
+    if valid_through is not None and valid_through != end:
+        raise ValueError(
+            f"validThrough must equal anchored window end {end.isoformat()}"
+        )
     return [start + timedelta(days=offset) for offset in range((end - start).days + 1)]
+
+
+def _directory_size_bytes(path: Path) -> int:
+    if not path.exists() and not path.is_symlink():
+        return 0
+    try:
+        output = subprocess.check_output(
+            ["du", "-skL", str(path)], stderr=subprocess.DEVNULL, text=True
+        )
+        return int(output.split()[0]) * 1024
+    except (OSError, subprocess.CalledProcessError, ValueError, IndexError):
+        return 0
+
+
+def _disk_telemetry(
+    *,
+    stage: str,
+    stop_data: Path,
+    releases_root: Path,
+    normalized_cache_root: Path,
+    static_artifact_root: Path,
+) -> None:
+    data_root = stop_data.parent.parent
+    free_bytes = shutil.disk_usage(data_root).free
+    generation_bytes = _directory_size_bytes(releases_root)
+    artifact_bytes = (
+        _directory_size_bytes(normalized_cache_root)
+        + _directory_size_bytes(static_artifact_root)
+    )
+    temporary_bytes = sum(
+        _directory_size_bytes(Path(path))
+        for pattern in ("/tmp/haltewecker-*", "/private/tmp/haltewecker-*")
+        for path in glob.glob(pattern)
+    )
+    print(
+        "[NightlyIncremental] "
+        f"disk stage={stage} free_bytes={free_bytes} "
+        f"generation_bytes={generation_bytes} "
+        f"artifact_bytes={artifact_bytes} "
+        f"temp_bytes={temporary_bytes}",
+        flush=True,
+    )
 
 
 def _read_json(path: Path) -> dict[str, object]:
@@ -475,6 +528,13 @@ def build_incremental_candidate(
     environment = dict(os.environ)
     environment["HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT"] = str(normalized_cache_root)
     environment["HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT"] = str(static_artifact_root)
+    _disk_telemetry(
+        stage="incremental-start",
+        stop_data=stop_data_root,
+        releases_root=releases_root,
+        normalized_cache_root=normalized_cache_root,
+        static_artifact_root=static_artifact_root,
+    )
     provider_builds: list[ProviderBuild] = []
     for provider_id in provider_ids:
         source = sources[provider_id]
@@ -506,6 +566,13 @@ def build_incremental_candidate(
                 f"artifact_key={normalized_use.semantic_key}",
                 flush=True,
             )
+            _disk_telemetry(
+                stage=f"{provider_id}:normalized",
+                stop_data=stop_data_root,
+                releases_root=releases_root,
+                normalized_cache_root=normalized_cache_root,
+                static_artifact_root=static_artifact_root,
+            )
             structural_started = time.monotonic()
             artifacts_use = load_or_build_static_provider_artifacts(
                 normalized_context=normalized_context,
@@ -535,6 +602,20 @@ def build_incremental_candidate(
                 f"validFrom={temporal.manifest['dependencies']['validFrom']} "
                 f"validThrough={temporal.manifest['dependencies']['validThrough']}",
                 flush=True,
+            )
+            _disk_telemetry(
+                stage=f"{provider_id}:structural",
+                stop_data=stop_data_root,
+                releases_root=releases_root,
+                normalized_cache_root=normalized_cache_root,
+                static_artifact_root=static_artifact_root,
+            )
+            _disk_telemetry(
+                stage=f"{provider_id}:temporal",
+                stop_data=stop_data_root,
+                releases_root=releases_root,
+                normalized_cache_root=normalized_cache_root,
+                static_artifact_root=static_artifact_root,
             )
             _validate_temporal_window(
                 provider_id=provider_id,
@@ -566,6 +647,13 @@ def build_incremental_candidate(
                 release_id=release_id,
                 provider_builds=provider_builds,
             ),
+        )
+        _disk_telemetry(
+            stage="common-catalog",
+            stop_data=stop_data_root,
+            releases_root=releases_root,
+            normalized_cache_root=normalized_cache_root,
+            static_artifact_root=static_artifact_root,
         )
         provider_inputs = {
             item.provider_id: {
@@ -601,9 +689,23 @@ def build_incremental_candidate(
             f"transition_ms={(time.monotonic() - publication_started) * 1000:.1f}",
             flush=True,
         )
+        _disk_telemetry(
+            stage="release-assembly",
+            stop_data=stop_data_root,
+            releases_root=releases_root,
+            normalized_cache_root=normalized_cache_root,
+            static_artifact_root=static_artifact_root,
+        )
         _stage(
             "validation",
             lambda: validate_candidate_release(published_release_directory),
+        )
+        _disk_telemetry(
+            stage="validation",
+            stop_data=stop_data_root,
+            releases_root=releases_root,
+            normalized_cache_root=normalized_cache_root,
+            static_artifact_root=static_artifact_root,
         )
         israel = next(item for item in provider_builds if item.provider_id == "israel-mot")
         israel_city = str(israel.cities[0]["id"])
@@ -697,6 +799,13 @@ def build_incremental_candidate(
                 },
                 trip_case=trip_case,
             ),
+        )
+        _disk_telemetry(
+            stage="readiness",
+            stop_data=stop_data_root,
+            releases_root=releases_root,
+            normalized_cache_root=normalized_cache_root,
+            static_artifact_root=static_artifact_root,
         )
         stop_metadata_path = stop_data_root.parent / "release-metadata.json"
         stop_metadata = _read_json(stop_metadata_path) if stop_metadata_path.is_file() else {}

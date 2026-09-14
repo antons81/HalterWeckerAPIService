@@ -6,7 +6,7 @@ import tempfile
 import unittest
 import zipfile
 from contextlib import redirect_stdout
-from datetime import date
+from datetime import date, timedelta
 from io import StringIO
 from pathlib import Path
 
@@ -464,23 +464,42 @@ class StaticProviderArtifactTests(unittest.TestCase):
             finally:
                 temporal.close()
 
-    def test_rolling_window_rebuilds_only_temporal_artifact(self) -> None:
+    def test_anchored_window_reuses_temporal_artifact_within_iso_week(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             feed, source, cities, stop_data = self._prepare_inputs(root)
             first = self._build_artifacts(
-                root, feed, source, cities, stop_data, [date(2026, 1, 5)]
+                root,
+                feed,
+                source,
+                cities,
+                stop_data,
+                [date(2026, 1, 5) + timedelta(days=offset) for offset in range(21)],
             )
-            second = self._build_artifacts(
-                root, feed, source, cities, stop_data, [date(2026, 1, 6)]
+            same_week = self._build_artifacts(
+                root,
+                feed,
+                source,
+                cities,
+                stop_data,
+                [date(2026, 1, 5) + timedelta(days=offset) for offset in range(21)],
             )
-            self.assertEqual(
-                first.structural.artifact_key,
-                second.structural.artifact_key,
+            next_week = self._build_artifacts(
+                root,
+                feed,
+                source,
+                cities,
+                stop_data,
+                [date(2026, 1, 12) + timedelta(days=offset) for offset in range(21)],
             )
-            self.assertEqual(second.structural.status, "HIT")
-            self.assertNotEqual(first.temporal.artifact_key, second.temporal.artifact_key)
-            self.assertEqual(second.temporal.status, "MISS")
+            self.assertEqual(first.structural.artifact_key, same_week.structural.artifact_key)
+            self.assertEqual(first.temporal.artifact_key, same_week.temporal.artifact_key)
+            self.assertEqual(same_week.structural.status, "HIT")
+            self.assertEqual(same_week.temporal.status, "HIT")
+            self.assertEqual(first.structural.artifact_key, next_week.structural.artifact_key)
+            self.assertNotEqual(first.temporal.artifact_key, next_week.temporal.artifact_key)
+            self.assertEqual(next_week.structural.status, "HIT")
+            self.assertEqual(next_week.temporal.status, "MISS")
 
     def test_structural_inputs_invalidate_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
