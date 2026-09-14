@@ -426,8 +426,8 @@ def _stop_data_fingerprint(stop_data: Path, city_ids: set[str]) -> str:
         )
     return _sha256_payload(
         {
-            "releaseID": manifest.get("releaseID"),
-            "version": manifest.get("version"),
+            # Release IDs and manifest versions identify a published generation.
+            # They do not change the provider structural representation.
             "cities": packages,
         }
     )

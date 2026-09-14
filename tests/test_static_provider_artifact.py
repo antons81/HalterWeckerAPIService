@@ -541,6 +541,54 @@ class StaticProviderArtifactTests(unittest.TestCase):
                 changed_normalized.structural.artifact_key,
             )
 
+    def test_stop_data_generation_metadata_does_not_invalidate_structural_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed, source, cities, stop_data = self._prepare_inputs(root)
+            first = self._build_artifacts(
+                root, feed, source, cities, stop_data, [date(2026, 1, 5)]
+            )
+
+            changed_generation = root / "changed-generation-stop-data"
+            shutil.copytree(stop_data, changed_generation)
+            manifest_path = changed_generation / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["releaseID"] = "another-generation"
+            manifest["version"] = "another-build-date"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            self.assertEqual(
+                static_artifact._stop_data_fingerprint(
+                    stop_data, {"fixture-israel"}
+                ),
+                static_artifact._stop_data_fingerprint(
+                    changed_generation, {"fixture-israel"}
+                ),
+            )
+            second = self._build_artifacts(
+                root,
+                feed,
+                source,
+                cities,
+                changed_generation,
+                [date(2026, 1, 5)],
+            )
+            self.assertEqual(first.structural.artifact_key, second.structural.artifact_key)
+            self.assertEqual(second.structural.status, "HIT")
+
+    def test_structural_schema_version_invalidates_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed, source, cities, stop_data = self._prepare_inputs(root)
+            first = self._build_artifacts(root, feed, source, cities, stop_data, [date(2026, 1, 5)])
+            original_version = static_artifact.STRUCTURAL_SCHEMA_VERSION
+            static_artifact.STRUCTURAL_SCHEMA_VERSION = original_version + 1
+            try:
+                changed = self._build_artifacts(root, feed, source, cities, stop_data, [date(2026, 1, 5)])
+            finally:
+                static_artifact.STRUCTURAL_SCHEMA_VERSION = original_version
+            self.assertNotEqual(first.structural.artifact_key, changed.structural.artifact_key)
+
     def test_corrupt_manifest_and_temporal_database_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
