@@ -1092,11 +1092,28 @@ class ExternalDepartureStage:
                 agency_id TEXT NOT NULL,
                 agency_name TEXT NOT NULL
             ) WITHOUT ROWID;
+            CREATE TABLE trip_services (
+                trip_id TEXT PRIMARY KEY,
+                service_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                headsign TEXT NOT NULL,
+                direction_id TEXT NOT NULL
+            ) WITHOUT ROWID;
+            CREATE TABLE service_dates (
+                service_id TEXT NOT NULL,
+                service_date TEXT NOT NULL,
+                PRIMARY KEY (service_id, service_date)
+            ) WITHOUT ROWID;
             CREATE TABLE active_trips (
                 trip_id TEXT PRIMARY KEY,
                 route_id TEXT NOT NULL,
                 headsign TEXT NOT NULL,
                 direction_id TEXT NOT NULL
+            ) WITHOUT ROWID;
+            CREATE TABLE active_service_dates (
+                trip_id TEXT NOT NULL,
+                service_date TEXT NOT NULL,
+                PRIMARY KEY (trip_id, service_date)
             ) WITHOUT ROWID;
             CREATE TABLE resolved_stops (
                 stop_id TEXT PRIMARY KEY,
@@ -1207,21 +1224,41 @@ class ExternalDepartureStage:
             ),
         )
         self.connection.executemany(
-            "INSERT INTO active_trips VALUES (?, ?, ?, ?)",
+            "INSERT INTO trip_services VALUES (?, ?, ?, ?, ?)",
             (
                 (
-                    trip_id,
-                    route_id,
+                    str(row.get("trip_id", "")).strip(),
+                    str(row.get("service_id", "")).strip(),
+                    str(row.get("route_id", "")).strip(),
                     str(row.get("trip_headsign", "") or "").strip(),
                     str(row.get("direction_id", "0") or "0"),
                 )
                 for row in source_rows("trips.txt")
                 for trip_id in [str(row.get("trip_id", "")).strip()]
+                for service_id in [str(row.get("service_id", "")).strip()]
                 for route_id in [str(row.get("route_id", "")).strip()]
-                if trip_id
-                and route_id
-                and str(row.get("service_id", "")).strip() in active_by_service
+                if trip_id and service_id and route_id
             ),
+        )
+        self.connection.executemany(
+            "INSERT INTO service_dates VALUES (?, ?)",
+            (
+                (str(service_id), str(service_date))
+                for service_id, dates in active_by_service.items()
+                for service_date in dates
+            ),
+        )
+        self.connection.executescript(
+            """
+            INSERT OR IGNORE INTO active_trips(trip_id, route_id, headsign, direction_id)
+            SELECT trip_id, route_id, headsign, direction_id
+            FROM trip_services
+            WHERE service_id IN (SELECT service_id FROM service_dates);
+            INSERT OR IGNORE INTO active_service_dates(trip_id, service_date)
+            SELECT trips.trip_id, dates.service_date
+            FROM trip_services trips
+            JOIN service_dates dates ON dates.service_id = trips.service_id;
+            """
         )
         log_memory_stage("departure-feed-tables", started=started)
 
@@ -1337,14 +1374,18 @@ class ExternalDepartureStage:
         city_stop_ids: dict[str, set[str]],
         namespace: str,
         timezone_name: str,
+        *,
+        service_date: str | None = None,
+        departure_output_directory: Path | None = None,
+        departure_filename: str | None = None,
     ) -> None:
         generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        departures_directory = output / "departures"
+        departures_directory = departure_output_directory or (output / "departures")
         departures_directory.mkdir(parents=True, exist_ok=True)
         for city in cities:
             started = time.monotonic()
             city_id = str(city["id"])
-            path = departures_directory / f"{city_id}.json"
+            path = departures_directory / (departure_filename or f"{city_id}.json")
             with path.open("w", encoding="utf-8") as stream:
                 stream.write(json.dumps({"generatedAt": generated_at, "timezone": timezone_name}, ensure_ascii=False)[:-1])
                 stream.write(',"stops":{')
@@ -1360,8 +1401,16 @@ class ExternalDepartureStage:
                         stream.write(",")
                     stream.write(json.dumps(published_id, ensure_ascii=False) + ":[")
                     first_item = True
+                    date_join = (
+                        "JOIN active_service_dates active_date "
+                        "ON active_date.trip_id=d.trip_id "
+                        if service_date
+                        else ""
+                    )
+                    date_filter = " AND active_date.service_date=?" if service_date else ""
+                    query_parameters = (raw_id, service_date) if service_date else (raw_id,)
                     for departure_time, trip_id, original_stop_id, platform_code, platform_display, floor_display, parent_station, stop_desc, sequence, route_id, headsign, direction_id, short_name, long_name, route_type, agency_id, agency_name, terminal_stop_id, terminal_name in self.connection.execute(
-                        """
+                        f"""
                         SELECT d.departure_time, d.trip_id, d.original_stop_id, d.platform_code,
                                feed.platform_display, feed.floor_display, feed.parent_station,
                                feed.stop_desc, d.sequence, t.route_id, t.headsign, t.direction_id,
@@ -1369,14 +1418,15 @@ class ExternalDepartureStage:
                                terminal.stop_id, terminal_feed.stop_name
                         FROM departures d
                         JOIN active_trips t ON t.trip_id=d.trip_id
+                        {date_join}
                         LEFT JOIN routes r ON r.route_id=t.route_id
                         LEFT JOIN feed_stops feed ON feed.stop_id=d.original_stop_id
                         LEFT JOIN terminal_stops terminal ON terminal.trip_id=d.trip_id
                         LEFT JOIN feed_stops terminal_feed ON terminal_feed.stop_id=terminal.stop_id
-                        WHERE d.public_stop_id=?
+                        WHERE d.public_stop_id=?{date_filter}
                         ORDER BY d.departure_time, d.trip_id, d.sequence
                         """,
-                        (raw_id,),
+                        query_parameters,
                     ):
                         destination = headsign or terminal_name or short_name or long_name or route_id
                         item = {

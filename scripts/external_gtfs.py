@@ -133,6 +133,10 @@ try:
         cache_key,
         cache_provider_allowed,
         transformed_cache_enabled,
+        DeparturePartitionCache,
+        departure_cache_enabled,
+        departure_provider_allowed,
+        departure_partition_key,
     )
 except ImportError:
     from external_build_cache import (
@@ -146,6 +150,10 @@ except ImportError:
         cache_key,
         cache_provider_allowed,
         transformed_cache_enabled,
+        DeparturePartitionCache,
+        departure_cache_enabled,
+        departure_provider_allowed,
+        departure_partition_key,
     )
 
 
@@ -1843,6 +1851,26 @@ def build_external_departure_index(
 _legacy_build_external_departure_index = build_external_departure_index
 
 
+def _departure_service_dates(
+    timezone_name: str,
+    departure_window_days: int,
+    *,
+    now: datetime | None = None,
+) -> tuple[str, ...]:
+    if departure_window_days < 1:
+        raise ValueError("departure_window_days must be positive")
+    zone = ZoneInfo(timezone_name)
+    current = now or datetime.now(zone)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=zone)
+    today = current.astimezone(zone).date()
+    offsets = (-1, 0, 1) if departure_window_days <= 3 else range(departure_window_days)
+    return tuple(
+        (today + timedelta(days=offset)).strftime("%Y%m%d")
+        for offset in offsets
+    )
+
+
 def build_external_departure_index_bounded(
     archive: zipfile.ZipFile,
     cities: list[dict[str, object]],
@@ -1851,19 +1879,18 @@ def build_external_departure_index_bounded(
     namespace: str = "",
     departure_window_days: int = 3,
     context: NormalizedProviderContext | None = None,
+    output_schema_version: int = 1,
+    now: datetime | None = None,
+    write_service_dates: tuple[str, ...] | None = None,
 ) -> None:
     """Build departure JSON through a disk-backed SQLite staging database."""
     if not cities:
         return
-    zone = ZoneInfo(timezone_name)
-    today = datetime.now(zone).date()
-    if departure_window_days < 1:
-        raise ValueError("departure_window_days must be positive")
-    offsets = (-1, 0, 1) if departure_window_days <= 3 else range(departure_window_days)
-    service_dates = [
-        (today + timedelta(days=offset)).strftime("%Y%m%d")
-        for offset in offsets
-    ]
+    if output_schema_version not in {1, 2}:
+        raise ValueError(f"unsupported external departures schema version: {output_schema_version}")
+    service_dates = _departure_service_dates(
+        timezone_name, departure_window_days, now=now
+    )
     active_by_service: dict[str, list[str]] = {}
     for service_id, service in _service_calendar_from_source(archive, context).items():
         active_dates = [
@@ -1893,7 +1920,41 @@ def build_external_departure_index_bounded(
     stage = ExternalDepartureStage()
     try:
         stage.populate(archive, active_by_service, public_stop_ids, context=context)
-        stage.write_outputs(output, cities, city_stop_ids, namespace, timezone_name)
+        if output_schema_version == 1:
+            stage.write_outputs(output, cities, city_stop_ids, namespace, timezone_name)
+        else:
+            partition_root = output / "departures-v2"
+            for city in cities:
+                city_id = str(city["id"])
+                city_partition_root = partition_root / city_id
+                city_partition_root.mkdir(parents=True, exist_ok=True)
+                for service_date in (write_service_dates or service_dates):
+                    stage.write_outputs(
+                        output,
+                        [city],
+                        city_stop_ids,
+                        namespace,
+                        timezone_name,
+                        service_date=service_date,
+                        departure_output_directory=city_partition_root,
+                        departure_filename=f"{service_date}.json",
+                    )
+                manifest = {
+                    "schemaVersion": 2,
+                    "cityID": city_id,
+                    "timezone": timezone_name,
+                    "partitions": [
+                        {
+                            "serviceDate": service_date,
+                            "path": f"{service_date}.json",
+                        }
+                        for service_date in service_dates
+                    ],
+                }
+                (city_partition_root / "manifest.json").write_text(
+                    json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    encoding="utf-8",
+                )
     finally:
         stage.close()
 
@@ -2224,26 +2285,43 @@ def apply_current_departure_headsign_enrichment(
                 "CREATE TABLE headsigns(trip_id TEXT PRIMARY KEY, headsign TEXT NOT NULL)"
             )
             departures_path = output / "departures" / f"{city_id}.json"
-            if departures_path.is_file():
-                connection.executemany(
-                    "INSERT OR IGNORE INTO headsigns VALUES (?, ?)",
+            partition_manifest_path = (
+                output / "departures-v2" / city_id / "manifest.json"
+            )
+            departure_paths: list[Path] = []
+            if partition_manifest_path.is_file():
+                manifest = json.loads(partition_manifest_path.read_text(encoding="utf-8"))
+                if not isinstance(manifest, dict) or manifest.get("schemaVersion") != 2:
+                    raise ValueError(f"unsupported departures manifest for {city_id}")
+                for partition in manifest.get("partitions", []):
+                    if not isinstance(partition, dict) or not isinstance(partition.get("path"), str):
+                        raise ValueError(f"invalid departures partition for {city_id}")
+                    relative = Path(partition["path"])
+                    if relative.is_absolute() or ".." in relative.parts:
+                        raise ValueError(f"unsafe departures partition for {city_id}")
+                    departure_paths.append(partition_manifest_path.parent / relative)
+            elif departures_path.is_file():
+                departure_paths.append(departures_path)
+            connection.executemany(
+                "INSERT OR IGNORE INTO headsigns VALUES (?, ?)",
+                (
                     (
-                        (
-                            str(value.get("t", ""))[len(namespace):]
-                            if namespace and str(value.get("t", "")).startswith(namespace)
-                            else str(value.get("t", "")),
-                            str(value.get("h", "") or ""),
-                        )
-                        for kind, _stop_id, value in iter_departure_payload_items(
-                            departures_path
-                        )
-                        if kind == "stop"
-                        and isinstance(value, dict)
-                        and str(value.get("t", "")).strip()
-                        and str(value.get("h", "") or "").strip()
-                    ),
-                )
-                connection.commit()
+                        str(value.get("t", ""))[len(namespace):]
+                        if namespace and str(value.get("t", "")).startswith(namespace)
+                        else str(value.get("t", "")),
+                        str(value.get("h", "") or ""),
+                    )
+                    for departure_path in departure_paths
+                    for kind, _stop_id, value in iter_departure_payload_items(
+                        departure_path
+                    )
+                    if kind == "stop"
+                    and isinstance(value, dict)
+                    and str(value.get("t", "")).strip()
+                    and str(value.get("h", "") or "").strip()
+                ),
+            )
+            connection.commit()
 
             final_path.parent.mkdir(parents=True, exist_ok=True)
             with final_path.open("w", encoding="utf-8") as stream:
@@ -2431,6 +2509,7 @@ def _merge_namespaced_city_records_bounded(
         )
         output_started = time.monotonic()
         stop_count, _metadata = stage.write_outputs(output, city_id)
+        _write_merged_v2_departures(city_id, records, output)
         log_memory_stage(
             "merge-output-assembly-write",
             source=city_id,
@@ -2461,6 +2540,274 @@ def _merge_namespaced_city_records_bounded(
             f"duration={time.monotonic() - total_started:.2f}s",
             flush=True,
         )
+
+
+def _departure_output_schema_version(environ: dict[str, str] | None) -> int:
+    values = environ if environ is not None else os.environ
+    raw = values.get("HALTEWECKER_EXTERNAL_DEPARTURES_SCHEMA", "1").strip()
+    try:
+        version = int(raw)
+    except ValueError as error:
+        raise ValueError("HALTEWECKER_EXTERNAL_DEPARTURES_SCHEMA must be an integer") from error
+    if version not in {1, 2}:
+        raise ValueError(f"unsupported external departures schema version: {version}")
+    return version
+
+
+def _write_departures_v2_manifest(
+    output: Path,
+    city_id: str,
+    timezone_name: str,
+    service_dates: tuple[str, ...],
+) -> None:
+    partition_root = output / "departures-v2" / city_id
+    partition_root.mkdir(parents=True, exist_ok=True)
+    for service_date in service_dates:
+        path = partition_root / f"{service_date}.json"
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"missing generated departures-v2 partition {city_id}/{service_date}"
+            )
+    manifest = {
+        "schemaVersion": 2,
+        "cityID": city_id,
+        "timezone": timezone_name,
+        "partitions": [
+            {"serviceDate": service_date, "path": f"{service_date}.json"}
+            for service_date in service_dates
+        ],
+    }
+    (partition_root / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+
+def _merge_departure_partition_payloads(
+    paths: tuple[Path, ...],
+    timezone_name: str,
+) -> dict[str, object]:
+    merged_stops: dict[str, list[dict[str, object]]] = {}
+    merged_platforms: dict[str, set[str]] = {}
+    generated_at: str | None = None
+    for path in paths:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("timezone") != timezone_name:
+            raise ValueError(f"invalid departures-v2 partition: {path}")
+        if isinstance(payload.get("generatedAt"), str):
+            generated_at = max(generated_at or payload["generatedAt"], payload["generatedAt"])
+        for stop_id, items in dict(payload.get("stops") or {}).items():
+            merged_stops.setdefault(str(stop_id), []).extend(
+                item for item in items if isinstance(item, dict)
+            )
+        for parent_id, children in dict(payload.get("platforms") or {}).items():
+            merged_platforms.setdefault(str(parent_id), set()).update(
+                str(child) for child in children if child
+            )
+    normalized: dict[str, list[dict[str, object]]] = {}
+    for stop_id, items in merged_stops.items():
+        unique = {
+            json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")): item
+            for item in items
+        }
+        normalized[stop_id] = sorted(
+            unique.values(),
+            key=lambda item: (
+                str(item.get("p", "")),
+                str(item.get("t", "")),
+                str(item.get("r", "")),
+            ),
+        )
+    return {
+        "generatedAt": generated_at,
+        "timezone": timezone_name,
+        "stops": dict(sorted(normalized.items())),
+        "platforms": {
+            parent_id: sorted(children)
+            for parent_id, children in sorted(merged_platforms.items())
+        },
+    }
+
+
+def _write_v1_departure_compatibility(
+    output: Path,
+    city_id: str,
+    timezone_name: str,
+    service_dates: tuple[str, ...],
+) -> None:
+    """Keep the existing namespace merge input available during v2 rollout."""
+    payload = _merge_departure_partition_payloads(
+        tuple(
+            output / "departures-v2" / city_id / f"{service_date}.json"
+            for service_date in service_dates
+        ),
+        timezone_name,
+    )
+    path = output / "departures" / f"{city_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+
+def _write_merged_v2_departures(
+    city_id: str,
+    records: list[dict[str, object]],
+    output: Path,
+) -> None:
+    manifests: list[tuple[str, dict[str, object], Path]] = []
+    for record in records:
+        source_output = Path(record["output"])
+        manifest_path = source_output / "departures-v2" / city_id / "manifest.json"
+        if not manifest_path.is_file():
+            return
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict) or manifest.get("schemaVersion") != 2:
+            raise ValueError(f"invalid departures-v2 member manifest: {manifest_path}")
+        timezone_name = str(manifest.get("timezone") or "")
+        if not timezone_name:
+            raise ValueError(f"departures-v2 member timezone is missing: {manifest_path}")
+        manifests.append((timezone_name, manifest, manifest_path.parent))
+    timezones = {item[0] for item in manifests}
+    if len(timezones) != 1:
+        raise ValueError(f"merged departures-v2 timezone conflict for {city_id}")
+    date_sets = [
+        {str(partition.get("serviceDate")): str(partition.get("path")) for partition in manifest.get("partitions", [])}\
+        for _timezone, manifest, _root in manifests
+    ]
+    if not date_sets or any(set(value) != set(date_sets[0]) for value in date_sets[1:]):
+        raise ValueError(f"merged departures-v2 date coverage conflict for {city_id}")
+    final_root = output / "departures-v2" / city_id
+    final_root.mkdir(parents=True, exist_ok=True)
+    service_dates = tuple(sorted(date_sets[0]))
+    for service_date in service_dates:
+        paths = tuple(
+            root / date_map[service_date]
+            for (_timezone, _manifest, root), date_map in zip(manifests, date_sets)
+        )
+        (final_root / f"{service_date}.json").write_text(
+            json.dumps(
+                _merge_departure_partition_payloads(paths, next(iter(timezones))),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+    _write_departures_v2_manifest(output, city_id, next(iter(timezones)), service_dates)
+
+
+def _build_external_departure_partitions(
+    *,
+    archive: zipfile.ZipFile,
+    cities: list[dict[str, object]],
+    output: Path,
+    timezone_name: str,
+    namespace: str,
+    departure_window_days: int,
+    context: NormalizedProviderContext | None,
+    output_schema_version: int,
+    provider_id: str,
+    source: dict[str, object],
+    repository_root: Path,
+    raw_artifact_digest: str | None,
+    structural_input_key: str,
+    gtfs_cache: GTFSArtifactCache | None,
+    environ: dict[str, str] | None,
+    now: datetime | None = None,
+) -> None:
+    if output_schema_version != 2:
+        build_external_departure_index(
+            archive,
+            cities,
+            output,
+            timezone_name=timezone_name,
+            namespace=namespace,
+            departure_window_days=departure_window_days,
+            context=context,
+        )
+        return
+
+    build_now = now or datetime.now(ZoneInfo(timezone_name))
+    service_dates = _departure_service_dates(
+        timezone_name, departure_window_days, now=build_now
+    )
+    cache: DeparturePartitionCache | None = None
+    cache_enabled_for_source = (
+        departure_cache_enabled(environ)
+        and departure_provider_allowed(provider_id, environ)
+        and gtfs_cache is not None
+        and raw_artifact_digest is not None
+    )
+    if cache_enabled_for_source:
+        cache = DeparturePartitionCache(
+            Path(gtfs_cache.root) / "external-departure-partitions",
+            provider_id,
+        )
+
+    misses: set[str] = set()
+    lookups: dict[tuple[str, str], object] = {}
+    keys: dict[tuple[str, str], object] = {}
+    for city in cities:
+        city_id = str(city["id"])
+        for service_date in service_dates:
+            if cache is None:
+                misses.add(service_date)
+                continue
+            key = departure_partition_key(
+                repository_root=repository_root,
+                provider_id=provider_id,
+                city_id=city_id,
+                service_date=service_date,
+                raw_sha256=str(raw_artifact_digest),
+                structural_input_key=structural_input_key,
+                calendar_fingerprint=str(raw_artifact_digest),
+                source=source,
+            )
+            lookup = cache.lookup(key)
+            keys[(city_id, service_date)] = key
+            lookups[(city_id, service_date)] = lookup
+            if lookup.status != "HIT":
+                misses.add(service_date)
+            print(
+                f"[StopData] source={provider_id} stage=departures-partition "
+                f"serviceDate={service_date} status={lookup.status if cache else 'MISS'} "
+                f"key={key.value[:12] if cache else 'n/a'}",
+                flush=True,
+            )
+
+    if misses:
+        build_external_departure_index(
+            archive,
+            cities,
+            output,
+            timezone_name=timezone_name,
+            namespace=namespace,
+            departure_window_days=departure_window_days,
+            context=context,
+            output_schema_version=2,
+            now=build_now,
+            write_service_dates=tuple(date for date in service_dates if date in misses),
+        )
+    for city in cities:
+        city_id = str(city["id"])
+        partition_root = output / "departures-v2" / city_id
+        partition_root.mkdir(parents=True, exist_ok=True)
+        for service_date in service_dates:
+            destination = partition_root / f"{service_date}.json"
+            lookup = lookups.get((city_id, service_date))
+            if lookup is not None and lookup.status == "HIT" and cache is not None:
+                cache.restore(lookup, destination)
+            if not destination.is_file():
+                raise FileNotFoundError(
+                    f"departure partition was not produced: {city_id}/{service_date}"
+                )
+            key = keys.get((city_id, service_date))
+            if cache is not None and key is not None and lookup is not None and lookup.status != "HIT":
+                cache.persist(key, destination)
+        _write_departures_v2_manifest(output, city_id, timezone_name, service_dates)
+        if namespace or str(source.get("mergeGroup", "")).strip():
+            _write_v1_departure_compatibility(output, city_id, timezone_name, service_dates)
 
 
 def process_external_gtfs_sources(
@@ -3001,20 +3348,49 @@ def process_external_gtfs_sources(
                     )
 
             if source.get("buildDepartures", True):
-                _timed_external_stage(
-                    source_id,
-                    "departures",
-                    partial(
-                        build_external_departure_index,
-                        archive,
-                        cities,
-                        source_output,
-                        timezone_name=str(source["timezone"]),
-                        namespace=namespace,
-                        departure_window_days=int(source.get("departurePackageDays", 3)),
-                        context=normalized_context,
-                    ),
-                )
+                departure_schema_version = _departure_output_schema_version(environ)
+                if departure_schema_version == 2:
+                    _timed_external_stage(
+                        source_id,
+                        "departures-v2",
+                        partial(
+                            _build_external_departure_partitions,
+                            archive=archive,
+                            cities=cities,
+                            output=source_output,
+                            timezone_name=str(source["timezone"]),
+                            namespace=namespace,
+                            departure_window_days=int(source.get("departurePackageDays", 3)),
+                            context=normalized_context,
+                            output_schema_version=departure_schema_version,
+                            provider_id=source_id,
+                            source=source,
+                            repository_root=repository_root,
+                            raw_artifact_digest=raw_artifact_digest,
+                            structural_input_key=(
+                                build_cache_key.value
+                                if build_cache_key is not None
+                                else (raw_artifact_digest or "")
+                            ),
+                            gtfs_cache=gtfs_cache,
+                            environ=environ,
+                        ),
+                    )
+                else:
+                    _timed_external_stage(
+                        source_id,
+                        "departures",
+                        partial(
+                            build_external_departure_index,
+                            archive,
+                            cities,
+                            source_output,
+                            timezone_name=str(source["timezone"]),
+                            namespace=namespace,
+                            departure_window_days=int(source.get("departurePackageDays", 3)),
+                            context=normalized_context,
+                        ),
+                    )
 
             if source.get("buildTripIndex", True):
                 if not build_cache_hit:

@@ -1,0 +1,264 @@
+import json
+import sys
+import tempfile
+import unittest
+import zipfile
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))
+
+import external_gtfs
+from external_build_cache import DeparturePartitionCache, departure_partition_key
+from gtfs_source_cache import GTFSArtifactCache
+from static_departures_api import ExternalStaticData
+
+
+class ExternalDeparturePartitionTests(unittest.TestCase):
+    def _feed(self, path: Path) -> None:
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("agency.txt", "agency_id,agency_name\nA,Fixture\n")
+            archive.writestr(
+                "stops.txt",
+                "stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station\n"
+                "stop,Stop,43.0,-79.0,0,\n",
+            )
+            archive.writestr(
+                "routes.txt",
+                "route_id,route_short_name,route_long_name,route_type,agency_id\n"
+                "R1,1,One,3,A\n",
+            )
+            archive.writestr(
+                "trips.txt",
+                "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+                "R1,S1,T1,Terminal,0\n",
+            )
+            archive.writestr(
+                "stop_times.txt",
+                "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+                "T1,08:00:00,08:00:00,stop,1\n",
+            )
+            archive.writestr(
+                "calendar.txt",
+                "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
+                "S1,1,1,1,1,1,1,1,20260101,20261231\n",
+            )
+
+    def _build(self, root: Path, archive_path: Path, schema: int) -> None:
+        (root / "stops").mkdir(parents=True)
+        (root / "stops" / "fixture-city.json").write_text(
+            json.dumps([{"id": "stop", "name": "Stop", "latitude": 43.0, "longitude": -79.0}]),
+            encoding="utf-8",
+        )
+        with zipfile.ZipFile(archive_path) as archive:
+            external_gtfs.build_external_departure_index(
+                archive,
+                [{"id": "fixture-city", "name": "Fixture"}],
+                root,
+                "America/Toronto",
+                output_schema_version=schema,
+                now=datetime(2026, 9, 14, 12, tzinfo=ZoneInfo("America/Toronto")),
+            )
+
+    def test_v2_partitions_merge_to_v1_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            archive_path = base / "fixture.zip"
+            self._feed(archive_path)
+            v1 = base / "v1"
+            v2 = base / "v2"
+            self._build(v1, archive_path, 1)
+            self._build(v2, archive_path, 2)
+            manifest = json.loads(
+                (v2 / "departures-v2" / "fixture-city" / "manifest.json").read_text()
+            )
+            self.assertEqual(manifest["schemaVersion"], 2)
+            self.assertEqual(
+                [item["serviceDate"] for item in manifest["partitions"]],
+                ["20260913", "20260914", "20260915"],
+            )
+            v1_data = ExternalStaticData(str(v1), "fixture-city", "", "America/Toronto", now_provider=lambda: datetime(2026, 9, 14, 12, tzinfo=ZoneInfo("America/Toronto")))
+            v2_data = ExternalStaticData(str(v2), "fixture-city", "", "America/Toronto", now_provider=lambda: datetime(2026, 9, 14, 12, tzinfo=ZoneInfo("America/Toronto")))
+            v1_data._ensure_loaded()
+            v2_data._ensure_loaded()
+            self.assertEqual(v1_data.departures, v2_data.departures)
+            self.assertEqual(v1_data.platforms, v2_data.platforms)
+
+    def test_v2_missing_required_partition_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            archive_path = base / "fixture.zip"
+            self._feed(archive_path)
+            self._build(base / "v2", archive_path, 2)
+            partition = base / "v2" / "departures-v2" / "fixture-city" / "20260914.json"
+            partition.unlink()
+            data = ExternalStaticData(str(base / "v2"), "fixture-city", "", "America/Toronto", now_provider=lambda: datetime(2026, 9, 14, 12, tzinfo=ZoneInfo("America/Toronto")))
+            with self.assertRaises(FileNotFoundError):
+                data._ensure_loaded()
+
+    def test_unknown_schema_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            partition_root = root / "departures-v2" / "fixture-city"
+            partition_root.mkdir(parents=True)
+            (root / "stops").mkdir()
+            (root / "stops" / "fixture-city.json").write_text("[]")
+            (partition_root / "manifest.json").write_text(json.dumps({"schemaVersion": 99}))
+            data = ExternalStaticData(str(root), "fixture-city", "", "UTC")
+            with self.assertRaises(ValueError):
+                data._ensure_loaded()
+
+    def test_sliding_window_reuses_two_partitions_and_builds_one(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            archive_path = base / "fixture.zip"
+            self._feed(archive_path)
+            source = {"id": "fixture", "timezone": "America/Toronto", "departurePackageDays": 3}
+            first = base / "first"
+            second = base / "second"
+            for root in (first, second):
+                (root / "stops").mkdir(parents=True)
+                (root / "stops" / "fixture-city.json").write_text(
+                    json.dumps([{"id": "stop", "name": "Stop", "latitude": 43.0, "longitude": -79.0}]),
+                    encoding="utf-8",
+                )
+            cache = GTFSArtifactCache(base / "gtfs-cache")
+            with zipfile.ZipFile(archive_path) as archive:
+                external_gtfs._build_external_departure_partitions(
+                    archive=archive, cities=[{"id": "fixture-city", "name": "Fixture"}],
+                    output=first, timezone_name="America/Toronto", namespace="",
+                    departure_window_days=3, context=None, output_schema_version=2,
+                    provider_id="fixture", source=source,
+                    repository_root=Path(__file__).resolve().parents[1],
+                    raw_artifact_digest="b" * 64, structural_input_key="structural",
+                    gtfs_cache=cache, environ={
+                        "HALTEWECKER_EXTERNAL_DEPARTURE_CACHE": "1",
+                        "HALTEWECKER_EXTERNAL_DEPARTURE_CACHE_PROVIDERS": "fixture",
+                    },
+                    now=datetime(2026, 9, 14, 12, tzinfo=ZoneInfo("America/Toronto")),
+                )
+            with zipfile.ZipFile(archive_path) as archive:
+                external_gtfs._build_external_departure_partitions(
+                    archive=archive, cities=[{"id": "fixture-city", "name": "Fixture"}],
+                    output=second, timezone_name="America/Toronto", namespace="",
+                    departure_window_days=3, context=None, output_schema_version=2,
+                    provider_id="fixture", source=source,
+                    repository_root=Path(__file__).resolve().parents[1],
+                    raw_artifact_digest="b" * 64, structural_input_key="structural",
+                    gtfs_cache=cache, environ={
+                        "HALTEWECKER_EXTERNAL_DEPARTURE_CACHE": "1",
+                        "HALTEWECKER_EXTERNAL_DEPARTURE_CACHE_PROVIDERS": "fixture",
+                    },
+                    now=datetime(2026, 9, 15, 12, tzinfo=ZoneInfo("America/Toronto")),
+                )
+            # The helper uses provider-local now; verify the cache has one partition per service date
+            # and that a second invocation never creates duplicate key directories.
+            keys = list((base / "gtfs-cache" / "external-departure-partitions" / "fixture" / "fixture-city").glob("*/*"))
+            self.assertEqual(len(keys), 4)
+            self.assertEqual(
+                {path.parent.name for path in keys},
+                {"20260913", "20260914", "20260915", "20260916"},
+            )
+
+    def test_service_dates_use_provider_timezone_at_boundaries(self) -> None:
+        self.assertEqual(
+            external_gtfs._departure_service_dates(
+                "America/Toronto", 3, now=datetime(2026, 9, 14, 0, 30, tzinfo=ZoneInfo("America/Toronto"))
+            ),
+            ("20260913", "20260914", "20260915"),
+        )
+        self.assertEqual(
+            external_gtfs._departure_service_dates(
+                "Pacific/Auckland", 3, now=datetime(2026, 1, 1, 0, 15, tzinfo=ZoneInfo("Pacific/Auckland"))
+            ),
+            ("20251231", "20260101", "20260102"),
+        )
+        self.assertEqual(
+            external_gtfs._departure_service_dates(
+                "America/Toronto", 3, now=datetime(2026, 9, 20, 12, tzinfo=ZoneInfo("America/Toronto"))
+            ),
+            ("20260919", "20260920", "20260921"),
+        )
+        self.assertEqual(
+            external_gtfs._departure_service_dates(
+                "America/Toronto", 3, now=datetime(2026, 3, 1, 12, tzinfo=ZoneInfo("America/Toronto"))
+            ),
+            ("20260228", "20260301", "20260302"),
+        )
+        self.assertEqual(
+            external_gtfs._departure_service_dates(
+                "America/Toronto", 3, now=datetime(2026, 3, 8, 12, tzinfo=ZoneInfo("America/Toronto"))
+            ),
+            ("20260307", "20260308", "20260309"),
+        )
+
+    def test_headsign_enrichment_reads_partitioned_departures(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "trip-index-base").mkdir(parents=True)
+            (root / "trip-index-base" / "fixture-city.json").write_text(
+                json.dumps({"ttc:T1": {"r": "ttc:R1"}}), encoding="utf-8"
+            )
+            partition_root = root / "departures-v2" / "fixture-city"
+            partition_root.mkdir(parents=True)
+            dates = ("20260913", "20260914", "20260915")
+            for service_date in dates:
+                (partition_root / f"{service_date}.json").write_text(
+                    json.dumps({
+                        "generatedAt": "2026-09-14T00:00:00Z",
+                        "timezone": "America/Toronto",
+                        "stops": {"ttc:stop": [{"t": "ttc:T1", "h": "Terminal", "p": "08:00:00", "r": "ttc:R1"}]},
+                        "platforms": {},
+                    }), encoding="utf-8"
+                )
+            (partition_root / "manifest.json").write_text(json.dumps({
+                "schemaVersion": 2, "cityID": "fixture-city", "timezone": "America/Toronto",
+                "partitions": [{"serviceDate": value, "path": f"{value}.json"} for value in dates],
+            }))
+            external_gtfs.apply_current_departure_headsign_enrichment(
+                root, [{"id": "fixture-city"}], namespace="ttc:"
+            )
+            self.assertEqual(
+                json.loads((root / "trips" / "fixture-city.json").read_text()),
+                {"ttc:T1": {"r": "ttc:R1", "h": "Terminal"}},
+            )
+
+    def test_partition_key_excludes_release_identity_and_cache_restores(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            key_a = departure_partition_key(
+                repository_root=Path(__file__).resolve().parents[1],
+                provider_id="fixture",
+                city_id="fixture-city",
+                service_date="20260914",
+                raw_sha256="a" * 64,
+                structural_input_key="structural-key",
+                calendar_fingerprint="calendar-key",
+                source={"timezone": "UTC", "departurePackageDays": 3},
+            )
+            key_b = departure_partition_key(
+                repository_root=Path(__file__).resolve().parents[1],
+                provider_id="fixture",
+                city_id="fixture-city",
+                service_date="20260914",
+                raw_sha256="a" * 64,
+                structural_input_key="structural-key",
+                calendar_fingerprint="calendar-key",
+                source={"timezone": "UTC", "departurePackageDays": 3, "releaseID": "different"},
+            )
+            self.assertEqual(key_a.value, key_b.value)
+            source = root / "partition.json"
+            source.write_text("{\"stops\":{}}")
+            cache = DeparturePartitionCache(root / "cache", "fixture")
+            cache.persist(key_a, source)
+            lookup = cache.lookup(key_b)
+            self.assertEqual(lookup.status, "HIT")
+            destination = root / "restored.json"
+            cache.restore(lookup, destination)
+            self.assertEqual(destination.read_text(), source.read_text())
+
+
+if __name__ == "__main__":
+    unittest.main()

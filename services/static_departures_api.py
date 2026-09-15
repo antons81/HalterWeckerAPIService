@@ -242,6 +242,127 @@ class ExternalStaticData:
             return None
         return stat_result.st_mtime_ns, stat_result.st_size
 
+    def _required_departure_dates(self, timezone_name: str) -> tuple[str, ...]:
+        zone = ZoneInfo(timezone_name)
+        current = self.now_provider()
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=zone)
+        today = current.astimezone(zone).date()
+        return tuple(
+            (today + timedelta(days=offset)).strftime("%Y%m%d")
+            for offset in (-1, 0, 1)
+        )
+
+    def _v2_departure_sources(self) -> tuple[Path, str, tuple[Path, ...]] | None:
+        if self.root is None:
+            raise FileNotFoundError("external static data root is not configured")
+        partition_root = self.root / "departures-v2" / self.city_id
+        manifest_path = partition_root / "manifest.json"
+        if not manifest_path.is_file():
+            return None
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("invalid departures-v2 manifest") from error
+        if not isinstance(manifest, dict) or manifest.get("schemaVersion") != 2:
+            raise ValueError("unsupported departures schema version")
+        timezone_name = str(manifest.get("timezone") or self.timezone_name)
+        try:
+            ZoneInfo(timezone_name)
+        except Exception as error:
+            raise ValueError("invalid departures-v2 timezone") from error
+        partitions = manifest.get("partitions")
+        if not isinstance(partitions, list):
+            raise ValueError("departures-v2 manifest partitions are missing")
+        by_date: dict[str, Path] = {}
+        for partition in partitions:
+            if not isinstance(partition, dict):
+                raise ValueError("invalid departures-v2 partition entry")
+            service_date = str(partition.get("serviceDate") or "")
+            relative_path = partition.get("path")
+            if not service_date or not isinstance(relative_path, str):
+                raise ValueError("invalid departures-v2 partition metadata")
+            relative = Path(relative_path)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError("departures-v2 partition path escapes release")
+            if service_date in by_date:
+                raise ValueError(f"duplicate departures-v2 partition: {service_date}")
+            by_date[service_date] = partition_root / relative
+        required_dates = self._required_departure_dates(timezone_name)
+        paths: list[Path] = []
+        for service_date in required_dates:
+            path = by_date.get(service_date)
+            if path is None or not path.is_file():
+                raise FileNotFoundError(
+                    f"missing required departures-v2 partition {self.city_id}/{service_date}"
+                )
+            paths.append(path)
+        return manifest_path, timezone_name, tuple(paths)
+
+    @staticmethod
+    def _merge_v2_departures(
+        paths: tuple[Path, ...],
+        timezone_name: str,
+    ) -> dict[str, object]:
+        merged_stops: dict[str, list[dict[str, object]]] = {}
+        merged_platforms: dict[str, set[str]] = {}
+        generated_at: str | None = None
+        for path in paths:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError(f"invalid departures-v2 partition: {path}") from error
+            if not isinstance(payload, dict):
+                raise ValueError(f"invalid departures-v2 partition: {path}")
+            partition_timezone = str(payload.get("timezone") or timezone_name)
+            if partition_timezone != timezone_name:
+                raise ValueError(f"departures-v2 timezone mismatch: {path}")
+            value = payload.get("generatedAt")
+            if isinstance(value, str):
+                generated_at = max(generated_at or value, value)
+            stops = payload.get("stops")
+            if not isinstance(stops, dict):
+                raise ValueError(f"departures-v2 stops are missing: {path}")
+            for stop_id, items in stops.items():
+                if not isinstance(stop_id, str) or not isinstance(items, list):
+                    raise ValueError(f"invalid departures-v2 stop payload: {path}")
+                merged_stops.setdefault(stop_id, []).extend(
+                    item for item in items if isinstance(item, dict)
+                )
+            platforms = payload.get("platforms", {})
+            if not isinstance(platforms, dict):
+                raise ValueError(f"invalid departures-v2 platforms: {path}")
+            for parent_id, child_ids in platforms.items():
+                if not isinstance(parent_id, str) or not isinstance(child_ids, list):
+                    raise ValueError(f"invalid departures-v2 platform payload: {path}")
+                merged_platforms.setdefault(parent_id, set()).update(
+                    str(child_id) for child_id in child_ids if child_id
+                )
+
+        normalized_stops: dict[str, list[dict[str, object]]] = {}
+        for stop_id, items in merged_stops.items():
+            unique: dict[str, dict[str, object]] = {}
+            for item in items:
+                identity = json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                unique.setdefault(identity, item)
+            normalized_stops[stop_id] = sorted(
+                unique.values(),
+                key=lambda item: (
+                    str(item.get("p", "")),
+                    str(item.get("t", "")),
+                    str(item.get("r", "")),
+                ),
+            )
+        return {
+            "generatedAt": generated_at,
+            "timezone": timezone_name,
+            "stops": dict(sorted(normalized_stops.items())),
+            "platforms": {
+                parent_id: sorted(children)
+                for parent_id, children in sorted(merged_platforms.items())
+            },
+        }
+
     def _load_if_needed(self) -> None:
         stops_path = self._path("stops", f"{self.city_id}.json")
         routes_path = (
@@ -249,19 +370,31 @@ class ExternalStaticData:
             if self.database is None
             else None
         )
+        v2_sources = (
+            self._v2_departure_sources() if self.database is None else None
+        )
         departures_path = (
             self._path("departures", f"{self.city_id}.json")
-            if self.database is None
+            if self.database is None and v2_sources is None
             else None
+        )
+        departure_signature = (
+            (
+                "v2",
+                self._file_signature(v2_sources[0]),
+                tuple(self._file_signature(path) for path in v2_sources[2]),
+            )
+            if v2_sources is not None
+            else self._file_signature(departures_path) if departures_path is not None else None
         )
         signature = (
             self._file_signature(stops_path),
             self._file_signature(routes_path) if routes_path is not None else None,
-            self._file_signature(departures_path) if departures_path is not None else None,
+            departure_signature,
         )
         if signature == self.signature:
             return
-        if signature[0] is None or (self.database is None and signature[2] is None):
+        if signature[0] is None or (self.database is None and departure_signature is None):
             raise FileNotFoundError("external static package is incomplete")
         log_memory_stage(
             "external-before-load",
@@ -278,9 +411,13 @@ class ExternalStaticData:
             else {}
         )
         departures_payload = (
-            json.loads(departures_path.read_text(encoding="utf-8"))
-            if departures_path is not None
-            else {}
+            self._merge_v2_departures(v2_sources[2], v2_sources[1])
+            if v2_sources is not None
+            else (
+                json.loads(departures_path.read_text(encoding="utf-8"))
+                if departures_path is not None
+                else {}
+            )
         )
         if not isinstance(stops_payload, list) or not isinstance(departures_payload, dict):
             raise ValueError("invalid external static package")

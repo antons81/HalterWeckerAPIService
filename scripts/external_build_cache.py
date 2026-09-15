@@ -161,6 +161,222 @@ class CacheRestore:
     package_stops_by_city_id: dict[str, list[dict[str, object]]] | None = None
 
 
+DEPARTURE_CACHE_SCHEMA_VERSION = 1
+DEPARTURE_OUTPUT_SCHEMA_VERSION = 2
+DEPARTURE_CACHE_LAYER = "external-departure-partition-v1"
+DEPARTURE_CACHE_FEATURE_GATE = "HALTEWECKER_EXTERNAL_DEPARTURE_CACHE"
+DEPARTURE_CACHE_PROVIDER_ALLOWLIST = "HALTEWECKER_EXTERNAL_DEPARTURE_CACHE_PROVIDERS"
+
+
+@dataclass(frozen=True)
+class DeparturePartitionKey:
+    value: str
+    provider_id: str
+    city_id: str
+    service_date: str
+    raw_sha256: str
+    structural_input_key: str
+    calendar_fingerprint: str
+    builder_fingerprint: str
+    config_fingerprint: str
+
+
+@dataclass(frozen=True)
+class DeparturePartitionLookup:
+    status: str
+    reason: str
+    key: DeparturePartitionKey
+    directory: Path | None = None
+
+
+def departure_cache_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    values = environ if environ is not None else os.environ
+    return values.get(DEPARTURE_CACHE_FEATURE_GATE, "0").strip() == "1"
+
+
+def departure_provider_allowed(
+    provider_id: str,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    values = environ if environ is not None else os.environ
+    configured = values.get(DEPARTURE_CACHE_PROVIDER_ALLOWLIST)
+    if configured is None:
+        return False
+    return provider_id in {item.strip() for item in configured.split(",") if item.strip()}
+
+
+def departure_config_fingerprint(source: Mapping[str, object]) -> str:
+    keys = (
+        "departurePackageDays",
+        "namespace",
+        "timezone",
+        "stopIDMode",
+        "publishPassengerStopIDs",
+        "exclusiveCityPartition",
+        "supplementalStopCatalog",
+    )
+    payload = {
+        key: _safe_config_value(key, source.get(key))
+        for key in keys
+        if key in source
+    }
+    return _sha256_json(payload)
+
+
+def departure_builder_fingerprint(repository_root: Path) -> str:
+    return _file_fingerprint(
+        repository_root,
+        (*BUILDER_INPUTS, "scripts/external_build_cache.py"),
+    )
+
+
+def departure_partition_key(
+    *,
+    repository_root: Path,
+    provider_id: str,
+    city_id: str,
+    service_date: str,
+    raw_sha256: str,
+    structural_input_key: str,
+    calendar_fingerprint: str,
+    source: Mapping[str, object],
+) -> DeparturePartitionKey:
+    if not provider_id or not city_id or not service_date:
+        raise CacheKeyUnavailable("departure partition identity is incomplete")
+    if len(raw_sha256) != 64 or not calendar_fingerprint:
+        raise CacheKeyUnavailable("departure partition provenance is incomplete")
+    builder = departure_builder_fingerprint(repository_root)
+    config = departure_config_fingerprint(source)
+    payload = {
+        "cacheSchemaVersion": DEPARTURE_CACHE_SCHEMA_VERSION,
+        "outputSchemaVersion": DEPARTURE_OUTPUT_SCHEMA_VERSION,
+        "cacheLayer": DEPARTURE_CACHE_LAYER,
+        "providerID": provider_id,
+        "cityID": city_id,
+        "serviceDate": service_date,
+        "rawGTFSsha256": raw_sha256,
+        "structuralInputKey": structural_input_key,
+        "calendarFingerprint": calendar_fingerprint,
+        "builderFingerprint": builder,
+        "departureConfigFingerprint": config,
+    }
+    return DeparturePartitionKey(
+        value=_sha256_json(payload),
+        provider_id=provider_id,
+        city_id=city_id,
+        service_date=service_date,
+        raw_sha256=raw_sha256,
+        structural_input_key=structural_input_key,
+        calendar_fingerprint=calendar_fingerprint,
+        builder_fingerprint=builder,
+        config_fingerprint=config,
+    )
+
+
+def _materialize_file(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
+    temporary.unlink(missing_ok=True)
+    try:
+        try:
+            os.link(source, temporary)
+        except OSError as error:
+            if error.errno != errno.EXDEV:
+                raise
+            shutil.copyfile(source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+class DeparturePartitionCache:
+    """Atomic cache for one v2 departure service-date partition."""
+
+    def __init__(self, root: Path | str, provider_id: str) -> None:
+        self.root = Path(root) / provider_id
+        self.provider_id = provider_id
+
+    def _directory(self, key: DeparturePartitionKey) -> Path:
+        return self.root / key.city_id / key.service_date / key.value
+
+    def lookup(self, key: DeparturePartitionKey) -> DeparturePartitionLookup:
+        directory = self._directory(key)
+        if not directory.is_dir():
+            return DeparturePartitionLookup("MISS", "cache key not found", key)
+        try:
+            manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+            partition = directory / "partition.json"
+            digest, size = artifact_provenance(partition)
+        except (OSError, ValueError, TypeError):
+            shutil.rmtree(directory, ignore_errors=True)
+            return DeparturePartitionLookup("INVALID", "partition cache is unreadable", key)
+        expected = {
+            "cacheSchemaVersion": DEPARTURE_CACHE_SCHEMA_VERSION,
+            "outputSchemaVersion": DEPARTURE_OUTPUT_SCHEMA_VERSION,
+            "cacheLayer": DEPARTURE_CACHE_LAYER,
+            "providerID": key.provider_id,
+            "cityID": key.city_id,
+            "serviceDate": key.service_date,
+            "key": key.value,
+            "rawGTFSsha256": key.raw_sha256,
+            "structuralInputKey": key.structural_input_key,
+            "calendarFingerprint": key.calendar_fingerprint,
+            "builderFingerprint": key.builder_fingerprint,
+            "departureConfigFingerprint": key.config_fingerprint,
+        }
+        if not isinstance(manifest, dict) or any(manifest.get(name) != value for name, value in expected.items()):
+            shutil.rmtree(directory, ignore_errors=True)
+            return DeparturePartitionLookup("INVALID", "partition manifest mismatch", key)
+        if manifest.get("status") != "complete" or manifest.get("sha256") != digest or manifest.get("size") != size:
+            shutil.rmtree(directory, ignore_errors=True)
+            return DeparturePartitionLookup("INVALID", "partition provenance mismatch", key)
+        return DeparturePartitionLookup("HIT", "validated partition", key, directory)
+
+    def restore(self, lookup: DeparturePartitionLookup, destination: Path) -> None:
+        if lookup.status != "HIT" or lookup.directory is None:
+            raise ValueError("only a validated departure partition HIT can be restored")
+        _materialize_file(lookup.directory / "partition.json", destination)
+
+    def persist(self, key: DeparturePartitionKey, source: Path) -> None:
+        digest, size = artifact_provenance(source)
+        directory = self._directory(key)
+        if directory.exists():
+            return
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        temporary = Path(tempfile.mkdtemp(prefix=f".{key.value}.", dir=directory.parent))
+        try:
+            _materialize_file(source, temporary / "partition.json")
+            manifest = {
+                "cacheSchemaVersion": DEPARTURE_CACHE_SCHEMA_VERSION,
+                "outputSchemaVersion": DEPARTURE_OUTPUT_SCHEMA_VERSION,
+                "cacheLayer": DEPARTURE_CACHE_LAYER,
+                "providerID": key.provider_id,
+                "cityID": key.city_id,
+                "serviceDate": key.service_date,
+                "key": key.value,
+                "rawGTFSsha256": key.raw_sha256,
+                "structuralInputKey": key.structural_input_key,
+                "calendarFingerprint": key.calendar_fingerprint,
+                "builderFingerprint": key.builder_fingerprint,
+                "departureConfigFingerprint": key.config_fingerprint,
+                "status": "complete",
+                "sha256": digest,
+                "size": size,
+            }
+            (temporary / "manifest.json").write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            try:
+                os.replace(temporary, directory)
+                temporary = None
+            except FileExistsError:
+                pass
+        finally:
+            if temporary is not None:
+                shutil.rmtree(temporary, ignore_errors=True)
+
+
 def cache_enabled(environ: Mapping[str, str] | None = None) -> bool:
     values = environ if environ is not None else os.environ
     return values.get(FEATURE_GATE, "0").strip() == "1"
