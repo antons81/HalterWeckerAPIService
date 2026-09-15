@@ -21,6 +21,7 @@ from external_build_cache import (
     CacheKey,
     CacheKeyUnavailable,
     ExternalBuildCache,
+    legacy_builder_fingerprint,
     projection_fingerprint,
     legacy_provider_config_fingerprint,
 )
@@ -1482,9 +1483,15 @@ class ExternalBuildCacheTests(unittest.TestCase):
             root = Path(temporary)
             feed = root / "cta.zip"
             _write_feed(feed)
-            with mock.patch(
-                "external_build_cache.provider_config_fingerprint",
-                side_effect=legacy_provider_config_fingerprint,
+            with (
+                mock.patch(
+                    "external_build_cache.provider_config_fingerprint",
+                    side_effect=legacy_provider_config_fingerprint,
+                ),
+                mock.patch(
+                    "external_build_cache.builder_fingerprint",
+                    side_effect=legacy_builder_fingerprint,
+                ),
             ):
                 self._build_once(root, feed)
             with mock.patch(

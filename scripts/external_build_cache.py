@@ -70,8 +70,8 @@ BUILDER_INPUTS = (
     "scripts/external_staging.py",
     "scripts/gtfs_csv.py",
     "scripts/build_stop_packages.py",
-    "scripts/external_build_cache.py",
 )
+LEGACY_BUILDER_INPUTS = (*BUILDER_INPUTS, "scripts/external_build_cache.py")
 
 
 def expected_artifacts(
@@ -142,6 +142,7 @@ class CacheKey:
     city_ids: tuple[str, ...] = ()
     legacy_value: str = ""
     legacy_provider_config_fingerprint: str = ""
+    legacy_builder_fingerprint: str = ""
 
 
 @dataclass(frozen=True)
@@ -286,6 +287,11 @@ def builder_fingerprint(repository_root: Path) -> str:
     return _file_fingerprint(repository_root, BUILDER_INPUTS)
 
 
+def legacy_builder_fingerprint(repository_root: Path) -> str:
+    """Return the pre-boundary builder fingerprint for cache migration."""
+    return _file_fingerprint(repository_root, LEGACY_BUILDER_INPUTS)
+
+
 def city_config_fingerprint(repository_root: Path, source: Mapping[str, object]) -> str:
     cities_path_value = source.get("cities")
     if not isinstance(cities_path_value, str) or not cities_path_value.strip():
@@ -323,6 +329,7 @@ def cache_key(
     legacy_provider_fingerprint = legacy_provider_config_fingerprint(source)
     cities_fingerprint = city_config_fingerprint(repository_root, source)
     build_fingerprint = builder_fingerprint(repository_root)
+    legacy_build_fingerprint = legacy_builder_fingerprint(repository_root)
     normalized_city_ids = tuple(city_ids or ((city_id,) if city_id else ()))
     if not normalized_city_ids or any(
         not value or Path(value).name != value for value in normalized_city_ids
@@ -336,7 +343,10 @@ def cache_key(
     supplemental_fingerprint = _supplemental_inputs_fingerprint(
         supplemental_input_digests
     )
-    def payload_for(provider_config: str) -> dict[str, object]:
+    def payload_for(
+        provider_config: str,
+        builder: str,
+    ) -> dict[str, object]:
         return {
             "cacheSchemaVersion": CACHE_SCHEMA_VERSION,
             "builderFamily": BUILDER_FAMILY,
@@ -347,13 +357,13 @@ def cache_key(
             "rawGTFSsha256": raw_sha256,
             "providerConfigFingerprint": provider_config,
             "cityConfigFingerprint": cities_fingerprint,
-            "builderFingerprint": build_fingerprint,
+            "builderFingerprint": builder,
             "projectionFingerprint": projection,
             "supplementalInputsFingerprint": supplemental_fingerprint,
         }
 
     return CacheKey(
-        value=_sha256_json(payload_for(provider_fingerprint)),
+        value=_sha256_json(payload_for(provider_fingerprint, build_fingerprint)),
         raw_sha256=raw_sha256,
         provider_config_fingerprint=provider_fingerprint,
         city_config_fingerprint=cities_fingerprint,
@@ -363,8 +373,11 @@ def cache_key(
         city_id=city_id,
         projection_fingerprint=projection,
         city_ids=normalized_city_ids,
-        legacy_value=_sha256_json(payload_for(legacy_provider_fingerprint)),
+        legacy_value=_sha256_json(
+            payload_for(legacy_provider_fingerprint, legacy_build_fingerprint)
+        ),
         legacy_provider_config_fingerprint=legacy_provider_fingerprint,
+        legacy_builder_fingerprint=legacy_build_fingerprint,
     )
 
 
@@ -512,12 +525,13 @@ class ExternalBuildCache:
                 raw_sha256=key.raw_sha256,
                 provider_config_fingerprint=key.legacy_provider_config_fingerprint,
                 city_config_fingerprint=key.city_config_fingerprint,
-                builder_fingerprint=key.builder_fingerprint,
+                builder_fingerprint=key.legacy_builder_fingerprint,
                 supplemental_inputs_fingerprint=key.supplemental_inputs_fingerprint,
                 provider_id=key.provider_id,
                 city_id=key.city_id,
                 projection_fingerprint=key.projection_fingerprint,
                 city_ids=key.city_ids,
+                legacy_builder_fingerprint=key.legacy_builder_fingerprint,
             )
             legacy_directory = self._directory(legacy_key)
             if legacy_directory.exists():
