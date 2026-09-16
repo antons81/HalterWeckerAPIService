@@ -211,11 +211,13 @@ class ExternalStaticData:
         timezone_name: str = "Asia/Jerusalem",
         now_provider: Callable[[], datetime] | None = None,
         database: Database | None = None,
+        provider_id: str | None = None,
     ) -> None:
         self.root = Path(root) if root else None
         self.city_id = city_id
         self.namespace = namespace
         self.timezone_name = timezone_name
+        self.provider_id = provider_id
         self.timezone = ZoneInfo(timezone_name)
         self.now_provider = now_provider or (lambda: datetime.now(self.timezone))
         self.database = database
@@ -264,8 +266,18 @@ class ExternalStaticData:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError("invalid departures-v2 manifest") from error
-        if not isinstance(manifest, dict) or manifest.get("schemaVersion") != 2:
+        schema_version = manifest.get("schemaVersion") if isinstance(manifest, dict) else None
+        if schema_version not in {2, 3}:
             raise ValueError("unsupported departures schema version")
+        if manifest.get("cityID") not in {None, self.city_id}:
+            raise ValueError("departures-v2 manifest city mismatch")
+        manifest_provider_id = manifest.get("providerID")
+        if (
+            schema_version == 3
+            and self.provider_id is not None
+            and manifest_provider_id != self.provider_id
+        ):
+            raise ValueError("departures-v3 manifest provider mismatch")
         timezone_name = str(manifest.get("timezone") or self.timezone_name)
         try:
             ZoneInfo(timezone_name)
@@ -285,10 +297,39 @@ class ExternalStaticData:
             relative = Path(relative_path)
             if relative.is_absolute() or ".." in relative.parts:
                 raise ValueError("departures-v2 partition path escapes release")
+            if Path(relative).name != f"{service_date}.json":
+                raise ValueError("departures-v2 partition date/path mismatch")
             if service_date in by_date:
                 raise ValueError(f"duplicate departures-v2 partition: {service_date}")
             by_date[service_date] = partition_root / relative
-        required_dates = self._required_departure_dates(timezone_name)
+        if schema_version == 3:
+            effective_date = manifest.get("effectiveDate")
+            selected_dates = manifest.get("selectedServiceDates")
+            if not isinstance(effective_date, str) or not effective_date:
+                raise ValueError("departures-v3 effectiveDate is missing")
+            try:
+                effective = datetime.strptime(effective_date, "%Y-%m-%d").date()
+            except ValueError as error:
+                raise ValueError("invalid departures-v3 effectiveDate") from error
+            if not isinstance(selected_dates, list) or not selected_dates:
+                raise ValueError("departures-v3 selectedServiceDates are missing")
+            required_dates = tuple(str(value) for value in selected_dates)
+            if len(set(required_dates)) != len(required_dates):
+                raise ValueError("duplicate departures-v3 selected service date")
+            if any(
+                len(value) != 8 or not value.isdigit()
+                for value in required_dates
+            ):
+                raise ValueError("invalid departures-v3 selected service date")
+            try:
+                for value in required_dates:
+                    datetime.strptime(value, "%Y%m%d")
+            except ValueError as error:
+                raise ValueError("invalid departures-v3 selected service date") from error
+            if effective.strftime("%Y%m%d") not in required_dates:
+                raise ValueError("effectiveDate is not selected")
+        else:
+            required_dates = self._required_departure_dates(timezone_name)
         paths: list[Path] = []
         for service_date in required_dates:
             path = by_date.get(service_date)

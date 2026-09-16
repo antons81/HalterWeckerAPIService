@@ -62,6 +62,64 @@ class ExternalDeparturePartitionTests(unittest.TestCase):
                 now=datetime(2026, 9, 14, 12, tzinfo=ZoneInfo("America/Toronto")),
             )
 
+    def _write_manifest_package(
+        self,
+        root: Path,
+        *,
+        schema: int = 3,
+        effective_date: str = "2026-09-14",
+        selected_dates: tuple[str, ...] = ("20260914",),
+        partition_dates: tuple[str, ...] = ("20260913", "20260914", "20260915"),
+        timezone_name: str = "America/Toronto",
+        city_id: str = "fixture-city",
+    ) -> None:
+        (root / "stops").mkdir(parents=True, exist_ok=True)
+        (root / "stops" / f"{city_id}.json").write_text(
+            json.dumps([{"id": "stop", "name": "Stop", "latitude": 43.0, "longitude": -79.0}]),
+            encoding="utf-8",
+        )
+        partition_root = root / "departures-v2" / city_id
+        partition_root.mkdir(parents=True, exist_ok=True)
+        for service_date in partition_dates:
+            (partition_root / f"{service_date}.json").write_text(
+                json.dumps({
+                    "generatedAt": f"{service_date}T00:00:00Z",
+                    "timezone": timezone_name,
+                    "stops": {
+                        "stop": [{"t": f"trip-{service_date}", "p": "08:00:00"}],
+                    },
+                    "platforms": {},
+                }),
+                encoding="utf-8",
+            )
+        manifest = {
+            "schemaVersion": schema,
+            "cityID": city_id,
+            "timezone": timezone_name,
+            "partitions": [
+                {"serviceDate": service_date, "path": f"{service_date}.json"}
+                for service_date in partition_dates
+            ],
+        }
+        if schema == 3:
+            manifest["effectiveDate"] = effective_date
+            manifest["selectedServiceDates"] = list(selected_dates)
+        (partition_root / "manifest.json").write_text(
+            json.dumps(manifest),
+            encoding="utf-8",
+        )
+
+    def _load_package(self, root: Path, *, timezone_name: str = "America/Toronto") -> ExternalStaticData:
+        data = ExternalStaticData(
+            str(root),
+            "fixture-city",
+            "",
+            timezone_name,
+            now_provider=lambda: datetime(2026, 9, 14, 23, 30, tzinfo=ZoneInfo("UTC")),
+        )
+        data._ensure_loaded()
+        return data
+
     def test_v2_partitions_merge_to_v1_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -109,6 +167,127 @@ class ExternalDeparturePartitionTests(unittest.TestCase):
             data = ExternalStaticData(str(root), "fixture-city", "", "UTC")
             with self.assertRaises(ValueError):
                 data._ensure_loaded()
+
+    def test_schema3_selected_one_date_excludes_other_cached_partitions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_manifest_package(root, selected_dates=("20260914",))
+            data = self._load_package(root)
+            self.assertEqual(
+                [item["t"] for item in data.departures["stop"]],
+                ["trip-20260914"],
+            )
+
+    def test_schema3_selected_two_dates_merges_only_selected_dates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_manifest_package(
+                root,
+                selected_dates=("20260913", "20260915"),
+            )
+            # The effective date must be one of the selected dates.
+            manifest_path = root / "departures-v2" / "fixture-city" / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["effectiveDate"] = "2026-09-13"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            data = self._load_package(root)
+            self.assertEqual(
+                {item["t"] for item in data.departures["stop"]},
+                {"trip-20260913", "trip-20260915"},
+            )
+
+    def test_schema3_selection_is_independent_of_restart_time_and_host_timezone(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_manifest_package(
+                root,
+                selected_dates=("20261231",),
+                effective_date="2026-12-31",
+                partition_dates=("20261230", "20261231", "20270101"),
+            )
+            first = ExternalStaticData(
+                str(root), "fixture-city", "", "Pacific/Auckland",
+                now_provider=lambda: datetime(2027, 1, 1, 0, 30, tzinfo=ZoneInfo("Pacific/Auckland")),
+            )
+            second = ExternalStaticData(
+                str(root), "fixture-city", "", "Pacific/Auckland",
+                now_provider=lambda: datetime(2027, 1, 2, 23, 30, tzinfo=ZoneInfo("UTC")),
+            )
+            first._ensure_loaded()
+            second._ensure_loaded()
+            self.assertEqual(first.departures, second.departures)
+
+    def test_schema3_missing_selection_metadata_fails_closed(self) -> None:
+        for field in ("effectiveDate", "selectedServiceDates"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                self._write_manifest_package(root)
+                manifest_path = root / "departures-v2" / "fixture-city" / "manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                manifest.pop(field)
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    self._load_package(root)
+
+    def test_schema3_missing_or_wrong_date_partition_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_manifest_package(
+                root,
+                selected_dates=("20260916",),
+                effective_date="2026-09-16",
+            )
+            with self.assertRaises(FileNotFoundError):
+                self._load_package(root)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_manifest_package(root, selected_dates=("20260914",))
+            manifest_path = root / "departures-v2" / "fixture-city" / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["partitions"][1]["path"] = "20260915.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                self._load_package(root)
+
+    def test_schema3_city_mismatch_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_manifest_package(root)
+            manifest_path = root / "departures-v2" / "fixture-city" / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["cityID"] = "other-city"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                self._load_package(root)
+
+    def test_schema3_provider_mismatch_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_manifest_package(root)
+            manifest_path = root / "departures-v2" / "fixture-city" / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["providerID"] = "provider-a"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            data = ExternalStaticData(
+                str(root), "fixture-city", "", "America/Toronto",
+                provider_id="provider-b",
+            )
+            with self.assertRaises(ValueError):
+                data._ensure_loaded()
+
+    def test_schema3_builder_publishes_selected_effective_date(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            archive_path = base / "fixture.zip"
+            self._feed(archive_path)
+            root = base / "v3"
+            self._build(root, archive_path, 3)
+            manifest = json.loads(
+                (root / "departures-v2" / "fixture-city" / "manifest.json").read_text()
+            )
+            self.assertEqual(manifest["schemaVersion"], 3)
+            self.assertEqual(manifest["effectiveDate"], "2026-09-14")
+            self.assertEqual(manifest["selectedServiceDates"], ["20260914"])
 
     def test_sliding_window_reuses_two_partitions_and_builds_one(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -223,6 +402,46 @@ class ExternalDeparturePartitionTests(unittest.TestCase):
             self.assertEqual(
                 json.loads((root / "trips" / "fixture-city.json").read_text()),
                 {"ttc:T1": {"r": "ttc:R1", "h": "Terminal"}},
+            )
+
+    def test_schema3_headsign_enrichment_ignores_unselected_partitions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "trip-index-base").mkdir(parents=True)
+            (root / "trip-index-base" / "fixture-city.json").write_text(
+                json.dumps({"T1": {"r": "R1"}}), encoding="utf-8"
+            )
+            partition_root = root / "departures-v2" / "fixture-city"
+            partition_root.mkdir(parents=True)
+            dates = ("20260913", "20260914", "20260915")
+            headsigns = {
+                "20260913": "Wrong before",
+                "20260914": "Selected terminal",
+                "20260915": "Wrong after",
+            }
+            for service_date in dates:
+                (partition_root / f"{service_date}.json").write_text(
+                    json.dumps({
+                        "generatedAt": "2026-09-14T00:00:00Z",
+                        "timezone": "America/Toronto",
+                        "stops": {"stop": [{"t": "T1", "h": headsigns[service_date], "p": "08:00:00"}]},
+                        "platforms": {},
+                    }), encoding="utf-8"
+                )
+            (partition_root / "manifest.json").write_text(json.dumps({
+                "schemaVersion": 3,
+                "cityID": "fixture-city",
+                "timezone": "America/Toronto",
+                "effectiveDate": "2026-09-14",
+                "selectedServiceDates": ["20260914"],
+                "partitions": [{"serviceDate": value, "path": f"{value}.json"} for value in dates],
+            }))
+            external_gtfs.apply_current_departure_headsign_enrichment(
+                root, [{"id": "fixture-city"}], namespace=""
+            )
+            self.assertEqual(
+                json.loads((root / "trips" / "fixture-city.json").read_text()),
+                {"T1": {"r": "R1", "h": "Selected terminal"}},
             )
 
     def test_partition_key_excludes_release_identity_and_cache_restores(self) -> None:

@@ -1886,7 +1886,7 @@ def build_external_departure_index_bounded(
     """Build departure JSON through a disk-backed SQLite staging database."""
     if not cities:
         return
-    if output_schema_version not in {1, 2}:
+    if output_schema_version not in {1, 2, 3}:
         raise ValueError(f"unsupported external departures schema version: {output_schema_version}")
     service_dates = _departure_service_dates(
         timezone_name, departure_window_days, now=now
@@ -1940,7 +1940,7 @@ def build_external_departure_index_bounded(
                         departure_filename=f"{service_date}.json",
                     )
                 manifest = {
-                    "schemaVersion": 2,
+                    "schemaVersion": 3 if output_schema_version == 3 else 2,
                     "cityID": city_id,
                     "timezone": timezone_name,
                     "partitions": [
@@ -1951,6 +1951,14 @@ def build_external_departure_index_bounded(
                         for service_date in service_dates
                     ],
                 }
+                if output_schema_version == 3:
+                    zone = ZoneInfo(timezone_name)
+                    effective_datetime = now or datetime.now(zone)
+                    if effective_datetime.tzinfo is None:
+                        effective_datetime = effective_datetime.replace(tzinfo=zone)
+                    effective_date = effective_datetime.astimezone(zone).strftime("%Y%m%d")
+                    manifest["effectiveDate"] = f"{effective_date[:4]}-{effective_date[4:6]}-{effective_date[6:]}"
+                    manifest["selectedServiceDates"] = [effective_date]
                 (city_partition_root / "manifest.json").write_text(
                     json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
                     encoding="utf-8",
@@ -2291,15 +2299,34 @@ def apply_current_departure_headsign_enrichment(
             departure_paths: list[Path] = []
             if partition_manifest_path.is_file():
                 manifest = json.loads(partition_manifest_path.read_text(encoding="utf-8"))
-                if not isinstance(manifest, dict) or manifest.get("schemaVersion") != 2:
+                if not isinstance(manifest, dict) or manifest.get("schemaVersion") not in {2, 3}:
                     raise ValueError(f"unsupported departures manifest for {city_id}")
+                selected_dates = None
+                if manifest.get("schemaVersion") == 3:
+                    raw_selected_dates = manifest.get("selectedServiceDates")
+                    if not isinstance(raw_selected_dates, list) or not raw_selected_dates:
+                        raise ValueError(f"selected departures dates are missing for {city_id}")
+                    selected_dates = {str(value) for value in raw_selected_dates}
                 for partition in manifest.get("partitions", []):
                     if not isinstance(partition, dict) or not isinstance(partition.get("path"), str):
                         raise ValueError(f"invalid departures partition for {city_id}")
+                    service_date = str(partition.get("serviceDate") or "")
+                    if selected_dates is not None and service_date not in selected_dates:
+                        continue
                     relative = Path(partition["path"])
                     if relative.is_absolute() or ".." in relative.parts:
                         raise ValueError(f"unsafe departures partition for {city_id}")
+                    if relative.name != f"{service_date}.json":
+                        raise ValueError(f"departures partition date/path mismatch for {city_id}")
                     departure_paths.append(partition_manifest_path.parent / relative)
+                if selected_dates is not None:
+                    available_dates = {
+                        str(partition.get("serviceDate") or "")
+                        for partition in manifest.get("partitions", [])
+                        if isinstance(partition, dict)
+                    }
+                    if not selected_dates.issubset(available_dates):
+                        raise FileNotFoundError(f"selected departures partition is missing for {city_id}")
             elif departures_path.is_file():
                 departure_paths.append(departures_path)
             connection.executemany(
@@ -2549,7 +2576,7 @@ def _departure_output_schema_version(environ: dict[str, str] | None) -> int:
         version = int(raw)
     except ValueError as error:
         raise ValueError("HALTEWECKER_EXTERNAL_DEPARTURES_SCHEMA must be an integer") from error
-    if version not in {1, 2}:
+    if version not in {1, 2, 3}:
         raise ValueError(f"unsupported external departures schema version: {version}")
     return version
 
@@ -2559,6 +2586,11 @@ def _write_departures_v2_manifest(
     city_id: str,
     timezone_name: str,
     service_dates: tuple[str, ...],
+    *,
+    schema_version: int = 3,
+    effective_date: str | None = None,
+    selected_service_dates: tuple[str, ...] | None = None,
+    provider_id: str | None = None,
 ) -> None:
     partition_root = output / "departures-v2" / city_id
     partition_root.mkdir(parents=True, exist_ok=True)
@@ -2568,8 +2600,10 @@ def _write_departures_v2_manifest(
             raise FileNotFoundError(
                 f"missing generated departures-v2 partition {city_id}/{service_date}"
             )
+    if schema_version not in {2, 3}:
+        raise ValueError(f"unsupported departures manifest schema: {schema_version}")
     manifest = {
-        "schemaVersion": 2,
+        "schemaVersion": schema_version,
         "cityID": city_id,
         "timezone": timezone_name,
         "partitions": [
@@ -2577,6 +2611,29 @@ def _write_departures_v2_manifest(
             for service_date in service_dates
         ],
     }
+    if provider_id:
+        manifest["providerID"] = provider_id
+    if schema_version == 3:
+        if not effective_date or not selected_service_dates:
+            raise ValueError("schema-3 departures manifest requires selected dates")
+        try:
+            datetime.strptime(effective_date, "%Y-%m-%d")
+        except ValueError as error:
+            raise ValueError("schema-3 departures manifest has invalid effective date") from error
+        selected = tuple(selected_service_dates)
+        if len(set(selected)) != len(selected):
+            raise ValueError("schema-3 departures manifest has duplicate selected dates")
+        if any(
+            len(service_date) != 8 or not service_date.isdigit()
+            for service_date in selected
+        ):
+            raise ValueError("schema-3 departures manifest has invalid selected date")
+        if effective_date.replace("-", "") not in selected:
+            raise ValueError("schema-3 effective date is not selected")
+        if any(service_date not in service_dates for service_date in selected):
+            raise ValueError("selected departures date is not a cached partition")
+        manifest["effectiveDate"] = effective_date
+        manifest["selectedServiceDates"] = list(selected)
     (partition_root / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         encoding="utf-8",
@@ -2663,7 +2720,7 @@ def _write_merged_v2_departures(
         if not manifest_path.is_file():
             return
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if not isinstance(manifest, dict) or manifest.get("schemaVersion") != 2:
+        if not isinstance(manifest, dict) or manifest.get("schemaVersion") not in {2, 3}:
             raise ValueError(f"invalid departures-v2 member manifest: {manifest_path}")
         timezone_name = str(manifest.get("timezone") or "")
         if not timezone_name:
@@ -2694,7 +2751,34 @@ def _write_merged_v2_departures(
             ),
             encoding="utf-8",
         )
-    _write_departures_v2_manifest(output, city_id, next(iter(timezones)), service_dates)
+    schema_versions = {int(manifest.get("schemaVersion")) for _timezone, manifest, _root in manifests}
+    if len(schema_versions) != 1:
+        raise ValueError(f"merged departures-v2 schema conflict for {city_id}")
+    schema_version = next(iter(schema_versions))
+    if schema_version == 3:
+        effective_dates = {str(manifest.get("effectiveDate") or "") for _timezone, manifest, _root in manifests}
+        selected_dates = {
+            tuple(str(value) for value in manifest.get("selectedServiceDates", []))
+            for _timezone, manifest, _root in manifests
+        }
+        if len(effective_dates) != 1 or "" in effective_dates or len(selected_dates) != 1:
+            raise ValueError(f"merged departures-v2 selection conflict for {city_id}")
+        effective_date = next(iter(effective_dates))
+        selected_service_dates = next(iter(selected_dates))
+        if effective_date.replace("-", "") not in selected_service_dates:
+            raise ValueError(f"merged departures-v2 effective date is not selected for {city_id}")
+    else:
+        effective_date = None
+        selected_service_dates = None
+    _write_departures_v2_manifest(
+        output,
+        city_id,
+        next(iter(timezones)),
+        service_dates,
+        schema_version=schema_version,
+        effective_date=effective_date,
+        selected_service_dates=selected_service_dates,
+    )
 
 
 def _build_external_departure_partitions(
@@ -2716,7 +2800,7 @@ def _build_external_departure_partitions(
     environ: dict[str, str] | None,
     now: datetime | None = None,
 ) -> None:
-    if output_schema_version != 2:
+    if output_schema_version not in {2, 3}:
         build_external_departure_index(
             archive,
             cities,
@@ -2805,7 +2889,17 @@ def _build_external_departure_partitions(
             key = keys.get((city_id, service_date))
             if cache is not None and key is not None and lookup is not None and lookup.status != "HIT":
                 cache.persist(key, destination)
-        _write_departures_v2_manifest(output, city_id, timezone_name, service_dates)
+        effective_date = build_now.astimezone(ZoneInfo(timezone_name)).strftime("%Y-%m-%d")
+        _write_departures_v2_manifest(
+            output,
+            city_id,
+            timezone_name,
+            service_dates,
+            schema_version=3,
+            effective_date=effective_date,
+            selected_service_dates=(effective_date.replace("-", ""),),
+            provider_id=provider_id,
+        )
         if namespace or str(source.get("mergeGroup", "")).strip():
             _write_v1_departure_compatibility(output, city_id, timezone_name, service_dates)
 
@@ -3349,7 +3443,7 @@ def process_external_gtfs_sources(
 
             if source.get("buildDepartures", True):
                 departure_schema_version = _departure_output_schema_version(environ)
-                if departure_schema_version == 2:
+                if departure_schema_version in {2, 3}:
                     _timed_external_stage(
                         source_id,
                         "departures-v2",
