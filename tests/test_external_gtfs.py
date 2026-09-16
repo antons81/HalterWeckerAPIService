@@ -5,8 +5,9 @@ import tempfile
 import unittest
 import urllib.error
 import zipfile
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -1746,6 +1747,131 @@ class ExternalStopAndDepartureTests(unittest.TestCase):
             self.assertEqual(departure["r"], "6612")
             self.assertEqual(departure["q"], "15")
 
+    def test_duplicate_trip_service_mapping_is_deduplicated_deterministically(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            archive_path = root / "duplicate-trip.zip"
+            _gtfs_zip(
+                archive_path,
+                stops="stop_id,stop_name,stop_lat,stop_lon\nstop,Stop,32.0,34.0\n",
+                trips=(
+                    "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+                    "R1,S1,T1,Destination,0\n"
+                    "R1,S1,T1,Destination,0\n"
+                ),
+                stop_times=(
+                    "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+                    "T1,08:00:00,08:00:00,stop,1\n"
+                ),
+            )
+            city = {
+                "id": "fixture",
+                "name": "Fixture",
+                "aliases": [],
+                "latitude": 32.0,
+                "longitude": 34.0,
+                "radiusMeters": 5_000,
+                "packageMode": "external",
+            }
+            with zipfile.ZipFile(archive_path) as archive:
+                build_external_stop_packages(archive, [city], root / "out")
+                build_external_departure_index(
+                    archive, [city], root / "out", "Asia/Jerusalem"
+                )
+            departures = json.loads(
+                (root / "out" / "departures" / "fixture.json").read_text()
+            )
+            self.assertEqual(
+                departures["stops"]["stop"],
+                [{"t": "T1", "r": "R1", "h": "Destination", "d": "0", "p": "08:00:00", "q": "1", "routeType": "0"}],
+            )
+
+    def test_trip_service_mappings_are_selected_by_active_service_date(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            archive_path = root / "trip-services.zip"
+            _gtfs_zip(
+                archive_path,
+                stops="stop_id,stop_name,stop_lat,stop_lon\nstop,Stop,32.0,34.0\n",
+                trips=(
+                    "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+                    "R1,S1,T1,Destination,0\n"
+                    "R1,S2,T1,Destination,0\n"
+                ),
+                stop_times=(
+                    "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+                    "T1,08:00:00,08:00:00,stop,1\n"
+                ),
+                calendar=(
+                    "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+                    "start_date,end_date\n"
+                    "S1,1,0,0,0,0,0,0,20260901,20260930\n"
+                    "S2,0,1,0,0,0,0,0,20260901,20260930\n"
+                ),
+            )
+            city = {
+                "id": "fixture",
+                "name": "Fixture",
+                "aliases": [],
+                "latitude": 32.0,
+                "longitude": 34.0,
+                "radiusMeters": 5_000,
+                "packageMode": "external",
+            }
+            with zipfile.ZipFile(archive_path) as archive:
+                build_external_stop_packages(archive, [city], root / "out")
+                build_external_departure_index(
+                    archive,
+                    [city],
+                    root / "out",
+                    "Asia/Jerusalem",
+                    output_schema_version=2,
+                    now=datetime(2026, 9, 14, 12, tzinfo=ZoneInfo("Asia/Jerusalem")),
+                    write_service_dates=("20260914", "20260915", "20260916"),
+                )
+            monday = json.loads(
+                (root / "out" / "departures-v2" / "fixture" / "20260914.json").read_text()
+            )
+            tuesday = json.loads(
+                (root / "out" / "departures-v2" / "fixture" / "20260915.json").read_text()
+            )
+            wednesday = json.loads(
+                (root / "out" / "departures-v2" / "fixture" / "20260916.json").read_text()
+            )
+            self.assertEqual([item["t"] for item in monday["stops"]["stop"]], ["T1"])
+            self.assertEqual([item["t"] for item in tuesday["stops"]["stop"]], ["T1"])
+            self.assertEqual(wednesday["stops"]["stop"], [])
+
+    def test_conflicting_trip_metadata_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            archive_path = root / "conflicting-trip.zip"
+            _gtfs_zip(
+                archive_path,
+                stops="stop_id,stop_name,stop_lat,stop_lon\nstop,Stop,32.0,34.0\n",
+                trips=(
+                    "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+                    "R1,S1,T1,Destination,0\n"
+                    "R2,S2,T1,Other,1\n"
+                ),
+                stop_times="trip_id,arrival_time,departure_time,stop_id,stop_sequence\nT1,08:00:00,08:00:00,stop,1\n",
+            )
+            city = {
+                "id": "fixture",
+                "name": "Fixture",
+                "aliases": [],
+                "latitude": 32.0,
+                "longitude": 34.0,
+                "radiusMeters": 5_000,
+                "packageMode": "external",
+            }
+            with zipfile.ZipFile(archive_path) as archive:
+                build_external_stop_packages(archive, [city], root / "out")
+                with self.assertRaisesRegex(ValueError, "conflicting GTFS trip metadata"):
+                    build_external_departure_index(
+                        archive, [city], root / "out", "Asia/Jerusalem"
+                    )
+
     def test_kyiv_empty_headsign_uses_terminal_stop_name(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1996,7 +2122,7 @@ class ExternalStopAndDepartureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             archive_path = root / "se.zip"
-            from datetime import datetime
+            from datetime import date, datetime
             from zoneinfo import ZoneInfo
 
             today = datetime.now(ZoneInfo("Europe/Stockholm")).date().strftime("%Y%m%d")

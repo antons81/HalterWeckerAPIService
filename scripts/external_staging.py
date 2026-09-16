@@ -1093,11 +1093,12 @@ class ExternalDepartureStage:
                 agency_name TEXT NOT NULL
             ) WITHOUT ROWID;
             CREATE TABLE trip_services (
-                trip_id TEXT PRIMARY KEY,
+                trip_id TEXT NOT NULL,
                 service_id TEXT NOT NULL,
                 route_id TEXT NOT NULL,
                 headsign TEXT NOT NULL,
-                direction_id TEXT NOT NULL
+                direction_id TEXT NOT NULL,
+                PRIMARY KEY (trip_id, service_id)
             ) WITHOUT ROWID;
             CREATE TABLE service_dates (
                 service_id TEXT NOT NULL,
@@ -1223,8 +1224,19 @@ class ExternalDepartureStage:
                 if str(row.get("stop_id", "")).strip()
             ),
         )
+        self.connection.execute(
+            """
+            CREATE TEMP TABLE trip_services_source (
+                trip_id TEXT NOT NULL,
+                service_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                headsign TEXT NOT NULL,
+                direction_id TEXT NOT NULL
+            )
+            """
+        )
         self.connection.executemany(
-            "INSERT INTO trip_services VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO trip_services_source VALUES (?, ?, ?, ?, ?)",
             (
                 (
                     str(row.get("trip_id", "")).strip(),
@@ -1240,6 +1252,70 @@ class ExternalDepartureStage:
                 if trip_id and service_id and route_id
             ),
         )
+        conflicting_pair = self.connection.execute(
+            """
+            SELECT trip_id, service_id
+            FROM trip_services_source
+            GROUP BY trip_id, service_id
+            HAVING COUNT(DISTINCT route_id) > 1
+                OR COUNT(DISTINCT headsign) > 1
+                OR COUNT(DISTINCT direction_id) > 1
+            ORDER BY trip_id, service_id
+            LIMIT 1
+            """
+        ).fetchone()
+        if conflicting_pair is not None:
+            trip_id, service_id = conflicting_pair
+            details = self.connection.execute(
+                """
+                SELECT route_id, headsign, direction_id
+                FROM trip_services_source
+                WHERE trip_id=? AND service_id=?
+                ORDER BY route_id, headsign, direction_id
+                """,
+                (trip_id, service_id),
+            ).fetchall()
+            raise ValueError(
+                "conflicting GTFS trip mapping for "
+                f"trip_id={trip_id!r}, service_id={service_id!r}: {details!r}"
+            )
+        conflicting_trip = self.connection.execute(
+            """
+            SELECT trip_id
+            FROM trip_services_source
+            GROUP BY trip_id
+            HAVING COUNT(DISTINCT route_id) > 1
+                OR COUNT(DISTINCT headsign) > 1
+                OR COUNT(DISTINCT direction_id) > 1
+            ORDER BY trip_id
+            LIMIT 1
+            """
+        ).fetchone()
+        if conflicting_trip is not None:
+            trip_id = conflicting_trip[0]
+            details = self.connection.execute(
+                """
+                SELECT service_id, route_id, headsign, direction_id
+                FROM trip_services_source
+                WHERE trip_id=?
+                ORDER BY service_id, route_id, headsign, direction_id
+                """,
+                (trip_id,),
+            ).fetchall()
+            raise ValueError(
+                "conflicting GTFS trip metadata across service mappings for "
+                f"trip_id={trip_id!r}: {details!r}"
+            )
+        self.connection.execute(
+            """
+            INSERT INTO trip_services(trip_id, service_id, route_id, headsign, direction_id)
+            SELECT trip_id, service_id, route_id, headsign, direction_id
+            FROM trip_services_source
+            GROUP BY trip_id, service_id, route_id, headsign, direction_id
+            ORDER BY trip_id, service_id
+            """
+        )
+        self.connection.execute("DROP TABLE trip_services_source")
         self.connection.executemany(
             "INSERT INTO service_dates VALUES (?, ?)",
             (
@@ -1250,12 +1326,13 @@ class ExternalDepartureStage:
         )
         self.connection.executescript(
             """
-            INSERT OR IGNORE INTO active_trips(trip_id, route_id, headsign, direction_id)
+            INSERT INTO active_trips(trip_id, route_id, headsign, direction_id)
             SELECT trip_id, route_id, headsign, direction_id
             FROM trip_services
-            WHERE service_id IN (SELECT service_id FROM service_dates);
-            INSERT OR IGNORE INTO active_service_dates(trip_id, service_date)
-            SELECT trips.trip_id, dates.service_date
+            WHERE service_id IN (SELECT service_id FROM service_dates)
+            GROUP BY trip_id, route_id, headsign, direction_id;
+            INSERT INTO active_service_dates(trip_id, service_date)
+            SELECT DISTINCT trips.trip_id, dates.service_date
             FROM trip_services trips
             JOIN service_dates dates ON dates.service_id = trips.service_id;
             """
