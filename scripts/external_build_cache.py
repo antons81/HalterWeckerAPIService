@@ -161,9 +161,9 @@ class CacheRestore:
     package_stops_by_city_id: dict[str, list[dict[str, object]]] | None = None
 
 
-DEPARTURE_CACHE_SCHEMA_VERSION = 1
+DEPARTURE_CACHE_SCHEMA_VERSION = 2
 DEPARTURE_OUTPUT_SCHEMA_VERSION = 2
-DEPARTURE_CACHE_LAYER = "external-departure-partition-v1"
+DEPARTURE_CACHE_LAYER = "external-departure-partition-v2"
 DEPARTURE_CACHE_FEATURE_GATE = "HALTEWECKER_EXTERNAL_DEPARTURE_CACHE"
 DEPARTURE_CACHE_PROVIDER_ALLOWLIST = "HALTEWECKER_EXTERNAL_DEPARTURE_CACHE_PROVIDERS"
 
@@ -176,6 +176,7 @@ class DeparturePartitionKey:
     service_date: str
     raw_sha256: str
     structural_input_key: str
+    stop_set_digest: str
     calendar_fingerprint: str
     builder_fingerprint: str
     config_fingerprint: str
@@ -230,6 +231,28 @@ def departure_builder_fingerprint(repository_root: Path) -> str:
     )
 
 
+def departure_stop_set_digest(stop_package: Path) -> tuple[str, int]:
+    """Return the canonical identity of the stop IDs consumed by the builder."""
+    try:
+        package = json.loads(stop_package.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CacheKeyUnavailable(
+            f"departure stop package is unreadable: {stop_package}"
+        ) from error
+    if not isinstance(package, list):
+        raise CacheKeyUnavailable(
+            f"departure stop package must be a JSON array: {stop_package}"
+        )
+    try:
+        stop_ids = sorted({str(stop["id"]) for stop in package})
+    except (KeyError, TypeError) as error:
+        raise CacheKeyUnavailable(
+            f"departure stop package has an invalid stop entry: {stop_package}"
+        ) from error
+    canonical_membership = "\n".join(stop_ids) + "\n"
+    return hashlib.sha256(canonical_membership.encode("utf-8")).hexdigest(), len(stop_ids)
+
+
 def departure_partition_key(
     *,
     repository_root: Path,
@@ -238,12 +261,17 @@ def departure_partition_key(
     service_date: str,
     raw_sha256: str,
     structural_input_key: str,
+    stop_set_digest: str,
     calendar_fingerprint: str,
     source: Mapping[str, object],
 ) -> DeparturePartitionKey:
     if not provider_id or not city_id or not service_date:
         raise CacheKeyUnavailable("departure partition identity is incomplete")
-    if len(raw_sha256) != 64 or not calendar_fingerprint:
+    if (
+        len(raw_sha256) != 64
+        or len(stop_set_digest) != 64
+        or not calendar_fingerprint
+    ):
         raise CacheKeyUnavailable("departure partition provenance is incomplete")
     builder = departure_builder_fingerprint(repository_root)
     config = departure_config_fingerprint(source)
@@ -256,6 +284,7 @@ def departure_partition_key(
         "serviceDate": service_date,
         "rawGTFSsha256": raw_sha256,
         "structuralInputKey": structural_input_key,
+        "stopSetDigest": stop_set_digest,
         "calendarFingerprint": calendar_fingerprint,
         "builderFingerprint": builder,
         "departureConfigFingerprint": config,
@@ -267,6 +296,7 @@ def departure_partition_key(
         service_date=service_date,
         raw_sha256=raw_sha256,
         structural_input_key=structural_input_key,
+        stop_set_digest=stop_set_digest,
         calendar_fingerprint=calendar_fingerprint,
         builder_fingerprint=builder,
         config_fingerprint=config,
@@ -320,6 +350,7 @@ class DeparturePartitionCache:
             "key": key.value,
             "rawGTFSsha256": key.raw_sha256,
             "structuralInputKey": key.structural_input_key,
+            "stopSetDigest": key.stop_set_digest,
             "calendarFingerprint": key.calendar_fingerprint,
             "builderFingerprint": key.builder_fingerprint,
             "departureConfigFingerprint": key.config_fingerprint,
@@ -356,6 +387,7 @@ class DeparturePartitionCache:
                 "key": key.value,
                 "rawGTFSsha256": key.raw_sha256,
                 "structuralInputKey": key.structural_input_key,
+                "stopSetDigest": key.stop_set_digest,
                 "calendarFingerprint": key.calendar_fingerprint,
                 "builderFingerprint": key.builder_fingerprint,
                 "departureConfigFingerprint": key.config_fingerprint,

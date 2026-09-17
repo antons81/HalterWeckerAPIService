@@ -137,6 +137,7 @@ try:
         departure_cache_enabled,
         departure_provider_allowed,
         departure_partition_key,
+        departure_stop_set_digest,
     )
 except ImportError:
     from external_build_cache import (
@@ -154,6 +155,7 @@ except ImportError:
         departure_cache_enabled,
         departure_provider_allowed,
         departure_partition_key,
+        departure_stop_set_digest,
     )
 
 
@@ -1958,7 +1960,8 @@ def build_external_departure_index_bounded(
                         effective_datetime = effective_datetime.replace(tzinfo=zone)
                     effective_date = effective_datetime.astimezone(zone).strftime("%Y%m%d")
                     manifest["effectiveDate"] = f"{effective_date[:4]}-{effective_date[4:6]}-{effective_date[6:]}"
-                    manifest["selectedServiceDates"] = [effective_date]
+                    manifest["selectionSemantics"] = "legacy-active-service-union"
+                    manifest["selectedServiceDates"] = list(service_dates)
                 (city_partition_root / "manifest.json").write_text(
                     json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
                     encoding="utf-8",
@@ -2590,6 +2593,7 @@ def _write_departures_v2_manifest(
     schema_version: int = 3,
     effective_date: str | None = None,
     selected_service_dates: tuple[str, ...] | None = None,
+    selection_semantics: str | None = None,
     provider_id: str | None = None,
 ) -> None:
     partition_root = output / "departures-v2" / city_id
@@ -2614,6 +2618,8 @@ def _write_departures_v2_manifest(
     if provider_id:
         manifest["providerID"] = provider_id
     if schema_version == 3:
+        if selection_semantics != "legacy-active-service-union":
+            raise ValueError("schema-3 departures manifest requires known selection semantics")
         if not effective_date or not selected_service_dates:
             raise ValueError("schema-3 departures manifest requires selected dates")
         try:
@@ -2632,6 +2638,7 @@ def _write_departures_v2_manifest(
             raise ValueError("schema-3 effective date is not selected")
         if any(service_date not in service_dates for service_date in selected):
             raise ValueError("selected departures date is not a cached partition")
+        manifest["selectionSemantics"] = selection_semantics
         manifest["effectiveDate"] = effective_date
         manifest["selectedServiceDates"] = list(selected)
     (partition_root / "manifest.json").write_text(
@@ -2761,15 +2768,26 @@ def _write_merged_v2_departures(
             tuple(str(value) for value in manifest.get("selectedServiceDates", []))
             for _timezone, manifest, _root in manifests
         }
-        if len(effective_dates) != 1 or "" in effective_dates or len(selected_dates) != 1:
+        selection_semantics_values = {
+            str(manifest.get("selectionSemantics") or "")
+            for _timezone, manifest, _root in manifests
+        }
+        if (
+            len(effective_dates) != 1
+            or "" in effective_dates
+            or len(selected_dates) != 1
+            or selection_semantics_values != {"legacy-active-service-union"}
+        ):
             raise ValueError(f"merged departures-v2 selection conflict for {city_id}")
         effective_date = next(iter(effective_dates))
         selected_service_dates = next(iter(selected_dates))
+        selection_semantics = next(iter(selection_semantics_values))
         if effective_date.replace("-", "") not in selected_service_dates:
             raise ValueError(f"merged departures-v2 effective date is not selected for {city_id}")
     else:
         effective_date = None
         selected_service_dates = None
+        selection_semantics = None
     _write_departures_v2_manifest(
         output,
         city_id,
@@ -2778,6 +2796,7 @@ def _write_merged_v2_departures(
         schema_version=schema_version,
         effective_date=effective_date,
         selected_service_dates=selected_service_dates,
+        selection_semantics=selection_semantics,
     )
 
 
@@ -2829,6 +2848,15 @@ def _build_external_departure_partitions(
             provider_id,
         )
 
+    stop_set_digests: dict[str, str] = {}
+    if cache is not None:
+        for city in cities:
+            city_id = str(city["id"])
+            digest, _stop_count = departure_stop_set_digest(
+                output / "stops" / f"{city_id}.json"
+            )
+            stop_set_digests[city_id] = digest
+
     misses: set[str] = set()
     lookups: dict[tuple[str, str], object] = {}
     keys: dict[tuple[str, str], object] = {}
@@ -2845,6 +2873,7 @@ def _build_external_departure_partitions(
                 service_date=service_date,
                 raw_sha256=str(raw_artifact_digest),
                 structural_input_key=structural_input_key,
+                stop_set_digest=stop_set_digests[city_id],
                 calendar_fingerprint=str(raw_artifact_digest),
                 source=source,
             )
@@ -2897,7 +2926,8 @@ def _build_external_departure_partitions(
             service_dates,
             schema_version=3,
             effective_date=effective_date,
-            selected_service_dates=(effective_date.replace("-", ""),),
+            selected_service_dates=service_dates,
+            selection_semantics="legacy-active-service-union",
             provider_id=provider_id,
         )
         if namespace or str(source.get("mergeGroup", "")).strip():

@@ -255,7 +255,9 @@ class ExternalStaticData:
             for offset in (-1, 0, 1)
         )
 
-    def _v2_departure_sources(self) -> tuple[Path, str, tuple[Path, ...]] | None:
+    def _v2_departure_sources(
+        self,
+    ) -> tuple[Path, str, tuple[Path, ...], str | None] | None:
         if self.root is None:
             raise FileNotFoundError("external static data root is not configured")
         partition_root = self.root / "departures-v2" / self.city_id
@@ -302,7 +304,11 @@ class ExternalStaticData:
             if service_date in by_date:
                 raise ValueError(f"duplicate departures-v2 partition: {service_date}")
             by_date[service_date] = partition_root / relative
+        selection_semantics: str | None = None
         if schema_version == 3:
+            selection_semantics = manifest.get("selectionSemantics")
+            if selection_semantics != "legacy-active-service-union":
+                raise ValueError("unsupported departures-v3 selection semantics")
             effective_date = manifest.get("effectiveDate")
             selected_dates = manifest.get("selectedServiceDates")
             if not isinstance(effective_date, str) or not effective_date:
@@ -338,12 +344,14 @@ class ExternalStaticData:
                     f"missing required departures-v2 partition {self.city_id}/{service_date}"
                 )
             paths.append(path)
-        return manifest_path, timezone_name, tuple(paths)
+        return manifest_path, timezone_name, tuple(paths), selection_semantics
 
     @staticmethod
     def _merge_v2_departures(
         paths: tuple[Path, ...],
         timezone_name: str,
+        selection_semantics: str | None = None,
+        provider_id: str | None = None,
     ) -> dict[str, object]:
         merged_stops: dict[str, list[dict[str, object]]] = {}
         merged_platforms: dict[str, set[str]] = {}
@@ -382,12 +390,48 @@ class ExternalStaticData:
 
         normalized_stops: dict[str, list[dict[str, object]]] = {}
         for stop_id, items in merged_stops.items():
-            unique: dict[str, dict[str, object]] = {}
+            unique: dict[object, tuple[str, dict[str, object]]] = {}
             for item in items:
-                identity = json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-                unique.setdefault(identity, item)
+                if selection_semantics == "legacy-active-service-union":
+                    identity_fields = ("t", "q", "p")
+                    if any(
+                        field not in item or item.get(field) in (None, "")
+                        for field in identity_fields
+                    ):
+                        raise ValueError(
+                            "legacy-active-service-union departure row identity is incomplete"
+                        )
+                    identity: object = (
+                        provider_id or "",
+                        stop_id,
+                        str(item["t"]),
+                        str(item["q"]),
+                        str(item["p"]),
+                    )
+                else:
+                    identity = json.dumps(
+                        item,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                payload = json.dumps(
+                    item,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                previous = unique.get(identity)
+                if previous is not None:
+                    if previous[0] != payload:
+                        raise ValueError(
+                            "conflicting duplicate departure row for "
+                            f"stop={stop_id!r}, identity={identity!r}"
+                        )
+                    continue
+                unique[identity] = (payload, item)
             normalized_stops[stop_id] = sorted(
-                unique.values(),
+                (value[1] for value in unique.values()),
                 key=lambda item: (
                     str(item.get("p", "")),
                     str(item.get("t", "")),
@@ -452,7 +496,12 @@ class ExternalStaticData:
             else {}
         )
         departures_payload = (
-            self._merge_v2_departures(v2_sources[2], v2_sources[1])
+            self._merge_v2_departures(
+                v2_sources[2],
+                v2_sources[1],
+                v2_sources[3],
+                self.provider_id,
+            )
             if v2_sources is not None
             else (
                 json.loads(departures_path.read_text(encoding="utf-8"))

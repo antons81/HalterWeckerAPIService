@@ -11,7 +11,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))
 
 import external_gtfs
-from external_build_cache import DeparturePartitionCache, departure_partition_key
+from external_build_cache import (
+    DeparturePartitionCache,
+    departure_partition_key,
+    departure_stop_set_digest,
+)
 from gtfs_source_cache import GTFSArtifactCache
 from static_departures_api import ExternalStaticData
 
@@ -86,7 +90,14 @@ class ExternalDeparturePartitionTests(unittest.TestCase):
                     "generatedAt": f"{service_date}T00:00:00Z",
                     "timezone": timezone_name,
                     "stops": {
-                        "stop": [{"t": f"trip-{service_date}", "p": "08:00:00"}],
+                        "stop": [{
+                            "t": f"trip-{service_date}",
+                            "p": "08:00:00",
+                            "q": "1",
+                            "r": "R1",
+                            "h": "Terminal",
+                            "d": "0",
+                        }],
                     },
                     "platforms": {},
                 }),
@@ -102,6 +113,7 @@ class ExternalDeparturePartitionTests(unittest.TestCase):
             ],
         }
         if schema == 3:
+            manifest["selectionSemantics"] = "legacy-active-service-union"
             manifest["effectiveDate"] = effective_date
             manifest["selectedServiceDates"] = list(selected_dates)
         (partition_root / "manifest.json").write_text(
@@ -177,6 +189,87 @@ class ExternalDeparturePartitionTests(unittest.TestCase):
                 [item["t"] for item in data.departures["stop"]],
                 ["trip-20260914"],
             )
+
+    def test_schema3_requires_legacy_union_selection_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_manifest_package(root)
+            manifest_path = root / "departures-v2" / "fixture-city" / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest.pop("selectionSemantics")
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                self._load_package(root)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_manifest_package(root)
+            manifest_path = root / "departures-v2" / "fixture-city" / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["selectionSemantics"] = "exact-effective-date"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                self._load_package(root)
+
+    def test_schema3_union_deduplicates_known_israel_rows_and_preserves_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_manifest_package(
+                root,
+                selected_dates=("20260913", "20260914", "20260915"),
+            )
+            partition_root = root / "departures-v2" / "fixture-city"
+            duplicate = {
+                "t": "21800555_140926",
+                "r": "17211",
+                "h": "Terminal",
+                "d": "0",
+                "p": "22:45:50",
+                "q": "20",
+            }
+            for service_date in ("20260913", "20260915"):
+                payload = json.loads((partition_root / f"{service_date}.json").read_text())
+                payload["stops"]["stop"] = [duplicate]
+                (partition_root / f"{service_date}.json").write_text(
+                    json.dumps(payload),
+                    encoding="utf-8",
+                )
+            data = self._load_package(root)
+            rows = data.departures["stop"]
+            self.assertEqual(
+                [item["t"] for item in rows],
+                ["trip-20260914", "21800555_140926"],
+            )
+
+    def test_schema3_union_conflicting_duplicate_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_manifest_package(
+                root,
+                selected_dates=("20260913", "20260914", "20260915"),
+            )
+            partition_root = root / "departures-v2" / "fixture-city"
+            first = json.loads((partition_root / "20260913.json").read_text())
+            second = json.loads((partition_root / "20260915.json").read_text())
+            first["stops"]["stop"] = [{
+                "t": "584892271_140926",
+                "r": "17211",
+                "h": "Terminal A",
+                "d": "0",
+                "p": "23:15:50",
+                "q": "20",
+            }]
+            second["stops"]["stop"] = [{
+                "t": "584892271_140926",
+                "r": "17211",
+                "h": "Terminal B",
+                "d": "0",
+                "p": "23:15:50",
+                "q": "20",
+            }]
+            (partition_root / "20260913.json").write_text(json.dumps(first), encoding="utf-8")
+            (partition_root / "20260915.json").write_text(json.dumps(second), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "conflicting duplicate departure row"):
+                self._load_package(root)
 
     def test_schema3_selected_two_dates_merges_only_selected_dates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -287,7 +380,14 @@ class ExternalDeparturePartitionTests(unittest.TestCase):
             )
             self.assertEqual(manifest["schemaVersion"], 3)
             self.assertEqual(manifest["effectiveDate"], "2026-09-14")
-            self.assertEqual(manifest["selectedServiceDates"], ["20260914"])
+            self.assertEqual(
+                manifest["selectionSemantics"],
+                "legacy-active-service-union",
+            )
+            self.assertEqual(
+                manifest["selectedServiceDates"],
+                ["20260913", "20260914", "20260915"],
+            )
 
     def test_sliding_window_reuses_two_partitions_and_builds_one(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -424,7 +524,14 @@ class ExternalDeparturePartitionTests(unittest.TestCase):
                     json.dumps({
                         "generatedAt": "2026-09-14T00:00:00Z",
                         "timezone": "America/Toronto",
-                        "stops": {"stop": [{"t": "T1", "h": headsigns[service_date], "p": "08:00:00"}]},
+                        "stops": {"stop": [{
+                            "t": "T1",
+                            "h": headsigns[service_date],
+                            "p": "08:00:00",
+                            "q": "1",
+                            "r": "R1",
+                            "d": "0",
+                        }]},
                         "platforms": {},
                     }), encoding="utf-8"
                 )
@@ -432,6 +539,7 @@ class ExternalDeparturePartitionTests(unittest.TestCase):
                 "schemaVersion": 3,
                 "cityID": "fixture-city",
                 "timezone": "America/Toronto",
+                "selectionSemantics": "legacy-active-service-union",
                 "effectiveDate": "2026-09-14",
                 "selectedServiceDates": ["20260914"],
                 "partitions": [{"serviceDate": value, "path": f"{value}.json"} for value in dates],
@@ -454,6 +562,7 @@ class ExternalDeparturePartitionTests(unittest.TestCase):
                 service_date="20260914",
                 raw_sha256="a" * 64,
                 structural_input_key="structural-key",
+                stop_set_digest="b" * 64,
                 calendar_fingerprint="calendar-key",
                 source={"timezone": "UTC", "departurePackageDays": 3},
             )
@@ -464,6 +573,7 @@ class ExternalDeparturePartitionTests(unittest.TestCase):
                 service_date="20260914",
                 raw_sha256="a" * 64,
                 structural_input_key="structural-key",
+                stop_set_digest="b" * 64,
                 calendar_fingerprint="calendar-key",
                 source={"timezone": "UTC", "departurePackageDays": 3, "releaseID": "different"},
             )
@@ -477,6 +587,57 @@ class ExternalDeparturePartitionTests(unittest.TestCase):
             destination = root / "restored.json"
             cache.restore(lookup, destination)
             self.assertEqual(destination.read_text(), source.read_text())
+
+    def test_stop_set_digest_is_canonical_membership(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "first.json"
+            second = root / "second.json"
+            first.write_text(json.dumps([{"id": "2"}, {"id": "1"}]))
+            second.write_text("[ {\"id\": \"1\"}, {\"id\": \"2\"} ]")
+            self.assertEqual(
+                departure_stop_set_digest(first),
+                departure_stop_set_digest(second),
+            )
+
+    def test_stop_set_change_changes_partition_key(self) -> None:
+        common = {
+            "repository_root": Path(__file__).resolve().parents[1],
+            "provider_id": "fixture",
+            "city_id": "fixture-city",
+            "service_date": "20260914",
+            "raw_sha256": "a" * 64,
+            "structural_input_key": "structural-key",
+            "calendar_fingerprint": "calendar-key",
+            "source": {"timezone": "UTC", "departurePackageDays": 3},
+        }
+        key_a = departure_partition_key(stop_set_digest="b" * 64, **common)
+        key_b = departure_partition_key(stop_set_digest="c" * 64, **common)
+        self.assertNotEqual(key_a.value, key_b.value)
+
+    def test_partition_without_stop_set_digest_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "partition.json"
+            source.write_text("{\"stops\":{}}")
+            key = departure_partition_key(
+                repository_root=Path(__file__).resolve().parents[1],
+                provider_id="fixture",
+                city_id="fixture-city",
+                service_date="20260914",
+                raw_sha256="a" * 64,
+                structural_input_key="structural-key",
+                stop_set_digest="b" * 64,
+                calendar_fingerprint="calendar-key",
+                source={"timezone": "UTC", "departurePackageDays": 3},
+            )
+            cache = DeparturePartitionCache(root / "cache", "fixture")
+            cache.persist(key, source)
+            manifest_path = cache._directory(key) / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            del manifest["stopSetDigest"]
+            manifest_path.write_text(json.dumps(manifest))
+            self.assertEqual(cache.lookup(key).status, "INVALID")
 
 
 if __name__ == "__main__":
