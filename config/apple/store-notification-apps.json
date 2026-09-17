@@ -11,6 +11,12 @@
       "bundleId": "com.aSoft.Pasty",
       "appAppleId": 6766716767,
       "environments": ["PRODUCTION", "SANDBOX"]
+    },
+    {
+      "name": "streckenkunden",
+      "bundleId": "app.asoftlabs.RouteRecall",
+      "appAppleId": 6806768949,
+      "environments": ["PRODUCTION", "SANDBOX"]
     }
   ]
 }

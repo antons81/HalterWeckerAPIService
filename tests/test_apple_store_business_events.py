@@ -75,6 +75,8 @@ class AppleStoreBusinessEventTests(unittest.TestCase):
             ("com.aSoft.HalteWecker", "com.asoft.haltewecker.unlimited.new"): ("haltewecker", "lifetime_current"),
             ("com.aSoft.HalteWecker", "com.asoft.haltewecker.unlimited"): ("haltewecker", "lifetime_legacy"),
             ("com.aSoft.Pasty", "com.aSoft.Pasty.pro.lifetime"): ("pasty", "lifetime"),
+            ("app.asoftlabs.RouteRecall", "com.asoftlabs.streckenkunde.monthly"): ("streckenkunden", "monthly"),
+            ("app.asoftlabs.RouteRecall", "com.asoftlabs.streckenkunde.yearly"): ("streckenkunden", "yearly"),
         }
         actual = {
             (bundle_id, product_id): (classification.app, classification.purchase_kind)
@@ -96,6 +98,20 @@ class AppleStoreBusinessEventTests(unittest.TestCase):
                 self.assertEqual(event.purchase_kind, purchase_kind)
                 self.assertTrue(event.is_handled)
                 self.assertEqual(event.received_at, 1_700_000_000_003)
+
+    def test_streckenkunden_monthly_and_yearly_subscription_events(self) -> None:
+        cases = (
+            ("com.asoftlabs.streckenkunde.monthly", "monthly"),
+            ("com.asoftlabs.streckenkunde.yearly", "yearly"),
+        )
+        for product_id, purchase_kind in cases:
+            with self.subTest(product_id=product_id):
+                event = normalize_notification(
+                    make_notification("SUBSCRIBED", "app.asoftlabs.RouteRecall", product_id)
+                )
+                self.assertEqual(event.app, "streckenkunden")
+                self.assertEqual(event.purchase_kind, purchase_kind)
+                self.assertTrue(event.is_handled)
 
     def test_did_renew_uses_renewal_product_and_status(self) -> None:
         event = normalize_notification(

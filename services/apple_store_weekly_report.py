@@ -15,6 +15,11 @@ from zoneinfo import ZoneInfo
 WEEKLY_REPORT_TIMEZONE = ZoneInfo("Europe/Berlin")
 DEFAULT_NOTIFICATION_STORE_PATH = "/data/apple-store-notifications/events.sqlite3"
 DEFAULT_REPORT_ENVIRONMENT = "Production"
+REPORT_APP_LABELS = (
+    ("HalteWecker", "haltewecker"),
+    ("Pasty", "pasty"),
+    ("Streckenkunden Pro", "streckenkunden"),
+)
 LOGGER = logging.getLogger(__name__)
 
 
@@ -256,8 +261,10 @@ def format_weekly_summary(summary: WeeklySalesSummary) -> str:
             f"Lifetime purchases: {summary.lifetime_purchases}",
             f"Refunds: {summary.refunds}",
             "",
-            f"HalteWecker: {summary.app_counts.get('haltewecker', 0)}",
-            f"Pasty: {summary.app_counts.get('pasty', 0)}",
+            *[
+                f"{label}: {summary.app_counts.get(app, 0)}"
+                for label, app in REPORT_APP_LABELS
+            ],
             "",
             "Top storefronts:",
             *storefront_lines,

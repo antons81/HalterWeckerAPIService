@@ -72,7 +72,7 @@ def make_notification(bundle_id: str, environment: Environment, nested: bool = F
 class AppleStoreNotificationVerifierTests(unittest.TestCase):
     def test_configuration_contains_both_apps_and_environments(self) -> None:
         candidates = build_verifier_candidates(enable_online_checks=False)
-        self.assertEqual(len(candidates), 4)
+        self.assertEqual(len(candidates), 6)
         self.assertEqual(
             {(candidate.bundle_id, candidate.environment) for candidate in candidates},
             {
@@ -80,6 +80,17 @@ class AppleStoreNotificationVerifierTests(unittest.TestCase):
                 ("com.aSoft.HalteWecker", Environment.SANDBOX),
                 ("com.aSoft.Pasty", Environment.PRODUCTION),
                 ("com.aSoft.Pasty", Environment.SANDBOX),
+                ("app.asoftlabs.RouteRecall", Environment.PRODUCTION),
+                ("app.asoftlabs.RouteRecall", Environment.SANDBOX),
+            },
+        )
+
+        self.assertEqual(
+            {(candidate.bundle_id, candidate.app_apple_id) for candidate in candidates},
+            {
+                ("com.aSoft.HalteWecker", 6789654959),
+                ("com.aSoft.Pasty", 6766716767),
+                ("app.asoftlabs.RouteRecall", 6806768949),
             },
         )
 
@@ -128,7 +139,7 @@ class AppleStoreNotificationVerifierTests(unittest.TestCase):
 
 
 class AppleStoreNotificationEndpointStubTests(unittest.TestCase):
-    def test_verified_haltewecker_and_pasty_production_sandbox_notifications_are_accepted(self) -> None:
+    def test_verified_configured_apps_production_sandbox_notifications_are_accepted(self) -> None:
         class StubVerifier:
             def __init__(self, notification: VerifiedAppleNotification) -> None:
                 self.notification = notification
@@ -141,6 +152,8 @@ class AppleStoreNotificationEndpointStubTests(unittest.TestCase):
             ("com.aSoft.HalteWecker", "SANDBOX", 6789654959),
             ("com.aSoft.Pasty", "PRODUCTION", 6766716767),
             ("com.aSoft.Pasty", "SANDBOX", 6766716767),
+            ("app.asoftlabs.RouteRecall", "PRODUCTION", 6806768949),
+            ("app.asoftlabs.RouteRecall", "SANDBOX", 6806768949),
         )
         for bundle_id, environment, _app_apple_id in cases:
             notification = VerifiedAppleNotification(

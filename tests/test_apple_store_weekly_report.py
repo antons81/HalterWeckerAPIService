@@ -91,6 +91,14 @@ class AppleStoreWeeklyReportTests(unittest.TestCase):
                 )
                 store.insert_once(
                     make_event(
+                        "streckenkunden-1",
+                        "SUBSCRIBED",
+                        transaction_id="streckenkunden-tx",
+                        app="streckenkunden",
+                    )
+                )
+                store.insert_once(
+                    make_event(
                         "refund-1",
                         "REFUND",
                         transaction_id="tx-1",
@@ -114,13 +122,16 @@ class AppleStoreWeeklyReportTests(unittest.TestCase):
                 environment="Production",
             )
 
-        self.assertEqual(summary.new_subscriptions, 1)
+        self.assertEqual(summary.new_subscriptions, 2)
         self.assertEqual(summary.renewals, 1)
         self.assertEqual(summary.lifetime_purchases, 1)
         self.assertEqual(summary.refunds, 1)
-        self.assertEqual(summary.app_counts, {"haltewecker": 2, "pasty": 1})
-        self.assertEqual(summary.storefront_counts, {"DEU": 3})
-        self.assertEqual(summary.revenue_by_currency, {"EUR": Decimal("5.98")})
+        self.assertEqual(
+            summary.app_counts,
+            {"haltewecker": 2, "pasty": 1, "streckenkunden": 1},
+        )
+        self.assertEqual(summary.storefront_counts, {"DEU": 4})
+        self.assertEqual(summary.revenue_by_currency, {"EUR": Decimal("6.97")})
 
     def test_zero_summary_is_still_rendered(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -141,6 +152,7 @@ class AppleStoreWeeklyReportTests(unittest.TestCase):
         self.assertIn("Refunds: 0", message)
         self.assertIn("HalteWecker: 0", message)
         self.assertIn("Pasty: 0", message)
+        self.assertIn("Streckenkunden Pro: 0", message)
         self.assertIn("— 0.00", message)
 
     def test_refund_full_prorated_and_reversed_adjust_revenue(self) -> None:

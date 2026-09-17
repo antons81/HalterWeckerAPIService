@@ -38,6 +38,7 @@ PASTY_NOTIFICATION_TYPES = frozenset(
         "REFUND_REVERSED",
     }
 )
+STRECKENKUNDEN_NOTIFICATION_TYPES = HALTEWECKER_NOTIFICATION_TYPES - {"ONE_TIME_CHARGE"}
 
 
 @dataclass(frozen=True)
@@ -191,6 +192,8 @@ def normalize_notification(
         if classification.app == "haltewecker"
         else notification_type in PASTY_NOTIFICATION_TYPES
         if classification.app == "pasty"
+        else notification_type in STRECKENKUNDEN_NOTIFICATION_TYPES
+        if classification.app == "streckenkunden"
         else False
     )
     is_handled = known_type and classification.purchase_kind != UNKNOWN_PURCHASE_KIND

@@ -81,6 +81,23 @@ class TelegramSalesNotifierTests(unittest.TestCase):
             "Product: com.aSoft.Pasty.pro.lifetime",
         )
 
+    def test_format_streckenkunden_subscription_message(self) -> None:
+        message = format_sales_message(
+            make_event(
+                app="streckenkunden",
+                bundle_id="app.asoftlabs.RouteRecall",
+                product_id="com.asoftlabs.streckenkunde.monthly",
+            )
+        )
+
+        self.assertEqual(
+            message,
+            "💰 Streckenkunden Pro\n"
+            "New monthly subscription\n"
+            "Environment: Production\n"
+            "Product: com.asoftlabs.streckenkunde.monthly",
+        )
+
     def test_format_refund_message(self) -> None:
         self.assertIn(
             "↩️ HalteWecker\nRefund",

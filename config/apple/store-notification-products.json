@@ -23,6 +23,16 @@
         "app": "pasty",
         "purchaseKind": "lifetime"
       }
+    },
+    "app.asoftlabs.RouteRecall": {
+      "com.asoftlabs.streckenkunde.monthly": {
+        "app": "streckenkunden",
+        "purchaseKind": "monthly"
+      },
+      "com.asoftlabs.streckenkunde.yearly": {
+        "app": "streckenkunden",
+        "purchaseKind": "yearly"
+      }
     }
   }
 }

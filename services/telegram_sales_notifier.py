@@ -15,6 +15,11 @@ from apple_store_business_events import NormalizedAppleStoreEvent
 
 TELEGRAM_API_URL = "https://api.telegram.org"
 DEFAULT_TIMEOUT_SECONDS = 5.0
+APP_DISPLAY_NAMES = {
+    "haltewecker": "HalteWecker",
+    "pasty": "Pasty",
+    "streckenkunden": "Streckenkunden Pro",
+}
 
 
 class TelegramSalesNotificationError(RuntimeError):
@@ -49,6 +54,10 @@ def _default_transport(
 
 def _environment_label(environment: str) -> str:
     return "Sandbox" if environment.casefold() == "sandbox" else "Production"
+
+
+def _app_display_name(app: str) -> str:
+    return APP_DISPLAY_NAMES.get(app, app)
 
 
 def _purchase_label(purchase_kind: str) -> str:
@@ -171,7 +180,7 @@ def format_sales_message(event: NormalizedAppleStoreEvent) -> str | None:
         return None
 
     icon, title = _event_title(event)
-    app_name = "HalteWecker" if event.app == "haltewecker" else "Pasty"
+    app_name = _app_display_name(event.app)
     lines = [
         f"{icon} {app_name}",
         title,
@@ -189,7 +198,7 @@ def format_test_message(event: NormalizedAppleStoreEvent) -> str | None:
     if event.notification_type != "TEST":
         return None
 
-    app_name = "HalteWecker" if event.app == "haltewecker" else "Pasty"
+    app_name = _app_display_name(event.app)
     return "\n".join(
         [
             "🧪 Apple Store TEST",
