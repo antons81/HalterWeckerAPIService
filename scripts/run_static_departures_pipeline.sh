@@ -52,6 +52,45 @@ LOG_PREFIX="[StaticDepartures]"
 CONTAINER_NAME="${STATIC_DEPARTURES_CONTAINER_NAME:-static-departures-api}"
 ACTIVE_RELEASE_DIR=""
 STATIC_DEPARTURES_RELEASE="${STATIC_DEPARTURES_RELEASE:-$DATA_ROOT/static-departures-release}"
+PRESERVED_CONTAINER_NAME=""
+PRESERVED_CONTAINER_RENAMED=0
+DEPLOYMENT_ROLLBACK_NEEDED=0
+
+rollback_previous_container() {
+  local status="$?"
+  trap - EXIT
+  if [[ "$DEPLOYMENT_ROLLBACK_NEEDED" == "1" && "$PRESERVED_CONTAINER_RENAMED" == "1" ]]; then
+    echo "$LOG_PREFIX restoring previous container name=$CONTAINER_NAME rollback=$PRESERVED_CONTAINER_NAME" >&2
+    if docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+      docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    fi
+    if docker inspect "$PRESERVED_CONTAINER_NAME" >/dev/null 2>&1; then
+      docker rename "$PRESERVED_CONTAINER_NAME" "$CONTAINER_NAME" >/dev/null 2>&1 || true
+      docker start "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    fi
+  fi
+  exit "$status"
+}
+
+preserve_existing_container() {
+  if ! docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+    return 0
+  fi
+  local suffix="${RELEASE_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+  suffix="${suffix//[^a-zA-Z0-9_.-]/-}"
+  PRESERVED_CONTAINER_NAME="${CONTAINER_NAME}-rollback-${suffix}"
+  PRESERVED_CONTAINER_NAME="${PRESERVED_CONTAINER_NAME:0:63}"
+  if docker inspect "$PRESERVED_CONTAINER_NAME" >/dev/null 2>&1; then
+    echo "$LOG_PREFIX ERROR: rollback container name already exists: $PRESERVED_CONTAINER_NAME" >&2
+    return 1
+  fi
+  DEPLOYMENT_ROLLBACK_NEEDED=1
+  trap rollback_previous_container EXIT
+  echo "$LOG_PREFIX preserving existing container=$CONTAINER_NAME as=$PRESERVED_CONTAINER_NAME"
+  docker rename "$CONTAINER_NAME" "$PRESERVED_CONTAINER_NAME"
+  PRESERVED_CONTAINER_RENAMED=1
+  docker stop --time "${STATIC_DEPARTURES_STOP_TIMEOUT_SECONDS:-30}" "$PRESERVED_CONTAINER_NAME" >/dev/null
+}
 if [[ -z "$RELEASE_ID" ]]; then
   if [[ ! -L "$STATIC_DEPARTURES_RELEASE" ]]; then
     echo "$LOG_PREFIX ERROR: no successful stop-data handoff for standalone release-scoped import" >&2
@@ -199,6 +238,10 @@ fi
 echo "$LOG_PREFIX activated databaseVersion=$VERSION"
 fi
 
+if [[ "$CONTAINER_NAME" == "static-departures-api" ]]; then
+  preserve_existing_container
+fi
+
 echo "$LOG_PREFIX refreshing static-departures-api container"
 docker compose -f "$REPO/deploy/static-departures.compose.yml" up -d --build
 
@@ -227,5 +270,7 @@ if actual != sys.argv[2]:
     raise SystemExit(f"runtime release mismatch: expected {sys.argv[2]}, got {actual or '<missing>'}")
 PY
 fi
+DEPLOYMENT_ROLLBACK_NEEDED=0
+trap - EXIT
 echo "$LOG_PREFIX release=${RELEASE_ID:-legacy} stage=readiness duration=$((SECONDS - readiness_started))s"
 echo "$LOG_PREFIX completed at $(date -Is)"

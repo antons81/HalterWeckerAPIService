@@ -11,6 +11,102 @@ PIPELINE = REPOSITORY_ROOT / "scripts" / "run_static_departures_pipeline.sh"
 
 
 class StaticDeparturesPipelineTests(unittest.TestCase):
+    def _run_readiness_with_mock_docker(
+        self, root: Path, *, health_release_id: str
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        docker_log = root / "docker.log"
+        docker_state = root / "docker-state"
+        docker_state.write_text("canonical\n", encoding="utf-8")
+        mock_docker = root / "docker"
+        mock_docker.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"log={str(docker_log)!r}\n"
+            f"state={str(docker_state)!r}\n"
+            "printf '%s\\n' \"$*\" >> \"$log\"\n"
+            "if [[ \"$1\" == inspect ]]; then\n"
+            "  name=\"${2:-}\"\n"
+            "  current=\"$(cat \"$state\")\"\n"
+            "  if [[ \"$name\" == static-departures-api && \"$current\" == canonical ]]; then exit 0; fi\n"
+            "  if [[ \"$name\" == static-departures-api-rollback-release-a && \"$current\" == rollback ]]; then exit 0; fi\n"
+            "  exit 1\n"
+            "fi\n"
+            "if [[ \"$1\" == rename ]]; then\n"
+            "  if [[ \"${3:-}\" == static-departures-api-rollback-release-a ]]; then printf '%s\\n' rollback > \"$state\"; else printf '%s\\n' canonical > \"$state\"; fi\n"
+            "  exit 0\n"
+            "fi\n"
+            "if [[ \"$1\" == rm ]]; then printf '%s\\n' rollback > \"$state\"; exit 0; fi\n"
+            "if [[ \"$1\" == stop || \"$1\" == start ]]; then exit 0; fi\n"
+            "if [[ \"$1\" == compose ]]; then printf '%s\\n' canonical > \"$state\"; exit 0; fi\n"
+            "if [[ \"$1\" == exec ]]; then\n"
+            f"  printf '%s\\n' '{{\"status\":\"ok\",\"database\":{{\"releaseID\":\"{health_release_id}\"}}}}'\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        mock_docker.chmod(0o755)
+        environment_file = root / "haltewecker-stop-data.env"
+        environment_file.write_text(
+            "GTFS_URL=https://example.invalid/german.zip\n",
+            encoding="utf-8",
+        )
+        wmata_file = root / "wmata.env"
+        wmata_file.write_text("WMATA_API_KEY=test-secret\n", encoding="utf-8")
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "REPO": str(REPOSITORY_ROOT),
+                "DATA_ROOT": str(root),
+                "STOP_DATA_ENV_FILE": str(environment_file),
+                "WMATA_SECRET_FILE": str(wmata_file),
+                "RELEASE_ID": "release-a",
+                "READINESS_ONLY": "1",
+                "PATH": f"{mock_docker.parent}:{environment['PATH']}",
+            }
+        )
+        result = subprocess.run(
+            ["bash", str(PIPELINE)],
+            cwd=REPOSITORY_ROOT,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        return result, docker_log
+
+    def test_canonical_readiness_preserves_existing_container(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result, docker_log = self._run_readiness_with_mock_docker(
+                Path(temporary_directory), health_release_id="release-a"
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = docker_log.read_text(encoding="utf-8")
+            self.assertIn(
+                "rename static-departures-api static-departures-api-rollback-release-a",
+                calls,
+            )
+            self.assertIn(
+                "stop --time 30 static-departures-api-rollback-release-a", calls
+            )
+            self.assertIn("compose -f", calls)
+            self.assertNotIn("rm -f static-departures-api", calls)
+
+    def test_canonical_readiness_rolls_back_on_health_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            result, docker_log = self._run_readiness_with_mock_docker(
+                root, health_release_id="wrong-release"
+            )
+            self.assertNotEqual(result.returncode, 0)
+            calls = docker_log.read_text(encoding="utf-8")
+            self.assertIn("rm -f static-departures-api", calls)
+            self.assertIn(
+                "rename static-departures-api-rollback-release-a static-departures-api",
+                calls,
+            )
+            self.assertIn("start static-departures-api", calls)
+
     def test_standalone_run_fails_closed_without_successful_stop_data_handoff(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
