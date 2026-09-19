@@ -2885,6 +2885,10 @@ def _build_external_departure_partitions(
                 source=source,
             )
             lookup = cache.lookup(key)
+            if lookup.status == "INVALID":
+                raise ValueError(
+                    f"provider={provider_id} date={service_date} departure cache INVALID: {lookup.reason}"
+                )
             keys[(city_id, service_date)] = key
             lookups[(city_id, service_date)] = lookup
             if lookup.status != "HIT":
