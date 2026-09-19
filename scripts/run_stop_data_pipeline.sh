@@ -7,6 +7,7 @@ RESUME_RELEASE_ID=""
 NO_ACTIVATE="${HALTEWECKER_NIGHTLY_NO_ACTIVATE:-0}"
 EXPLICIT_NO_ACTIVATE=0
 INCREMENTAL_NO_ACTIVATE=0
+INCREMENTAL_PRODUCTION="${HALTEWECKER_INCREMENTAL_PRODUCTION:-1}"
 INCREMENTAL_PROOF_OVERRIDE="${HALTEWECKER_INCREMENTAL_PROOF_OVERRIDE:-0}"
 REUSE_STOP_DATA=0
 STOP_DATA_ONLY=0
@@ -38,6 +39,11 @@ cleanup_failed_no_activate() {
   if [[ "$NO_ACTIVATE" == "1" ]]; then
     diagnostics_write_report "$status"
   fi
+  if [[ "$DIAGNOSTICS_REPLAY" == "1" ]]; then
+    cat "$DIAGNOSTICS_LOG" >&3
+    cat "$DIAGNOSTICS_STDERR_LOG" >&4
+    exec 3>&- 4>&-
+  fi
   exit "$status"
 }
 if [[ "${1:-}" == "--resume" ]]; then
@@ -63,12 +69,16 @@ elif [[ "${1:-}" == "--incremental-no-activate" && "$#" -eq 1 ]]; then
   NO_ACTIVATE=1
   EXPLICIT_NO_ACTIVATE=1
   INCREMENTAL_NO_ACTIVATE=1
+elif [[ "${1:-}" == "--incremental" && "$#" -eq 1 ]]; then
+  INCREMENTAL_PRODUCTION=1
+elif [[ "${1:-}" == "--legacy-full" && "$#" -eq 1 ]]; then
+  INCREMENTAL_PRODUCTION=0
 elif [[ "${1:-}" == "--stop-data-only" && "$#" -eq 1 ]]; then
   NO_ACTIVATE=1
   EXPLICIT_NO_ACTIVATE=1
   STOP_DATA_ONLY=1
 elif [[ "$#" -ne 0 ]]; then
-  echo "usage: $0 [--resume RELEASE_ID|--stop-data-only|--incremental-no-activate|--no-activate [--reuse-stop-data [RELEASE_ID]]]" >&2
+  echo "usage: $0 [--resume RELEASE_ID|--incremental|--legacy-full|--stop-data-only|--incremental-no-activate|--no-activate [--reuse-stop-data [RELEASE_ID]]]" >&2
   exit 64
 fi
 
@@ -83,6 +93,16 @@ fi
 if [[ "$INCREMENTAL_PROOF_OVERRIDE" == "1" && "$INCREMENTAL_NO_ACTIVATE" != "1" ]]; then
   echo "[StopData] ERROR: incremental proof override requires --incremental-no-activate" >&2
   exit 64
+fi
+if [[ "$INCREMENTAL_PRODUCTION" != "0" && "$INCREMENTAL_PRODUCTION" != "1" ]]; then
+  echo "[StopData] ERROR: HALTEWECKER_INCREMENTAL_PRODUCTION must be 0 or 1" >&2
+  exit 64
+fi
+if [[ "$NO_ACTIVATE" == "1" ]]; then
+  INCREMENTAL_PRODUCTION=0
+fi
+if [[ "$RUN_MODE" == "resume" ]]; then
+  INCREMENTAL_PRODUCTION=0
 fi
 
 REPO="${REPO:-/srv/haltewecker/pipeline/HalterWeckerAPIService}"
@@ -99,6 +119,7 @@ else
 fi
 RELEASE_DIR="$RELEASES/$RELEASE_ID"
 INCREMENTAL_RELEASES_ROOT="${HALTEWECKER_INCREMENTAL_RELEASES_ROOT:-$DATA_ROOT/releases/incremental}"
+PILOT_CURRENT="$INCREMENTAL_RELEASES_ROOT/pilot-current"
 INCREMENTAL_RELEASE_DIR="$INCREMENTAL_RELEASES_ROOT/$RELEASE_ID"
 BUILD_DIR="$RELEASE_DIR/stop-data"
 ARTIFACTS_JSON="$RELEASE_DIR/gtfs-artifacts.json"
@@ -186,11 +207,20 @@ DIAGNOSTICS_STAGING_PATH=""
 DIAGNOSTICS_PUBLISHED_PATH=""
 DIAGNOSTICS_PUBLICATION_TRANSITION_MS=""
 BUILD_FINGERPRINT=""
+OLD_PILOT_TARGET=""
+INCREMENTAL_POINTER_CHANGED=0
+DIAGNOSTICS_REPLAY=0
 
 if [[ "$NO_ACTIVATE" == "1" ]]; then
   mkdir -p "$DIAGNOSTICS_ROOT"
-  exec > >(tee -a "$DIAGNOSTICS_LOG")
-  exec 2> >(tee -a "$DIAGNOSTICS_STDERR_LOG" >&2)
+  if [[ "${HALTEWECKER_DIAGNOSTICS_DISABLE_TEE:-0}" == "1" ]]; then
+    exec 3>&1 4>&2
+    exec >>"$DIAGNOSTICS_LOG" 2>>"$DIAGNOSTICS_STDERR_LOG"
+    DIAGNOSTICS_REPLAY=1
+  else
+    exec > >(tee -a "$DIAGNOSTICS_LOG")
+    exec 2> >(tee -a "$DIAGNOSTICS_STDERR_LOG" >&2)
+  fi
 fi
 
 diagnostics_set_stage() {
@@ -535,6 +565,49 @@ activate_runtime() {
   echo "[StopData] release=$RELEASE_ID static departures synchronized"
 }
 
+restore_incremental_pilot_pointer() {
+  if [[ "$INCREMENTAL_POINTER_CHANGED" != "1" ]]; then
+    return 0
+  fi
+  if [[ -n "$OLD_PILOT_TARGET" ]]; then
+    replace_link "$PILOT_CURRENT" "$OLD_PILOT_TARGET"
+  else
+    rm -f "$PILOT_CURRENT" "$PILOT_CURRENT.next"
+  fi
+  INCREMENTAL_POINTER_CHANGED=0
+  echo "[Nightly] stage=pilot-pointer status=RESTORED target=${OLD_PILOT_TARGET:-none}"
+}
+
+publish_incremental_pilot_pointer() {
+  mkdir -p "$(dirname "$PILOT_CURRENT")"
+  if [[ -e "$PILOT_CURRENT" && ! -L "$PILOT_CURRENT" ]]; then
+    echo "[Nightly] ERROR: incremental pilot pointer is not a symlink: $PILOT_CURRENT" >&2
+    return 1
+  fi
+  if [[ -L "$PILOT_CURRENT" ]]; then
+    OLD_PILOT_TARGET="$(readlink "$PILOT_CURRENT")"
+  fi
+  replace_link "$PILOT_CURRENT" "$RELEASE_ID"
+  INCREMENTAL_POINTER_CHANGED=1
+  echo "[Nightly] stage=pilot-pointer status=PUBLISHED release=$RELEASE_ID previous=${OLD_PILOT_TARGET:-none}"
+}
+
+activate_incremental_runtime() {
+  local container_pointer="/data/releases/incremental/$RELEASE_ID"
+  echo "[Nightly] release=$RELEASE_ID activating hybrid pilot runtime"
+  if ! HALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME=1 \
+    HALTEWECKER_STATIC_DEPARTURES_HYBRID_PROVIDERS="israel-mot,ttc-surface,ttc-subway" \
+    HALTEWECKER_STATIC_DEPARTURES_HYBRID_RELEASE_POINTER="$container_pointer" \
+    READINESS_ONLY=1 \
+    RELEASE_ID="" \
+    EXTERNAL_GTFS_ARTIFACTS_JSON="" \
+    "$STATIC_DEPARTURES_PIPELINE"; then
+    echo "[Nightly] ERROR: release=$RELEASE_ID hybrid runtime readiness failed" >&2
+    return 1
+  fi
+  echo "[Nightly] release=$RELEASE_ID hybrid runtime synchronized"
+}
+
 cd "$REPO"
 TOTAL_STARTED=$SECONDS
 PEAK_USED_KB=0
@@ -640,6 +713,10 @@ proof_disk_preflight() {
       warning_free_kb=$((45 * 1024 * 1024))
       disk_mode="production-shaped-no-activate"
     fi
+  elif [[ "$INCREMENTAL_PRODUCTION" == "1" ]]; then
+    minimum_free_kb=$((45 * 1024 * 1024))
+    warning_free_kb=$minimum_free_kb
+    disk_mode="incremental-production"
   else
     minimum_free_kb=$(( ${HALTEWECKER_MIN_FREE_GB:-45} * 1024 * 1024 ))
     warning_free_kb="$minimum_free_kb"
@@ -657,7 +734,7 @@ proof_disk_preflight() {
   fi
 }
 
-if [[ "$NO_ACTIVATE" == "1" && "$RUN_MODE" == "normal" ]]; then
+if [[ "$RUN_MODE" == "normal" && ( "$NO_ACTIVATE" == "1" || "$INCREMENTAL_PRODUCTION" == "1" ) ]]; then
   log_disk_state "run-start"
   proof_disk_preflight
 fi
@@ -1168,9 +1245,11 @@ if [[ "$RUN_MODE" == "normal" ]]; then
     log_disk_peak
     exit 0
   fi
-  if [[ "$NO_ACTIVATE" == "1" ]]; then
+  if [[ "$NO_ACTIVATE" == "1" || "$INCREMENTAL_PRODUCTION" == "1" ]]; then
     if [[ "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
       echo "[Nightly] stage=legacy-import status=SKIPPED release=$RELEASE_ID reason=production-shaped-no-activate"
+    elif [[ "$INCREMENTAL_PRODUCTION" == "1" ]]; then
+      echo "[Nightly] stage=legacy-import status=SKIPPED release=$RELEASE_ID reason=incremental-production"
     else
       echo "[Nightly] stage=legacy-import status=SKIPPED release=$RELEASE_ID reason=no-activate-proof"
     fi
@@ -1221,7 +1300,7 @@ else
   esac
 fi
 
-if [[ "$NO_ACTIVATE" == "1" ]]; then
+if [[ "$NO_ACTIVATE" == "1" || "$INCREMENTAL_PRODUCTION" == "1" ]]; then
   log_disk_state "incremental-start"
   diagnostics_set_stage "incremental-provider"
   NORMALIZED_CACHE_ROOT="${HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT:-${DATA_ROOT}/provider-artifacts/normalized}"
@@ -1237,13 +1316,10 @@ if [[ "$NO_ACTIVATE" == "1" ]]; then
     --normalized-cache-root "$NORMALIZED_CACHE_ROOT"
     --static-artifact-root "$STATIC_ARTIFACT_ROOT"
   )
-  if [[ "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
-    INCREMENTAL_ARGS+=(--result-json "$RELEASE_DIR/incremental-result.json")
-  fi
+  INCREMENTAL_ARGS+=(--result-json "$RELEASE_DIR/incremental-result.json")
   python3 "$REPO/scripts/run_incremental_provider_pipeline.py" \
     "${INCREMENTAL_ARGS[@]}"
-  if [[ "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
-    python3 - "$RELEASE_DIR/incremental-result.json" "$RELEASE_ID" "$BUILD_DIR" "$BUILD_FINGERPRINT" <<'PY'
+  python3 - "$RELEASE_DIR/incremental-result.json" "$RELEASE_ID" "$BUILD_DIR" "$BUILD_FINGERPRINT" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -1272,21 +1348,42 @@ print(
     f"release={release_id} candidate={candidate} fingerprint={expected_fingerprint}"
 )
 PY
-  fi
+  INCREMENTAL_RELEASE_DIR="$(python3 - "$RELEASE_DIR/incremental-result.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+result = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(Path(str(result["releaseDirectory"])).resolve())
+PY
+)"
   if [[ "$REUSE_STOP_DATA" == "1" ]]; then
     verify_reused_stop_data_unchanged
   fi
   echo "[Nightly] stage=incremental-provider status=PASS release=$RELEASE_ID duration=$((SECONDS - INCREMENTAL_STARTED))s"
   log_disk_state "incremental-complete"
-  echo "[Nightly] stage=readiness status=PASS release=$RELEASE_ID no_activate=true"
-  if [[ "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
+  echo "[Nightly] stage=readiness status=PASS release=$RELEASE_ID mode=incremental-candidate"
+  if [[ "$NO_ACTIVATE" == "1" ]]; then
     echo "[Nightly] stage=nightly-complete status=PASS release=$RELEASE_ID mode=production-shaped-no-activate activation=NOT_RUN"
-  else
-    echo "[Nightly] stage=nightly-complete status=PASS release=$RELEASE_ID no_activate=true"
+    log_disk_state "after"
+    log_disk_peak
+    exit 0
   fi
-  log_disk_state "after"
-  log_disk_peak
-  exit 0
+  if [[ "$INCREMENTAL_PRODUCTION" == "1" ]]; then
+    if ! publish_incremental_pilot_pointer; then
+      exit 1
+    fi
+    if ! activate_incremental_runtime; then
+      restore_incremental_pilot_pointer
+      exit 1
+    fi
+    INCREMENTAL_POINTER_CHANGED=0
+    echo "[Nightly] stage=pilot-activation status=PASS release=$RELEASE_ID candidate=$INCREMENTAL_RELEASE_DIR"
+    echo "[Nightly] stage=nightly-complete status=PASS release=$RELEASE_ID mode=incremental-production activation=PILOT_HYBRID"
+    log_disk_state "after"
+    log_disk_peak
+    exit 0
+  fi
 fi
 
 OLD_RELEASE_TARGET=""

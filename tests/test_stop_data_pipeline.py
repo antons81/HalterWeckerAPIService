@@ -501,6 +501,10 @@ PY
         path.chmod(0o755)
 
     def run_pipeline(self, *arguments: str, **extra_environment: str) -> subprocess.CompletedProcess[str]:
+        use_default_production_mode = extra_environment.pop("USE_DEFAULT_PRODUCTION", "0") == "1"
+        explicit_modes = {"--resume", "--incremental", "--legacy-full", "--stop-data-only", "--incremental-no-activate", "--no-activate"}
+        if not use_default_production_mode and (not arguments or arguments[0] not in explicit_modes):
+            arguments = ("--legacy-full", *arguments)
         environment = os.environ.copy()
         environment.update({
             "REPO": str(REPOSITORY_ROOT),
@@ -517,6 +521,7 @@ PY
             "STATIC_CALLS_LOG": str(self.root / "static-calls.log"),
             "STAGED_STOP_DATA_LOG": str(self.root / "staged-stop-data.log"),
             "STATIC_DEPARTURES_PIPELINE": str(self.bin_directory / "static-departures-pipeline"),
+            "HALTEWECKER_DIAGNOSTICS_DISABLE_TEE": "1",
             "REAL_PYTHON": sys.executable,
             "GTFS_URL": "https://example.invalid/german.zip",
             "SWISS_GTFS_URL": "https://example.invalid/swiss.zip",
@@ -559,7 +564,7 @@ PY
         releases = [
             path
             for path in (self.data_root / "releases").iterdir()
-            if path.is_dir() and path.name != "old"
+            if path.is_dir() and path.name not in {"old", "incremental"}
         ]
         self.assertEqual(len(releases), 1)
         return releases[0].name
@@ -604,6 +609,41 @@ PY
         self.assertNotEqual(
             (self.data_root / "previous" / "stop-data" / "release-marker").read_text(),
             "new",
+        )
+
+    def test_default_invocation_uses_incremental_production_mode(self) -> None:
+        result = self.run_pipeline(USE_DEFAULT_PRODUCTION="1")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)
+        self.assertIn("reason=incremental-production", result.stdout)
+        self.assertIn("stage=pilot-activation status=PASS", result.stdout)
+        self.assertIn("activation=PILOT_HYBRID", result.stdout)
+        self.assertFalse((self.data_root / "current-release").exists())
+        self.assertFalse((self.data_root / "departures-current.sqlite").exists())
+        pilot_pointer = self.data_root / "releases" / "incremental" / "pilot-current"
+        self.assertTrue(pilot_pointer.is_symlink())
+        self.assertTrue((self.root / "static-calls.log").is_file())
+        self.assertEqual(
+            (self.root / "static-calls.log").read_text(encoding="utf-8").splitlines(),
+            ["1"],
+        )
+
+    def test_incremental_production_failure_restores_previous_pilot_pointer(self) -> None:
+        pilot_root = self.data_root / "releases" / "incremental"
+        pilot_root.mkdir(parents=True, exist_ok=True)
+        old_candidate = pilot_root / "old-candidate"
+        old_candidate.mkdir()
+        (pilot_root / "pilot-current").symlink_to("old-candidate")
+
+        result = self.run_pipeline(USE_DEFAULT_PRODUCTION="1", READINESS_FAIL="1")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((pilot_root / "pilot-current").is_symlink())
+        self.assertEqual(os.readlink(pilot_root / "pilot-current"), "old-candidate")
+        self.assertEqual(
+            (self.data_root / "current" / "release-marker").read_text(encoding="utf-8"),
+            "old",
         )
 
     def test_stop_data_only_persists_validated_source_without_downstream_stages(self) -> None:
