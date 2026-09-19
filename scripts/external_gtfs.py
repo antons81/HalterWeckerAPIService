@@ -2572,8 +2572,11 @@ def _merge_namespaced_city_records_bounded(
         )
 
 
-def _departure_output_schema_version(environ: dict[str, str] | None) -> int:
+def _departure_output_schema_version(environ: dict[str, str] | None, provider_id: str = "") -> int:
     values = environ if environ is not None else os.environ
+    required = {value.strip() for value in values.get("HALTEWECKER_EXTERNAL_DEPARTURES_V3_PROVIDERS", "").split(",")}
+    if provider_id and provider_id in required:
+        return 3
     raw = values.get("HALTEWECKER_EXTERNAL_DEPARTURES_SCHEMA", "1").strip()
     try:
         version = int(raw)
@@ -2842,6 +2845,10 @@ def _build_external_departure_partitions(
         and gtfs_cache is not None
         and raw_artifact_digest is not None
     )
+    values = environ if environ is not None else os.environ
+    required_providers = values.get("HALTEWECKER_EXTERNAL_DEPARTURES_V3_PROVIDERS", "").split(",")
+    if provider_id in {value.strip() for value in required_providers} and not cache_enabled_for_source:
+        raise ValueError(f"provider={provider_id} requires departure v3 cache and raw provenance")
     if cache_enabled_for_source:
         cache = DeparturePartitionCache(
             Path(gtfs_cache.root) / "external-departure-partitions",
@@ -3472,7 +3479,7 @@ def process_external_gtfs_sources(
                     )
 
             if source.get("buildDepartures", True):
-                departure_schema_version = _departure_output_schema_version(environ)
+                departure_schema_version = _departure_output_schema_version(environ, source_id)
                 if departure_schema_version in {2, 3}:
                     _timed_external_stage(
                         source_id,

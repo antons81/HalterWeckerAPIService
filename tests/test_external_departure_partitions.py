@@ -21,6 +21,23 @@ from static_departures_api import ExternalStaticData
 
 
 class ExternalDeparturePartitionTests(unittest.TestCase):
+    def test_required_provider_without_cache_fails_before_build(self):
+        with self.assertRaisesRegex(ValueError, "requires departure v3 cache"):
+            external_gtfs._build_external_departure_partitions(
+                archive=None, cities=[], output=Path("unused"),
+                timezone_name="UTC", namespace="", departure_window_days=3,
+                context=None, output_schema_version=3, provider_id="israel-mot",
+                source={}, repository_root=Path.cwd(), raw_artifact_digest=None,
+                structural_input_key="", gtfs_cache=None,
+                environ={"HALTEWECKER_EXTERNAL_DEPARTURES_V3_PROVIDERS": "israel-mot"},
+            )
+
+    def test_required_v3_providers_cannot_use_legacy_writer(self):
+        environment = {"HALTEWECKER_EXTERNAL_DEPARTURES_V3_PROVIDERS": "israel-mot,ttc-surface,ttc-subway", "HALTEWECKER_EXTERNAL_DEPARTURES_SCHEMA": "1"}
+        for provider in ("israel-mot", "ttc-surface", "ttc-subway"):
+            self.assertEqual(external_gtfs._departure_output_schema_version(environment, provider), 3)
+        self.assertEqual(external_gtfs._departure_output_schema_version(environment, "cta-chicago"), 1)
+
     def _feed(self, path: Path) -> None:
         with zipfile.ZipFile(path, "w") as archive:
             archive.writestr("agency.txt", "agency_id,agency_name\nA,Fixture\n")

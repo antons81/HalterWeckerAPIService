@@ -615,6 +615,7 @@ PY
         result = self.run_pipeline(USE_DEFAULT_PRODUCTION="1")
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stage=cache-policy schema=3 providers=israel-mot,ttc-surface,ttc-subway", result.stdout)
         self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)
         self.assertIn("reason=incremental-production", result.stdout)
         self.assertIn("stage=pilot-activation status=PASS", result.stdout)

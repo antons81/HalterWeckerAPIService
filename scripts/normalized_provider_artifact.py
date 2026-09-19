@@ -547,6 +547,23 @@ def _write_raw_index(path: Path, values: dict[str, str]) -> None:
     os.replace(temporary, path)
 
 
+def _live_raw_index(path: Path) -> dict[str, str]:
+    """Retire references to missing directories, never damaged artifacts."""
+    values = _read_raw_index(path)
+    live = {}
+    for raw_sha, key in values.items():
+        directory = path.parent / key
+        try:
+            directory.lstat()
+        except FileNotFoundError:
+            print(f"[NormalizedCache] status=MISS reason=stale-index key={key}", flush=True)
+        else:
+            live[raw_sha] = key
+    if live != values:
+        _write_raw_index(path, live)
+    return live
+
+
 def load_existing_for_raw_sha(
     *,
     repository_root: Path,
@@ -571,7 +588,7 @@ def load_existing_for_raw_sha(
         gtfs_cache_root=gtfs_cache_root,
         environ=environ,
     ) / provider_id
-    raw_index = _read_raw_index(provider_root / "raw-sha-index.json")
+    raw_index = _live_raw_index(provider_root / "raw-sha-index.json")
     semantic_key = raw_index.get(raw_sha)
     if not semantic_key:
         raise NormalizedArtifactError(
@@ -633,7 +650,7 @@ def load_or_build(
     started = time.monotonic()
 
     raw_index_path = provider_root / "raw-sha-index.json"
-    raw_index = _read_raw_index(raw_index_path)
+    raw_index = _live_raw_index(raw_index_path)
     indexed_key = raw_index.get(raw_sha) if raw_sha else None
     if indexed_key:
         indexed_directory = provider_root / indexed_key
@@ -725,6 +742,14 @@ def load_or_build(
             encoding="utf-8",
         )
         os.replace(manifest_temporary, temporary / "manifest.json")
+        _validate_manifest(
+            manifest,
+            directory=temporary,
+            provider_id=provider_id,
+            semantic_key=semantic_key,
+            builder=builder,
+            expected_semantic=semantic,
+        )
         if directory.exists():
             raise NormalizedArtifactError(
                 f"normalized artifact appeared concurrently: {semantic_key[:12]}"

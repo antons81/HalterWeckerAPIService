@@ -1,4 +1,5 @@
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -59,6 +60,25 @@ def _write_feed(
 
 
 class NormalizedProviderArtifactTests(unittest.TestCase):
+    def test_deleted_artifact_rebuilds_and_then_hits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "feed.zip"
+            _write_feed(feed, order=("stops.txt", "routes.txt", "trips.txt", "stop_times.txt", "calendar.txt"), compression=zipfile.ZIP_STORED)
+            context, first = self._build(root, feed, "a" * 64)
+            context.close()
+            shutil.rmtree(first.artifact_directory)
+            context, rebuilt = self._build(root, feed, "a" * 64)
+            context.close()
+            self.assertEqual(rebuilt.status, "MISS")
+            self.assertEqual(first.semantic_key, rebuilt.semantic_key)
+            context, warm = self._build(root, feed, "a" * 64)
+            context.close()
+            self.assertEqual(warm.status, "HIT")
+            (warm.artifact_directory / "manifest.json").unlink()
+            with self.assertRaises(artifact.NormalizedArtifactError):
+                self._build(root, feed, "a" * 64)
+
     def _build(self, root: Path, feed: Path, raw_sha: str):
         archive = zipfile.ZipFile(feed)
         context, usage = artifact.load_or_build(
