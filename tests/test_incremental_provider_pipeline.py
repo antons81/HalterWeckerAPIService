@@ -4,6 +4,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest.mock import Mock
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,39 @@ from test_static_provider_artifact import StaticProviderArtifactTests  # noqa: E
 
 
 class IncrementalProviderPipelineTests(unittest.TestCase):
+    def test_failed_initialization_preserves_original_exception(self):
+        for archive in (None, Mock()):
+            with self.subTest(archive_created=archive is not None):
+                original = ValueError("normalized or archive initialization failed")
+                with self.assertRaises(ValueError) as caught:
+                    try:
+                        raise original
+                    finally:
+                        incremental._close_provider_resources(None, archive)
+                self.assertIs(caught.exception, original)
+                if archive is not None:
+                    archive.close.assert_called_once_with()
+
+    def test_cleanup_failure_does_not_mask_primary_and_closes_archive(self):
+        context, archive = Mock(), Mock()
+        context.close.side_effect = RuntimeError("context cleanup failed")
+        archive.close.side_effect = RuntimeError("archive cleanup failed")
+        original = ValueError("original failure")
+        with self.assertRaises(ValueError) as caught:
+            try:
+                raise original
+            finally:
+                incremental._close_provider_resources(context, archive)
+        self.assertIs(caught.exception, original)
+        archive.close.assert_called_once_with()
+
+    def test_cleanup_failure_without_primary_fails_closed(self):
+        context, archive = Mock(), Mock()
+        context.close.side_effect = RuntimeError("cleanup failed")
+        with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
+            incremental._close_provider_resources(context, archive)
+        archive.close.assert_called_once_with()
+
     @staticmethod
     def _write_active_services(path: Path, service_dates: list[str]) -> None:
         with sqlite3.connect(path) as connection:

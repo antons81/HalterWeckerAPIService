@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -50,6 +51,24 @@ except ImportError:
 PILOT_PROVIDER_IDS = ("israel-mot", "ttc-surface", "ttc-subway")
 DEFAULT_WINDOW_DAYS = 21
 ANCHORED_WINDOW_DAYS = DEFAULT_WINDOW_DAYS
+
+
+def _close_provider_resources(*resources: object) -> None:
+    """Close every acquired resource without masking an active exception."""
+    primary = sys.exc_info()[1]
+    cleanup_error = None
+    for resource in resources:
+        if resource is None:
+            continue
+        try:
+            resource.close()
+        except BaseException as error:
+            if primary is not None or cleanup_error is not None:
+                traceback.print_exception(error, file=sys.stderr)
+            else:
+                cleanup_error = error
+    if primary is None and cleanup_error is not None:
+        raise cleanup_error
 
 
 @dataclass(frozen=True)
@@ -544,9 +563,10 @@ def build_incremental_candidate(
         )
         source = dict(source)
         cities = load_external_cities(source, repository_root)
-        archive = load_gtfs_archive(str(raw_path))
+        archive = None
         normalized_context = None
         try:
+            archive = load_gtfs_archive(str(raw_path))
             normalized_started = time.monotonic()
             normalized_context, normalized_use = load_or_build_normalized(
                 archive=archive,
@@ -634,8 +654,7 @@ def build_incremental_candidate(
                 )
             )
         finally:
-            normalized_context.close()
-            archive.close()
+            _close_provider_resources(normalized_context, archive)
 
     work_root = _create_incremental_staging_directory(releases_root, release_id)
     try:
@@ -881,6 +900,7 @@ def main(argv: list[str] | None = None) -> int:
             dates=dates,
         )
     except Exception as error:
+        traceback.print_exc(file=sys.stderr)
         print(
             f"[NightlyIncremental] stage=nightly-complete status=ERROR "
             f"duration_ms={(time.monotonic() - started) * 1000:.1f} "
