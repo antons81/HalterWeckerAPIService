@@ -2670,6 +2670,7 @@ class ExternalBuildCacheTests(unittest.TestCase):
         self,
     ) -> None:
         reviewed = {
+            "cta-chicago",
             "511-bay-area",
             "australia-translink-seq",
             "australia-transport-nsw",
@@ -2677,6 +2678,7 @@ class ExternalBuildCacheTests(unittest.TestCase):
             "poland-warsaw",
             "wmata-bus",
             "mbta-boston",
+            "stm-montreal",
             "sweden",
             "mta-ny-nyct-bus",
             "ttc-surface",
