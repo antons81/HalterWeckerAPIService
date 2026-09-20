@@ -108,12 +108,12 @@ fi
 if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
   export HALTEWECKER_EXTERNAL_BUILD_CACHE=1
   export HALTEWECKER_EXTERNAL_TRANSFORMED_BUILD_CACHE=1
-  export HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS="${HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS:-cta-chicago},israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd"
-  export HALTEWECKER_EXTERNAL_DEPARTURES_V3_PROVIDERS="israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd"
+  export HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS="${HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS:-cta-chicago},511-bay-area,australia-translink-seq,australia-transport-nsw,israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd"
+  export HALTEWECKER_EXTERNAL_DEPARTURES_V3_PROVIDERS="511-bay-area,australia-translink-seq,australia-transport-nsw,israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd"
   export HALTEWECKER_EXTERNAL_DEPARTURE_CACHE=1
   export HALTEWECKER_PERSISTENT_NORMALIZED_PROVIDER_ARTIFACT=1
   export HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT="${HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT:-${DATA_ROOT:-/srv/haltewecker/data}/provider-artifacts/normalized}"
-  export HALTEWECKER_EXTERNAL_DEPARTURE_CACHE_PROVIDERS="${HALTEWECKER_EXTERNAL_DEPARTURE_CACHE_PROVIDERS:-cta-chicago},israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd"
+  export HALTEWECKER_EXTERNAL_DEPARTURE_CACHE_PROVIDERS="${HALTEWECKER_EXTERNAL_DEPARTURE_CACHE_PROVIDERS:-cta-chicago},511-bay-area,australia-translink-seq,australia-transport-nsw,israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd"
   echo "[Nightly] stage=cache-policy schema=3 providers=$HALTEWECKER_EXTERNAL_DEPARTURES_V3_PROVIDERS allowlist=$HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS"
 fi
 

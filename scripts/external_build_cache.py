@@ -33,6 +33,8 @@ CACHEABLE_PROVIDER_CITY_IDS = {
 TRANSFORMED_CACHE_PROVIDER_IDS = frozenset(
     {
         *CACHEABLE_PROVIDER_CITY_IDS,
+        "511-bay-area",
+        "australia-translink-seq",
         "finland-hsl",
         "norway",
         "poland-warsaw",

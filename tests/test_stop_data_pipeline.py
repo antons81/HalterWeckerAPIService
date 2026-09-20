@@ -617,7 +617,8 @@ PY
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
             "stage=cache-policy schema=3 "
-            "providers=israel-mot,ttc-surface,ttc-subway,norway,sweden,"
+            "providers=511-bay-area,australia-translink-seq,australia-transport-nsw,"
+            "israel-mot,ttc-surface,ttc-subway,norway,sweden,"
             "poland-warsaw,poland-wkd",
             result.stdout,
         )

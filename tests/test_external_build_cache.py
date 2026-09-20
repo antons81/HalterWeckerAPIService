@@ -2670,6 +2670,9 @@ class ExternalBuildCacheTests(unittest.TestCase):
         self,
     ) -> None:
         reviewed = {
+            "511-bay-area",
+            "australia-translink-seq",
+            "australia-transport-nsw",
             "finland-hsl",
             "poland-warsaw",
             "wmata-bus",
@@ -2677,7 +2680,6 @@ class ExternalBuildCacheTests(unittest.TestCase):
             "sweden",
             "mta-ny-nyct-bus",
             "ttc-surface",
-            "australia-transport-nsw",
         }
         with tempfile.TemporaryDirectory() as temporary:
             feed = Path(temporary) / "fixture.zip"
