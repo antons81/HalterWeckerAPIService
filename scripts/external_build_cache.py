@@ -34,7 +34,9 @@ TRANSFORMED_CACHE_PROVIDER_IDS = frozenset(
     {
         *CACHEABLE_PROVIDER_CITY_IDS,
         "finland-hsl",
+        "norway",
         "poland-warsaw",
+        "poland-wkd",
         "wmata-bus",
         "mbta-boston",
         "sweden",
