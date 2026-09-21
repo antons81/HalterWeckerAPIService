@@ -568,6 +568,7 @@ PY
             f"Environment=HALTEWECKER_INCREMENTAL_PROVIDER_IDS={MIXED_INCREMENTAL_PROVIDERS}",
             service,
         )
+        self.assertNotIn("EnvironmentFile=", service)
         self.assertNotIn("update_stop_data.sh", service)
 
     def test_nightly_timer_is_non_persistent(self) -> None:

@@ -8,7 +8,6 @@ Type=oneshot
 User=deploy
 Group=deploy
 WorkingDirectory=/srv/haltewecker/pipeline/HalterWeckerAPIService
-EnvironmentFile=/etc/haltewecker-stop-data.env
 Environment=REPO=/srv/haltewecker/pipeline/HalterWeckerAPIService
 Environment=DATA_ROOT=/srv/haltewecker/data
 Environment=HALTEWECKER_INCREMENTAL_PROVIDER_IDS=israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd,511-bay-area,australia-translink-seq,australia-transport-nsw,cta-chicago,mbta-boston,stm-montreal
