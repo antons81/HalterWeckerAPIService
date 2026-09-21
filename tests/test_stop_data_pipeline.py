@@ -676,6 +676,26 @@ PY
             ["1"],
         )
 
+    def test_incremental_cache_policy_overrides_stale_env_allowlist(self) -> None:
+        self.environment_file.write_text(
+            "HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS=cta-chicago\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_pipeline(
+            "--incremental-no-activate",
+            HALTEWECKER_MIN_FREE_GB="35",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "stage=cache-policy schema=3 "
+            f"incrementalProviders={MIXED_INCREMENTAL_PROVIDERS} "
+            f"providers={MIXED_INCREMENTAL_PROVIDERS} "
+            f"allowlist={MIXED_INCREMENTAL_PROVIDERS}",
+            result.stdout,
+        )
+
     def test_incremental_production_failure_restores_previous_pilot_pointer(self) -> None:
         pilot_root = self.data_root / "releases" / "incremental"
         pilot_root.mkdir(parents=True, exist_ok=True)
