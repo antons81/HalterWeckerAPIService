@@ -18,6 +18,123 @@ from test_static_provider_artifact import StaticProviderArtifactTests  # noqa: E
 
 
 class IncrementalProviderPipelineTests(unittest.TestCase):
+    MIXED_PROVIDER_IDS = (
+        "israel-mot",
+        "ttc-surface",
+        "ttc-subway",
+        "norway",
+        "sweden",
+        "poland-warsaw",
+        "poland-wkd",
+        "511-bay-area",
+        "australia-translink-seq",
+        "australia-transport-nsw",
+        "cta-chicago",
+        "mbta-boston",
+        "stm-montreal",
+    )
+
+    @classmethod
+    def _selection_environment(cls, *, selected=None, capabilities=None):
+        selected = cls.MIXED_PROVIDER_IDS if selected is None else tuple(selected)
+        capabilities = cls.MIXED_PROVIDER_IDS if capabilities is None else tuple(capabilities)
+        configured = ",".join(capabilities)
+        return {
+            incremental.INCREMENTAL_PROVIDER_IDS_ENV: ",".join(selected),
+            incremental.BUILD_CACHE_PROVIDER_IDS_ENV: configured,
+            incremental.DEPARTURES_V3_PROVIDER_IDS_ENV: configured,
+            incremental.DEPARTURE_CACHE_PROVIDER_IDS_ENV: configured,
+        }
+
+    def test_production_selection_contains_exact_mixed_thirteen(self):
+        plan = incremental.provider_selection_plan(
+            REPOSITORY_ROOT,
+            environ=self._selection_environment(),
+        )
+        self.assertEqual(plan["selectedProviders"], list(self.MIXED_PROVIDER_IDS))
+        self.assertEqual(
+            plan["representativeReadinessProviders"],
+            list(incremental.REPRESENTATIVE_READINESS_PROVIDER_IDS),
+        )
+        self.assertEqual(
+            plan["mergeGroups"]["poland-warsaw"]["selected"],
+            ["poland-warsaw", "poland-wkd"],
+        )
+
+    def test_old_three_provider_pilot_does_not_cap_selection(self):
+        plan = incremental.provider_selection_plan(
+            REPOSITORY_ROOT,
+            environ=self._selection_environment(),
+        )
+        self.assertNotEqual(plan["selectedProviders"], ["israel-mot", "ttc-surface", "ttc-subway"])
+        self.assertEqual(len(plan["selectedProviders"]), 13)
+
+    def test_unknown_provider_fails_closed(self):
+        environment = self._selection_environment(selected=("unknown-provider",))
+        with self.assertRaisesRegex(ValueError, "unknown incremental providers"):
+            incremental.provider_selection_plan(REPOSITORY_ROOT, environ=environment)
+
+    def test_provider_without_required_capability_fails_closed(self):
+        environment = self._selection_environment(
+            selected=("ireland",),
+            capabilities=self.MIXED_PROVIDER_IDS,
+        )
+        with self.assertRaisesRegex(ValueError, "required incremental capabilities"):
+            incremental.provider_selection_plan(REPOSITORY_ROOT, environ=environment)
+
+    def test_empty_allowlist_fails_closed(self):
+        environment = self._selection_environment(selected=())
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            incremental.provider_selection_plan(REPOSITORY_ROOT, environ=environment)
+
+    def test_duplicate_ids_are_normalized_deterministically(self):
+        selected = ("norway", "israel-mot", "norway", "israel-mot")
+        environment = self._selection_environment(selected=selected)
+        plan = incremental.provider_selection_plan(
+            REPOSITORY_ROOT,
+            environ=environment,
+        )
+        self.assertEqual(plan["selectedProviders"], ["norway", "israel-mot"])
+
+    def test_partial_poland_merge_group_fails_closed(self):
+        environment = self._selection_environment(selected=("poland-warsaw",))
+        with self.assertRaisesRegex(ValueError, "partial incremental merge-group"):
+            incremental.provider_selection_plan(REPOSITORY_ROOT, environ=environment)
+
+    def test_complete_poland_merge_group_passes(self):
+        selected = ("poland-warsaw", "poland-wkd")
+        plan = incremental.provider_selection_plan(
+            REPOSITORY_ROOT,
+            environ=self._selection_environment(selected=selected),
+        )
+        self.assertEqual(plan["selectedProviders"], list(selected))
+        self.assertTrue(plan["mergeGroups"]["poland-warsaw"]["complete"])
+
+    def test_deferred_providers_are_excluded_from_mixed_plan(self):
+        plan = incremental.provider_selection_plan(
+            REPOSITORY_ROOT,
+            environ=self._selection_environment(),
+        )
+        excluded = {item["providerID"] for item in plan["excludedProviders"]}
+        self.assertTrue({"finland-hsl", "ireland", "wmata-bus"}.issubset(excluded))
+
+    def test_capability_status_is_reported_for_every_selected_provider(self):
+        plan = incremental.provider_selection_plan(
+            REPOSITORY_ROOT,
+            environ=self._selection_environment(),
+        )
+        self.assertEqual(set(plan["capabilityStatus"]), set(self.MIXED_PROVIDER_IDS))
+        for status in plan["capabilityStatus"].values():
+            self.assertEqual(
+                status,
+                {
+                    "normalized": True,
+                    "structural": True,
+                    "departuresV3": True,
+                    "stopSetDigest": True,
+                },
+            )
+
     def test_failed_initialization_preserves_original_exception(self):
         for archive in (None, Mock()):
             with self.subTest(archive_created=archive is not None):

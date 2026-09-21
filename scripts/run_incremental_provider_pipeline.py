@@ -48,7 +48,11 @@ except ImportError:
     from static_provider_artifact import load_or_build_static_provider_artifacts
 
 
-PILOT_PROVIDER_IDS = ("israel-mot", "ttc-surface", "ttc-subway")
+INCREMENTAL_PROVIDER_IDS_ENV = "HALTEWECKER_INCREMENTAL_PROVIDER_IDS"
+BUILD_CACHE_PROVIDER_IDS_ENV = "HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS"
+DEPARTURES_V3_PROVIDER_IDS_ENV = "HALTEWECKER_EXTERNAL_DEPARTURES_V3_PROVIDERS"
+DEPARTURE_CACHE_PROVIDER_IDS_ENV = "HALTEWECKER_EXTERNAL_DEPARTURE_CACHE_PROVIDERS"
+REPRESENTATIVE_READINESS_PROVIDER_IDS = ("israel-mot", "ttc-surface", "ttc-subway")
 DEFAULT_WINDOW_DAYS = 21
 ANCHORED_WINDOW_DAYS = DEFAULT_WINDOW_DAYS
 
@@ -226,6 +230,123 @@ def _source_map(repository_root: Path) -> dict[str, dict[str, object]]:
         repository_root / "config" / "external-gtfs-sources.json"
     )
     return {str(source["id"]): source for source in sources}
+
+
+def _normalize_provider_ids(
+    raw: str | Iterable[str] | None,
+    *,
+    source_name: str,
+) -> tuple[str, ...]:
+    if raw is None:
+        raise ValueError(f"{source_name} must be configured")
+    values = raw.split(",") if isinstance(raw, str) else raw
+    normalized = tuple(
+        dict.fromkeys(
+            str(value).strip()
+            for value in values
+            if str(value).strip()
+        )
+    )
+    if not normalized:
+        raise ValueError(f"{source_name} must not be empty")
+    return normalized
+
+
+def _environment_provider_ids(
+    environ: Mapping[str, str],
+    variable_name: str,
+) -> tuple[str, ...]:
+    return _normalize_provider_ids(
+        environ.get(variable_name),
+        source_name=variable_name,
+    )
+
+
+def provider_selection_plan(
+    repository_root: Path,
+    *,
+    environ: Mapping[str, str] | None = None,
+    provider_ids: Iterable[str] | None = None,
+) -> dict[str, object]:
+    """Validate and describe the configured production incremental scope."""
+    values = dict(os.environ if environ is None else environ)
+    selected = _normalize_provider_ids(
+        values.get(INCREMENTAL_PROVIDER_IDS_ENV)
+        if provider_ids is None
+        else provider_ids,
+        source_name=INCREMENTAL_PROVIDER_IDS_ENV,
+    )
+    sources = _source_map(repository_root)
+    unknown = sorted(set(selected) - set(sources))
+    if unknown:
+        raise ValueError(f"unknown incremental providers: {unknown}")
+
+    build_cache_ids = set(
+        _environment_provider_ids(values, BUILD_CACHE_PROVIDER_IDS_ENV)
+    )
+    departures_v3_ids = set(
+        _environment_provider_ids(values, DEPARTURES_V3_PROVIDER_IDS_ENV)
+    )
+    departure_cache_ids = set(
+        _environment_provider_ids(values, DEPARTURE_CACHE_PROVIDER_IDS_ENV)
+    )
+    capability_status: dict[str, dict[str, bool]] = {}
+    unsupported: list[str] = []
+    for provider_id in selected:
+        source = sources[provider_id]
+        status = {
+            "normalized": provider_id in build_cache_ids,
+            "structural": provider_id in build_cache_ids,
+            "departuresV3": provider_id in departures_v3_ids,
+            "stopSetDigest": provider_id in departure_cache_ids,
+        }
+        capability_status[provider_id] = status
+        if not all(status.values()) or source.get("buildDepartures") is not True:
+            unsupported.append(provider_id)
+    if unsupported:
+        raise ValueError(
+            "providers lack required incremental capabilities: "
+            f"{sorted(set(unsupported))}"
+        )
+
+    merge_groups: dict[str, dict[str, object]] = {}
+    for provider_id, source in sources.items():
+        merge_group = str(source.get("mergeGroup", "")).strip()
+        if not merge_group:
+            continue
+        group = merge_groups.setdefault(
+            merge_group,
+            {"providers": [], "selected": [], "complete": False},
+        )
+        group["providers"].append(provider_id)
+    for merge_group, group in merge_groups.items():
+        members = tuple(sorted(str(value) for value in group["providers"]))
+        selected_members = tuple(
+            provider_id for provider_id in selected if provider_id in members
+        )
+        group["providers"] = list(members)
+        group["selected"] = list(selected_members)
+        group["complete"] = bool(selected_members) and set(selected_members) == set(members)
+        if selected_members and not group["complete"]:
+            raise ValueError(
+                f"partial incremental merge-group selection: {merge_group} "
+                f"selected={list(selected_members)} required={list(members)}"
+            )
+    return {
+        "selectedProviders": list(selected),
+        "normalizedCanonicalIDs": list(selected),
+        "mergeGroups": {
+            key: merge_groups[key]
+            for key in sorted(merge_groups)
+            if merge_groups[key]["selected"]
+        },
+        "capabilityStatus": capability_status,
+        "representativeReadinessProviders": list(REPRESENTATIVE_READINESS_PROVIDER_IDS),
+        "excludedProviders": [
+            {"providerID": provider_id, "reason": "not-allowlisted"}
+            for provider_id in sorted(set(sources) - set(selected))
+        ],
+    }
 
 
 def _configured_stop_id_prefix(source: Mapping[str, object]) -> str:
@@ -529,12 +650,13 @@ def build_incremental_candidate(
     normalized_cache_root: Path,
     static_artifact_root: Path,
     dates: list[date],
-    provider_ids: tuple[str, ...] = PILOT_PROVIDER_IDS,
+    provider_ids: tuple[str, ...] | None = None,
 ) -> dict[str, object]:
-    if tuple(provider_ids) != PILOT_PROVIDER_IDS:
-        raise ValueError(
-            "Phase 6 pilot scope is fixed to israel-mot, ttc-surface, ttc-subway"
-        )
+    selection_plan = provider_selection_plan(
+        repository_root,
+        provider_ids=provider_ids,
+    )
+    provider_ids = tuple(selection_plan["selectedProviders"])
     stop_manifest = _read_json(stop_data_root / "manifest.json")
     if str(stop_manifest.get("releaseID")) != release_id:
         raise ValueError("stop-data releaseID does not match nightly release ID")
@@ -542,7 +664,9 @@ def build_incremental_candidate(
     sources = _source_map(repository_root)
     missing_sources = sorted(set(provider_ids) - set(sources))
     if missing_sources:
-        raise ValueError(f"pilot providers are absent from source registry: {missing_sources}")
+        raise ValueError(
+            f"incremental providers are absent from source registry: {missing_sources}"
+        )
 
     environment = dict(os.environ)
     environment["HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT"] = str(normalized_cache_root)
@@ -839,6 +963,7 @@ def build_incremental_candidate(
                 "buildFingerprint": stop_metadata.get("buildFingerprint"),
                 "manifestSha256": stop_manifest_sha256,
             },
+            "selectionPlan": selection_plan,
             "providerIDs": list(provider_ids),
             "dates": {"validFrom": dates[0].isoformat(), "validThrough": dates[-1].isoformat()},
             "readinessProbeDates": probe_dates,
@@ -861,26 +986,56 @@ def build_incremental_candidate(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repository-root", type=Path, required=True)
-    parser.add_argument("--release-id", required=True)
-    parser.add_argument("--releases-root", type=Path, required=True)
-    parser.add_argument("--stop-data", type=Path, required=True)
-    parser.add_argument("--gtfs-artifacts", type=Path, required=True)
-    parser.add_argument("--normalized-cache-root", type=Path, required=True)
-    parser.add_argument("--static-artifact-root", type=Path, required=True)
+    parser.add_argument("--repository-root", type=Path)
+    parser.add_argument("--release-id")
+    parser.add_argument("--releases-root", type=Path)
+    parser.add_argument("--stop-data", type=Path)
+    parser.add_argument("--gtfs-artifacts", type=Path)
+    parser.add_argument("--normalized-cache-root", type=Path)
+    parser.add_argument("--static-artifact-root", type=Path)
     parser.add_argument("--valid-from", type=date.fromisoformat)
     parser.add_argument("--valid-through", type=date.fromisoformat)
     parser.add_argument("--window-days", type=int, default=DEFAULT_WINDOW_DAYS)
     parser.add_argument("--result-json", type=Path)
+    parser.add_argument("--selection-plan", action="store_true")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     started = time.monotonic()
+    if args.repository_root is None:
+        raise SystemExit("--repository-root is required")
+    repository_root = args.repository_root.resolve()
+    try:
+        selection_plan = provider_selection_plan(repository_root)
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        return 1
+    if args.selection_plan:
+        print(json.dumps(selection_plan, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    required_arguments = {
+        "--release-id": args.release_id,
+        "--releases-root": args.releases_root,
+        "--stop-data": args.stop_data,
+        "--gtfs-artifacts": args.gtfs_artifacts,
+        "--normalized-cache-root": args.normalized_cache_root,
+        "--static-artifact-root": args.static_artifact_root,
+    }
+    missing_arguments = [
+        name for name, value in required_arguments.items() if value is None
+    ]
+    if missing_arguments:
+        raise SystemExit("missing required arguments: " + ", ".join(missing_arguments))
     print(
         f"[NightlyIncremental] stage=nightly-start status=started release_id={args.release_id} "
-        f"providers={','.join(PILOT_PROVIDER_IDS)}",
+        f"providers={','.join(selection_plan['selectedProviders'])}",
+        flush=True,
+    )
+    print(
+        "[NightlyIncremental] stage=selection-plan status=PASS "
+        + json.dumps(selection_plan, ensure_ascii=False, sort_keys=True),
         flush=True,
     )
     dates = service_dates(
@@ -890,7 +1045,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         result = build_incremental_candidate(
-            repository_root=args.repository_root.resolve(),
+            repository_root=repository_root,
             release_id=args.release_id,
             releases_root=args.releases_root.resolve(),
             stop_data_root=args.stop_data.resolve(),
@@ -898,6 +1053,7 @@ def main(argv: list[str] | None = None) -> int:
             normalized_cache_root=args.normalized_cache_root.resolve(),
             static_artifact_root=args.static_artifact_root.resolve(),
             dates=dates,
+            provider_ids=tuple(selection_plan["selectedProviders"]),
         )
     except Exception as error:
         traceback.print_exc(file=sys.stderr)
