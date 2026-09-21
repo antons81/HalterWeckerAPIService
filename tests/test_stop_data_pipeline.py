@@ -565,6 +565,11 @@ PY
             service,
         )
         self.assertIn(
+            "ExecStart=/srv/haltewecker/pipeline/HalterWeckerAPIService/scripts/update_stop_data_wrapper.sh",
+            service,
+        )
+        self.assertNotIn("flock -n", service)
+        self.assertIn(
             f"Environment=HALTEWECKER_INCREMENTAL_PROVIDER_IDS={MIXED_INCREMENTAL_PROVIDERS}",
             service,
         )
