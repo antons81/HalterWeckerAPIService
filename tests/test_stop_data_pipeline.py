@@ -17,6 +17,14 @@ from kyiv_open_data import KyivOpenDataError
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 PIPELINE = REPOSITORY_ROOT / "scripts" / "run_stop_data_pipeline.sh"
+NIGHTLY_WRAPPER = REPOSITORY_ROOT / "scripts" / "update_stop_data_wrapper.sh"
+NIGHTLY_SERVICE = REPOSITORY_ROOT / "deploy" / "systemd" / "haltewecker-stop-data.service"
+NIGHTLY_TIMER = REPOSITORY_ROOT / "deploy" / "systemd" / "haltewecker-stop-data.timer"
+MIXED_INCREMENTAL_PROVIDERS = (
+    "israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd,"
+    "511-bay-area,australia-translink-seq,australia-transport-nsw,cta-chicago,"
+    "mbta-boston,stm-montreal"
+)
 
 
 class StopDataPipelineTests(unittest.TestCase):
@@ -543,6 +551,32 @@ PY
             return []
         return self.systemctl_log.read_text(encoding="utf-8").splitlines()
 
+    def test_nightly_systemd_path_is_explicit_incremental_and_non_legacy(self) -> None:
+        wrapper = NIGHTLY_WRAPPER.read_text(encoding="utf-8")
+        service = NIGHTLY_SERVICE.read_text(encoding="utf-8")
+
+        self.assertIn(
+            'exec "$REPO/scripts/run_stop_data_pipeline.sh" --incremental',
+            wrapper,
+        )
+        self.assertNotIn("--legacy-full", wrapper)
+        self.assertIn(
+            "/srv/haltewecker/pipeline/HalterWeckerAPIService/scripts/update_stop_data_wrapper.sh",
+            service,
+        )
+        self.assertIn(
+            f"Environment=HALTEWECKER_INCREMENTAL_PROVIDER_IDS={MIXED_INCREMENTAL_PROVIDERS}",
+            service,
+        )
+        self.assertNotIn("update_stop_data.sh", service)
+
+    def test_nightly_timer_is_non_persistent(self) -> None:
+        timer = NIGHTLY_TIMER.read_text(encoding="utf-8")
+
+        self.assertIn("OnCalendar=*-*-* 00:35:00 Europe/Berlin", timer)
+        self.assertIn("Persistent=false", timer)
+        self.assertIn("Unit=haltewecker-stop-data.service", timer)
+
     def configure_resume_pointer_layout(self) -> None:
         old_release = self.data_root / "releases" / "old"
         old_stop_data = old_release / "stop-data"
@@ -617,10 +651,9 @@ PY
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
             "stage=cache-policy schema=3 "
-            "providers=cta-chicago,mbta-boston,stm-montreal,511-bay-area,"
-            "australia-translink-seq,australia-transport-nsw,"
-            "israel-mot,ttc-surface,ttc-subway,norway,sweden,"
-            "poland-warsaw,poland-wkd",
+            f"incrementalProviders={MIXED_INCREMENTAL_PROVIDERS} "
+            f"providers={MIXED_INCREMENTAL_PROVIDERS} "
+            f"allowlist={MIXED_INCREMENTAL_PROVIDERS}",
             result.stdout,
         )
         self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)

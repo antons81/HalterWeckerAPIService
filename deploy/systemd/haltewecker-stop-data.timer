@@ -1,0 +1,10 @@
+[Unit]
+Description=Run HalteWecker stop-data build nightly
+
+[Timer]
+OnCalendar=*-*-* 00:35:00 Europe/Berlin
+Persistent=false
+Unit=haltewecker-stop-data.service
+
+[Install]
+WantedBy=timers.target
