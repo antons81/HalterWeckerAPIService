@@ -21,6 +21,7 @@ from external_build_cache import (
     CacheKey,
     CacheKeyUnavailable,
     ExternalBuildCache,
+    cache_provider_allowed,
     legacy_builder_fingerprint,
     projection_fingerprint,
     legacy_provider_config_fingerprint,
@@ -569,6 +570,109 @@ class ExternalBuildCacheTests(unittest.TestCase):
             first_departures.pop("generatedAt", None)
             second_departures.pop("generatedAt", None)
             self.assertEqual(first_departures, second_departures)
+
+    def test_cache_only_probe_hits_without_invoking_a_builder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "cta.zip"
+            _write_feed(feed)
+            self._build_once(root, feed)
+            source = self._source(feed)
+            raw_sha256, _size = artifact_provenance(feed)
+            key = external_gtfs.cache_key(
+                repository_root=REPOSITORY_ROOT,
+                provider_id="cta-chicago",
+                raw_sha256=raw_sha256,
+                source=source,
+                city_id="chicago",
+            )
+            cache = ExternalBuildCache(
+                root / "gtfs-cache" / "external-build",
+                provider_id="cta-chicago",
+                city_id="chicago",
+                include_trip_index=bool(source.get("buildTripIndex", True)),
+            )
+            with mock.patch(
+                "external_gtfs.build_external_stop_packages",
+                side_effect=AssertionError("cache-only probe must not build"),
+            ):
+                lookup = cache.probe(key)
+
+            self.assertEqual(lookup.status, "HIT")
+            self.assertEqual(lookup.key.value, key.value)
+
+    def test_cache_only_probe_reports_miss_without_invoking_a_builder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "cta.zip"
+            _write_feed(feed)
+            source = self._source(feed)
+            raw_sha256, _size = artifact_provenance(feed)
+            key = external_gtfs.cache_key(
+                repository_root=REPOSITORY_ROOT,
+                provider_id="cta-chicago",
+                raw_sha256=raw_sha256,
+                source=source,
+                city_id="chicago",
+            )
+            cache = ExternalBuildCache(
+                root / "gtfs-cache" / "external-build",
+                provider_id="cta-chicago",
+                city_id="chicago",
+                include_trip_index=bool(source.get("buildTripIndex", True)),
+            )
+            with mock.patch(
+                "external_gtfs.build_external_stop_packages",
+                side_effect=AssertionError("cache-only probe must not build"),
+            ):
+                lookup = cache.probe(key)
+
+            self.assertEqual(lookup.status, "MISS")
+            self.assertEqual(lookup.reason, "cache key not found")
+
+    def test_cache_only_probe_reports_invalid_without_deleting_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "cta.zip"
+            _write_feed(feed)
+            source = self._source(feed)
+            raw_sha256, _size = artifact_provenance(feed)
+            key = external_gtfs.cache_key(
+                repository_root=REPOSITORY_ROOT,
+                provider_id="cta-chicago",
+                raw_sha256=raw_sha256,
+                source=source,
+                city_id="chicago",
+            )
+            cache = ExternalBuildCache(
+                root / "gtfs-cache" / "external-build",
+                provider_id="cta-chicago",
+                city_id="chicago",
+                include_trip_index=bool(source.get("buildTripIndex", True)),
+            )
+            directory = cache._directory(key)
+            directory.mkdir(parents=True)
+            (directory / "manifest.json").write_text("{}", encoding="utf-8")
+
+            lookup = cache.probe(key)
+
+            self.assertEqual(lookup.status, "INVALID")
+            self.assertTrue(directory.exists())
+
+    def test_incremental_cache_policy_enables_selected_providers_only(self) -> None:
+        selected = (
+            "israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,"
+            "poland-wkd,511-bay-area,australia-translink-seq,"
+            "australia-transport-nsw,cta-chicago,mbta-boston,stm-montreal"
+        )
+        environment = {
+            "HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS": selected,
+        }
+
+        for provider_id in ("israel-mot", "norway", "cta-chicago"):
+            self.assertTrue(cache_provider_allowed(provider_id, environment))
+        self.assertFalse(cache_provider_allowed("finland-hsl", environment))
+        self.assertFalse(cache_provider_allowed("unknown-provider", environment))
 
     def test_cache_hit_bypasses_normalized_provider_context(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -334,6 +334,18 @@ class DeparturePartitionCache:
         return self.root / key.city_id / key.service_date / key.value
 
     def lookup(self, key: DeparturePartitionKey) -> DeparturePartitionLookup:
+        return self._lookup(key, remove_invalid=True)
+
+    def probe(self, key: DeparturePartitionKey) -> DeparturePartitionLookup:
+        """Validate an exact partition key without building or mutating cache state."""
+        return self._lookup(key, remove_invalid=False)
+
+    def _lookup(
+        self,
+        key: DeparturePartitionKey,
+        *,
+        remove_invalid: bool,
+    ) -> DeparturePartitionLookup:
         directory = self._directory(key)
         if not directory.is_dir():
             return DeparturePartitionLookup("MISS", "cache key not found", key)
@@ -342,7 +354,8 @@ class DeparturePartitionCache:
             partition = directory / "partition.json"
             digest, size = artifact_provenance(partition)
         except (OSError, ValueError, TypeError):
-            shutil.rmtree(directory, ignore_errors=True)
+            if remove_invalid:
+                shutil.rmtree(directory, ignore_errors=True)
             return DeparturePartitionLookup("INVALID", "partition cache is unreadable", key)
         expected = {
             "cacheSchemaVersion": DEPARTURE_CACHE_SCHEMA_VERSION,
@@ -360,10 +373,12 @@ class DeparturePartitionCache:
             "departureConfigFingerprint": key.config_fingerprint,
         }
         if not isinstance(manifest, dict) or any(manifest.get(name) != value for name, value in expected.items()):
-            shutil.rmtree(directory, ignore_errors=True)
+            if remove_invalid:
+                shutil.rmtree(directory, ignore_errors=True)
             return DeparturePartitionLookup("INVALID", "partition manifest mismatch", key)
         if manifest.get("status") != "complete" or manifest.get("sha256") != digest or manifest.get("size") != size:
-            shutil.rmtree(directory, ignore_errors=True)
+            if remove_invalid:
+                shutil.rmtree(directory, ignore_errors=True)
             return DeparturePartitionLookup("INVALID", "partition provenance mismatch", key)
         return DeparturePartitionLookup("HIT", "validated partition", key, directory)
 
@@ -768,10 +783,23 @@ class ExternalBuildCache:
         return self.root / key.value
 
     def lookup(self, key: CacheKey) -> CacheLookup:
+        return self._lookup(key, allow_legacy=True, remove_invalid=True)
+
+    def probe(self, key: CacheKey) -> CacheLookup:
+        """Validate only the exact current key without building or mutating cache state."""
+        return self._lookup(key, allow_legacy=False, remove_invalid=False)
+
+    def _lookup(
+        self,
+        key: CacheKey,
+        *,
+        allow_legacy: bool,
+        remove_invalid: bool,
+    ) -> CacheLookup:
         directory = self._directory(key)
         validation_key = key
         migration = False
-        if not directory.exists() and key.legacy_value:
+        if allow_legacy and not directory.exists() and key.legacy_value:
             legacy_key = CacheKey(
                 value=key.legacy_value,
                 raw_sha256=key.raw_sha256,
@@ -796,7 +824,8 @@ class ExternalBuildCache:
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
-            shutil.rmtree(directory, ignore_errors=True)
+            if remove_invalid:
+                shutil.rmtree(directory, ignore_errors=True)
             return CacheLookup("INVALID", "manifest is unreadable", key)
         valid, reason = _manifest_matches(
             manifest,
@@ -806,7 +835,8 @@ class ExternalBuildCache:
             self.artifacts,
         )
         if not valid:
-            shutil.rmtree(directory, ignore_errors=True)
+            if remove_invalid:
+                shutil.rmtree(directory, ignore_errors=True)
             return CacheLookup("INVALID", reason, key)
         if migration:
             reason = "validated legacy manifest after fingerprint boundary change"
