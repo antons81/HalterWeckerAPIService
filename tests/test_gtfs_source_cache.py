@@ -415,6 +415,38 @@ class GTFSArtifactCacheTests(unittest.TestCase):
 
             self.assertEqual(result.status, "unchanged")
             mocked.assert_called_once()
+            persisted = json.loads(state_path.read_text())
+            self.assertEqual(persisted["sourceCheckStatus"], "success")
+            self.assertIsInstance(persisted["sourceCheckedAt"], str)
+
+    def test_same_checksum_after_fresh_get_records_upstream_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.zip"
+            write_gtfs(source)
+            cache = GTFSArtifactCache(root / "cache")
+            first = cache.resolve("vbb", str(source), source_version={"version": 1})
+            state_path = root / "cache" / "vbb" / "state.json"
+            state = json.loads(state_path.read_text())
+            state.pop("sourceCheckedAt", None)
+            state.pop("sourceCheckStatus", None)
+            state_path.write_text(json.dumps(state))
+
+            with patch(
+                "gtfs_source_cache.urllib.request.urlopen",
+                return_value=FakeResponse(body=source.read_bytes()),
+            ):
+                result = cache.resolve(
+                    "vbb",
+                    "https://example.invalid/vbb.zip",
+                    metadata_probe=False,
+                )
+
+            self.assertEqual(result.status, "unchanged")
+            persisted = json.loads(state_path.read_text())
+            self.assertEqual(persisted["sha256"], first.state["sha256"])
+            self.assertEqual(persisted["sourceCheckStatus"], "success")
+            self.assertIsInstance(persisted["sourceCheckedAt"], str)
 
     def test_austria_uses_mvo_version_without_downloading_again(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

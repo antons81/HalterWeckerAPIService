@@ -1,0 +1,11 @@
+[Unit]
+Description=Run HalteWecker VBB refresh hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=2m
+Unit=haltewecker-vbb-refresh.service
+
+[Install]
+WantedBy=timers.target

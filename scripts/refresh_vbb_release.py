@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import errno
+import fcntl
 import json
 import os
 import shutil
@@ -12,6 +14,7 @@ import sys
 import time
 import uuid
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -41,10 +44,104 @@ DEFAULT_VBB_URL = (
     "API-Datensaetze/gtfs-mastscharf/GTFS.zip"
 )
 PRODUCTION_FLOOR_BYTES = 45 * 1024**3
+DEFAULT_LOCK_PATH = Path("/run/lock/haltewecker-vbb-refresh.lock")
+VBB_SOURCE_FRESHNESS_SECONDS = 2 * 60 * 60
+REFRESH_STATE_FILENAME = "vbb-refresh-state.json"
 
 
 class VBBRefreshError(ValueError):
     """Raised when a scoped refresh cannot produce a coherent candidate."""
+
+
+@contextmanager
+def _refresh_lock(path: Path):
+    """Hold the single process-wide VBB refresh lock for the full operation."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN}:
+                yield False
+                return
+            raise
+        try:
+            yield True
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _refresh_state_path(data_root: Path) -> Path:
+    return data_root / REFRESH_STATE_FILENAME
+
+
+def _read_refresh_state(data_root: Path) -> dict[str, object]:
+    path = _refresh_state_path(data_root)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_refresh_state(data_root: Path, state: dict[str, object]) -> None:
+    _write_copy_on_write(_refresh_state_path(data_root), state)
+    print(
+        "[VBBRefresh] state="
+        + json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        flush=True,
+    )
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _vbb_source_provenance(
+    url: str,
+    digest: str,
+    size: int,
+    state: dict[str, object],
+) -> dict[str, object]:
+    checked_at = _parse_timestamp(state.get("sourceCheckedAt"))
+    now = datetime.now(timezone.utc)
+    if checked_at is None:
+        raise VBBRefreshError("VBB source was not freshly checked upstream")
+    age_seconds = max(0, int((now - checked_at).total_seconds()))
+    if age_seconds > VBB_SOURCE_FRESHNESS_SECONDS:
+        raise VBBRefreshError(
+            "VBB source check is stale: "
+            f"ageSeconds={age_seconds} limitSeconds={VBB_SOURCE_FRESHNESS_SECONDS}"
+        )
+    return {
+        "sourceUrl": url,
+        "sha256": digest,
+        "size": size,
+        "downloadedAt": state.get("downloadedAt"),
+        "sourceCheckedAt": state.get("sourceCheckedAt"),
+        "sourceFresh": True,
+        "sourceFreshnessSeconds": age_seconds,
+        "lastModified": state.get("lastModified"),
+        "etag": state.get("etag"),
+        "contentLength": state.get("contentLength"),
+    }
+
+
+def _current_release_name(data_root: Path) -> str | None:
+    pointer = data_root / "current-release"
+    try:
+        return pointer.resolve().name
+    except OSError:
+        return None
 
 
 def _json_object(path: Path) -> dict[str, Any]:
@@ -102,15 +199,16 @@ def _write_copy_on_write(path: Path, payload: object) -> None:
 def _resolve_vbb_artifact(
     cache_root: Path,
     url: str,
-) -> tuple[Path, str, int]:
-    artifact = GTFSArtifactCache(cache_root).resolve(
+) -> tuple[Path, str, int, dict[str, object]]:
+    cache = GTFSArtifactCache(cache_root)
+    artifact = cache.resolve(
         "vbb",
         url,
         allow_stale=False,
         metadata_probe=True,
     )
     digest, size = artifact_provenance(artifact.path)
-    return artifact.path, digest, size
+    return artifact.path, digest, size, cache.state("vbb") or {}
 
 
 def _base_release(data_root: Path) -> tuple[Path, str]:
@@ -168,9 +266,7 @@ def _refresh_metadata(
     candidate: Path,
     base_release_id: str,
     candidate_id: str,
-    vbb_digest: str,
-    vbb_size: int,
-    vbb_url: str,
+    source_provenance: dict[str, object],
 ) -> None:
     generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     refresh = {
@@ -178,11 +274,7 @@ def _refresh_metadata(
         "candidateID": candidate_id,
         "refreshedProviders": ["vbb"],
         "generatedAt": generated_at,
-        "vbb": {
-            "sha256": vbb_digest,
-            "size": vbb_size,
-            "origin": vbb_url,
-        },
+        "vbb": source_provenance,
     }
     metadata_path = candidate / "release-metadata.json"
     metadata = _json_object(metadata_path)
@@ -249,7 +341,13 @@ def build_candidate(
         3 * cached_vbb.stat().st_size if cached_vbb.is_file() else 0,
     )
     disk = _disk_preflight(data_root, expected_output)
-    vbb_archive, vbb_digest, vbb_size = _resolve_vbb_artifact(cache_root, vbb_url)
+    vbb_archive, vbb_digest, vbb_size, source_state = _resolve_vbb_artifact(cache_root, vbb_url)
+    source_provenance = _vbb_source_provenance(
+        vbb_url,
+        vbb_digest,
+        vbb_size,
+        source_state,
+    )
     candidate_id = (
         f"vbb-refresh-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
         f"-{os.getpid()}-{uuid.uuid4().hex[:8]}"
@@ -261,7 +359,8 @@ def build_candidate(
     try:
         print(
             f"[VBBRefresh] base={base} baseReleaseID={base_release_id} "
-            f"vbbSHA={vbb_digest} vbbBytes={vbb_size}",
+            f"vbbSHA={vbb_digest} vbbBytes={vbb_size} "
+            f"sourceCheckedAt={source_provenance['sourceCheckedAt']}",
             flush=True,
         )
         _hardlink_tree(base, staging)
@@ -276,9 +375,7 @@ def build_candidate(
             staging,
             base_release_id,
             candidate_id,
-            vbb_digest,
-            vbb_size,
-            vbb_url,
+            source_provenance,
         )
         vbb_report = _validate_vbb_packages(staging / "stop-data")
         validate_release(staging)
@@ -304,6 +401,7 @@ def build_candidate(
                 "files": final_vbb_report["fileCount"],
                 "currentHour": final_vbb_report["currentHour"],
                 "previousHour": final_vbb_report["previousHour"],
+                **source_provenance,
             },
             "disk": {**disk, "free_after": usage.free},
             "readiness": "PASS" if run_readiness_check else "NOT_RUN",
@@ -317,7 +415,7 @@ def build_candidate(
 
 
 def _relative_target(data_root: Path, candidate: Path) -> str:
-    return os.path.relpath(candidate, data_root)
+    return os.path.relpath(candidate, data_root.resolve())
 
 
 def _link_target(path: Path) -> str | None:
@@ -414,14 +512,82 @@ def activate_candidate(data_root: Path, repository_root: Path, candidate: Path) 
         raise
 
 
+def _run_operation(args: argparse.Namespace) -> int:
+    started = time.monotonic()
+    previous_state = _read_refresh_state(args.data_root)
+    attempt_at = _now()
+    _write_refresh_state(
+        args.data_root,
+        {
+            **previous_state,
+            "schemaVersion": 1,
+            "status": "running",
+            "lastAttemptAt": attempt_at,
+            "error": None,
+        },
+    )
+    try:
+        report: dict[str, object] = {}
+        candidate: Path | None = None
+        if args.activate is not None:
+            activate_candidate(args.data_root, args.repository_root, args.activate)
+            candidate = args.activate
+        else:
+            candidate, report = build_candidate(
+                args.data_root,
+                args.repository_root,
+                vbb_url=args.vbb_url,
+                cache_root=args.cache_root,
+                run_readiness_check=True,
+            )
+            if args.refresh:
+                activate_candidate(args.data_root, args.repository_root, candidate)
+
+        vbb_report = report.get("vbb") if isinstance(report.get("vbb"), dict) else {}
+        completed_at = _now()
+        _write_refresh_state(
+            args.data_root,
+            {
+                **previous_state,
+                "schemaVersion": 1,
+                "status": "success",
+                "lastAttemptAt": attempt_at,
+                "lastSuccessAt": completed_at,
+                "currentRelease": _current_release_name(args.data_root),
+                "candidateRelease": candidate.name if candidate is not None else None,
+                "currentVbbPackageHour": vbb_report.get("currentHour"),
+                "sourceCheckedAt": vbb_report.get("sourceCheckedAt"),
+                "sourceSha256": vbb_report.get("sha256"),
+                "duration": round(time.monotonic() - started, 3),
+                "error": None,
+            },
+        )
+        return 0
+    except Exception as error:
+        _write_refresh_state(
+            args.data_root,
+            {
+                **previous_state,
+                "schemaVersion": 1,
+                "status": "failed",
+                "lastAttemptAt": attempt_at,
+                "duration": round(time.monotonic() - started, 3),
+                "error": f"{type(error).__name__}: {error}",
+            },
+        )
+        raise
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--stage-only", action="store_true", help="build and validate without activation")
+    mode.add_argument("--refresh", action="store_true", help="build, validate, and activate the VBB candidate")
     mode.add_argument("--activate", type=Path, metavar="CANDIDATE", help="activate a validated candidate")
     parser.add_argument("--data-root", type=Path, default=Path("/srv/haltewecker/data"))
     parser.add_argument("--repository-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--cache-root", type=Path, default=DEFAULT_CACHE_ROOT)
+    parser.add_argument("--lock-path", type=Path, default=DEFAULT_LOCK_PATH)
     parser.add_argument("--vbb-url", default=DEFAULT_VBB_URL)
     return parser.parse_args(argv)
 
@@ -429,17 +595,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        if args.activate is not None:
-            activate_candidate(args.data_root, args.repository_root, args.activate)
-        else:
-            build_candidate(
-                args.data_root,
-                args.repository_root,
-                vbb_url=args.vbb_url,
-                cache_root=args.cache_root,
-                run_readiness_check=True,
-            )
-        return 0
+        with _refresh_lock(args.lock_path) as acquired:
+            if not acquired:
+                print("[VBBRefresh] status=skipped reason=already-running", flush=True)
+                return 0
+            return _run_operation(args)
     except (VBBRefreshError, OSError, RuntimeError, subprocess.SubprocessError, zipfile.BadZipFile) as error:
         print(f"[VBBRefresh] ERROR: {error}", file=sys.stderr)
         return 1

@@ -200,6 +200,11 @@ class GTFSArtifactCache:
             return None
         return payload if isinstance(payload, dict) else None
 
+    def state(self, source_id: str) -> dict[str, object] | None:
+        """Return persisted provenance without performing a source request."""
+        _, state_path, _ = self._paths(source_id)
+        return self._read_state(state_path)
+
     def _state_artifact_is_valid(
         self,
         artifact: Path,
@@ -228,6 +233,24 @@ class GTFSArtifactCache:
             self._fsync_directory(path.parent)
         finally:
             temporary.unlink(missing_ok=True)
+
+    def _mark_source_checked(
+        self,
+        state_path: Path,
+        state: Mapping[str, object],
+        headers: Mapping[str, str],
+    ) -> dict[str, object]:
+        checked = dict(state)
+        checked["sourceCheckedAt"] = _now()
+        checked["sourceCheckStatus"] = "success"
+        if headers.get("etag"):
+            checked["etag"] = headers["etag"]
+        if headers.get("last-modified"):
+            checked["lastModified"] = headers["last-modified"]
+        if headers.get("content-length", "").isdigit():
+            checked["contentLength"] = int(headers["content-length"])
+        self._write_state(state_path, checked)
+        return checked
 
     @staticmethod
     def _fsync_directory(directory: Path) -> None:
@@ -532,10 +555,13 @@ class GTFSArtifactCache:
                     metadata_request = urllib.request.Request(url, headers=request_headers, method="HEAD")
                     with urllib.request.urlopen(metadata_request, timeout=30) as response:
                         metadata = _headers(response)
-                    if valid_cache and (state or {}).get("url") == _state_url(url, state_url) and _fingerprint_matches(state or {}, metadata):
-                        return ArtifactResult(source_id, artifact, "unchanged", "remote metadata", state)
+                    if valid_cache and (state or {}).get("url") == _state_url(url, state_url):
+                        state = self._mark_source_checked(state_path, state or {}, metadata)
+                        if _fingerprint_matches(state, metadata):
+                            return ArtifactResult(source_id, artifact, "unchanged", "remote metadata", state)
                 except urllib.error.HTTPError as error:
                     if error.code == 304 and valid_cache:
+                        state = self._mark_source_checked(state_path, state or {}, {})
                         return ArtifactResult(source_id, artifact, "unchanged", "HTTP 304", state)
                     metadata = {}
                 except (OSError, ValueError):
@@ -580,9 +606,14 @@ class GTFSArtifactCache:
                                         getattr(response, "headers", {}),
                                         None,
                                     )
-                                if status == 304 and valid_cache:
-                                    return ArtifactResult(source_id, artifact, "unchanged", "HTTP 304", state)
                                 response_headers = _headers(response)
+                                if status == 304 and valid_cache:
+                                    state = self._mark_source_checked(
+                                        state_path,
+                                        state or {},
+                                        response_headers,
+                                    )
+                                    return ArtifactResult(source_id, artifact, "unchanged", "HTTP 304", state)
                                 _copy_http_body(response, output, response_headers)
                             output.flush()
                             os.fsync(output.fileno())
@@ -590,8 +621,21 @@ class GTFSArtifactCache:
                         if minimum_size is not None and size < max(1024, minimum_size // 2):
                             raise ValueError(f"GTFS artifact is smaller than expected for {source_id}")
                         if valid_cache and digest == state.get("sha256") and size == int(state.get("size", -1)):
+                            state = self._mark_source_checked(
+                                state_path,
+                                state or {},
+                                response_headers,
+                            )
                             return ArtifactResult(source_id, artifact, "unchanged", "checksum", state)
-                        new_state = self._state(source_id, _state_url(url, state_url), source_version, response_headers, digest, size)
+                        new_state = self._state(
+                            source_id,
+                            _state_url(url, state_url),
+                            source_version,
+                            response_headers,
+                            digest,
+                            size,
+                            source_checked_at=_now(),
+                        )
                         if candidate.parent != artifact.parent:
                             raise RuntimeError("GTFS candidate and cache artifact are on different filesystems")
                         self._activate_candidate(candidate, artifact, state_path, new_state)
@@ -628,7 +672,9 @@ class GTFSArtifactCache:
         headers: Mapping[str, str],
         digest: str,
         size: int,
+        source_checked_at: str | None = None,
     ) -> dict[str, object]:
+        downloaded_at = _now()
         return {
             "schemaVersion": 1,
             "sourceID": source_id,
@@ -641,7 +687,10 @@ class GTFSArtifactCache:
             "sha256": digest,
             "size": size,
             "validated": True,
-            "validatedAt": _now(),
+            "validatedAt": downloaded_at,
+            "downloadedAt": downloaded_at,
+            "sourceCheckedAt": source_checked_at,
+            "sourceCheckStatus": "success" if source_checked_at else "not-checked",
         }
 
 
