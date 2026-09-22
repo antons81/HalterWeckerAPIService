@@ -29,9 +29,21 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             release.joinpath("stop-data").mkdir(parents=True)
             (release / "departures.sqlite").write_bytes(b"fixture")
             (release / "release-metadata.json").write_text("{}\n", encoding="utf-8")
+            (data_root / "current-release").symlink_to("releases/20260907T000000Z-fixture")
+            vbb_releases = (
+                "vbb-refresh-20260921T230000Z-100-aaaa1111",
+                "vbb-refresh-20260922T000000Z-101-bbbb2222",
+                "vbb-refresh-20260922T010000Z-102-cccc3333",
+            )
+            for vbb_name in vbb_releases:
+                vbb_release = data_root / "releases" / vbb_name
+                vbb_release.joinpath("stop-data").mkdir(parents=True)
+                (vbb_release / "departures.sqlite").write_bytes(b"vbb-fixture")
+                (vbb_release / "release-metadata.json").write_text("{}\n", encoding="utf-8")
             source_directory.mkdir(parents=True)
             (root / "stop.lock").touch()
             (root / "static.lock").touch()
+            (root / "vbb.lock").touch()
 
             current = source_directory / "current.zip"
             write_gtfs(current)
@@ -69,7 +81,7 @@ class HalteWeckerCleanupTests(unittest.TestCase):
                     "DATA_ROOT": str(data_root),
                     "GTFS_CACHE_ROOT": str(cache_root),
                     "HALTEWECKER_PIPELINE_REPO": str(REPOSITORY_ROOT),
-                    "HALTEWECKER_CLEANUP_LOCKS": f"{root / 'stop.lock'}:{root / 'static.lock'}",
+                    "HALTEWECKER_CLEANUP_LOCKS": f"{root / 'stop.lock'}:{root / 'static.lock'}:{root / 'vbb.lock'}",
                     "SYSTEMCTL_BIN": str(systemctl),
                     "FLOCK_BIN": str(flock),
                     "HALTEWECKER_GTFS_ORPHAN_TEMP_MAX_AGE_HOURS": "1",
@@ -91,6 +103,9 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             self.assertTrue(current_hash.samefile(current))
             self.assertTrue((source_directory / ".lock").exists())
             self.assertTrue((source_directory / "state.json").exists())
+            self.assertTrue((data_root / "releases" / vbb_releases[-1]).exists())
+            self.assertFalse((data_root / "releases" / vbb_releases[0]).exists())
+            self.assertFalse((data_root / "releases" / vbb_releases[1]).exists())
             self.assertFalse(stale_hash.exists())
             self.assertFalse(orphan_temp.exists())
 

@@ -93,9 +93,9 @@ if "$SYSTEMCTL_BIN" is-active --quiet haltewecker-stop-data.service ||
     exit 0
 fi
 
-# The full and scoped pipelines share these locks. Holding both prevents a
-# release from being staged or activated while retention is being evaluated.
-LOCKS="${HALTEWECKER_CLEANUP_LOCKS:-/run/lock/haltewecker-stop-data.lock:/run/lock/haltewecker-static-departures.lock}"
+# The full, scoped, and VBB pipelines share these locks. Holding all of them
+# prevents a release from being staged or activated while retention is evaluated.
+LOCKS="${HALTEWECKER_CLEANUP_LOCKS:-/run/lock/haltewecker-stop-data.lock:/run/lock/haltewecker-static-departures.lock:/run/lock/haltewecker-vbb-refresh.lock}"
 declare -a LOCK_FDS=()
 if [[ -n "$LOCKS" ]]; then
     IFS=: read -r -a LOCK_PATHS <<< "$LOCKS"
@@ -106,6 +106,7 @@ if [[ -n "$LOCKS" ]]; then
         case "$lock_index" in
             0) exec 8<"$lock_path"; lock_fd=8 ;;
             1) exec 9<"$lock_path"; lock_fd=9 ;;
+            2) exec 10<"$lock_path"; lock_fd=10 ;;
             *)
                 echo "CLEANUP_SKIPPED reason=too-many-pipeline-locks"
                 exit 0
@@ -287,7 +288,7 @@ for rollback_path in "$ROLLBACK_ROOT"/*; do
 done
 
 is_release_name() {
-    [[ "$1" =~ ^(scoped-)?[0-9]{8}T[0-9]{6}Z-[[:alnum:]]+$ ]]
+    [[ "$1" =~ ^((scoped-)?[0-9]{8}T[0-9]{6}Z-[[:alnum:]]+|vbb-refresh-[0-9]{8}T[0-9]{6}Z-[[:alnum:]]+-[[:alnum:]]+)$ ]]
 }
 
 is_published_release() {
@@ -310,7 +311,10 @@ for release_path in "${release_entries[@]}"; do
     is_release_name "$release_name" || continue
     is_published_release "$release_path" || continue
     sortable_name="$release_name"
-    [[ "$sortable_name" == scoped-* ]] && sortable_name="${sortable_name#scoped-}"
+    case "$sortable_name" in
+        scoped-*) sortable_name="${sortable_name#scoped-}" ;;
+        vbb-refresh-*) sortable_name="${sortable_name#vbb-refresh-}" ;;
+    esac
     printf '%s\t%s\n' "${sortable_name%%-*}" "$release_name" >> "$ordered_candidates"
 done
 
