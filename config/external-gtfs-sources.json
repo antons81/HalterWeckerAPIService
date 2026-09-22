@@ -169,6 +169,12 @@
     "importIntoStaticDepartures": true,
     "staticIdentifierPrefix": "cta-chicago:",
     "staticStopIDPrefix": "cta-chicago:",
+    "artifactCapabilities": {
+      "structuralProviderArtifactEligible": true,
+      "staticProviderArtifactEligible": true,
+      "shardRuntimeEligible": true,
+      "authoritativeHybridRuntimeEligible": true
+    },
     "country": "US"
   },
   {
@@ -346,6 +352,12 @@
     "staticDepartureMode": "exact-stop-with-parent-fallback",
     "staticIdentifierPrefix": "stm-montreal:",
     "staticStopIDPrefix": "stm-montreal:",
+    "artifactCapabilities": {
+      "structuralProviderArtifactEligible": true,
+      "staticProviderArtifactEligible": true,
+      "shardRuntimeEligible": true,
+      "authoritativeHybridRuntimeEligible": true
+    },
     "country": "CA"
   },
   {

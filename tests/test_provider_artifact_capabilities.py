@@ -29,6 +29,14 @@ class ProviderArtifactCapabilityTests(unittest.TestCase):
         self.assertFalse(provider_capability(REPOSITORY_ROOT, "swiss", HYBRID_RUNTIME))
         self.assertFalse(provider_capability(REPOSITORY_ROOT, "unknown-provider", SHARD_RUNTIME))
 
+    def test_targeted_structural_providers_do_not_require_normalized_artifacts(self) -> None:
+        for provider_id in ("cta-chicago", "stm-montreal"):
+            self.assertFalse(provider_artifact_eligible(REPOSITORY_ROOT, provider_id))
+            self.assertEqual(
+                provider_artifact_strategy(REPOSITORY_ROOT, provider_id),
+                STRUCTURAL_SUFFICIENT,
+            )
+
     def test_malformed_capability_configuration_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
