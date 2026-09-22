@@ -243,6 +243,8 @@ class GTFSArtifactCache:
         checked = dict(state)
         checked["sourceCheckedAt"] = _now()
         checked["sourceCheckStatus"] = "success"
+        downloaded_at = checked.get("downloadedAt") or checked.get("validatedAt")
+        checked["downloadedAt"] = downloaded_at if isinstance(downloaded_at, str) and downloaded_at else _now()
         if headers.get("etag"):
             checked["etag"] = headers["etag"]
         if headers.get("last-modified"):

@@ -404,6 +404,7 @@ class GTFSArtifactCacheTests(unittest.TestCase):
             state = json.loads(state_path.read_text())
             state["etag"] = '"same"'
             state["url"] = "https://example.invalid/swiss.zip"
+            state.pop("downloadedAt", None)
             state_path.write_text(json.dumps(state))
 
             def fake_urlopen(request, timeout=0):
@@ -418,6 +419,7 @@ class GTFSArtifactCacheTests(unittest.TestCase):
             persisted = json.loads(state_path.read_text())
             self.assertEqual(persisted["sourceCheckStatus"], "success")
             self.assertIsInstance(persisted["sourceCheckedAt"], str)
+            self.assertIsInstance(persisted["downloadedAt"], str)
 
     def test_same_checksum_after_fresh_get_records_upstream_check(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
