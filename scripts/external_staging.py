@@ -1466,10 +1466,22 @@ class ExternalDepartureStage:
             parent = self.connection.execute(
                 "SELECT public_stop_id FROM resolved_stops WHERE stop_id=?", (parent_id,)
             ).fetchone()
-            if child and child[0] and parent and parent[0]:
+            # Match the legacy platform contract when the parent is present:
+            # a public child still needs its parent mapping. If the parent row
+            # is absent, retain the child-resolution fallback used by feeds
+            # whose public stop package contains the parent ID only.
+            canonical_parent = parent[0] if parent and parent[0] else None
+            canonical_child = child[0] if child and child[0] else None
+            if canonical_parent and canonical_parent != child_id:
+                mapping = (canonical_parent, child_id)
+            elif canonical_child and canonical_child != child_id:
+                mapping = (canonical_child, child_id)
+            else:
+                mapping = None
+            if mapping is not None:
                 self.connection.execute(
                     "INSERT OR IGNORE INTO platforms VALUES (?, ?)",
-                    (parent[0], child_id),
+                    mapping,
                 )
         self.connection.commit()
         log_memory_stage("departure-platforms", started=started)

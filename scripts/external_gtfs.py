@@ -159,6 +159,11 @@ except ImportError:
     )
 
 
+# Sweden's legacy trip index applies headsigns collected from all provider
+# cities, rather than only from the current city's departure payload.
+LEGACY_PROVIDER_GLOBAL_HEADSIGN_MAP = frozenset({"sweden"})
+
+
 # Auth is resolved at runtime from environment variables. Secrets never appear
 # in config JSON. Future sources can register here without touching GTFS parsers.
 EXTERNAL_SOURCE_AUTH: dict[str, dict[str, object]] = {
@@ -2280,114 +2285,141 @@ def apply_current_departure_headsign_enrichment(
     output: Path,
     cities: list[dict[str, object]],
     namespace: str = "",
+    *,
+    provider_global_headsigns: bool = False,
 ) -> None:
     """Add current-window headsigns to an immutable trip-index base."""
-    for city in cities:
-        city_id = str(city["id"])
-        base_path = output / "trip-index-base" / f"{city_id}.json"
-        final_path = output / "trips" / f"{city_id}.json"
-        if not base_path.is_file():
-            continue
+    def departure_paths_for_city(city_id: str) -> list[Path]:
+        departures_path = output / "departures" / f"{city_id}.json"
+        partition_manifest_path = output / "departures-v2" / city_id / "manifest.json"
+        departure_paths: list[Path] = []
+        if partition_manifest_path.is_file():
+            manifest = json.loads(partition_manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict) or manifest.get("schemaVersion") not in {2, 3}:
+                raise ValueError(f"unsupported departures manifest for {city_id}")
+            selected_dates = None
+            if manifest.get("schemaVersion") == 3:
+                raw_selected_dates = manifest.get("selectedServiceDates")
+                if not isinstance(raw_selected_dates, list) or not raw_selected_dates:
+                    raise ValueError(f"selected departures dates are missing for {city_id}")
+                selected_dates = {str(value) for value in raw_selected_dates}
+            for partition in manifest.get("partitions", []):
+                if not isinstance(partition, dict) or not isinstance(partition.get("path"), str):
+                    raise ValueError(f"invalid departures partition for {city_id}")
+                service_date = str(partition.get("serviceDate") or "")
+                if selected_dates is not None and service_date not in selected_dates:
+                    continue
+                relative = Path(partition["path"])
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ValueError(f"unsafe departures partition for {city_id}")
+                if relative.name != f"{service_date}.json":
+                    raise ValueError(f"departures partition date/path mismatch for {city_id}")
+                departure_paths.append(partition_manifest_path.parent / relative)
+            if selected_dates is not None:
+                available_dates = {
+                    str(partition.get("serviceDate") or "")
+                    for partition in manifest.get("partitions", [])
+                    if isinstance(partition, dict)
+                }
+                if not selected_dates.issubset(available_dates):
+                    raise FileNotFoundError(
+                        f"selected departures partition is missing for {city_id}"
+                    )
+        elif departures_path.is_file():
+            departure_paths.append(departures_path)
+        return departure_paths
 
-        temporary = tempfile.TemporaryDirectory(prefix="haltewecker-trip-headsigns-")
-        connection = sqlite3.connect(Path(temporary.name) / "headsigns.sqlite")
-        try:
-            connection.execute(
-                "CREATE TABLE headsigns(trip_id TEXT PRIMARY KEY, headsign TEXT NOT NULL)"
-            )
-            departures_path = output / "departures" / f"{city_id}.json"
-            partition_manifest_path = (
-                output / "departures-v2" / city_id / "manifest.json"
-            )
-            departure_paths: list[Path] = []
-            if partition_manifest_path.is_file():
-                manifest = json.loads(partition_manifest_path.read_text(encoding="utf-8"))
-                if not isinstance(manifest, dict) or manifest.get("schemaVersion") not in {2, 3}:
-                    raise ValueError(f"unsupported departures manifest for {city_id}")
-                selected_dates = None
-                if manifest.get("schemaVersion") == 3:
-                    raw_selected_dates = manifest.get("selectedServiceDates")
-                    if not isinstance(raw_selected_dates, list) or not raw_selected_dates:
-                        raise ValueError(f"selected departures dates are missing for {city_id}")
-                    selected_dates = {str(value) for value in raw_selected_dates}
-                for partition in manifest.get("partitions", []):
-                    if not isinstance(partition, dict) or not isinstance(partition.get("path"), str):
-                        raise ValueError(f"invalid departures partition for {city_id}")
-                    service_date = str(partition.get("serviceDate") or "")
-                    if selected_dates is not None and service_date not in selected_dates:
-                        continue
-                    relative = Path(partition["path"])
-                    if relative.is_absolute() or ".." in relative.parts:
-                        raise ValueError(f"unsafe departures partition for {city_id}")
-                    if relative.name != f"{service_date}.json":
-                        raise ValueError(f"departures partition date/path mismatch for {city_id}")
-                    departure_paths.append(partition_manifest_path.parent / relative)
-                if selected_dates is not None:
-                    available_dates = {
-                        str(partition.get("serviceDate") or "")
-                        for partition in manifest.get("partitions", [])
-                        if isinstance(partition, dict)
-                    }
-                    if not selected_dates.issubset(available_dates):
-                        raise FileNotFoundError(f"selected departures partition is missing for {city_id}")
-            elif departures_path.is_file():
-                departure_paths.append(departures_path)
-            connection.executemany(
-                "INSERT OR IGNORE INTO headsigns VALUES (?, ?)",
+    def insert_headsigns(connection: sqlite3.Connection, departure_paths: list[Path]) -> None:
+        connection.executemany(
+            "INSERT OR IGNORE INTO headsigns VALUES (?, ?)",
+            (
                 (
-                    (
-                        str(value.get("t", ""))[len(namespace):]
-                        if namespace and str(value.get("t", "")).startswith(namespace)
-                        else str(value.get("t", "")),
-                        str(value.get("h", "") or ""),
-                    )
-                    for departure_path in departure_paths
-                    for kind, _stop_id, value in iter_departure_payload_items(
-                        departure_path
-                    )
-                    if kind == "stop"
-                    and isinstance(value, dict)
-                    and str(value.get("t", "")).strip()
-                    and str(value.get("h", "") or "").strip()
-                ),
-            )
-            connection.commit()
+                    str(value.get("t", ""))[len(namespace):]
+                    if namespace and str(value.get("t", "")).startswith(namespace)
+                    else str(value.get("t", "")),
+                    str(value.get("h", "") or ""),
+                )
+                for departure_path in departure_paths
+                for kind, _stop_id, value in iter_departure_payload_items(departure_path)
+                if kind == "stop"
+                and isinstance(value, dict)
+                and str(value.get("t", "")).strip()
+                and str(value.get("h", "") or "").strip()
+            ),
+        )
 
-            final_path.parent.mkdir(parents=True, exist_ok=True)
-            with final_path.open("w", encoding="utf-8") as stream:
-                stream.write("{")
-                first = True
-                for trip_id, value in iter_json_object(base_path):
-                    if not isinstance(value, dict):
-                        raise TypeError(f"Trip index base entry is invalid: {trip_id}")
-                    if set(value) != {"r"} or not isinstance(value.get("r"), str):
-                        raise ValueError(
-                            f"Trip index base entry is not immutable: {trip_id}"
+    shared_temporary = (
+        tempfile.TemporaryDirectory(prefix="haltewecker-trip-headsigns-")
+        if provider_global_headsigns
+        else None
+    )
+    shared_connection: sqlite3.Connection | None = None
+    if shared_temporary is not None:
+        shared_connection = sqlite3.connect(Path(shared_temporary.name) / "headsigns.sqlite")
+        shared_connection.execute(
+            "CREATE TABLE headsigns(trip_id TEXT PRIMARY KEY, headsign TEXT NOT NULL)"
+        )
+
+    try:
+        for city in cities:
+            city_id = str(city["id"])
+            base_path = output / "trip-index-base" / f"{city_id}.json"
+            final_path = output / "trips" / f"{city_id}.json"
+            if not base_path.is_file():
+                continue
+
+            temporary = None
+            connection = shared_connection
+            if connection is None:
+                temporary = tempfile.TemporaryDirectory(prefix="haltewecker-trip-headsigns-")
+                connection = sqlite3.connect(Path(temporary.name) / "headsigns.sqlite")
+                connection.execute(
+                    "CREATE TABLE headsigns(trip_id TEXT PRIMARY KEY, headsign TEXT NOT NULL)"
+                )
+            insert_headsigns(connection, departure_paths_for_city(city_id))
+            connection.commit()
+            try:
+                final_path.parent.mkdir(parents=True, exist_ok=True)
+                with final_path.open("w", encoding="utf-8") as stream:
+                    stream.write("{")
+                    first = True
+                    for trip_id, value in iter_json_object(base_path):
+                        if not isinstance(value, dict):
+                            raise TypeError(f"Trip index base entry is invalid: {trip_id}")
+                        if set(value) != {"r"} or not isinstance(value.get("r"), str):
+                            raise ValueError(
+                                f"Trip index base entry is not immutable: {trip_id}"
+                            )
+                        entry = {"r": value["r"]}
+                        raw_trip_id = (
+                            trip_id[len(namespace):]
+                            if namespace and trip_id.startswith(namespace)
+                            else trip_id
                         )
-                    entry = {"r": value["r"]}
-                    raw_trip_id = (
-                        trip_id[len(namespace):]
-                        if namespace and trip_id.startswith(namespace)
-                        else trip_id
-                    )
-                    row = connection.execute(
-                        "SELECT headsign FROM headsigns WHERE trip_id=?",
-                        (raw_trip_id,),
-                    ).fetchone()
-                    if row is not None and row[0]:
-                        entry["h"] = str(row[0])
-                    if not first:
-                        stream.write(",")
-                    stream.write(json.dumps(trip_id, ensure_ascii=False))
-                    stream.write(":")
-                    stream.write(
-                        json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
-                    )
-                    first = False
-                stream.write("}")
-        finally:
-            connection.close()
-            temporary.cleanup()
+                        row = connection.execute(
+                            "SELECT headsign FROM headsigns WHERE trip_id=?",
+                            (raw_trip_id,),
+                        ).fetchone()
+                        if row is not None and row[0]:
+                            entry["h"] = str(row[0])
+                        if not first:
+                            stream.write(",")
+                        stream.write(json.dumps(trip_id, ensure_ascii=False))
+                        stream.write(":")
+                        stream.write(
+                            json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+                        )
+                        first = False
+                    stream.write("}")
+            finally:
+                if temporary is not None:
+                    connection.close()
+                    temporary.cleanup()
+    finally:
+        if shared_connection is not None:
+            shared_connection.close()
+        if shared_temporary is not None:
+            shared_temporary.cleanup()
 
 
 def _timed_external_stage(
@@ -3555,6 +3587,9 @@ def process_external_gtfs_sources(
                         source_output,
                         cities,
                         namespace=namespace,
+                        provider_global_headsigns=(
+                            source_id in LEGACY_PROVIDER_GLOBAL_HEADSIGN_MAP
+                        ),
                     ),
                 )
             elif source_id == CTA_PROVIDER_ID:

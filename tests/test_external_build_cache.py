@@ -181,6 +181,79 @@ def _write_route_field_feed(
 
 
 class ExternalBuildCacheTests(unittest.TestCase):
+    def test_platform_mappings_match_legacy_resolution_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            feed = Path(temporary) / "platform-contract.zip"
+            with zipfile.ZipFile(feed, "w") as archive:
+                archive.writestr(
+                    "stops.txt",
+                    "stop_id,stop_name,stop_lat,stop_lon,parent_station,location_type\n"
+                    "26154,Station,59.0,18.0,,1\n"
+                    "9022050026154001,Public child,59.0,18.0,26154,0\n"
+                    "9022050026154002,Real child,59.0,18.0,26154,0\n"
+                    "DB-0095,Readville platform,42.2,-71.1,place-DB-0095,0\n"
+                    "station-child,Station child,42.2,-71.1,place-DB-0095,1\n"
+                    "orphan,Orphan,42.2,-71.1,,0\n",
+                )
+                archive.writestr(
+                    "routes.txt",
+                    "route_id,route_short_name,route_long_name,route_type\n"
+                    "R1,1,Fixture,3\n",
+                )
+                archive.writestr(
+                    "trips.txt",
+                    "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+                    "R1,S1,T1,Terminal,0\n",
+                )
+                archive.writestr(
+                    "stop_times.txt",
+                    "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+                    "T1,08:00:00,08:00:00,9022050026154002,1\n",
+                )
+                archive.writestr(
+                    "calendar.txt",
+                    "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
+                    "S1,1,1,1,1,1,1,1,20200101,20301231\n",
+                )
+
+            expected = [
+                ("26154", "9022050026154001"),
+                ("26154", "9022050026154002"),
+                ("place-DB-0095", "DB-0095"),
+            ]
+            public_stop_ids = {
+                "26154",
+                "9022050026154001",
+                "place-DB-0095",
+            }
+            for use_context in (False, True):
+                archive = load_gtfs_archive(str(feed))
+                context = (
+                    NormalizedProviderContext.from_archive(archive)
+                    if use_context
+                    else None
+                )
+                stage = ExternalDepartureStage()
+                try:
+                    stage.populate(
+                        archive,
+                        {"S1": ["20260922"]},
+                        public_stop_ids,
+                        context=context,
+                    )
+                    actual = list(
+                        stage.connection.execute(
+                            "SELECT parent_id, child_id FROM platforms "
+                            "ORDER BY parent_id, child_id"
+                        )
+                    )
+                finally:
+                    stage.close()
+                    if context is not None:
+                        context.close()
+                    archive.close()
+                self.assertEqual(actual, expected, use_context)
+
     def _write_cities(
         self,
         path: Path,

@@ -27,6 +27,7 @@ from external_gtfs import (  # noqa: E402
     build_external_route_index,
     build_external_stop_packages,
     build_external_trip_index,
+    apply_current_departure_headsign_enrichment,
     _deduplicate_merged_stops,
     _merge_namespaced_city_records_bounded,
     external_city_ids,
@@ -2229,6 +2230,80 @@ class ExternalStopAndDepartureTests(unittest.TestCase):
             self.assertEqual(trip_index["1410000012345678"]["h"], "Vasttrafik Headsign")
             # Trips whose route is not present in routes.txt are excluded.
             self.assertNotIn("NON_REALTIME_ID", trip_index)
+
+    def test_sweden_legacy_global_departure_headsigns_apply_across_cities(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cities = [{"id": "stockholm"}, {"id": "orebro"}, {"id": "goteborg"}]
+            output = root / "output"
+            (output / "trip-index-base").mkdir(parents=True)
+            for city_id in ("stockholm", "orebro", "goteborg"):
+                (output / "trip-index-base" / f"{city_id}.json").write_text(
+                    json.dumps({"T1": {"r": "R1"}}), encoding="utf-8"
+                )
+            (output / "departures").mkdir(parents=True)
+            (output / "departures/orebro.json").write_text(
+                json.dumps(
+                    {
+                        "stops": {
+                            "terminal": [
+                                {"t": "T1", "h": "Hallsbergs resecentrum"}
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            apply_current_departure_headsign_enrichment(
+                output,
+                cities,
+                provider_global_headsigns=True,
+            )
+
+            for city_id in ("orebro", "goteborg"):
+                trip_index = json.loads(
+                    (output / "trips" / f"{city_id}.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    trip_index,
+                    {"T1": {"r": "R1", "h": "Hallsbergs resecentrum"}},
+                )
+            self.assertEqual(
+                json.loads((output / "trips/stockholm.json").read_text(encoding="utf-8")),
+                {"T1": {"r": "R1"}},
+            )
+
+    def test_non_legacy_provider_keeps_city_scoped_headsigns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "output"
+            (output / "trip-index-base").mkdir(parents=True)
+            for city_id in ("orebro", "goteborg"):
+                (output / "trip-index-base" / f"{city_id}.json").write_text(
+                    json.dumps({"T1": {"r": "R1"}}), encoding="utf-8"
+                )
+            (output / "departures").mkdir(parents=True)
+            (output / "departures/goteborg.json").write_text(
+                json.dumps(
+                    {"stops": {"terminal": [{"t": "T1", "h": "Hallsbergs resecentrum"}]}}
+                ),
+                encoding="utf-8",
+            )
+
+            apply_current_departure_headsign_enrichment(
+                output,
+                [{"id": "orebro"}, {"id": "goteborg"}],
+            )
+
+            self.assertEqual(
+                json.loads((output / "trips/orebro.json").read_text(encoding="utf-8")),
+                {"T1": {"r": "R1"}},
+            )
+            self.assertEqual(
+                json.loads((output / "trips/goteborg.json").read_text(encoding="utf-8")),
+                {"T1": {"r": "R1", "h": "Hallsbergs resecentrum"}},
+            )
 
     def test_mta_namespace_trip_index_preserves_headsigns(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
