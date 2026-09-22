@@ -12,8 +12,11 @@ from provider_artifact_capabilities import (  # noqa: E402
     HYBRID_RUNTIME,
     SHARD_RUNTIME,
     STATIC_PROVIDER,
+    STRUCTURAL_PROVIDER,
+    STRUCTURAL_SUFFICIENT,
     provider_artifact_eligible,
     provider_capability,
+    provider_artifact_strategy,
 )
 
 
@@ -39,6 +42,54 @@ class ProviderArtifactCapabilityTests(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 provider_capability(root, "fixture", PERSISTENT_NORMALIZED)
+
+    def test_structural_sufficient_strategy_requires_explicit_structural_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "config").mkdir()
+            registry = root / "config" / "external-gtfs-sources.json"
+            registry.write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "fixture",
+                            "artifactCapabilities": {
+                                STRUCTURAL_PROVIDER: True,
+                                STATIC_PROVIDER: True,
+                                SHARD_RUNTIME: True,
+                                HYBRID_RUNTIME: True,
+                            },
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            self.assertFalse(provider_artifact_eligible(root, "fixture"))
+            self.assertEqual(
+                provider_artifact_strategy(root, "fixture"),
+                STRUCTURAL_SUFFICIENT,
+            )
+
+            registry.write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "fixture",
+                            "artifactCapabilities": {
+                                STRUCTURAL_PROVIDER: True,
+                                STATIC_PROVIDER: True,
+                                SHARD_RUNTIME: True,
+                                HYBRID_RUNTIME: False,
+                            },
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                provider_artifact_strategy(root, "fixture"),
+                "unsupported",
+            )
 
             registry.write_text(
                 json.dumps(

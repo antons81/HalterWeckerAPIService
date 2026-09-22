@@ -21,6 +21,7 @@ import import_static_departures_database as static_importer  # noqa: E402
 from build_german_departure_index import connect  # noqa: E402
 from build_stop_packages import load_gtfs_archive  # noqa: E402
 from external_gtfs import load_external_cities  # noqa: E402
+from external_staging import StructuralProviderContext  # noqa: E402
 from artifact_provenance import artifact_provenance  # noqa: E402
 from test_static_departures_normalized import write_feed  # noqa: E402
 
@@ -124,6 +125,45 @@ class StaticProviderArtifactTests(unittest.TestCase):
                 environ={
                     static_artifact.ARTIFACT_ROOT_ENV: str(
                         root / "static-provider-artifacts"
+                    ),
+                },
+            )
+        finally:
+            context.close()
+
+    def _build_structural_artifacts(
+        self,
+        root: Path,
+        feed: Path,
+        source: dict,
+        cities: list[dict],
+        stop_data: Path,
+        dates: list[date],
+    ) -> static_artifact.StaticProviderArtifacts:
+        archive = load_gtfs_archive(str(feed))
+        context = StructuralProviderContext(
+            archive,
+            provider_id="israel-mot",
+            structural_input_key="validated-transformed-cache-key",
+            stop_set_digest="validated-stop-set-digest",
+            calendar_fingerprints={
+                "calendar.txt": "calendar-fingerprint",
+                "calendar_dates.txt": "calendar-dates-fingerprint",
+            },
+            provenance={"source": "fixture"},
+        )
+        try:
+            return static_artifact.load_or_build_static_provider_artifacts(
+                structural_context=context,
+                repository_root=REPOSITORY_ROOT,
+                provider_id="israel-mot",
+                source=source,
+                cities=cities,
+                stop_data=stop_data,
+                dates=dates,
+                environ={
+                    static_artifact.ARTIFACT_ROOT_ENV: str(
+                        root / "structural-provider-artifacts"
                     ),
                 },
             )
@@ -463,6 +503,56 @@ class StaticProviderArtifactTests(unittest.TestCase):
                 )
             finally:
                 temporal.close()
+
+    def test_structural_sufficient_context_builds_without_normalized_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed, source, cities, stop_data = self._prepare_inputs(root)
+            first = self._build_structural_artifacts(
+                root, feed, source, cities, stop_data, [date(2026, 1, 5)]
+            )
+            second = self._build_structural_artifacts(
+                root, feed, source, cities, stop_data, [date(2026, 1, 5)]
+            )
+
+            self.assertEqual(first.structural.status, "MISS")
+            self.assertEqual(second.structural.status, "HIT")
+            self.assertEqual(first.structural.artifact_key, second.structural.artifact_key)
+            self.assertEqual(first.temporal.artifact_key, second.temporal.artifact_key)
+            manifest = first.structural.manifest
+            self.assertEqual(
+                manifest["structuralContextKind"],
+                static_artifact.STRUCTURAL_CONTEXT_KIND,
+            )
+            self.assertEqual(
+                manifest["structuralInputKey"],
+                "validated-transformed-cache-key",
+            )
+            self.assertEqual(manifest["stopSetDigest"], "validated-stop-set-digest")
+            self.assertEqual(manifest["structuralProvenance"], {"source": "fixture"})
+            self.assertNotIn("normalizedArtifactSemanticKey", manifest)
+            self.assertFalse((root / "normalized-providers").exists())
+            static_artifact.validate_artifacts(first, provider_id="israel-mot")
+
+            validated = sqlite3.connect(first.structural.database_path)
+            try:
+                self.assertEqual(
+                    validated.execute(
+                        "SELECT COUNT(*) FROM provider_city_stops"
+                    ).fetchone()[0],
+                    2,
+                )
+            finally:
+                validated.close()
+
+            manifest_path = first.structural.artifact_directory / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["stopSetDigest"] = "different-stop-set-digest"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaises(static_artifact.StaticProviderArtifactError):
+                self._build_structural_artifacts(
+                    root, feed, source, cities, stop_data, [date(2026, 1, 5)]
+                )
 
     def test_anchored_window_reuses_temporal_artifact_within_iso_week(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

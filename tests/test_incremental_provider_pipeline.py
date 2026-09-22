@@ -160,6 +160,51 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
                 ("norway",),
             )
 
+    def test_structural_cache_miss_fails_closed_without_builder_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache_key = SimpleNamespace(
+                value="structural-cache-key",
+                builder_fingerprint="builder-fingerprint",
+                city_ids=("fixture-city",),
+                projection_fingerprint="projection-fingerprint",
+            )
+            cache = Mock()
+            cache.probe.return_value = SimpleNamespace(
+                status="MISS",
+                reason="cache key not found",
+                manifest=None,
+            )
+            environment = {
+                "HALTEWECKER_EXTERNAL_BUILD_CACHE": "1",
+                "HALTEWECKER_EXTERNAL_TRANSFORMED_BUILD_CACHE": "1",
+                incremental.BUILD_CACHE_PROVIDER_IDS_ENV: "norway",
+            }
+            with (
+                unittest.mock.patch.object(
+                    incremental, "cache_key", return_value=cache_key
+                ),
+                unittest.mock.patch.object(
+                    incremental, "ExternalBuildCache", return_value=cache
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "structural-sufficient cache is not reusable for norway: MISS",
+                ):
+                    incremental._load_structural_provider_context(
+                        archive=Mock(),
+                        repository_root=REPOSITORY_ROOT,
+                        provider_id="norway",
+                        raw_sha="a" * 64,
+                        source={"buildTripIndex": True},
+                        cities=[{"id": "fixture-city"}],
+                        sources={"norway": {"mergeGroup": ""}},
+                        stop_data_root=Path(temporary),
+                        normalized_cache_root=Path(temporary) / "normalized",
+                        environ=environment,
+                    )
+            cache.probe.assert_called_once_with(cache_key)
+
     def test_failed_initialization_preserves_original_exception(self):
         for archive in (None, Mock()):
             with self.subTest(archive_created=archive is not None):

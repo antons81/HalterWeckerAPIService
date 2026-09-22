@@ -12,11 +12,25 @@ PERSISTENT_NORMALIZED = "persistentNormalizedArtifactEligible"
 STATIC_PROVIDER = "staticProviderArtifactEligible"
 SHARD_RUNTIME = "shardRuntimeEligible"
 HYBRID_RUNTIME = "authoritativeHybridRuntimeEligible"
+STRUCTURAL_PROVIDER = "structuralProviderArtifactEligible"
 NORMALIZED_REQUIRED = "normalized-required"
 STRUCTURAL_SUFFICIENT = "structural-sufficient"
 UNSUPPORTED = "unsupported"
 SUPPORTED_CAPABILITIES = (
     PERSISTENT_NORMALIZED,
+    STATIC_PROVIDER,
+    SHARD_RUNTIME,
+    HYBRID_RUNTIME,
+    STRUCTURAL_PROVIDER,
+)
+NORMALIZED_REQUIRED_CAPABILITIES = (
+    PERSISTENT_NORMALIZED,
+    STATIC_PROVIDER,
+    SHARD_RUNTIME,
+    HYBRID_RUNTIME,
+)
+STRUCTURAL_SUFFICIENT_CAPABILITIES = (
+    STRUCTURAL_PROVIDER,
     STATIC_PROVIDER,
     SHARD_RUNTIME,
     HYBRID_RUNTIME,
@@ -75,18 +89,17 @@ def provider_artifact_eligible(repository_root: Path, provider_id: str) -> bool:
     """Return whether all persistent artifact layers are explicitly enabled."""
     return all(
         provider_capability(repository_root, provider_id, capability)
-        for capability in SUPPORTED_CAPABILITIES
+        for capability in NORMALIZED_REQUIRED_CAPABILITIES
     )
 
 
 def provider_artifact_strategy(repository_root: Path, provider_id: str) -> str:
-    """Return the only artifact strategy currently supported by the pipeline.
-
-    A structural-sufficient strategy is intentionally not inferred from a
-    transformed build-cache hit: the static artifact builder still requires a
-    normalized context. It must be implemented and validated separately before
-    a provider can use that strategy.
-    """
+    """Return an explicitly validated artifact strategy for a provider."""
     if provider_artifact_eligible(repository_root, provider_id):
         return NORMALIZED_REQUIRED
+    if all(
+        provider_capability(repository_root, provider_id, capability)
+        for capability in STRUCTURAL_SUFFICIENT_CAPABILITIES
+    ):
+        return STRUCTURAL_SUFFICIENT
     return UNSUPPORTED

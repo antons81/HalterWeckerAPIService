@@ -8,7 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -161,6 +161,36 @@ class JSONStream:
                 self._buffer = self._buffer[1:]
                 return
             self._consume(",")
+
+
+class StructuralProviderContext:
+    """Raw GTFS row source plus validated structural provenance."""
+
+    def __init__(
+        self,
+        archive,
+        *,
+        provider_id: str,
+        structural_input_key: str,
+        stop_set_digest: str,
+        calendar_fingerprints: Mapping[str, str],
+        provenance: Mapping[str, object],
+    ) -> None:
+        self.archive = archive
+        self.provider_id = provider_id
+        self.structural_input_key = structural_input_key
+        self.stop_set_digest = stop_set_digest
+        self.calendar_fingerprints = dict(calendar_fingerprints)
+        self.provenance = dict(provenance)
+
+    def namelist(self):
+        return self.archive.namelist()
+
+    def open(self, name: str):
+        return self.archive.open(name)
+
+    def close(self) -> None:
+        self.archive.close()
 
 
 def iter_json_array(path: Path) -> Iterator[object]:

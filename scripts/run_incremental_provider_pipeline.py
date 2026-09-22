@@ -24,7 +24,17 @@ try:
     from .artifact_provenance import artifact_provenance
     from .build_stop_packages import load_gtfs_archive
     from .common_catalog import build_common_catalog
+    from .external_build_cache import (
+        CACHEABLE_PROVIDER_CITY_IDS,
+        TRANSFORMED_CACHE_PROVIDER_IDS,
+        ExternalBuildCache,
+        cache_enabled,
+        cache_key,
+        cache_provider_allowed,
+        transformed_cache_enabled,
+    )
     from .external_gtfs import load_external_cities, load_external_gtfs_sources
+    from .external_staging import StructuralProviderContext
     from .normalized_provider_artifact import load_or_build as load_or_build_normalized
     from .provider_release_assembler import (
         ReleaseAssembly,
@@ -34,6 +44,7 @@ try:
     )
     from .provider_artifact_capabilities import (
         NORMALIZED_REQUIRED,
+        STRUCTURAL_SUFFICIENT,
         provider_artifact_strategy,
     )
     from .static_provider_artifact import load_or_build_static_provider_artifacts
@@ -41,7 +52,17 @@ except ImportError:
     from artifact_provenance import artifact_provenance
     from build_stop_packages import load_gtfs_archive
     from common_catalog import build_common_catalog
+    from external_build_cache import (
+        CACHEABLE_PROVIDER_CITY_IDS,
+        TRANSFORMED_CACHE_PROVIDER_IDS,
+        ExternalBuildCache,
+        cache_enabled,
+        cache_key,
+        cache_provider_allowed,
+        transformed_cache_enabled,
+    )
     from external_gtfs import load_external_cities, load_external_gtfs_sources
+    from external_staging import StructuralProviderContext
     from normalized_provider_artifact import load_or_build as load_or_build_normalized
     from provider_release_assembler import (
         ReleaseAssembly,
@@ -51,6 +72,7 @@ except ImportError:
     )
     from provider_artifact_capabilities import (
         NORMALIZED_REQUIRED,
+        STRUCTURAL_SUFFICIENT,
         provider_artifact_strategy,
     )
     from static_provider_artifact import load_or_build_static_provider_artifacts
@@ -92,6 +114,7 @@ class ProviderBuild:
     structural: object
     temporal: object
     provider_release_entry: dict[str, object]
+    strategy: str = NORMALIZED_REQUIRED
 
 
 def _stage(name: str, callback):
@@ -373,7 +396,7 @@ def validate_incremental_artifact_strategies(
     unsupported = sorted(
         provider_id
         for provider_id, strategy in strategies.items()
-        if strategy != NORMALIZED_REQUIRED
+        if strategy not in {NORMALIZED_REQUIRED, STRUCTURAL_SUFFICIENT}
     )
     if unsupported:
         details = ", ".join(
@@ -415,6 +438,172 @@ def _raw_entry(
     if isinstance(declared_size, int) and declared_size != size:
         raise ValueError(f"provider={provider_id} raw artifact size mismatch")
     return path, digest
+
+
+def _external_build_cache_root(
+    normalized_cache_root: Path,
+    environ: Mapping[str, str],
+) -> Path:
+    configured = str(environ.get("HALTEWECKER_EXTERNAL_BUILD_CACHE_ROOT", "")).strip()
+    if configured:
+        return Path(configured)
+    provider_artifacts_root = normalized_cache_root.parent
+    if provider_artifacts_root.name == "provider-artifacts":
+        return provider_artifacts_root.parent / "cache" / "gtfs" / "external-build"
+    return provider_artifacts_root / "gtfs" / "external-build"
+
+
+def _merge_group_members(
+    provider_id: str,
+    source: Mapping[str, object],
+    sources: Mapping[str, Mapping[str, object]],
+) -> tuple[str, ...]:
+    merge_group = str(source.get("mergeGroup", "")).strip()
+    if not merge_group:
+        return ()
+    return tuple(
+        sorted(
+            candidate_id
+            for candidate_id, candidate in sources.items()
+            if str(candidate.get("mergeGroup", "")).strip() == merge_group
+        )
+    )
+
+
+def _archive_member_fingerprints(archive) -> dict[str, str]:
+    fingerprints: dict[str, str] = {}
+    for filename in ("calendar.txt", "calendar_dates.txt"):
+        if filename not in archive.namelist():
+            continue
+        digest = hashlib.sha256()
+        with archive.open(filename) as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        fingerprints[filename] = digest.hexdigest()
+    return fingerprints
+
+
+def _stop_data_stop_set_digest(stop_data_root: Path, city_ids: tuple[str, ...]) -> str:
+    manifest_path = stop_data_root / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"stop-data manifest is unreadable: {manifest_path}") from error
+    if not isinstance(manifest, Mapping):
+        raise ValueError(f"stop-data manifest is invalid: {manifest_path}")
+    entries = {
+        str(item.get("id")): item
+        for item in manifest.get("cities", ())
+        if isinstance(item, Mapping) and item.get("id")
+    }
+    city_payloads: list[dict[str, object]] = []
+    for city_id in city_ids:
+        entry = entries.get(city_id)
+        if not isinstance(entry, Mapping):
+            raise ValueError(f"stop-data city package is missing: {city_id}")
+        package_path = stop_data_root / str(entry.get("url", ""))
+        try:
+            payload = json.loads(package_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"stop-data stop package is unreadable: {package_path}"
+            ) from error
+        if not isinstance(payload, list):
+            raise ValueError(f"stop-data stop package is invalid: {package_path}")
+        stop_ids = sorted(
+            {
+                str(item["id"])
+                for item in payload
+                if isinstance(item, Mapping) and item.get("id")
+            }
+        )
+        if not stop_ids:
+            raise ValueError(f"stop-data stop package is empty: {package_path}")
+        city_payloads.append({"cityID": city_id, "stopIDs": stop_ids})
+    canonical = json.dumps(
+        city_payloads,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _load_structural_provider_context(
+    *,
+    archive,
+    repository_root: Path,
+    provider_id: str,
+    raw_sha: str,
+    source: Mapping[str, object],
+    cities: list[dict[str, object]],
+    sources: Mapping[str, Mapping[str, object]],
+    stop_data_root: Path,
+    normalized_cache_root: Path,
+    environ: Mapping[str, str],
+) -> StructuralProviderContext:
+    if provider_id not in TRANSFORMED_CACHE_PROVIDER_IDS:
+        raise ValueError(
+            f"structural-sufficient provider is not transformed-cache eligible: {provider_id}"
+        )
+    if not cache_enabled(environ):
+        raise ValueError(
+            f"structural-sufficient provider requires external build cache: {provider_id}"
+        )
+    if provider_id not in CACHEABLE_PROVIDER_CITY_IDS and not transformed_cache_enabled(environ):
+        raise ValueError(
+            f"structural-sufficient transformed cache is disabled: {provider_id}"
+        )
+    if not cache_provider_allowed(provider_id, environ):
+        raise ValueError(
+            f"structural-sufficient provider is not cache-allowlisted: {provider_id}"
+        )
+    city_ids = tuple(str(city["id"]) for city in cities)
+    if not city_ids:
+        raise ValueError(f"structural-sufficient provider has no cities: {provider_id}")
+    key = cache_key(
+        repository_root=repository_root,
+        provider_id=provider_id,
+        raw_sha256=raw_sha,
+        source=source,
+        city_id=city_ids[0],
+        city_ids=city_ids,
+        merge_group_members=_merge_group_members(provider_id, source, sources),
+    )
+    cache = ExternalBuildCache(
+        _external_build_cache_root(normalized_cache_root, environ),
+        provider_id=provider_id,
+        city_id=city_ids[0],
+        city_ids=city_ids,
+        include_trip_index=bool(source.get("buildTripIndex", True)),
+    )
+    lookup = cache.probe(key)
+    print(
+        f"[NightlyIncremental] provider={provider_id} stage=build-cache "
+        f"strategy={STRUCTURAL_SUFFICIENT} status={lookup.status} "
+        f"reason={lookup.reason} key={key.value[:12]} rawSHA={raw_sha[:12]}",
+        flush=True,
+    )
+    if lookup.status != "HIT":
+        raise ValueError(
+            f"structural-sufficient cache is not reusable for {provider_id}: "
+            f"{lookup.status} {lookup.reason}"
+        )
+    deterministic_provenance = {
+        "cacheKey": key.value,
+        "rawSHA256": raw_sha,
+        "cacheBuilderFingerprint": key.builder_fingerprint,
+        "cacheCityIDs": list(key.city_ids),
+        "cacheProjectionFingerprint": key.projection_fingerprint,
+    }
+    return StructuralProviderContext(
+        archive,
+        provider_id=provider_id,
+        structural_input_key=key.value,
+        stop_set_digest=_stop_data_stop_set_digest(stop_data_root, city_ids),
+        calendar_fingerprints=_archive_member_fingerprints(archive),
+        provenance=deterministic_provenance,
+    )
 
 
 def _manifest_reference(use: object) -> dict[str, object]:
@@ -719,6 +908,7 @@ def build_incremental_candidate(
     provider_builds: list[ProviderBuild] = []
     for provider_id in provider_ids:
         source = sources[provider_id]
+        strategy = str(selection_plan["artifactStrategies"][provider_id])
         raw_path, raw_sha = _stage(
             f"{provider_id}:raw-refresh",
             lambda provider_id=provider_id: _raw_entry(artifacts, provider_id),
@@ -727,38 +917,60 @@ def build_incremental_candidate(
         cities = load_external_cities(source, repository_root)
         archive = None
         normalized_context = None
+        structural_context = None
         try:
             archive = load_gtfs_archive(str(raw_path))
-            normalized_started = time.monotonic()
-            normalized_context, normalized_use = load_or_build_normalized(
-                archive=archive,
-                repository_root=repository_root,
-                provider_id=provider_id,
-                raw_artifact_sha256=raw_sha,
-                gtfs_cache_root=normalized_cache_root.parent / "gtfs",
-                environ=environment,
-            )
-            normalized_size = int(
-                normalized_use.manifest.get("normalizedSQLite", {}).get("size", 0)
-            )
-            print(
-                f"[NightlyIncremental] provider={provider_id} stage=normalized-provider "
-                f"status={normalized_use.status} duration_ms={(time.monotonic() - normalized_started) * 1000:.1f} "
-                f"bytes_written={0 if normalized_use.status == 'HIT' else normalized_size} "
-                f"artifact_key={normalized_use.semantic_key}",
-                flush=True,
-            )
-            _disk_telemetry(
-                stage=f"{provider_id}:normalized",
-                stop_data=stop_data_root,
-                releases_root=releases_root,
-                normalized_cache_root=normalized_cache_root,
-                static_artifact_root=static_artifact_root,
-            )
+            normalized_use = None
+            if strategy == NORMALIZED_REQUIRED:
+                normalized_started = time.monotonic()
+                normalized_context, normalized_use = load_or_build_normalized(
+                    archive=archive,
+                    repository_root=repository_root,
+                    provider_id=provider_id,
+                    raw_artifact_sha256=raw_sha,
+                    gtfs_cache_root=normalized_cache_root.parent / "gtfs",
+                    environ=environment,
+                )
+                normalized_size = int(
+                    normalized_use.manifest.get("normalizedSQLite", {}).get("size", 0)
+                )
+                print(
+                    f"[NightlyIncremental] provider={provider_id} stage=normalized-provider "
+                    f"strategy={strategy} status={normalized_use.status} "
+                    f"duration_ms={(time.monotonic() - normalized_started) * 1000:.1f} "
+                    f"bytes_written={0 if normalized_use.status == 'HIT' else normalized_size} "
+                    f"artifact_key={normalized_use.semantic_key}",
+                    flush=True,
+                )
+                _disk_telemetry(
+                    stage=f"{provider_id}:normalized",
+                    stop_data=stop_data_root,
+                    releases_root=releases_root,
+                    normalized_cache_root=normalized_cache_root,
+                    static_artifact_root=static_artifact_root,
+                )
+            elif strategy == STRUCTURAL_SUFFICIENT:
+                structural_context = _load_structural_provider_context(
+                    archive=archive,
+                    repository_root=repository_root,
+                    provider_id=provider_id,
+                    raw_sha=raw_sha,
+                    source=source,
+                    cities=cities,
+                    sources=sources,
+                    stop_data_root=stop_data_root,
+                    normalized_cache_root=normalized_cache_root,
+                    environ=environment,
+                )
+            else:
+                raise ValueError(
+                    f"unsupported incremental artifact strategy for {provider_id}: {strategy}"
+                )
             structural_started = time.monotonic()
             artifacts_use = load_or_build_static_provider_artifacts(
                 normalized_context=normalized_context,
                 normalized_artifact=normalized_use,
+                structural_context=structural_context,
                 repository_root=repository_root,
                 provider_id=provider_id,
                 source=source,
@@ -813,10 +1025,15 @@ def build_incremental_candidate(
                     structural=structural,
                     temporal=temporal,
                     provider_release_entry={},
+                    strategy=strategy,
                 )
             )
         finally:
-            _close_provider_resources(normalized_context, archive)
+            _close_provider_resources(
+                normalized_context,
+                structural_context,
+                archive if structural_context is None else None,
+            )
 
     work_root = _create_incremental_staging_directory(releases_root, release_id)
     try:
@@ -1007,10 +1224,19 @@ def build_incremental_candidate(
             "readinessProbeDates": probe_dates,
             "providers": {
                 item.provider_id: {
-                    "normalized": item.normalized.status,
+                    "artifactStrategy": item.strategy,
+                    "normalized": (
+                        item.normalized.status
+                        if item.normalized is not None
+                        else "NOT_USED"
+                    ),
                     "structural": item.structural.status,
                     "temporal": item.temporal.status,
-                    "normalizedKey": item.normalized.semantic_key,
+                    "normalizedKey": (
+                        item.normalized.semantic_key
+                        if item.normalized is not None
+                        else None
+                    ),
                     "structuralKey": item.structural.artifact_key,
                     "temporalKey": item.temporal.artifact_key,
                 }

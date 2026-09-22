@@ -50,6 +50,7 @@ EXPERIMENTAL_FEATURE_GATE = "HALTEWECKER_STATIC_PROVIDER_ARTIFACT_EXPERIMENTAL"
 ARTIFACT_ROOT_ENV = "HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT"
 STRUCTURAL_SCHEMA_VERSION = 2
 TEMPORAL_SCHEMA_VERSION = 1
+STRUCTURAL_CONTEXT_KIND = "structural-sufficient-v1"
 
 STRUCTURAL_TABLES = (
     "agencies",
@@ -155,6 +156,11 @@ TEMPORAL_BUILDER_SYMBOLS = {
         "_temporal_key",
         "_build_temporal_database",
     ),
+}
+
+STRUCTURAL_SUFFICIENT_BUILDER_SYMBOLS = {
+    **STRUCTURAL_BUILDER_SYMBOLS,
+    "scripts/external_staging.py": ("StructuralProviderContext",),
 }
 
 
@@ -276,6 +282,23 @@ def _builder_fingerprint(repository_root: Path, *, temporal: bool = False) -> st
         if not path.is_file():
             raise StaticProviderArtifactError(
                 f"Missing static artifact builder input: {relative}"
+            )
+        payload.append(
+            {
+                "path": relative,
+                "symbols": _ast_symbol_payload(path, names),
+            }
+        )
+    return _sha256_payload(payload)
+
+
+def _structural_sufficient_builder_fingerprint(repository_root: Path) -> str:
+    payload: list[object] = []
+    for relative, names in sorted(STRUCTURAL_SUFFICIENT_BUILDER_SYMBOLS.items()):
+        path = repository_root / relative
+        if not path.is_file():
+            raise StaticProviderArtifactError(
+                f"Missing structural-sufficient builder input: {relative}"
             )
         payload.append(
             {
@@ -447,6 +470,31 @@ def _structural_key(
             "providerID": provider_id,
             "structuralSchemaVersion": STRUCTURAL_SCHEMA_VERSION,
             "normalizedArtifactSemanticKey": normalized_semantic_key,
+            "providerProjectionConfigFingerprint": projection_config_fingerprint,
+            "stopDataFingerprint": stop_data_fingerprint,
+            "staticImporterFingerprint": builder_fingerprint,
+            "structuralSchemaFingerprint": structural_schema_fingerprint,
+        }
+    )
+
+
+def _structural_sufficient_key(
+    *,
+    provider_id: str,
+    structural_input_key: str,
+    stop_set_digest: str,
+    projection_config_fingerprint: str,
+    stop_data_fingerprint: str,
+    builder_fingerprint: str,
+    structural_schema_fingerprint: str,
+) -> str:
+    return _sha256_payload(
+        {
+            "providerID": provider_id,
+            "structuralContextKind": STRUCTURAL_CONTEXT_KIND,
+            "structuralSchemaVersion": STRUCTURAL_SCHEMA_VERSION,
+            "structuralInputKey": structural_input_key,
+            "stopSetDigest": stop_set_digest,
             "providerProjectionConfigFingerprint": projection_config_fingerprint,
             "stopDataFingerprint": stop_data_fingerprint,
             "staticImporterFingerprint": builder_fingerprint,
@@ -817,6 +865,10 @@ def _structural_manifest(
     stop_data_fingerprint: str,
     builder_fingerprint: str,
     database_path: Path,
+    context_kind: str = "normalized-required",
+    structural_input_key: str = "",
+    stop_set_digest: str = "",
+    structural_provenance: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     digest, size = _manifest_provenance(database_path)
     row_counts = _validate_database(
@@ -825,12 +877,11 @@ def _structural_manifest(
         required_indexes=STRUCTURAL_INDEXES,
         expected_columns=STRUCTURAL_COLUMNS,
     )
-    return {
+    manifest = {
         "artifactType": "structural",
         "structuralSchemaVersion": STRUCTURAL_SCHEMA_VERSION,
         "providerID": provider_id,
         "artifactKey": artifact_key,
-        "normalizedArtifactSemanticKey": normalized_semantic_key,
         "dependencies": {
             "providerProjectionConfigFingerprint": projection_config_fingerprint,
             "stopDataFingerprint": stop_data_fingerprint,
@@ -846,6 +897,28 @@ def _structural_manifest(
         "rowCounts": row_counts,
         "sqlite": {"path": "provider.sqlite", "sha256": digest, "size": size},
     }
+    if context_kind == "normalized-required":
+        manifest["normalizedArtifactSemanticKey"] = normalized_semantic_key
+    elif context_kind == STRUCTURAL_CONTEXT_KIND:
+        if not structural_input_key or not stop_set_digest:
+            raise StaticProviderArtifactError(
+                "Structural-sufficient manifest provenance is incomplete"
+            )
+        manifest["structuralContextKind"] = context_kind
+        manifest["structuralInputKey"] = structural_input_key
+        manifest["stopSetDigest"] = stop_set_digest
+        manifest["structuralProvenance"] = _canonical_value(structural_provenance or {})
+        manifest["dependencies"].update(
+            {
+                "structuralContextKind": context_kind,
+                "structuralInputKey": structural_input_key,
+                "stopSetDigest": stop_set_digest,
+                "structuralProvenance": _canonical_value(structural_provenance or {}),
+            }
+        )
+    else:
+        raise StaticProviderArtifactError(f"Unknown structural context kind: {context_kind}")
+    return manifest
 
 
 def _temporal_manifest(
@@ -1018,8 +1091,9 @@ def _load_or_build_one(
 
 def load_or_build_static_provider_artifacts(
     *,
-    normalized_context,
-    normalized_artifact,
+    normalized_context=None,
+    normalized_artifact=None,
+    structural_context=None,
     repository_root: Path,
     provider_id: str,
     source: Mapping[str, object],
@@ -1034,11 +1108,44 @@ def load_or_build_static_provider_artifacts(
         )
     if not dates:
         raise StaticProviderArtifactError("Temporal provider artifact requires dates")
-    normalized_key = str(normalized_artifact.semantic_key)
+    structural_mode = structural_context is not None
+    if structural_mode:
+        if normalized_context is not None or normalized_artifact is not None:
+            raise StaticProviderArtifactError(
+                "Structural-sufficient artifacts cannot receive normalized context"
+            )
+        if str(structural_context.provider_id) != provider_id:
+            raise StaticProviderArtifactError(
+                f"Structural context provider mismatch: expected={provider_id} "
+                f"actual={structural_context.provider_id}"
+            )
+        structural_input_key = str(structural_context.structural_input_key).strip()
+        stop_set_digest = str(structural_context.stop_set_digest).strip()
+        if not structural_input_key or not stop_set_digest:
+            raise StaticProviderArtifactError(
+                "Structural-sufficient context provenance is incomplete"
+            )
+        normalized_key = ""
+        calendar_fingerprints = dict(structural_context.calendar_fingerprints)
+        context_kind = STRUCTURAL_CONTEXT_KIND
+        structural_builder = _structural_sufficient_builder_fingerprint(repository_root)
+    else:
+        if normalized_context is None or normalized_artifact is None:
+            raise StaticProviderArtifactError(
+                "Normalized artifact context is required for normalized strategy"
+            )
+        structural_input_key = ""
+        stop_set_digest = ""
+        normalized_key = str(normalized_artifact.semantic_key)
+        calendar_fingerprints = {
+            name: normalized_artifact.manifest.get("fileFingerprints", {}).get(name)
+            for name in ("calendar.txt", "calendar_dates.txt")
+        }
+        context_kind = "normalized-required"
+        structural_builder = _builder_fingerprint(repository_root)
     city_ids = {str(city["id"]) for city in cities}
     projection_fingerprint = _projection_config_fingerprint(source, cities)
     stop_data_fingerprint = _stop_data_fingerprint(stop_data, city_ids)
-    structural_builder = _builder_fingerprint(repository_root)
     structural_schema = _structural_schema_fingerprint()
     structural_dependencies = {
         "providerProjectionConfigFingerprint": projection_fingerprint,
@@ -1046,14 +1153,40 @@ def load_or_build_static_provider_artifacts(
         "staticImporterFingerprint": structural_builder,
         "structuralSchemaFingerprint": structural_schema,
     }
-    structural_key = _structural_key(
-        provider_id=provider_id,
-        normalized_semantic_key=normalized_key,
-        projection_config_fingerprint=projection_fingerprint,
-        stop_data_fingerprint=stop_data_fingerprint,
-        builder_fingerprint=structural_builder,
-        structural_schema_fingerprint=structural_schema,
-    )
+    structural_provenance: dict[str, object] = {}
+    if structural_mode:
+        structural_provenance = dict(structural_context.provenance)
+        if not structural_provenance:
+            raise StaticProviderArtifactError(
+                "Structural-sufficient context provenance is incomplete"
+            )
+    if structural_mode:
+        structural_key = _structural_sufficient_key(
+            provider_id=provider_id,
+            structural_input_key=structural_input_key,
+            stop_set_digest=stop_set_digest,
+            projection_config_fingerprint=projection_fingerprint,
+            stop_data_fingerprint=stop_data_fingerprint,
+            builder_fingerprint=structural_builder,
+            structural_schema_fingerprint=structural_schema,
+        )
+        structural_dependencies.update(
+            {
+                "structuralContextKind": context_kind,
+                "structuralInputKey": structural_input_key,
+                "stopSetDigest": stop_set_digest,
+                "structuralProvenance": _canonical_value(structural_provenance),
+            }
+        )
+    else:
+        structural_key = _structural_key(
+            provider_id=provider_id,
+            normalized_semantic_key=normalized_key,
+            projection_config_fingerprint=projection_fingerprint,
+            stop_data_fingerprint=stop_data_fingerprint,
+            builder_fingerprint=structural_builder,
+            structural_schema_fingerprint=structural_schema,
+        )
     root = _artifact_root_for(provider_id, repository_root, environ)
     structural_directory = root / structural_key
     structural = _load_or_build_one(
@@ -1066,7 +1199,15 @@ def load_or_build_static_provider_artifacts(
         expected_schema_version=STRUCTURAL_SCHEMA_VERSION,
         expected_dependencies=structural_dependencies,
         log_stage="static-provider-shard",
-        expected_fields={"normalizedArtifactSemanticKey": normalized_key},
+        expected_fields=(
+            {
+                "structuralContextKind": context_kind,
+                "structuralInputKey": structural_input_key,
+                "stopSetDigest": stop_set_digest,
+            }
+            if structural_mode
+            else {"normalizedArtifactSemanticKey": normalized_key}
+        ),
         manifest_builder=lambda database_path: _structural_manifest(
             provider_id=provider_id,
             artifact_key=structural_key,
@@ -1075,11 +1216,15 @@ def load_or_build_static_provider_artifacts(
             stop_data_fingerprint=stop_data_fingerprint,
             builder_fingerprint=structural_builder,
             database_path=database_path,
+            context_kind=context_kind,
+            structural_input_key=structural_input_key,
+            stop_set_digest=stop_set_digest,
+            structural_provenance=structural_provenance,
         ),
         database_builder=lambda database_path: _build_structural_database(
             database_path,
             repository_root=repository_root,
-            normalized_context=normalized_context,
+            normalized_context=(structural_context if structural_mode else normalized_context),
             source=source,
             cities=cities,
             stop_data=stop_data,
@@ -1088,10 +1233,6 @@ def load_or_build_static_provider_artifacts(
         ),
     )
 
-    calendar_fingerprints = {
-        name: normalized_artifact.manifest.get("fileFingerprints", {}).get(name)
-        for name in ("calendar.txt", "calendar_dates.txt")
-    }
     timezone = str(source["timezone"])
     temporal_builder = _builder_fingerprint(repository_root, temporal=True)
     temporal_schema = _temporal_schema_fingerprint()
@@ -1150,6 +1291,42 @@ def validate_artifacts(
     *,
     provider_id: str,
 ) -> None:
+    structural_manifest = artifacts.structural.manifest
+    structural_context_kind = structural_manifest.get("structuralContextKind")
+    if structural_context_kind == STRUCTURAL_CONTEXT_KIND:
+        structural_fields = {
+            "structuralContextKind": STRUCTURAL_CONTEXT_KIND,
+            "structuralInputKey": structural_manifest.get("structuralInputKey"),
+            "stopSetDigest": structural_manifest.get("stopSetDigest"),
+            "structuralProvenance": structural_manifest.get("structuralProvenance"),
+        }
+        if (
+            not all(
+                isinstance(structural_fields[name], str) and structural_fields[name]
+                for name in (
+                    "structuralContextKind",
+                    "structuralInputKey",
+                    "stopSetDigest",
+                )
+            )
+            or not isinstance(structural_fields["structuralProvenance"], Mapping)
+            or not structural_fields["structuralProvenance"]
+        ):
+            raise StaticProviderArtifactError(
+                "Structural-sufficient artifact manifest provenance is incomplete"
+            )
+    elif structural_context_kind is None and structural_manifest.get(
+        "normalizedArtifactSemanticKey"
+    ):
+        structural_fields = {
+            "normalizedArtifactSemanticKey": structural_manifest[
+                "normalizedArtifactSemanticKey"
+            ]
+        }
+    else:
+        raise StaticProviderArtifactError(
+            "Unknown or incomplete structural artifact context kind"
+        )
     _validate_manifest(
         artifacts.structural.artifact_directory,
         expected_artifact_key=artifacts.structural.artifact_key,
@@ -1159,11 +1336,7 @@ def validate_artifacts(
         required_indexes=STRUCTURAL_INDEXES,
         expected_schema_version=STRUCTURAL_SCHEMA_VERSION,
         expected_dependencies=artifacts.structural.manifest["dependencies"],
-        expected_fields={
-            "normalizedArtifactSemanticKey": artifacts.structural.manifest.get(
-                "normalizedArtifactSemanticKey"
-            )
-        },
+        expected_fields=structural_fields,
     )
     _validate_manifest(
         artifacts.temporal.artifact_directory,
