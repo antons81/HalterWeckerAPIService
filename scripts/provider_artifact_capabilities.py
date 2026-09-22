@@ -12,6 +12,9 @@ PERSISTENT_NORMALIZED = "persistentNormalizedArtifactEligible"
 STATIC_PROVIDER = "staticProviderArtifactEligible"
 SHARD_RUNTIME = "shardRuntimeEligible"
 HYBRID_RUNTIME = "authoritativeHybridRuntimeEligible"
+NORMALIZED_REQUIRED = "normalized-required"
+STRUCTURAL_SUFFICIENT = "structural-sufficient"
+UNSUPPORTED = "unsupported"
 SUPPORTED_CAPABILITIES = (
     PERSISTENT_NORMALIZED,
     STATIC_PROVIDER,
@@ -74,3 +77,16 @@ def provider_artifact_eligible(repository_root: Path, provider_id: str) -> bool:
         provider_capability(repository_root, provider_id, capability)
         for capability in SUPPORTED_CAPABILITIES
     )
+
+
+def provider_artifact_strategy(repository_root: Path, provider_id: str) -> str:
+    """Return the only artifact strategy currently supported by the pipeline.
+
+    A structural-sufficient strategy is intentionally not inferred from a
+    transformed build-cache hit: the static artifact builder still requires a
+    normalized context. It must be implemented and validated separately before
+    a provider can use that strategy.
+    """
+    if provider_artifact_eligible(repository_root, provider_id):
+        return NORMALIZED_REQUIRED
+    return UNSUPPORTED

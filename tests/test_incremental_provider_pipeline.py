@@ -135,6 +135,31 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
                 },
             )
 
+    def test_artifact_strategy_reports_only_validated_normalized_providers(self):
+        plan = incremental.provider_selection_plan(
+            REPOSITORY_ROOT,
+            environ=self._selection_environment(),
+        )
+        self.assertEqual(
+            plan["artifactStrategies"]["israel-mot"],
+            "normalized-required",
+        )
+        self.assertEqual(
+            plan["artifactStrategies"]["ttc-surface"],
+            "normalized-required",
+        )
+        self.assertEqual(plan["artifactStrategies"]["norway"], "unsupported")
+
+    def test_unsupported_artifact_strategy_fails_before_provider_work(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            r"artifact strategy preflight failed before provider work: norway=unsupported",
+        ):
+            incremental.validate_incremental_artifact_strategies(
+                REPOSITORY_ROOT,
+                ("norway",),
+            )
+
     def test_failed_initialization_preserves_original_exception(self):
         for archive in (None, Mock()):
             with self.subTest(archive_created=archive is not None):

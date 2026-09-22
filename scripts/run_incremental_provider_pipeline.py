@@ -32,6 +32,10 @@ try:
         readiness_probe,
         validate_candidate_release,
     )
+    from .provider_artifact_capabilities import (
+        NORMALIZED_REQUIRED,
+        provider_artifact_strategy,
+    )
     from .static_provider_artifact import load_or_build_static_provider_artifacts
 except ImportError:
     from artifact_provenance import artifact_provenance
@@ -44,6 +48,10 @@ except ImportError:
         assemble_release,
         readiness_probe,
         validate_candidate_release,
+    )
+    from provider_artifact_capabilities import (
+        NORMALIZED_REQUIRED,
+        provider_artifact_strategy,
     )
     from static_provider_artifact import load_or_build_static_provider_artifacts
 
@@ -341,12 +349,41 @@ def provider_selection_plan(
             if merge_groups[key]["selected"]
         },
         "capabilityStatus": capability_status,
+        "artifactStrategies": {
+            provider_id: provider_artifact_strategy(repository_root, provider_id)
+            for provider_id in selected
+        },
         "representativeReadinessProviders": list(REPRESENTATIVE_READINESS_PROVIDER_IDS),
         "excludedProviders": [
             {"providerID": provider_id, "reason": "not-allowlisted"}
             for provider_id in sorted(set(sources) - set(selected))
         ],
     }
+
+
+def validate_incremental_artifact_strategies(
+    repository_root: Path,
+    provider_ids: Iterable[str],
+) -> dict[str, str]:
+    """Fail before provider work when no validated artifact strategy exists."""
+    strategies = {
+        provider_id: provider_artifact_strategy(repository_root, provider_id)
+        for provider_id in provider_ids
+    }
+    unsupported = sorted(
+        provider_id
+        for provider_id, strategy in strategies.items()
+        if strategy != NORMALIZED_REQUIRED
+    )
+    if unsupported:
+        details = ", ".join(
+            f"{provider_id}={strategies[provider_id]}" for provider_id in unsupported
+        )
+        raise ValueError(
+            "incremental artifact strategy preflight failed before provider work: "
+            f"{details}"
+        )
+    return strategies
 
 
 def _configured_stop_id_prefix(source: Mapping[str, object]) -> str:
@@ -657,6 +694,7 @@ def build_incremental_candidate(
         provider_ids=provider_ids,
     )
     provider_ids = tuple(selection_plan["selectedProviders"])
+    validate_incremental_artifact_strategies(repository_root, provider_ids)
     stop_manifest = _read_json(stop_data_root / "manifest.json")
     if str(stop_manifest.get("releaseID")) != release_id:
         raise ValueError("stop-data releaseID does not match nightly release ID")
