@@ -168,6 +168,70 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
             {"sweden": "structural-sufficient"},
         )
 
+    def test_boston_structural_preflight_preserves_trip_index_without_legacy_fallback(self):
+        plan = incremental.provider_selection_plan(
+            REPOSITORY_ROOT,
+            environ=self._selection_environment(selected=("mbta-boston",)),
+        )
+        self.assertEqual(
+            plan["artifactStrategies"],
+            {"mbta-boston": "structural-sufficient"},
+        )
+        self.assertEqual(
+            incremental.validate_incremental_artifact_strategies(
+                REPOSITORY_ROOT,
+                ("mbta-boston",),
+            ),
+            {"mbta-boston": "structural-sufficient"},
+        )
+
+        source = incremental._source_map(REPOSITORY_ROOT)["mbta-boston"]
+        self.assertIs(source.get("buildTripIndex"), True)
+        cache_key = SimpleNamespace(
+            value="b" * 64,
+            builder_fingerprint="builder-fingerprint",
+            city_ids=("boston",),
+            projection_fingerprint="projection-fingerprint",
+        )
+        lookup = SimpleNamespace(status="HIT", reason="validated manifest and artifacts")
+        cache = Mock()
+        cache.probe.return_value = lookup
+        environment = {
+            "HALTEWECKER_EXTERNAL_BUILD_CACHE": "1",
+            "HALTEWECKER_EXTERNAL_TRANSFORMED_BUILD_CACHE": "1",
+            incremental.BUILD_CACHE_PROVIDER_IDS_ENV: "mbta-boston",
+        }
+        with (
+            unittest.mock.patch.object(incremental, "cache_key", return_value=cache_key),
+            unittest.mock.patch.object(
+                incremental, "ExternalBuildCache", return_value=cache
+            ) as cache_factory,
+            unittest.mock.patch.object(
+                incremental, "_stop_data_stop_set_digest", return_value="c" * 64
+            ),
+            unittest.mock.patch.object(
+                incremental, "_archive_member_fingerprints", return_value={"trips.txt": "d" * 64}
+            ),
+        ):
+            structural_context = incremental._load_structural_provider_context(
+                archive=Mock(),
+                repository_root=REPOSITORY_ROOT,
+                provider_id="mbta-boston",
+                raw_sha="a" * 64,
+                source=source,
+                cities=[{"id": "boston"}],
+                sources=incremental._source_map(REPOSITORY_ROOT),
+                stop_data_root=Path("/unused/stop-data"),
+                normalized_cache_root=Path("/unused/cache"),
+                environ=environment,
+            )
+
+        self.assertIsInstance(structural_context, incremental.StructuralProviderContext)
+        self.assertEqual(structural_context.provider_id, "mbta-boston")
+        self.assertTrue(cache_factory.call_args.kwargs["include_trip_index"])
+        cache.probe.assert_called_once_with(cache_key)
+        cache.lookup.assert_not_called()
+
     def test_unsupported_artifact_strategy_fails_before_provider_work(self):
         with self.assertRaisesRegex(
             ValueError,

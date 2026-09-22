@@ -290,6 +290,12 @@
     "importIntoStaticDepartures": true,
     "staticIdentifierPrefix": "mbta-boston:",
     "staticStopIDPrefix": "mbta-boston:",
+    "artifactCapabilities": {
+      "structuralProviderArtifactEligible": true,
+      "staticProviderArtifactEligible": true,
+      "shardRuntimeEligible": true,
+      "authoritativeHybridRuntimeEligible": true
+    },
     "agencyID": "1",
     "country": "US"
   },
