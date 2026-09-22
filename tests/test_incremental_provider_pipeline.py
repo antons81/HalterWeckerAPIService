@@ -148,7 +148,25 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
             plan["artifactStrategies"]["ttc-surface"],
             "normalized-required",
         )
+        self.assertEqual(
+            plan["artifactStrategies"]["sweden"],
+            "structural-sufficient",
+        )
         self.assertEqual(plan["artifactStrategies"]["norway"], "unsupported")
+
+    def test_sweden_structural_preflight_does_not_require_normalized_artifacts(self):
+        plan = incremental.provider_selection_plan(
+            REPOSITORY_ROOT,
+            environ=self._selection_environment(selected=("sweden",)),
+        )
+        self.assertEqual(plan["artifactStrategies"], {"sweden": "structural-sufficient"})
+        self.assertEqual(
+            incremental.validate_incremental_artifact_strategies(
+                REPOSITORY_ROOT,
+                ("sweden",),
+            ),
+            {"sweden": "structural-sufficient"},
+        )
 
     def test_unsupported_artifact_strategy_fails_before_provider_work(self):
         with self.assertRaisesRegex(

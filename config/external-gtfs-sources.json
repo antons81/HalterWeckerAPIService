@@ -40,6 +40,12 @@
     "buildStops": true,
     "buildRoutes": true,
     "buildDepartures": true,
+    "artifactCapabilities": {
+      "structuralProviderArtifactEligible": true,
+      "staticProviderArtifactEligible": true,
+      "shardRuntimeEligible": true,
+      "authoritativeHybridRuntimeEligible": true
+    },
     "country": "SE"
   },
   {
