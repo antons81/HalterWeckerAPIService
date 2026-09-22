@@ -356,6 +356,142 @@ class ProviderStopIdentityTests(unittest.TestCase):
                     populate_gtfs(connection, archive, provider_id="provider-a")
             connection.close()
 
+    def test_identical_duplicate_transfer_rows_are_deduplicated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "feed.zip"
+            _feed(
+                feed,
+                "13114,13115,route,route-a,,,2,60\n"
+                "13114,13115,route,route-a,,,2,60\n",
+            )
+            connection = connect(root / "departures.sqlite")
+            with zipfile.ZipFile(feed) as archive:
+                populate_gtfs(connection, archive, provider_id="provider-a")
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM transfers WHERE from_stop_id='13114'"
+                ).fetchone()[0],
+                1,
+            )
+            connection.close()
+
+    def test_empty_and_timed_transfer_types_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "feed.zip"
+            _feed(
+                feed,
+                "13114,13115,route,route-a,trip-a,trip-b,,\n"
+                "13114,13115,route,route-a,trip-a,trip-b,1,\n",
+            )
+            connection = connect(root / "departures.sqlite")
+            with zipfile.ZipFile(feed) as archive:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Conflicting duplicate GTFS transfer rows",
+                ):
+                    populate_gtfs(connection, archive, provider_id="provider-a")
+            connection.close()
+
+    def test_empty_and_minimum_time_transfer_conflict_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "feed.zip"
+            _feed(
+                feed,
+                "13114,13115,route,route-a,trip-a,trip-b,,\n"
+                "13114,13115,route,route-a,trip-a,trip-b,,30\n",
+            )
+            connection = connect(root / "departures.sqlite")
+            with zipfile.ZipFile(feed) as archive:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Conflicting duplicate GTFS transfer rows",
+                ):
+                    populate_gtfs(connection, archive, provider_id="provider-a")
+            connection.close()
+
+    def test_empty_and_minimum_transfer_type_two_conflict_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "feed.zip"
+            _feed(
+                feed,
+                "13114,13115,route,route-a,trip-a,trip-b,,\n"
+                "13114,13115,route,route-a,trip-a,trip-b,2,\n",
+            )
+            connection = connect(root / "departures.sqlite")
+            with zipfile.ZipFile(feed) as archive:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Conflicting duplicate GTFS transfer rows",
+                ):
+                    populate_gtfs(connection, archive, provider_id="provider-a")
+            connection.close()
+
+    def test_empty_transfer_type_maps_to_zero_and_one_remains_timed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "feed.zip"
+            _feed(
+                feed,
+                "13114,13115,route,route-a,,,,\n"
+                "13114,13115,route,route-b,,,1,\n",
+            )
+            connection = connect(root / "departures.sqlite")
+            with zipfile.ZipFile(feed) as archive:
+                populate_gtfs(connection, archive, provider_id="provider-a")
+            self.assertEqual(
+                connection.execute(
+                    "SELECT transfer_type FROM transfers ORDER BY to_route_id"
+                ).fetchall(),
+                [(0,), (1,)],
+            )
+            connection.close()
+
+    def test_transfer_type_one_and_two_conflict_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "feed.zip"
+            _feed(
+                feed,
+                "13114,13115,route,route-a,trip-a,trip-b,1,\n"
+                "13114,13115,route,route-a,trip-a,trip-b,2,\n",
+            )
+            connection = connect(root / "departures.sqlite")
+            with zipfile.ZipFile(feed) as archive:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Conflicting duplicate GTFS transfer rows",
+                ):
+                    populate_gtfs(connection, archive, provider_id="provider-a")
+            connection.close()
+
+    def test_norway_transfer_conflict_uses_gtfs_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "norway.zip"
+            _feed(
+                feed,
+                "NSR:Quay:13861,NSR:Quay:13861,,,INN:ServiceJourney:55925,INN:ServiceJourney:81345,,\n"
+                "NSR:Quay:13861,NSR:Quay:13861,,,INN:ServiceJourney:55925,INN:ServiceJourney:81345,1,\n",
+            )
+            connection = connect(root / "departures.sqlite")
+            with zipfile.ZipFile(feed) as archive:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Conflicting duplicate GTFS transfer rows for provider norway",
+                ):
+                    populate_gtfs(
+                        connection,
+                        archive,
+                        identifier_prefix="no:",
+                        stop_id_prefix="no:",
+                        provider_id="norway",
+                    )
+            connection.close()
+
     def test_package_membership_maps_public_511_id_to_internal_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

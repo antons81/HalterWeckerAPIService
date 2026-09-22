@@ -38,6 +38,17 @@ def _run_import_stage(
     return stage_runner(stage_name, callback)
 
 
+def _normalized_transfer_type(value: object, provider_id: str) -> int:
+    """Normalize the GTFS empty transfer_type value to its specified value 0."""
+    raw_value = str(value or "").strip()
+    try:
+        return int(raw_value or "0")
+    except ValueError as error:
+        raise ValueError(
+            f"Invalid transfer numeric field for provider {provider_id}."
+        ) from error
+
+
 def internal_stop_id(native_stop_id: str, prefix: str = "") -> str:
     """Return the deterministic internal ID for a native GTFS stop ID."""
     value = native_stop_id.strip()
@@ -565,8 +576,10 @@ def populate_gtfs(
                 native_to_stop_id = row.get("to_stop_id", "").strip()
                 if not native_from_stop_id or not native_to_stop_id:
                     continue
+                transfer_type = _normalized_transfer_type(
+                    row.get("transfer_type", "0"), provider_id
+                )
                 try:
-                    transfer_type = int(row.get("transfer_type", "0") or 0)
                     min_transfer_time = int(row.get("min_transfer_time", "0") or 0)
                 except ValueError as error:
                     raise ValueError(
