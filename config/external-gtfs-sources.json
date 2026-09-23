@@ -1194,6 +1194,12 @@
     "staticIdentifierPrefix": "au-nsw:",
     "staticStopIDPrefix": "au-nsw:",
     "allowStale": true,
+    "artifactCapabilities": {
+      "structuralProviderArtifactEligible": true,
+      "staticProviderArtifactEligible": true,
+      "shardRuntimeEligible": true,
+      "authoritativeHybridRuntimeEligible": true
+    },
     "country": "AU"
   },
   {
