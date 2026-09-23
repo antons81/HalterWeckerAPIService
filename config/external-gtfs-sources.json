@@ -987,6 +987,12 @@
     "staticIdentifierPrefix": "au-seq:",
     "staticStopIDPrefix": "au-seq:",
     "allowStale": true,
+    "artifactCapabilities": {
+      "structuralProviderArtifactEligible": true,
+      "staticProviderArtifactEligible": true,
+      "shardRuntimeEligible": true,
+      "authoritativeHybridRuntimeEligible": true
+    },
     "country": "AU"
   },
   {
