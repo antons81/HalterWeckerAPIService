@@ -157,7 +157,7 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
             plan["artifactStrategies"]["sweden"],
             "structural-sufficient",
         )
-        self.assertEqual(plan["artifactStrategies"]["norway"], "unsupported")
+        self.assertEqual(plan["artifactStrategies"]["norway"], "structural-sufficient")
 
     def test_sweden_structural_preflight_does_not_require_normalized_artifacts(self):
         plan = incremental.provider_selection_plan(
@@ -240,11 +240,11 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
     def test_unsupported_artifact_strategy_fails_before_provider_work(self):
         with self.assertRaisesRegex(
             ValueError,
-            r"artifact strategy preflight failed before provider work: norway=unsupported",
+            r"artifact strategy preflight failed before provider work: ireland=unsupported",
         ):
             incremental.validate_incremental_artifact_strategies(
                 REPOSITORY_ROOT,
-                ("norway",),
+                ("ireland",),
             )
 
     def test_structural_cache_miss_fails_closed_without_builder_fallback(self):

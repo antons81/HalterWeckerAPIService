@@ -25,6 +25,7 @@ SCHEMA_VERSION = 1
 DEFAULT_TIMEZONE = "Europe/Berlin"
 DEFAULT_PROVIDER_ID = "germany"
 TRANSFER_KEY_SEPARATOR = "\x1f"
+NORWAY_TIMED_TRANSFER_OVERRIDE_REASON = "exact-identity-0-1-same-min-transfer-time"
 ImportStageRunner = Callable[[str, Callable[[], object]], object]
 
 
@@ -571,6 +572,7 @@ def populate_gtfs(
 
         def import_transfers() -> int:
             seen_transfers: dict[tuple[str, str, str, str, str, str], tuple[int, int]] = {}
+            transfer_row_indices: dict[tuple[str, str, str, str, str, str], int] = {}
             for row in gtfs_rows(archive, "transfers.txt"):
                 native_from_stop_id = row.get("from_stop_id", "").strip()
                 native_to_stop_id = row.get("to_stop_id", "").strip()
@@ -597,12 +599,31 @@ def populate_gtfs(
                 previous_values = seen_transfers.get(transfer_key)
                 if previous_values is not None:
                     if previous_values != semantic_values:
+                        if (
+                            provider_id == "norway"
+                            and previous_values[1] == semantic_values[1]
+                            and {previous_values[0], semantic_values[0]} == {0, 1}
+                        ):
+                            selected_values = (1, previous_values[1])
+                            seen_transfers[transfer_key] = selected_values
+                            transfer_rows[transfer_row_indices[transfer_key]] = (
+                                *transfer_key,
+                                *selected_values,
+                            )
+                            print(
+                                "[GTFS] provider=norway "
+                                f"transfer_identity={transfer_key!r} "
+                                "original_values=[0,1] selected=1 "
+                                f"reason={NORWAY_TIMED_TRANSFER_OVERRIDE_REASON}"
+                            )
+                            continue
                         raise ValueError(
                             "Conflicting duplicate GTFS transfer rows for provider "
                             f"{provider_id} and transfer key {transfer_key!r}."
                         )
                     continue
                 seen_transfers[transfer_key] = semantic_values
+                transfer_row_indices[transfer_key] = len(transfer_rows)
                 transfer_rows.append((*transfer_key, transfer_type, min_transfer_time))
             connection.executemany(
                 """

@@ -40,6 +40,7 @@ class ProviderArtifactCapabilityTests(unittest.TestCase):
             "511-bay-area",
             "australia-translink-seq",
             "australia-transport-nsw",
+            "norway",
         ):
             self.assertFalse(provider_artifact_eligible(REPOSITORY_ROOT, provider_id))
             self.assertEqual(
@@ -63,13 +64,14 @@ class ProviderArtifactCapabilityTests(unittest.TestCase):
             "511-bay-area",
             "australia-translink-seq",
             "australia-transport-nsw",
+            "norway",
         ):
             self.assertEqual(
                 provider_artifact_strategy(REPOSITORY_ROOT, provider_id),
                 STRUCTURAL_SUFFICIENT,
             )
         self.assertEqual(
-            provider_artifact_strategy(REPOSITORY_ROOT, "norway"),
+            provider_artifact_strategy(REPOSITORY_ROOT, "ireland"),
             "unsupported",
         )
 

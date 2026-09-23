@@ -394,6 +394,54 @@ class ProviderStopIdentityTests(unittest.TestCase):
                     populate_gtfs(connection, archive, provider_id="provider-a")
             connection.close()
 
+    def test_norway_exact_empty_and_timed_transfer_selects_type_one(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "feed.zip"
+            _feed(
+                feed,
+                "13114,13115,route,route-a,trip-a,trip-b,,\n"
+                "13114,13115,route,route-a,trip-a,trip-b,1,\n",
+            )
+            connection = connect(root / "departures.sqlite")
+            with zipfile.ZipFile(feed) as archive:
+                populate_gtfs(connection, archive, provider_id="norway")
+            self.assertEqual(
+                connection.execute(
+                    "SELECT transfer_type, min_transfer_time FROM transfers "
+                    "WHERE from_stop_id='13114'"
+                ).fetchone(),
+                (1, 0),
+            )
+            connection.close()
+
+    def test_norway_unapproved_transfer_conflicts_fail_closed(self) -> None:
+        cases = (
+            ("0", "2", "0", "0"),
+            ("1", "2", "0", "0"),
+            ("0", "1", "30", "60"),
+        )
+        for first_type, second_type, first_time, second_time in cases:
+            with self.subTest(case=(first_type, second_type, first_time, second_time)):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    feed = root / "feed.zip"
+                    _feed(
+                        feed,
+                        "13114,13115,route,route-a,trip-a,trip-b,{},{}\n"
+                        "13114,13115,route,route-a,trip-a,trip-b,{},{}\n".format(
+                            first_type, first_time, second_type, second_time
+                        ),
+                    )
+                    connection = connect(root / "departures.sqlite")
+                    with zipfile.ZipFile(feed) as archive:
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "Conflicting duplicate GTFS transfer rows",
+                        ):
+                            populate_gtfs(connection, archive, provider_id="norway")
+                    connection.close()
+
     def test_empty_and_minimum_time_transfer_conflict_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -479,17 +527,17 @@ class ProviderStopIdentityTests(unittest.TestCase):
             )
             connection = connect(root / "departures.sqlite")
             with zipfile.ZipFile(feed) as archive:
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "Conflicting duplicate GTFS transfer rows for provider norway",
-                ):
-                    populate_gtfs(
-                        connection,
-                        archive,
-                        identifier_prefix="no:",
-                        stop_id_prefix="no:",
-                        provider_id="norway",
-                    )
+                populate_gtfs(
+                    connection,
+                    archive,
+                    identifier_prefix="no:",
+                    stop_id_prefix="no:",
+                    provider_id="norway",
+                )
+            self.assertEqual(
+                connection.execute("SELECT transfer_type, min_transfer_time FROM transfers").fetchone(),
+                (1, 0),
+            )
             connection.close()
 
     def test_package_membership_maps_public_511_id_to_internal_owner(self) -> None:

@@ -60,7 +60,13 @@
     "buildRoutes": true,
     "buildDepartures": true,
     "buildTripIndex": false,
-    "country": "NO"
+    "country": "NO",
+    "artifactCapabilities": {
+      "structuralProviderArtifactEligible": true,
+      "staticProviderArtifactEligible": true,
+      "shardRuntimeEligible": true,
+      "authoritativeHybridRuntimeEligible": true
+    }
   },
   {
     "id": "ireland",
