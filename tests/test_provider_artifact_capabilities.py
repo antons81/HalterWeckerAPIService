@@ -37,6 +37,7 @@ class ProviderArtifactCapabilityTests(unittest.TestCase):
             "mbta-boston",
             "poland-warsaw",
             "poland-wkd",
+            "511-bay-area",
         ):
             self.assertFalse(provider_artifact_eligible(REPOSITORY_ROOT, provider_id))
             self.assertEqual(
@@ -57,6 +58,7 @@ class ProviderArtifactCapabilityTests(unittest.TestCase):
             "mbta-boston",
             "poland-warsaw",
             "poland-wkd",
+            "511-bay-area",
         ):
             self.assertEqual(
                 provider_artifact_strategy(REPOSITORY_ROOT, provider_id),
