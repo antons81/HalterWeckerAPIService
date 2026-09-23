@@ -101,6 +101,11 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "partial incremental merge-group"):
             incremental.provider_selection_plan(REPOSITORY_ROOT, environ=environment)
 
+    def test_wkd_only_partial_poland_merge_group_fails_closed(self):
+        environment = self._selection_environment(selected=("poland-wkd",))
+        with self.assertRaisesRegex(ValueError, "partial incremental merge-group"):
+            incremental.provider_selection_plan(REPOSITORY_ROOT, environ=environment)
+
     def test_complete_poland_merge_group_passes(self):
         selected = ("poland-warsaw", "poland-wkd")
         plan = incremental.provider_selection_plan(

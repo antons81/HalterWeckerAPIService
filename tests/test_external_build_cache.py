@@ -674,6 +674,85 @@ class ExternalBuildCacheTests(unittest.TestCase):
             self.assertEqual(lookup.status, "HIT")
             self.assertEqual(lookup.key.value, key.value)
 
+    def test_exact_probe_rejects_922847_fingerprint_and_hits_current_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            legacy_root = root / "legacy"
+            legacy_root.mkdir()
+            feed = root / "cta.zip"
+            _write_feed(feed)
+            source = self._source(feed)
+            raw_sha256, _size = artifact_provenance(feed)
+            old_fingerprint = (
+                "922847ad5cad8e1e9c8ea203997c9efb6ca8c9c1adc6c184d45e41c0fc9bf089"
+            )
+
+            with mock.patch(
+                "external_build_cache.builder_fingerprint",
+                return_value=old_fingerprint,
+            ):
+                old_key = external_gtfs.cache_key(
+                    repository_root=REPOSITORY_ROOT,
+                    provider_id="cta-chicago",
+                    raw_sha256=raw_sha256,
+                    source=source,
+                    city_id="chicago",
+                )
+                self._build_once(legacy_root, feed)
+
+            current_key = external_gtfs.cache_key(
+                repository_root=REPOSITORY_ROOT,
+                provider_id="cta-chicago",
+                raw_sha256=raw_sha256,
+                source=source,
+                city_id="chicago",
+            )
+            legacy_directory = self._cache_directory(legacy_root)
+            self.assertTrue(legacy_directory.is_dir())
+            self.assertEqual(legacy_directory.name, old_key.value)
+            self.assertNotEqual(current_key.value, old_key.value)
+
+            legacy_cache = ExternalBuildCache(
+                legacy_root / "gtfs-cache" / "external-build",
+                provider_id="cta-chicago",
+                city_id="chicago",
+                include_trip_index=bool(source.get("buildTripIndex", True)),
+            )
+            old_directory = legacy_cache._directory(old_key)
+            self.assertTrue(old_directory.is_dir())
+            old_exact_hit = legacy_cache.probe(old_key)
+            self.assertEqual(old_exact_hit.status, "HIT")
+            self.assertEqual(old_exact_hit.key.builder_fingerprint, old_fingerprint)
+            self.assertNotEqual(current_key.value, old_key.value)
+
+            with mock.patch(
+                "external_gtfs.build_external_stop_packages",
+                side_effect=AssertionError("exact-only probe must not build"),
+            ):
+                exact_only_miss = legacy_cache.probe(current_key)
+
+            self.assertEqual(exact_only_miss.status, "MISS")
+            self.assertEqual(exact_only_miss.reason, "cache key not found")
+            self.assertTrue(old_directory.is_dir())
+
+            current_root = root / "current"
+            current_root.mkdir()
+            self._build_once(current_root, feed)
+            current_cache = ExternalBuildCache(
+                current_root / "gtfs-cache" / "external-build",
+                provider_id="cta-chicago",
+                city_id="chicago",
+                include_trip_index=bool(source.get("buildTripIndex", True)),
+            )
+            with mock.patch(
+                "external_gtfs.build_external_stop_packages",
+                side_effect=AssertionError("exact-only probe must not build"),
+            ):
+                exact_hit = current_cache.probe(current_key)
+
+            self.assertEqual(exact_hit.status, "HIT")
+            self.assertEqual(exact_hit.key.value, current_key.value)
+
     def test_cache_only_probe_reports_miss_without_invoking_a_builder(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

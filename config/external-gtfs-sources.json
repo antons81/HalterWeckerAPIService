@@ -1222,6 +1222,12 @@
     "importIntoStaticDepartures": true,
     "filterCitiesByProvider": true,
     "country": "PL",
+    "artifactCapabilities": {
+      "structuralProviderArtifactEligible": true,
+      "staticProviderArtifactEligible": true,
+      "shardRuntimeEligible": true,
+      "authoritativeHybridRuntimeEligible": true
+    },
     "sourceName": "Mikołaj Kuranowski / Warsaw City Hall open data",
     "sourceURL": "https://mkuran.pl/gtfs/",
     "sourceType": "community",
@@ -1249,6 +1255,12 @@
     "importIntoStaticDepartures": true,
     "filterCitiesByProvider": true,
     "country": "PL",
+    "artifactCapabilities": {
+      "structuralProviderArtifactEligible": true,
+      "staticProviderArtifactEligible": true,
+      "shardRuntimeEligible": true,
+      "authoritativeHybridRuntimeEligible": true
+    },
     "sourceName": "Mikołaj Kuranowski / Warszawska Kolej Dojazdowa",
     "sourceURL": "https://mkuran.pl/gtfs/",
     "sourceType": "community",
