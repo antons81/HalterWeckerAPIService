@@ -1,9 +1,11 @@
 import hashlib
+import json
 import shutil
 import sqlite3
 import sys
 import tempfile
 import unittest
+import zipfile
 from unittest.mock import Mock
 from datetime import date
 from pathlib import Path
@@ -790,6 +792,107 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
             payload = {"external": {"israel-mot": {"path": str(raw), "sha256": "wrong", "size": 7}}}
             with self.assertRaises(ValueError):
                 incremental._raw_entry(payload, "israel-mot")
+
+    def test_raw_snapshot_manifest_pins_input_when_mutable_current_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pinned = root / "raw" / "israel-mot" / "snapshot.zip"
+            pinned.parent.mkdir(parents=True)
+            with zipfile.ZipFile(pinned, "w") as archive:
+                for name in (
+                    "agency.txt",
+                    "routes.txt",
+                    "stops.txt",
+                    "stop_times.txt",
+                    "trips.txt",
+                ):
+                    archive.writestr(name, "id\nvalue\n")
+            digest, size = incremental.artifact_provenance(pinned)
+            manifest = root / "raw-manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "providers": [
+                            {
+                                "providerID": "israel-mot",
+                                "pinnedPath": str(pinned),
+                                "sha256": digest,
+                                "size": size,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            entries = incremental.load_raw_snapshot_manifest(
+                manifest,
+                required_provider_ids=("israel-mot",),
+            )
+            mutable_current = root / "current.zip"
+            mutable_current.write_bytes(b"new mutable input")
+            path, selected_digest = incremental._raw_entry(
+                {
+                    "external": {
+                        "israel-mot": {
+                            "path": str(mutable_current),
+                            "sha256": "0" * 64,
+                            "size": mutable_current.stat().st_size,
+                        }
+                    }
+                },
+                "israel-mot",
+                raw_snapshot=entries,
+            )
+            self.assertEqual(path, pinned.resolve())
+            self.assertEqual(selected_digest, digest)
+
+    def test_raw_snapshot_missing_provider_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = Path(temporary) / "raw-manifest.json"
+            manifest.write_text(
+                json.dumps({"schemaVersion": 1, "providers": []}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "missing providers"):
+                incremental.load_raw_snapshot_manifest(
+                    manifest,
+                    required_provider_ids=("israel-mot",),
+                )
+
+    def test_raw_snapshot_sha_mismatch_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pinned = root / "snapshot.zip"
+            with zipfile.ZipFile(pinned, "w") as archive:
+                for name in (
+                    "agency.txt",
+                    "routes.txt",
+                    "stops.txt",
+                    "stop_times.txt",
+                    "trips.txt",
+                ):
+                    archive.writestr(name, "id\nvalue\n")
+            _digest, size = incremental.artifact_provenance(pinned)
+            manifest = root / "raw-manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "providers": [
+                            {
+                                "providerID": "israel-mot",
+                                "pinnedPath": str(pinned),
+                                "sha256": "0" * 64,
+                                "size": size,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "pinned raw SHA mismatch"):
+                incremental.load_raw_snapshot_manifest(manifest)
 
     def test_provider_scope_is_fixed_to_phase_six_pilot(self) -> None:
         with self.assertRaises(ValueError):

@@ -2991,6 +2991,7 @@ def process_external_gtfs_sources(
     gtfs_cache: GTFSArtifactCache | None = None,
     kyiv_resource_cache: KyivResourceCache | None = None,
     use_normalized_context: bool = True,
+    exact_cache_only: bool = False,
 ) -> tuple[
     list[dict[str, object]],
     list[dict[str, object]],
@@ -3293,7 +3294,15 @@ def process_external_gtfs_sources(
                         include_trip_index=bool(source.get("buildTripIndex", True)),
                     )
                     lookup_started = time.monotonic()
-                    build_cache_lookup = build_cache.lookup(build_cache_key)
+                    exact_cache_only = exact_cache_only or (
+                        str((environ or {}).get("HALTEWECKER_EXTERNAL_BUILD_CACHE_EXACT_ONLY", "0"))
+                        == "1"
+                    )
+                    build_cache_lookup = (
+                        build_cache.probe(build_cache_key)
+                        if exact_cache_only
+                        else build_cache.lookup(build_cache_key)
+                    )
                     build_cache_hit = build_cache_lookup.status == "HIT"
                     print(
                         f"[StopData] source={source_id} stage=build-cache "
@@ -3302,6 +3311,7 @@ def process_external_gtfs_sources(
                         f"key={build_cache_key.value[:12]} rawSHA={raw_artifact_digest[:12]} "
                         f"providerConfig={build_cache_key.provider_config_fingerprint[:12]} "
                         f"builder={build_cache_key.builder_fingerprint[:12]} "
+                        f"lookupMode={'exact-only' if exact_cache_only else 'legacy-compatible'} "
                         f"supplemental={build_cache_key.supplemental_inputs_fingerprint[:12]}"
                     )
                 except (CacheKeyUnavailable, OSError, ValueError) as error:

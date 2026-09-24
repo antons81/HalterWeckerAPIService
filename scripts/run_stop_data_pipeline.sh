@@ -9,6 +9,8 @@ EXPLICIT_NO_ACTIVATE=0
 INCREMENTAL_NO_ACTIVATE=0
 INCREMENTAL_PRODUCTION="${HALTEWECKER_INCREMENTAL_PRODUCTION:-1}"
 INCREMENTAL_PROOF_OVERRIDE="${HALTEWECKER_INCREMENTAL_PROOF_OVERRIDE:-0}"
+RAW_SNAPSHOT_MANIFEST="${HALTEWECKER_RAW_SNAPSHOT_MANIFEST:-}"
+RAW_SNAPSHOT_MANIFEST_ARG=""
 REUSE_STOP_DATA=0
 STOP_DATA_ONLY=0
 REUSE_STOP_DATA_REFERENCE=""
@@ -69,6 +71,11 @@ elif [[ "${1:-}" == "--incremental-no-activate" && "$#" -eq 1 ]]; then
   NO_ACTIVATE=1
   EXPLICIT_NO_ACTIVATE=1
   INCREMENTAL_NO_ACTIVATE=1
+elif [[ "${1:-}" == "--incremental-no-activate" && "${2:-}" == "--raw-snapshot-manifest" && "$#" -eq 3 ]]; then
+  NO_ACTIVATE=1
+  EXPLICIT_NO_ACTIVATE=1
+  INCREMENTAL_NO_ACTIVATE=1
+  RAW_SNAPSHOT_MANIFEST_ARG="$3"
 elif [[ "${1:-}" == "--incremental" && "$#" -eq 1 ]]; then
   INCREMENTAL_PRODUCTION=1
 elif [[ "${1:-}" == "--legacy-full" && "$#" -eq 1 ]]; then
@@ -78,7 +85,7 @@ elif [[ "${1:-}" == "--stop-data-only" && "$#" -eq 1 ]]; then
   EXPLICIT_NO_ACTIVATE=1
   STOP_DATA_ONLY=1
 elif [[ "$#" -ne 0 ]]; then
-  echo "usage: $0 [--resume RELEASE_ID|--incremental|--legacy-full|--stop-data-only|--incremental-no-activate|--no-activate [--reuse-stop-data [RELEASE_ID]]]" >&2
+  echo "usage: $0 [--resume RELEASE_ID|--incremental|--legacy-full|--stop-data-only|--incremental-no-activate [--raw-snapshot-manifest PATH]|--no-activate [--reuse-stop-data [RELEASE_ID]]]" >&2
   exit 64
 fi
 
@@ -166,6 +173,18 @@ if [[ -f "$AUSTRALIA_ENV_FILE" ]]; then
   set +a
 fi
 
+if [[ -n "$RAW_SNAPSHOT_MANIFEST_ARG" ]]; then
+  RAW_SNAPSHOT_MANIFEST="$RAW_SNAPSHOT_MANIFEST_ARG"
+fi
+if [[ -n "$RAW_SNAPSHOT_MANIFEST" ]]; then
+  if [[ ! -f "$RAW_SNAPSHOT_MANIFEST" ]]; then
+    echo "[Nightly] ERROR: raw snapshot manifest is missing: $RAW_SNAPSHOT_MANIFEST" >&2
+    exit 64
+  fi
+  export HALTEWECKER_RAW_SNAPSHOT_MANIFEST="$RAW_SNAPSHOT_MANIFEST"
+  echo "[Nightly] stage=raw-snapshot status=PINNED manifest=$RAW_SNAPSHOT_MANIFEST"
+fi
+
 # Incremental mode is the single source of truth for all proven cache layers.
 # Apply it after environment files so stale legacy allowlists cannot override it.
 if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
@@ -179,6 +198,9 @@ if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; 
   export HALTEWECKER_PERSISTENT_NORMALIZED_PROVIDER_ARTIFACT=1
   export HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT="${HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT:-$DATA_ROOT/provider-artifacts/normalized}"
   export HALTEWECKER_EXTERNAL_DEPARTURE_CACHE_PROVIDERS="$HALTEWECKER_INCREMENTAL_PROVIDER_IDS"
+  if [[ -n "$RAW_SNAPSHOT_MANIFEST" ]]; then
+    export HALTEWECKER_EXTERNAL_BUILD_CACHE_EXACT_ONLY=1
+  fi
   echo "[Nightly] stage=cache-policy schema=3 incrementalProviders=$HALTEWECKER_INCREMENTAL_PROVIDER_IDS providers=$HALTEWECKER_EXTERNAL_DEPARTURES_V3_PROVIDERS allowlist=$HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS"
 fi
 
@@ -789,6 +811,9 @@ PREPARE_ARGS=(
 if [[ ${#EXTERNAL_URL_OVERRIDES[@]} -gt 0 ]]; then
   PREPARE_ARGS+=("${EXTERNAL_URL_OVERRIDES[@]}")
 fi
+if [[ -n "$RAW_SNAPSHOT_MANIFEST" ]]; then
+  PREPARE_ARGS+=(--raw-snapshot-manifest "$RAW_SNAPSHOT_MANIFEST")
+fi
 PREPARE_ARGS+=(--output "$ARTIFACTS_JSON")
 PREPARE_ARGS+=(--release-root "$RELEASE_DIR")
 log_disk_state "raw-download"
@@ -1338,6 +1363,9 @@ if [[ "$NO_ACTIVATE" == "1" || "$INCREMENTAL_PRODUCTION" == "1" ]]; then
     --normalized-cache-root "$NORMALIZED_CACHE_ROOT"
     --static-artifact-root "$STATIC_ARTIFACT_ROOT"
   )
+  if [[ -n "$RAW_SNAPSHOT_MANIFEST" ]]; then
+    INCREMENTAL_ARGS+=(--raw-snapshot-manifest "$RAW_SNAPSHOT_MANIFEST")
+  fi
   INCREMENTAL_ARGS+=(--result-json "$RELEASE_DIR/incremental-result.json")
   python3 "$REPO/scripts/run_incremental_provider_pipeline.py" \
     "${INCREMENTAL_ARGS[@]}"

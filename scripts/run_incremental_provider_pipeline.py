@@ -47,6 +47,10 @@ try:
         STRUCTURAL_SUFFICIENT,
         provider_artifact_strategy,
     )
+    from .raw_snapshot import (
+        load_raw_snapshot_manifest,
+        validate_raw_snapshot_entry,
+    )
     from .static_provider_artifact import load_or_build_static_provider_artifacts
 except ImportError:
     from artifact_provenance import artifact_provenance
@@ -75,6 +79,7 @@ except ImportError:
         STRUCTURAL_SUFFICIENT,
         provider_artifact_strategy,
     )
+    from raw_snapshot import load_raw_snapshot_manifest, validate_raw_snapshot_entry
     from static_provider_artifact import load_or_build_static_provider_artifacts
 
 
@@ -420,7 +425,17 @@ def _configured_stop_id_prefix(source: Mapping[str, object]) -> str:
 def _raw_entry(
     artifacts: Mapping[str, object],
     provider_id: str,
+    *,
+    raw_snapshot: Mapping[str, Mapping[str, object]] | None = None,
 ) -> tuple[Path, str]:
+    if raw_snapshot is not None:
+        entry = raw_snapshot.get(provider_id)
+        if not isinstance(entry, Mapping):
+            raise ValueError(f"provider={provider_id} is missing from raw snapshot")
+        try:
+            return validate_raw_snapshot_entry(provider_id, entry)
+        except ValueError as error:
+            raise ValueError(str(error)) from error
     external = artifacts.get("external")
     if not isinstance(external, Mapping):
         raise ValueError("GTFS artifact manifest has no external section")
@@ -877,6 +892,7 @@ def build_incremental_candidate(
     static_artifact_root: Path,
     dates: list[date],
     provider_ids: tuple[str, ...] | None = None,
+    raw_snapshot: Mapping[str, Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     selection_plan = provider_selection_plan(
         repository_root,
@@ -911,7 +927,11 @@ def build_incremental_candidate(
         strategy = str(selection_plan["artifactStrategies"][provider_id])
         raw_path, raw_sha = _stage(
             f"{provider_id}:raw-refresh",
-            lambda provider_id=provider_id: _raw_entry(artifacts, provider_id),
+            lambda provider_id=provider_id: _raw_entry(
+                artifacts,
+                provider_id,
+                raw_snapshot=raw_snapshot,
+            ),
         )
         source = dict(source)
         cities = load_external_cities(source, repository_root)
@@ -1257,6 +1277,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gtfs-artifacts", type=Path)
     parser.add_argument("--normalized-cache-root", type=Path)
     parser.add_argument("--static-artifact-root", type=Path)
+    parser.add_argument("--raw-snapshot-manifest", type=Path)
     parser.add_argument("--valid-from", type=date.fromisoformat)
     parser.add_argument("--valid-through", type=date.fromisoformat)
     parser.add_argument("--window-days", type=int, default=DEFAULT_WINDOW_DAYS)
@@ -1279,6 +1300,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.selection_plan:
         print(json.dumps(selection_plan, ensure_ascii=False, sort_keys=True, indent=2))
         return 0
+    raw_snapshot = None
+    if args.raw_snapshot_manifest is not None:
+        try:
+            raw_snapshot = load_raw_snapshot_manifest(
+                args.raw_snapshot_manifest,
+                required_provider_ids=selection_plan["selectedProviders"],
+            )
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+            return 1
+        print(
+            "[NightlyIncremental] stage=raw-snapshot status=PASS "
+            f"manifest={args.raw_snapshot_manifest.resolve()} providers={len(raw_snapshot)}",
+            flush=True,
+        )
     required_arguments = {
         "--release-id": args.release_id,
         "--releases-root": args.releases_root,
@@ -1318,6 +1354,7 @@ def main(argv: list[str] | None = None) -> int:
             static_artifact_root=args.static_artifact_root.resolve(),
             dates=dates,
             provider_ids=tuple(selection_plan["selectedProviders"]),
+            raw_snapshot=raw_snapshot,
         )
     except Exception as error:
         traceback.print_exc(file=sys.stderr)

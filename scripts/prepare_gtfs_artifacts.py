@@ -24,6 +24,7 @@ from external_gtfs import (
 from dynamic_resource_resolver import resolve_gtfs_resource
 from gtfs_source_cache import DEFAULT_CACHE_ROOT, ArtifactResult, GTFSArtifactCache
 from ireland_artifact_snapshot import capture_ireland_snapshot
+from raw_snapshot import load_raw_snapshot_manifest, validate_raw_snapshot_entry
 
 
 KYIV_SOURCE_ID = "kyiv"
@@ -237,6 +238,11 @@ def main() -> None:
         type=Path,
         help="Release directory used for the Ireland local-source snapshot.",
     )
+    parser.add_argument(
+        "--raw-snapshot-manifest",
+        type=Path,
+        help="Use immutable pinned raw inputs for the listed external providers.",
+    )
     args = parser.parse_args()
 
     cache = GTFSArtifactCache(args.cache_root)
@@ -259,8 +265,31 @@ def main() -> None:
             print(f"[GTFSCache] source=netherlands stage=resolve status=failed reason={error}")
 
     external_urls = parse_external_gtfs_url_args(args.external_gtfs_url)
+    raw_snapshot = (
+        load_raw_snapshot_manifest(args.raw_snapshot_manifest)
+        if args.raw_snapshot_manifest is not None
+        else {}
+    )
     for source in load_external_gtfs_sources(Path(args.external_sources)):
         source_id = str(source["id"])
+        if source_id in raw_snapshot:
+            pinned_path, _ = validate_raw_snapshot_entry(
+                source_id,
+                raw_snapshot[source_id],
+            )
+            result["external"][source_id] = artifact_payload(
+                ArtifactResult(
+                    source_id,
+                    pinned_path,
+                    "snapshot",
+                    "immutable raw snapshot",
+                )
+            )
+            print(
+                f"[GTFSCache] source={source_id} stage=resolve "
+                f"status=pinned-snapshot path={pinned_path}"
+            )
+            continue
         classification = source_classification(source)
         local_path = str(source.get("localPath") or "").strip()
         if local_path and source_id not in external_urls:
