@@ -722,8 +722,13 @@ proof_disk_preflight() {
   estimated_free_kb=$((free_kb - estimated_additional_kb))
   if [[ "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
     if [[ "$INCREMENTAL_PROOF_OVERRIDE" == "1" ]]; then
-      minimum_free_kb=$((35 * 1024 * 1024))
-      warning_free_kb=$((40 * 1024 * 1024))
+      manual_min_free_gb="${HALTEWECKER_MANUAL_PROOF_MIN_FREE_GB:-35}"
+      if ! [[ "$manual_min_free_gb" =~ ^[0-9]+$ ]] || (( manual_min_free_gb < 30 || manual_min_free_gb > 45 )); then
+        echo "[Nightly] ERROR: HALTEWECKER_MANUAL_PROOF_MIN_FREE_GB must be an integer between 30 and 45" >&2
+        return 1
+      fi
+      minimum_free_kb=$((manual_min_free_gb * 1024 * 1024))
+      warning_free_kb=$(((manual_min_free_gb + 5) * 1024 * 1024))
       disk_mode="manual-production-shaped-proof"
     else
       minimum_free_kb=$((45 * 1024 * 1024))

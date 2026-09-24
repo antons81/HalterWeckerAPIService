@@ -810,6 +810,16 @@ PY
         self.assertIn("mode=manual-production-shaped-proof", result.stdout)
         self.assertIn("warning_free_gb=40", result.stdout)
         self.assertIn("minimum_free_gb=35", result.stdout)
+    def test_manual_incremental_proof_floor_can_be_lowered_to_30_explicitly(self) -> None:
+        result = self.run_pipeline(
+            "--incremental-no-activate",
+            HALTEWECKER_INCREMENTAL_PROOF_OVERRIDE="1",
+            HALTEWECKER_MANUAL_PROOF_MIN_FREE_GB="30",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("warning_free_gb=35", result.stdout)
+        self.assertIn("minimum_free_gb=30", result.stdout)
         self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)
 
     def test_production_shaped_incremental_failure_cleans_candidate_and_keeps_pointers(self) -> None:
