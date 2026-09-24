@@ -107,6 +107,7 @@ fi
 
 REPO="${REPO:-/srv/haltewecker/pipeline/HalterWeckerAPIService}"
 DATA_ROOT="${DATA_ROOT:-/srv/haltewecker/data}"
+CACHE_ROOT="${GTFS_CACHE_ROOT:-$DATA_ROOT/cache/gtfs}"
 RELEASES="$DATA_ROOT/releases"
 if [[ "$RUN_MODE" == "resume" ]]; then
   if ! [[ "$RESUME_RELEASE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
@@ -170,6 +171,7 @@ fi
 if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
   export HALTEWECKER_EXTERNAL_BUILD_CACHE=1
   export HALTEWECKER_EXTERNAL_TRANSFORMED_BUILD_CACHE=1
+  export HALTEWECKER_EXTERNAL_BUILD_CACHE_ROOT="$CACHE_ROOT/external-build"
   export HALTEWECKER_INCREMENTAL_PROVIDER_IDS="${HALTEWECKER_INCREMENTAL_PROVIDER_IDS-israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd,511-bay-area,australia-translink-seq,australia-transport-nsw,cta-chicago,mbta-boston,stm-montreal}"
   export HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS="$HALTEWECKER_INCREMENTAL_PROVIDER_IDS"
   export HALTEWECKER_EXTERNAL_DEPARTURES_V3_PROVIDERS="$HALTEWECKER_INCREMENTAL_PROVIDER_IDS"
@@ -773,7 +775,7 @@ if [[ -n "${SWEDEN_GTFS_URL:-}" ]]; then
   EXTERNAL_URL_OVERRIDES+=(--external-gtfs-url "sweden=$SWEDEN_GTFS_URL")
 fi
 PREPARE_ARGS=(
-  --cache-root "${GTFS_CACHE_ROOT:-/srv/haltewecker/cache/gtfs}"
+  --cache-root "$CACHE_ROOT"
   --gtfs-url "$GTFS_URL"
   --swiss-gtfs-url "$SWISS_GTFS_URL"
   --nl-gtfs-url "${NL_GTFS_URL:-}"
@@ -790,7 +792,7 @@ VBB_INPUT_URL="${VBB_GTFS_URL:-https://unternehmen.vbb.de/fileadmin/user_upload/
 RNV_INPUT_URL="${RNV_GTFS_URL:-https://gtfs-sandbox-dds.rnv-online.de/latest/gtfs.zip}"
 log_disk_state "raw-extract"
 python3 "$REPO/scripts/prepare_custom_gtfs_artifacts.py" \
-  --cache-root "${GTFS_CACHE_ROOT:-/srv/haltewecker/cache/gtfs}" \
+  --cache-root "$CACHE_ROOT" \
   --vbb-url "$VBB_INPUT_URL" \
   --rnv-url "$RNV_INPUT_URL" \
   --output "$CUSTOM_ARTIFACTS_JSON"
@@ -861,7 +863,7 @@ run_build_stop_packages() {
   cmd+=(--vbb-gtfs-url "$VBB_GTFS_ARTIFACT")
   cmd+=(--rnv-gtfs-url "$RNV_GTFS_ARTIFACT")
   cmd+=(--kyiv-cache-root "${KYIV_OPEN_DATA_CACHE_ROOT:-$DATA_ROOT/kyiv-open-data-cache}")
-  cmd+=(--gtfs-cache-root "${GTFS_CACHE_ROOT:-/srv/haltewecker/cache/gtfs}")
+  cmd+=(--gtfs-cache-root "$CACHE_ROOT")
   cmd+=(--previous-stop-data "$CURRENT")
   if [ -n "$nl_url" ]; then
     cmd+=(--nl-gtfs-url "$nl_url")

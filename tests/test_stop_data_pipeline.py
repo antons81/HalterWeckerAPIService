@@ -978,7 +978,7 @@ PY
             build_args,
         )
         self.assertIn(f"--kyiv-cache-root {self.data_root / 'kyiv-open-data-cache'}", build_args)
-        self.assertIn("--gtfs-cache-root /srv/haltewecker/cache/gtfs", build_args)
+        self.assertIn(f"--gtfs-cache-root {self.data_root / 'cache' / 'gtfs'}", build_args)
         self.assertIn(f"--previous-stop-data {self.data_root / 'current'}", build_args)
         self.assertIn("511-bay-area=", build_args)
         self.assertEqual(
