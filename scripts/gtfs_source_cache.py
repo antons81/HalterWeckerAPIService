@@ -473,6 +473,7 @@ class GTFSArtifactCache:
         source_version: Mapping[str, object] | None = None,
         allow_stale: bool = False,
         seed_path: Path | None = None,
+        seed_state: Mapping[str, object] | None = None,
         state_url: str | None = None,
         minimum_size: int | None = None,
         metadata_probe: bool = True,
@@ -504,7 +505,36 @@ class GTFSArtifactCache:
                     digest, size = validate_gtfs_archive(candidate, validator=validator)
                     if minimum_size is not None and size < max(1024, minimum_size // 2):
                         raise ValueError(f"GTFS artifact is smaller than expected for {source_id}")
-                    new_state = self._state(source_id, _state_url(url, state_url), source_version, {}, digest, size)
+                    if seed_state is not None:
+                        expected_digest = seed_state.get("sha256")
+                        expected_size = seed_state.get("size")
+                        if (
+                            seed_state.get("validated") is not True
+                            or expected_digest != digest
+                            or expected_size != size
+                        ):
+                            raise ValueError(f"invalid seed state for {source_id}")
+                        new_state = dict(seed_state)
+                        new_state.update(
+                            {
+                                "sourceID": source_id,
+                                "url": _state_url(url, state_url),
+                                "artifact": "current.zip",
+                                "sha256": digest,
+                                "size": size,
+                                "validated": True,
+                                "seededFromLegacyCache": True,
+                            }
+                        )
+                    else:
+                        new_state = self._state(
+                            source_id,
+                            _state_url(url, state_url),
+                            source_version,
+                            {},
+                            digest,
+                            size,
+                        )
                     self._activate_candidate(candidate, artifact, state_path, new_state)
                     valid_cache = True
                     state = new_state
@@ -514,7 +544,8 @@ class GTFSArtifactCache:
                         state_path,
                     )
                 except Exception:
-                    pass
+                    if seed_state is not None:
+                        raise
                 finally:
                     candidate.unlink(missing_ok=True)
 

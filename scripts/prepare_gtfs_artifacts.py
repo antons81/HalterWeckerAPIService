@@ -8,6 +8,7 @@ import json
 import os
 import time
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 from artifact_provenance import artifact_provenance, immutable_file_path
@@ -23,6 +24,53 @@ from external_gtfs import (
 from dynamic_resource_resolver import resolve_gtfs_resource
 from gtfs_source_cache import DEFAULT_CACHE_ROOT, ArtifactResult, GTFSArtifactCache
 from ireland_artifact_snapshot import capture_ireland_snapshot
+
+
+KYIV_SOURCE_ID = "kyiv"
+
+
+def _kyiv_stale_cache_seed(
+    cache_root: Path,
+) -> tuple[Path | None, dict[str, object] | None]:
+    """Return a validated legacy-root Kyiv seed when the canonical cache is empty."""
+    canonical_dir = cache_root / KYIV_SOURCE_ID
+    canonical_current = canonical_dir / "current.zip"
+    canonical_state = canonical_dir / "state.json"
+    if canonical_current.exists() or canonical_state.exists():
+        return None, None
+
+    fallback_root = Path(
+        os.environ.get("HALTEWECKER_KYIV_STALE_CACHE_ROOT", str(DEFAULT_CACHE_ROOT))
+    )
+    if fallback_root.resolve() == cache_root.resolve():
+        return None, None
+
+    fallback_dir = fallback_root / KYIV_SOURCE_ID
+    seed_path = fallback_dir / "current.zip"
+    state_path = fallback_dir / "state.json"
+    if not seed_path.exists() and not state_path.exists():
+        return None, None
+    if not seed_path.is_file() or not state_path.is_file():
+        raise ValueError("Kyiv stale cache is incomplete")
+
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as error:
+        raise ValueError("Kyiv stale cache manifest is unreadable") from error
+    if not isinstance(state, dict):
+        raise ValueError("Kyiv stale cache manifest is invalid")
+
+    digest, size = artifact_provenance(seed_path)
+    if (
+        state.get("sourceID") != KYIV_SOURCE_ID
+        or state.get("artifact") != "current.zip"
+        or state.get("validated") is not True
+        or state.get("sha256") != digest
+        or state.get("size") != size
+    ):
+        raise ValueError("Kyiv stale cache provenance mismatch")
+    validate_kyiv_gtfs_archive(seed_path)
+    return seed_path, state
 
 
 def safe_error_reason(error: BaseException) -> str:
@@ -89,6 +137,8 @@ def resolve_one(
     metadata_probe: bool = True,
     retry_attempts: int = 1,
     validator=None,
+    seed_path: Path | None = None,
+    seed_state: dict[str, object] | None = None,
 ) -> ArtifactResult:
     started = time.monotonic()
     try:
@@ -102,6 +152,8 @@ def resolve_one(
             metadata_probe=metadata_probe,
             retry_attempts=retry_attempts,
             validator=validator,
+            seed_path=seed_path,
+            seed_state=seed_state,
         )
     except Exception as error:
         duration = time.monotonic() - started
@@ -120,6 +172,20 @@ def resolve_one(
         f"status={result.status} duration={duration:.2f}s"
         + (f" reason={result.reason}" if result.reason else "")
     )
+    if source_id == KYIV_SOURCE_ID and result.status == "preserved-stale":
+        downloaded_at = (result.state or {}).get("downloadedAt")
+        cache_age = "unknown"
+        if isinstance(downloaded_at, str):
+            try:
+                downloaded = datetime.fromisoformat(downloaded_at.replace("Z", "+00:00"))
+                cache_age = f"{max(0, int((datetime.now(timezone.utc) - downloaded).total_seconds()))}s"
+            except ValueError:
+                pass
+        print(
+            f"[GTFSCache] provider=kyiv upstream_status=unavailable "
+            f"source=cached stale=true cache_age={cache_age} "
+            "status=PASS_WITH_STALE_CACHE"
+        )
     download_status = "skipped" if result.status == "unchanged" else result.status
     print(
         f"[GTFSCache] source={source_id} stage=download "
@@ -262,6 +328,10 @@ def main() -> None:
             continue
         preflight = str(source.get("preflight", "head"))
         resilience_policy = external_gtfs_resilience_policy(source)
+        seed_path = None
+        seed_state = None
+        if source_id == KYIV_SOURCE_ID:
+            seed_path, seed_state = _kyiv_stale_cache_seed(Path(args.cache_root))
         artifact = resolve_one(
             cache,
             source_id,
@@ -294,6 +364,8 @@ def main() -> None:
                 and bool(resilience_policy["requireDataRows"])
                 else None
             ),
+            seed_path=seed_path,
+            seed_state=seed_state,
         )
         result["external"][source_id] = artifact_payload(artifact)
 

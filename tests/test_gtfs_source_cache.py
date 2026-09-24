@@ -213,6 +213,60 @@ class GTFSArtifactCacheTests(unittest.TestCase):
             self.assertEqual(result.state["sha256"], first.state["sha256"])
             self.assertEqual((root / "cache" / "kyiv" / "current.zip").read_bytes(), source.read_bytes())
 
+    def test_seeded_kyiv_stale_cache_preserves_provenance_and_age(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "legacy-kyiv.zip"
+            write_kyiv_gtfs(source, "legacy")
+            legacy = GTFSArtifactCache(root / "legacy-cache")
+            seeded = legacy.resolve(
+                "kyiv",
+                str(source),
+                validator=validate_kyiv_gtfs_archive,
+            )
+            seed_state = dict(seeded.state or {})
+            canonical = GTFSArtifactCache(root / "canonical-cache")
+
+            with patch(
+                "gtfs_source_cache.urllib.request.urlopen",
+                side_effect=TimeoutError("simulated timeout"),
+            ):
+                result = canonical.resolve(
+                    "kyiv",
+                    "https://data.kyivcity.gov/gtfs.zip",
+                    allow_stale=True,
+                    metadata_probe=False,
+                    retry_attempts=1,
+                    validator=validate_kyiv_gtfs_archive,
+                    seed_path=source,
+                    seed_state=seed_state,
+                )
+
+            self.assertEqual(result.status, "preserved-stale")
+            self.assertEqual(result.state["sha256"], seed_state["sha256"])
+            self.assertEqual(result.state["downloadedAt"], seed_state["downloadedAt"])
+            self.assertTrue(result.state["seededFromLegacyCache"])
+            self.assertEqual(
+                (root / "canonical-cache" / "kyiv" / "current.zip").read_bytes(),
+                source.read_bytes(),
+            )
+
+    def test_invalid_kyiv_seed_state_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "kyiv.zip"
+            write_kyiv_gtfs(source)
+            with self.assertRaisesRegex(ValueError, "invalid seed state"):
+                GTFSArtifactCache(root / "cache").resolve(
+                    "kyiv",
+                    "https://data.kyivcity.gov/gtfs.zip",
+                    allow_stale=True,
+                    metadata_probe=False,
+                    seed_path=source,
+                    seed_state={"validated": True, "sha256": "wrong", "size": source.stat().st_size},
+                    validator=validate_kyiv_gtfs_archive,
+                )
+
     def test_kyiv_corrupt_download_does_not_replace_valid_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
