@@ -9,7 +9,7 @@ import os
 import shutil
 import tempfile
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -69,12 +69,20 @@ IMMUTABLE_OUTPUT_CONFIG_KEYS = (
     "stopIDMode",
     "supplementalStopCatalog",
 )
+SEMANTIC_FINGERPRINT_SCHEMA = "external-gtfs-v1"
+COMPATIBLE_LEGACY_BUILDER_FINGERPRINTS = {
+    SEMANTIC_FINGERPRINT_SCHEMA: frozenset(
+        {
+            "e89943c0e6b7cb4116fd415b0e5fbad6b25453dba4ea82473c490636ab042cca",
+        }
+    ),
+}
 BUILDER_INPUTS = (
     "scripts/external_gtfs.py",
     "scripts/external_staging.py",
     "scripts/gtfs_csv.py",
-    "scripts/build_stop_packages.py",
 )
+CODE_FINGERPRINT_INPUTS = (*BUILDER_INPUTS, "scripts/build_stop_packages.py")
 LEGACY_BUILDER_INPUTS = (*BUILDER_INPUTS, "scripts/external_build_cache.py")
 
 
@@ -147,6 +155,9 @@ class CacheKey:
     legacy_value: str = ""
     legacy_provider_config_fingerprint: str = ""
     legacy_builder_fingerprint: str = ""
+    semantic_fingerprint: str = ""
+    code_fingerprint: str = ""
+    compatibility_values: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -499,6 +510,22 @@ def projection_fingerprint(
     return _sha256_json(payload)
 
 
+def canonical_merge_group_members(
+    source: Mapping[str, object],
+    sources: Mapping[str, Mapping[str, object]] | list[Mapping[str, object]] | tuple[Mapping[str, object], ...],
+) -> tuple[str, ...]:
+    """Resolve merge members in the provider registry's canonical order."""
+    merge_group = str(source.get("mergeGroup", "")).strip()
+    if not merge_group:
+        return ()
+    candidates = sources.values() if isinstance(sources, Mapping) else sources
+    return tuple(
+        str(candidate["id"])
+        for candidate in candidates
+        if str(candidate.get("mergeGroup", "")).strip() == merge_group
+    )
+
+
 def _safe_config_value(key: str, value: object) -> object:
     lowered = key.casefold()
     if any(marker in lowered for marker in SENSITIVE_CONFIG_MARKERS):
@@ -550,8 +577,18 @@ def _file_fingerprint(repository_root: Path, relative_paths: tuple[str, ...]) ->
     return digest.hexdigest()
 
 
-def builder_fingerprint(repository_root: Path) -> str:
+def semantic_builder_fingerprint(repository_root: Path) -> str:
     return _file_fingerprint(repository_root, BUILDER_INPUTS)
+
+
+def builder_fingerprint(repository_root: Path) -> str:
+    """Return the semantic artifact fingerprint for compatibility callers."""
+    return semantic_builder_fingerprint(repository_root)
+
+
+def code_fingerprint(repository_root: Path) -> str:
+    """Fingerprint orchestration and semantic code for diagnostics."""
+    return _file_fingerprint(repository_root, CODE_FINGERPRINT_INPUTS)
 
 
 def legacy_builder_fingerprint(repository_root: Path) -> str:
@@ -595,7 +632,8 @@ def cache_key(
     provider_fingerprint = provider_config_fingerprint(source)
     legacy_provider_fingerprint = legacy_provider_config_fingerprint(source)
     cities_fingerprint = city_config_fingerprint(repository_root, source)
-    build_fingerprint = builder_fingerprint(repository_root)
+    semantic_fingerprint = builder_fingerprint(repository_root)
+    full_code_fingerprint = code_fingerprint(repository_root)
     legacy_build_fingerprint = legacy_builder_fingerprint(repository_root)
     normalized_city_ids = tuple(city_ids or ((city_id,) if city_id else ()))
     if not normalized_city_ids or any(
@@ -630,11 +668,11 @@ def cache_key(
         }
 
     return CacheKey(
-        value=_sha256_json(payload_for(provider_fingerprint, build_fingerprint)),
+        value=_sha256_json(payload_for(provider_fingerprint, semantic_fingerprint)),
         raw_sha256=raw_sha256,
         provider_config_fingerprint=provider_fingerprint,
         city_config_fingerprint=cities_fingerprint,
-        builder_fingerprint=build_fingerprint,
+        builder_fingerprint=semantic_fingerprint,
         supplemental_inputs_fingerprint=supplemental_fingerprint,
         provider_id=provider_id,
         city_id=city_id,
@@ -645,6 +683,19 @@ def cache_key(
         ),
         legacy_provider_config_fingerprint=legacy_provider_fingerprint,
         legacy_builder_fingerprint=legacy_build_fingerprint,
+        semantic_fingerprint=semantic_fingerprint,
+        code_fingerprint=full_code_fingerprint,
+        compatibility_values=tuple(
+            (
+                _sha256_json(payload_for(provider_fingerprint, compatible_builder)),
+                compatible_builder,
+            )
+            for compatible_builder in COMPATIBLE_LEGACY_BUILDER_FINGERPRINTS.get(
+                SEMANTIC_FINGERPRINT_SCHEMA,
+                (),
+            )
+            if compatible_builder != semantic_fingerprint
+        ),
     )
 
 
@@ -681,6 +732,8 @@ def _manifest_matches(
     directory: Path,
     provider_id: str,
     artifacts: tuple[tuple[str, str], ...],
+    *,
+    compatibility: bool = False,
 ) -> tuple[bool, str]:
     if not isinstance(manifest, dict):
         return False, "manifest is not an object"
@@ -705,6 +758,16 @@ def _manifest_matches(
         return False, "city configuration fingerprint mismatch"
     if manifest.get("builderFingerprint") != expected.builder_fingerprint:
         return False, "builder fingerprint mismatch"
+    if compatibility:
+        if manifest.get("semanticFingerprint") not in (None, expected.semantic_fingerprint):
+            return False, "semantic fingerprint mismatch"
+    else:
+        if manifest.get("semanticSchemaVersion") != SEMANTIC_FINGERPRINT_SCHEMA:
+            return False, "semantic fingerprint schema mismatch"
+        if manifest.get("semanticFingerprint") != expected.semantic_fingerprint:
+            return False, "semantic fingerprint mismatch"
+        if manifest.get("codeFingerprint") != expected.code_fingerprint:
+            return False, "code fingerprint mismatch"
     if manifest.get("projectionFingerprint") != expected.projection_fingerprint:
         return False, "projection fingerprint mismatch"
     expected_city_ids = expected.city_ids or (
@@ -799,6 +862,40 @@ class ExternalBuildCache:
         directory = self._directory(key)
         validation_key = key
         migration = False
+        if not directory.exists():
+            for compatible_value, compatible_builder in key.compatibility_values:
+                compatible_directory = self.root / compatible_value
+                if not compatible_directory.is_dir():
+                    continue
+                compatible_key = replace(
+                    key,
+                    value=compatible_value,
+                    builder_fingerprint=compatible_builder,
+                    semantic_fingerprint=compatible_builder,
+                    code_fingerprint="",
+                )
+                manifest_path = compatible_directory / "manifest.json"
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, TypeError):
+                    continue
+                valid, reason = _manifest_matches(
+                    manifest,
+                    compatible_key,
+                    compatible_directory,
+                    self.provider_id,
+                    self.artifacts,
+                    compatibility=True,
+                )
+                if valid:
+                    return CacheLookup(
+                        "HIT_COMPATIBLE",
+                        "validated explicit compatibility manifest",
+                        compatible_key,
+                        compatible_directory,
+                        manifest,
+                    )
+            directory = self._directory(key)
         if allow_legacy and not directory.exists() and key.legacy_value:
             legacy_key = CacheKey(
                 value=key.legacy_value,
@@ -812,6 +909,7 @@ class ExternalBuildCache:
                 projection_fingerprint=key.projection_fingerprint,
                 city_ids=key.city_ids,
                 legacy_builder_fingerprint=key.legacy_builder_fingerprint,
+                semantic_fingerprint=key.legacy_builder_fingerprint,
             )
             legacy_directory = self._directory(legacy_key)
             if legacy_directory.exists():
@@ -833,6 +931,7 @@ class ExternalBuildCache:
             directory,
             self.provider_id,
             self.artifacts,
+            compatibility=migration,
         )
         if not valid:
             if remove_invalid:
@@ -843,7 +942,7 @@ class ExternalBuildCache:
         return CacheLookup("HIT", reason, validation_key, directory, manifest)
 
     def restore(self, lookup: CacheLookup, output: Path) -> CacheRestore:
-        if lookup.status != "HIT" or lookup.directory is None:
+        if lookup.status not in {"HIT", "HIT_COMPATIBLE"} or lookup.directory is None:
             raise ValueError("only a validated cache HIT can be restored")
         source_directory = lookup.directory
         package_stops: dict[str, list[dict[str, object]]] = {}
@@ -976,6 +1075,9 @@ class ExternalBuildCache:
                 "providerConfigFingerprint": key.provider_config_fingerprint,
                 "cityConfigFingerprint": key.city_config_fingerprint,
                 "builderFingerprint": key.builder_fingerprint,
+                "semanticSchemaVersion": SEMANTIC_FINGERPRINT_SCHEMA,
+                "semanticFingerprint": key.semantic_fingerprint,
+                "codeFingerprint": key.code_fingerprint,
                 "projectionFingerprint": key.projection_fingerprint,
                 "cityIDs": list(key.city_ids or self.city_ids),
                 "supplementalInputsFingerprint": key.supplemental_inputs_fingerprint,

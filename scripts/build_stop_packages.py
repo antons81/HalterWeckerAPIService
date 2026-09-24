@@ -3165,6 +3165,7 @@ def main(argv: list[str] | None = None) -> None:
             occupied_city_ids=set(manifest_sources),
             gtfs_cache=GTFSArtifactCache(Path(args.gtfs_cache_root)),
             kyiv_resource_cache=KyivResourceCache(Path(args.kyiv_cache_root)),
+            environ=dict(os.environ),
         ),
     )
     if external_manifest_entries:

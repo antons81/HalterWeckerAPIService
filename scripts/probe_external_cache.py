@@ -17,10 +17,12 @@ try:
         CacheKeyUnavailable,
         cache_key,
         cache_provider_allowed,
+        canonical_merge_group_members,
         departure_partition_key,
         departure_stop_set_digest,
     )
     from .external_gtfs import load_external_cities, load_external_gtfs_sources
+    from .raw_snapshot import load_raw_snapshot_manifest
 except ImportError:
     from external_build_cache import (
         DeparturePartitionCache,
@@ -28,10 +30,12 @@ except ImportError:
         CacheKeyUnavailable,
         cache_key,
         cache_provider_allowed,
+        canonical_merge_group_members,
         departure_partition_key,
         departure_stop_set_digest,
     )
     from external_gtfs import load_external_cities, load_external_gtfs_sources
+    from raw_snapshot import load_raw_snapshot_manifest
 
 
 def _arguments() -> argparse.Namespace:
@@ -42,7 +46,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument(
         "--cache-root",
         type=Path,
-        default=Path("/srv/haltewecker/cache/gtfs"),
+        default=Path("/srv/haltewecker/data/cache/gtfs"),
     )
     parser.add_argument(
         "--sources",
@@ -51,6 +55,11 @@ def _arguments() -> argparse.Namespace:
     )
     parser.add_argument("--provider", action="append", required=True)
     parser.add_argument(
+        "--raw-snapshot-manifest",
+        type=Path,
+        help="Use validated immutable raw inputs instead of mutable current.zip files.",
+    )
+    parser.add_argument(
         "--service-date",
         action="append",
         help="Provider-local YYYYMMDD date; defaults to local D-1, D, D+1.",
@@ -58,7 +67,23 @@ def _arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _raw_sha256(cache_root: Path, provider_id: str) -> str:
+def _raw_sha256(
+    cache_root: Path,
+    provider_id: str,
+    raw_snapshot: dict[str, dict[str, object]] | None = None,
+) -> str:
+    if raw_snapshot is not None:
+        entry = raw_snapshot.get(provider_id)
+        if not isinstance(entry, dict):
+            raise CacheKeyUnavailable(
+                f"raw snapshot is missing for {provider_id}"
+            )
+        digest = str(entry.get("sha256") or "").lower()
+        if len(digest) != 64:
+            raise CacheKeyUnavailable(
+                f"raw snapshot SHA is invalid for {provider_id}"
+            )
+        return digest
     state_path = cache_root / provider_id / "state.json"
     artifact_path = cache_root / provider_id / "current.zip"
     try:
@@ -78,6 +103,13 @@ def _raw_sha256(cache_root: Path, provider_id: str) -> str:
     return state["sha256"]
 
 
+def _merge_group_members(
+    source: dict[str, object],
+    sources: dict[str, dict[str, object]],
+) -> tuple[str, ...]:
+    return canonical_merge_group_members(source, sources)
+
+
 def _service_dates(source: dict[str, object], requested: list[str] | None) -> list[str]:
     if requested:
         return requested
@@ -94,8 +126,10 @@ def probe_provider(
     repository_root: Path,
     cache_root: Path,
     source: dict[str, object],
+    sources: dict[str, dict[str, object]],
     service_dates: list[str],
     incremental_providers: str,
+    raw_snapshot: dict[str, dict[str, object]] | None = None,
 ) -> dict[str, object]:
     provider_id = str(source["id"])
     cities = load_external_cities(source, repository_root)
@@ -119,13 +153,16 @@ def probe_provider(
         "buildStatus": "DISABLED" if not enabled else "INVALID",
         "buildReason": "provider-not-allowlisted" if not enabled else None,
         "builderFingerprint": None,
+        "semanticFingerprint": None,
+        "codeFingerprint": None,
+        "mergeGroupMembers": [],
         "stopSetDigest": None,
         "departurePartitions": [],
     }
     if not enabled:
         return report
 
-    raw_sha = _raw_sha256(cache_root, provider_id)
+    raw_sha = _raw_sha256(cache_root, provider_id, raw_snapshot)
     report["rawSHA"] = raw_sha
     key = cache_key(
         repository_root=repository_root,
@@ -134,9 +171,13 @@ def probe_provider(
         source=source,
         city_id=city_id,
         city_ids=city_ids,
+        merge_group_members=_merge_group_members(source, sources),
     )
     report["buildKey"] = key.value
     report["builderFingerprint"] = key.builder_fingerprint
+    report["semanticFingerprint"] = key.semantic_fingerprint
+    report["codeFingerprint"] = key.code_fingerprint
+    report["mergeGroupMembers"] = list(_merge_group_members(source, sources))
     build_cache = ExternalBuildCache(
         cache_root / "external-build",
         provider_id=provider_id,
@@ -205,6 +246,12 @@ def main() -> int:
     )
     if not incremental_providers.strip():
         raise SystemExit("HALTEWECKER_INCREMENTAL_PROVIDER_IDS is required")
+    raw_snapshot = None
+    if arguments.raw_snapshot_manifest is not None:
+        raw_snapshot = load_raw_snapshot_manifest(
+            arguments.raw_snapshot_manifest,
+            required_provider_ids=arguments.provider,
+        )
     reports: list[dict[str, object]] = []
     for provider_id in arguments.provider:
         source = sources.get(provider_id)
@@ -216,8 +263,10 @@ def main() -> int:
                 repository_root=repository_root,
                 cache_root=arguments.cache_root,
                 source=source,
+                sources=sources,
                 service_dates=dates,
                 incremental_providers=incremental_providers,
+                raw_snapshot=raw_snapshot,
             )
         )
     print(json.dumps(reports, ensure_ascii=False, sort_keys=True, indent=2))

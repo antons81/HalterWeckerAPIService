@@ -129,6 +129,7 @@ try:
         CacheKey,
         CacheKeyUnavailable,
         ExternalBuildCache,
+        canonical_merge_group_members,
         cache_enabled,
         cache_key,
         cache_provider_allowed,
@@ -147,6 +148,7 @@ except ImportError:
         CacheKey,
         CacheKeyUnavailable,
         ExternalBuildCache,
+        canonical_merge_group_members,
         cache_enabled,
         cache_key,
         cache_provider_allowed,
@@ -3021,16 +3023,20 @@ def process_external_gtfs_sources(
     input_provenance: dict[str, dict[str, object]] = {}
     skipped_sources: dict[str, dict[str, object]] = {}
     namespace_root = output / ".external-namespaces"
+    selected_sources = [
+        candidate
+        for candidate in sources
+        if selected_source_ids is None
+        or str(candidate["id"]) in selected_source_ids
+    ]
     merge_group_members_by_group: dict[str, tuple[str, ...]] = {}
-    for candidate in sources:
-        candidate_id = str(candidate["id"])
-        if selected_source_ids is not None and candidate_id not in selected_source_ids:
-            continue
+    for candidate in selected_sources:
         merge_group = str(candidate.get("mergeGroup", "")).strip()
         if merge_group:
-            members = list(merge_group_members_by_group.get(merge_group, ()))
-            members.append(candidate_id)
-            merge_group_members_by_group[merge_group] = tuple(members)
+            merge_group_members_by_group[merge_group] = canonical_merge_group_members(
+                candidate,
+                selected_sources,
+            )
 
     for source in sources:
         source_id = str(source["id"])
@@ -3303,7 +3309,10 @@ def process_external_gtfs_sources(
                         if exact_cache_only
                         else build_cache.lookup(build_cache_key)
                     )
-                    build_cache_hit = build_cache_lookup.status == "HIT"
+                    build_cache_hit = build_cache_lookup.status in {
+                        "HIT",
+                        "HIT_COMPATIBLE",
+                    }
                     print(
                         f"[StopData] source={source_id} stage=build-cache "
                         f"status={build_cache_lookup.status} reason={build_cache_lookup.reason} "

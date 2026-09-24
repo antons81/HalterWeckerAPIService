@@ -1027,7 +1027,10 @@ PY
             "_source": "test external source",
         }
 
+        captured_external_kwargs: dict[str, object] = {}
+
         def fake_external_sources(**_kwargs):
+            captured_external_kwargs.update(_kwargs)
             return [manifest_entry], [kyiv_city], {"kyiv": []}, {}
 
         with mock.patch(
@@ -1038,6 +1041,10 @@ PY
         ), mock.patch(
             "kyiv_open_data.build_kyiv_systems_artifact",
             side_effect=KyivOpenDataError("simulated Kyiv outage"),
+        ), mock.patch.dict(
+            os.environ,
+            {"HALTEWECKER_EXTERNAL_BUILD_CACHE_EXACT_ONLY": "1"},
+            clear=False,
         ):
             with self.assertRaises(KyivOpenDataError):
                 stop_package_builder.main([
@@ -1055,6 +1062,13 @@ PY
                     "--previous-stop-data",
                     str(self.data_root / "current"),
                 ])
+
+        forwarded_environment = captured_external_kwargs["environ"]
+        self.assertIsInstance(forwarded_environment, dict)
+        self.assertEqual(
+            forwarded_environment["HALTEWECKER_EXTERNAL_BUILD_CACHE_EXACT_ONLY"],
+            "1",
+        )
 
         self.assertEqual(
             (self.data_root / "current" / "release-marker").read_text(encoding="utf-8"),

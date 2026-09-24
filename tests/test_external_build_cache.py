@@ -22,6 +22,9 @@ from external_build_cache import (
     CacheKeyUnavailable,
     ExternalBuildCache,
     cache_provider_allowed,
+    code_fingerprint,
+    COMPATIBLE_LEGACY_BUILDER_FINGERPRINTS,
+    semantic_builder_fingerprint,
     legacy_builder_fingerprint,
     projection_fingerprint,
     legacy_provider_config_fingerprint,
@@ -673,6 +676,82 @@ class ExternalBuildCacheTests(unittest.TestCase):
 
             self.assertEqual(lookup.status, "HIT")
             self.assertEqual(lookup.key.value, key.value)
+
+    def test_orchestration_only_change_keeps_semantic_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for relative in (
+                "scripts/external_gtfs.py",
+                "scripts/external_staging.py",
+                "scripts/gtfs_csv.py",
+                "scripts/build_stop_packages.py",
+            ):
+                destination = root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(REPOSITORY_ROOT / relative, destination)
+            semantic_before = semantic_builder_fingerprint(root)
+            code_before = code_fingerprint(root)
+            wrapper = root / "scripts/build_stop_packages.py"
+            wrapper.write_bytes(
+                wrapper.read_bytes().replace(
+                    b"            environ=dict(os.environ),\n",
+                    b"",
+                )
+            )
+            self.assertEqual(semantic_builder_fingerprint(root), semantic_before)
+            self.assertNotEqual(code_fingerprint(root), code_before)
+
+    def test_semantic_transformer_change_changes_semantic_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for relative in (
+                "scripts/external_gtfs.py",
+                "scripts/external_staging.py",
+                "scripts/gtfs_csv.py",
+            ):
+                destination = root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(REPOSITORY_ROOT / relative, destination)
+            semantic_before = semantic_builder_fingerprint(root)
+            staging = root / "scripts/external_staging.py"
+            staging.write_bytes(staging.read_bytes() + b"\n# semantic fixture change\n")
+            self.assertNotEqual(semantic_builder_fingerprint(root), semantic_before)
+
+    def test_explicit_legacy_fingerprint_is_hit_compatible(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "cta.zip"
+            _write_feed(feed)
+            source = self._source(feed)
+            compatible = next(iter(COMPATIBLE_LEGACY_BUILDER_FINGERPRINTS["external-gtfs-v1"]))
+            with mock.patch(
+                "external_build_cache.builder_fingerprint",
+                return_value=compatible,
+            ):
+                self._build_once(root, feed)
+            directory = self._cache_directory(root)
+            manifest_path = directory / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest.pop("semanticSchemaVersion", None)
+            manifest.pop("semanticFingerprint", None)
+            manifest.pop("codeFingerprint", None)
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            current_key = external_gtfs.cache_key(
+                repository_root=REPOSITORY_ROOT,
+                provider_id="cta-chicago",
+                raw_sha256=artifact_provenance(feed)[0],
+                source=source,
+                city_id="chicago",
+            )
+            cache = ExternalBuildCache(
+                root / "gtfs-cache" / "external-build",
+                provider_id="cta-chicago",
+                city_id="chicago",
+                include_trip_index=bool(source.get("buildTripIndex", True)),
+            )
+            lookup = cache.probe(current_key)
+            self.assertEqual(lookup.status, "HIT_COMPATIBLE")
+            self.assertEqual(lookup.key.builder_fingerprint, compatible)
 
     def test_exact_probe_rejects_922847_fingerprint_and_hits_current_key(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

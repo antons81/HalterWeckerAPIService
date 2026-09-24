@@ -31,6 +31,7 @@ try:
         cache_enabled,
         cache_key,
         cache_provider_allowed,
+        canonical_merge_group_members,
         transformed_cache_enabled,
     )
     from .external_gtfs import load_external_cities, load_external_gtfs_sources
@@ -63,6 +64,7 @@ except ImportError:
         cache_enabled,
         cache_key,
         cache_provider_allowed,
+        canonical_merge_group_members,
         transformed_cache_enabled,
     )
     from external_gtfs import load_external_cities, load_external_gtfs_sources
@@ -473,16 +475,7 @@ def _merge_group_members(
     source: Mapping[str, object],
     sources: Mapping[str, Mapping[str, object]],
 ) -> tuple[str, ...]:
-    merge_group = str(source.get("mergeGroup", "")).strip()
-    if not merge_group:
-        return ()
-    return tuple(
-        sorted(
-            candidate_id
-            for candidate_id, candidate in sources.items()
-            if str(candidate.get("mergeGroup", "")).strip() == merge_group
-        )
-    )
+    return canonical_merge_group_members(source, sources)
 
 
 def _archive_member_fingerprints(archive) -> dict[str, str]:
@@ -599,7 +592,7 @@ def _load_structural_provider_context(
         f"reason={lookup.reason} key={key.value[:12]} rawSHA={raw_sha[:12]}",
         flush=True,
     )
-    if lookup.status != "HIT":
+    if lookup.status not in {"HIT", "HIT_COMPATIBLE"}:
         raise ValueError(
             f"structural-sufficient cache is not reusable for {provider_id}: "
             f"{lookup.status} {lookup.reason}"
