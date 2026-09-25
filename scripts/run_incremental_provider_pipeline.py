@@ -951,6 +951,7 @@ def full_chain_preflight(
     dates: list[date],
     provider_ids: tuple[str, ...],
     raw_snapshot: Mapping[str, Mapping[str, object]],
+    common_snapshot_fingerprint: str | None = None,
 ) -> dict[str, object]:
     """Probe the complete runtime artifact chain without building or mutating cache."""
     selection_plan = provider_selection_plan(
@@ -1088,6 +1089,7 @@ def full_chain_preflight(
                     stop_data=stop_data_root,
                     dates=dates,
                     environ=environment,
+                    common_snapshot_fingerprint=common_snapshot_fingerprint,
                 )
                 report["structural"] = {
                     "status": probes.structural.status,
@@ -1221,6 +1223,7 @@ def build_incremental_candidate(
     dates: list[date],
     provider_ids: tuple[str, ...] | None = None,
     raw_snapshot: Mapping[str, Mapping[str, object]] | None = None,
+    common_snapshot_fingerprint: str | None = None,
 ) -> dict[str, object]:
     selection_plan = provider_selection_plan(
         repository_root,
@@ -1326,6 +1329,7 @@ def build_incremental_candidate(
                 stop_data=stop_data_root,
                 dates=dates,
                 environ=environment,
+                common_snapshot_fingerprint=common_snapshot_fingerprint,
             )
             structural = artifacts_use.structural
             temporal = artifacts_use.temporal
@@ -1606,6 +1610,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--normalized-cache-root", type=Path)
     parser.add_argument("--static-artifact-root", type=Path)
     parser.add_argument("--raw-snapshot-manifest", type=Path)
+    parser.add_argument("--common-snapshot-fingerprint")
     parser.add_argument("--valid-from", type=date.fromisoformat)
     parser.add_argument("--valid-through", type=date.fromisoformat)
     parser.add_argument("--window-days", type=int, default=DEFAULT_WINDOW_DAYS)
@@ -1675,6 +1680,7 @@ def main(argv: list[str] | None = None) -> int:
             dates=dates,
             provider_ids=tuple(selection_plan["selectedProviders"]),
             raw_snapshot=raw_snapshot,
+            common_snapshot_fingerprint=args.common_snapshot_fingerprint,
         )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
         return 0 if result["status"] == "PASS" else 1
@@ -1718,6 +1724,7 @@ def main(argv: list[str] | None = None) -> int:
             dates=dates,
             provider_ids=tuple(selection_plan["selectedProviders"]),
             raw_snapshot=raw_snapshot,
+            common_snapshot_fingerprint=args.common_snapshot_fingerprint,
         )
     except Exception as error:
         traceback.print_exc(file=sys.stderr)

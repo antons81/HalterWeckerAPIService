@@ -489,6 +489,37 @@ def _stop_data_fingerprint(stop_data: Path, city_ids: set[str]) -> str:
     )
 
 
+def _resolve_stop_data_fingerprint(
+    stop_data: Path,
+    city_ids: set[str],
+    common_snapshot_fingerprint: str | None,
+) -> str:
+    """Resolve the provider-local or explicitly validated common snapshot identity."""
+    if common_snapshot_fingerprint is None:
+        return _stop_data_fingerprint(stop_data, city_ids)
+
+    supplied = str(common_snapshot_fingerprint).strip().lower()
+    if len(supplied) != 64 or any(
+        character not in "0123456789abcdef" for character in supplied
+    ):
+        raise StaticProviderArtifactError(
+            "common snapshot fingerprint must be a lowercase SHA-256 value"
+        )
+    try:
+        manifest = json.loads((stop_data / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise StaticProviderArtifactError(
+            f"Cannot validate common snapshot fingerprint: {error}"
+        ) from error
+    declared = str(manifest.get("stopDataFingerprint", "")).strip().lower()
+    if declared != supplied:
+        raise StaticProviderArtifactError(
+            "common snapshot fingerprint does not match stop-data manifest: "
+            f"supplied={supplied} declared={declared or '<missing>'}"
+        )
+    return supplied
+
+
 def _structural_key(
     *,
     provider_id: str,
@@ -965,6 +996,7 @@ def _temporal_manifest(
     calendar_fingerprints: Mapping[str, object],
     builder_fingerprint: str,
     database_path: Path,
+    stop_data_fingerprint: str | None = None,
 ) -> dict[str, object]:
     digest, size = _manifest_provenance(database_path)
     row_counts = _validate_database(
@@ -972,20 +1004,23 @@ def _temporal_manifest(
         required_tables=TEMPORAL_TABLES,
         expected_columns=TEMPORAL_COLUMNS,
     )
+    dependencies = {
+        "timezone": timezone,
+        "validFrom": valid_from.isoformat(),
+        "validThrough": valid_through.isoformat(),
+        "calendarSemantics": _canonical_value(calendar_fingerprints),
+        "temporalBuilderFingerprint": builder_fingerprint,
+        "temporalSchemaFingerprint": _temporal_schema_fingerprint(),
+    }
+    if stop_data_fingerprint is not None:
+        dependencies["stopDataFingerprint"] = stop_data_fingerprint
     return {
         "artifactType": "temporal",
         "temporalSchemaVersion": TEMPORAL_SCHEMA_VERSION,
         "providerID": provider_id,
         "artifactKey": artifact_key,
         "structuralArtifactKey": structural_key,
-        "dependencies": {
-            "timezone": timezone,
-            "validFrom": valid_from.isoformat(),
-            "validThrough": valid_through.isoformat(),
-            "calendarSemantics": _canonical_value(calendar_fingerprints),
-            "temporalBuilderFingerprint": builder_fingerprint,
-            "temporalSchemaFingerprint": _temporal_schema_fingerprint(),
-        },
+        "dependencies": dependencies,
         "status": "complete",
         "validation": {
             "fullSha256": True,
@@ -1017,6 +1052,7 @@ def resolve_static_provider_artifact_identity(
     stop_data: Path,
     dates: list[date],
     environ: Mapping[str, str] | None = None,
+    common_snapshot_fingerprint: str | None = None,
 ) -> StaticProviderArtifactIdentity:
     """Resolve the immutable structural and temporal identities used by runtime."""
     if not provider_capability(repository_root, provider_id, STATIC_PROVIDER):
@@ -1069,7 +1105,11 @@ def resolve_static_provider_artifact_identity(
 
     city_ids = {str(city["id"]) for city in cities}
     projection_fingerprint = _projection_config_fingerprint(source, cities)
-    stop_data_fingerprint = _stop_data_fingerprint(stop_data, city_ids)
+    stop_data_fingerprint = _resolve_stop_data_fingerprint(
+        stop_data,
+        city_ids,
+        common_snapshot_fingerprint,
+    )
     structural_schema = _structural_schema_fingerprint()
     structural_dependencies: dict[str, object] = {
         "providerProjectionConfigFingerprint": projection_fingerprint,
@@ -1126,6 +1166,8 @@ def resolve_static_provider_artifact_identity(
         "temporalBuilderFingerprint": temporal_builder,
         "temporalSchemaFingerprint": temporal_schema,
     }
+    if common_snapshot_fingerprint is not None:
+        temporal_dependencies["stopDataFingerprint"] = stop_data_fingerprint
     temporal_key = _temporal_key(
         provider_id=provider_id,
         structural_key=structural_key,
@@ -1219,6 +1261,7 @@ def probe_static_provider_artifacts(
     stop_data: Path,
     dates: list[date],
     environ: Mapping[str, str] | None = None,
+    common_snapshot_fingerprint: str | None = None,
 ) -> StaticProviderArtifactProbes:
     """Probe structural and temporal artifacts without building or mutating cache."""
     identity = resolve_static_provider_artifact_identity(
@@ -1231,6 +1274,7 @@ def probe_static_provider_artifacts(
         stop_data=stop_data,
         dates=dates,
         environ=environ,
+        common_snapshot_fingerprint=common_snapshot_fingerprint,
     )
     structural = _probe_existing_artifact(
         artifact_key=identity.structural_key,
@@ -1385,6 +1429,7 @@ def load_or_build_static_provider_artifacts(
     stop_data: Path,
     dates: list[date],
     environ: Mapping[str, str] | None = None,
+    common_snapshot_fingerprint: str | None = None,
 ) -> StaticProviderArtifacts:
     if not provider_capability(repository_root, provider_id, STATIC_PROVIDER):
         raise StaticProviderArtifactError(
@@ -1429,7 +1474,11 @@ def load_or_build_static_provider_artifacts(
         structural_builder = _builder_fingerprint(repository_root)
     city_ids = {str(city["id"]) for city in cities}
     projection_fingerprint = _projection_config_fingerprint(source, cities)
-    stop_data_fingerprint = _stop_data_fingerprint(stop_data, city_ids)
+    stop_data_fingerprint = _resolve_stop_data_fingerprint(
+        stop_data,
+        city_ids,
+        common_snapshot_fingerprint,
+    )
     structural_schema = _structural_schema_fingerprint()
     structural_dependencies = {
         "providerProjectionConfigFingerprint": projection_fingerprint,
@@ -1481,6 +1530,7 @@ def load_or_build_static_provider_artifacts(
         stop_data=stop_data,
         dates=dates,
         environ=environ,
+        common_snapshot_fingerprint=common_snapshot_fingerprint,
     )
     structural_key = identity.structural_key
     structural_dependencies = identity.structural_dependencies
@@ -1578,6 +1628,9 @@ def load_or_build_static_provider_artifacts(
             calendar_fingerprints=calendar_fingerprints,
             builder_fingerprint=temporal_builder,
             database_path=database_path,
+            stop_data_fingerprint=(
+                stop_data_fingerprint if common_snapshot_fingerprint is not None else None
+            ),
         ),
         database_builder=lambda database_path: _build_temporal_database(
             database_path,

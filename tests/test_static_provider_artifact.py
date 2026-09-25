@@ -111,6 +111,7 @@ class StaticProviderArtifactTests(unittest.TestCase):
         cities: list[dict],
         stop_data: Path,
         dates: list[date],
+        common_snapshot_fingerprint: str | None = None,
     ) -> static_artifact.StaticProviderArtifacts:
         context, normalized_use = self._build_normalized(root, feed)
         try:
@@ -123,6 +124,7 @@ class StaticProviderArtifactTests(unittest.TestCase):
                 cities=cities,
                 stop_data=stop_data,
                 dates=dates,
+                common_snapshot_fingerprint=common_snapshot_fingerprint,
                 environ={
                     static_artifact.ARTIFACT_ROOT_ENV: str(
                         root / "static-provider-artifacts"
@@ -768,6 +770,76 @@ class StaticProviderArtifactTests(unittest.TestCase):
             )
             self.assertEqual(first.structural.artifact_key, second.structural.artifact_key)
             self.assertEqual(second.structural.status, "HIT")
+
+    def test_explicit_common_snapshot_fingerprint_is_shared_and_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed, source, cities, stop_data = self._prepare_inputs(root)
+            fingerprint = "f" * 64
+            manifest_path = stop_data / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["stopDataFingerprint"] = fingerprint
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with patch.object(
+                static_artifact,
+                "_stop_data_fingerprint",
+                side_effect=AssertionError("provider-local resolver must be bypassed"),
+            ):
+                first = self._build_artifacts(
+                    root,
+                    feed,
+                    source,
+                    cities,
+                    stop_data,
+                    [date(2026, 1, 5)],
+                    common_snapshot_fingerprint=fingerprint,
+                )
+                context, normalized_use = self._build_normalized(root, feed)
+                try:
+                    probes = static_artifact.probe_static_provider_artifacts(
+                        normalized_artifact=normalized_use,
+                        repository_root=REPOSITORY_ROOT,
+                        provider_id="israel-mot",
+                        source=source,
+                        cities=cities,
+                        stop_data=stop_data,
+                        dates=[date(2026, 1, 5)],
+                        common_snapshot_fingerprint=fingerprint,
+                        environ={
+                            static_artifact.ARTIFACT_ROOT_ENV: str(
+                                root / "static-provider-artifacts"
+                            ),
+                        },
+                    )
+                finally:
+                    context.close()
+
+            self.assertEqual(first.structural.status, "MISS")
+            self.assertEqual(first.temporal.status, "MISS")
+            self.assertEqual(probes.structural.status, "HIT")
+            self.assertEqual(probes.temporal.status, "HIT")
+            self.assertEqual(
+                first.structural.manifest["dependencies"]["stopDataFingerprint"],
+                fingerprint,
+            )
+            self.assertEqual(
+                first.temporal.manifest["dependencies"]["stopDataFingerprint"],
+                fingerprint,
+            )
+            self.assertEqual(first.structural.artifact_key, probes.structural.artifact_key)
+            self.assertEqual(first.temporal.artifact_key, probes.temporal.artifact_key)
+
+            with self.assertRaises(static_artifact.StaticProviderArtifactError):
+                self._build_artifacts(
+                    root,
+                    feed,
+                    source,
+                    cities,
+                    stop_data,
+                    [date(2026, 1, 5)],
+                    common_snapshot_fingerprint="e" * 64,
+                )
 
     def test_structural_schema_version_invalidates_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
