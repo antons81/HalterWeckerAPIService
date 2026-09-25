@@ -622,6 +622,57 @@ def load_existing_for_raw_sha(
     )
 
 
+def probe_existing_for_raw_sha(
+    *,
+    repository_root: Path,
+    provider_id: str,
+    raw_artifact_sha256: str,
+    gtfs_cache_root: Path | None,
+    environ: dict[str, str] | None = None,
+) -> NormalizedArtifactUse:
+    """Probe a raw-SHA normalized artifact without mutating or building cache."""
+    if not provider_enabled(provider_id, repository_root):
+        raise NormalizedArtifactError(f"provider is not enabled: {provider_id}")
+    raw_sha = str(raw_artifact_sha256 or "").strip()
+    if not raw_sha:
+        raise NormalizedArtifactError("raw artifact SHA-256 is unavailable")
+    started = time.monotonic()
+    provider_root = default_cache_root(
+        gtfs_cache_root=gtfs_cache_root,
+        environ=environ,
+    ) / provider_id
+    raw_index = _read_raw_index(provider_root / "raw-sha-index.json")
+    semantic_key = raw_index.get(raw_sha)
+    if not semantic_key:
+        raise NormalizedArtifactError(
+            "persistent normalized artifact is absent for raw artifact SHA-256"
+        )
+    directory = provider_root / semantic_key
+    try:
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        validated = _validate_manifest(
+            manifest,
+            directory=directory,
+            provider_id=provider_id,
+            semantic_key=semantic_key,
+            builder=builder_fingerprint(repository_root),
+            expected_raw_sha256=raw_sha,
+        )
+    except (OSError, TypeError, ValueError, NormalizedArtifactError) as error:
+        raise NormalizedArtifactError(
+            f"persistent normalized artifact INVALID: {error}"
+        ) from error
+    database_path = directory / "normalized.sqlite"
+    return NormalizedArtifactUse(
+        status="HIT_COMPATIBLE",
+        reason="raw SHA index matched; persistent artifact validated without build",
+        semantic_key=semantic_key,
+        artifact_directory=directory,
+        database_path=database_path,
+        manifest=validated,
+        duration_seconds=time.monotonic() - started,
+    )
+
 def load_or_build(
     *,
     archive,

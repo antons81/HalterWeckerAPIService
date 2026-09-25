@@ -186,6 +186,39 @@ class StaticProviderArtifacts:
     structural: StaticProviderArtifactUse
     temporal: StaticProviderArtifactUse
 
+@dataclass(frozen=True)
+class StaticProviderArtifactIdentity:
+    provider_id: str
+    structural_key: str
+    structural_directory: Path
+    structural_dependencies: dict[str, object]
+    structural_fields: dict[str, object]
+    structural_context_kind: str
+    structural_input_key: str
+    stop_set_digest: str
+    normalized_semantic_key: str
+    structural_provenance: dict[str, object]
+    calendar_fingerprints: dict[str, object]
+    timezone: str
+    temporal_key: str
+    temporal_directory: Path
+    temporal_dependencies: dict[str, object]
+
+
+@dataclass(frozen=True)
+class StaticProviderArtifactProbe:
+    status: str
+    reason: str
+    artifact_key: str
+    artifact_directory: Path
+    database_path: Path
+    manifest: dict[str, object] | None
+
+
+@dataclass(frozen=True)
+class StaticProviderArtifactProbes:
+    structural: StaticProviderArtifactProbe
+    temporal: StaticProviderArtifactProbe
 
 def feature_enabled(environ: Mapping[str, str] | None = None) -> bool:
     values = environ if environ is not None else os.environ
@@ -973,6 +1006,257 @@ def _publish_directory(temporary: Path, destination: Path) -> None:
     os.replace(temporary, destination)
 
 
+def resolve_static_provider_artifact_identity(
+    *,
+    normalized_artifact=None,
+    structural_context=None,
+    repository_root: Path,
+    provider_id: str,
+    source: Mapping[str, object],
+    cities: list[dict[str, object]],
+    stop_data: Path,
+    dates: list[date],
+    environ: Mapping[str, str] | None = None,
+) -> StaticProviderArtifactIdentity:
+    """Resolve the immutable structural and temporal identities used by runtime."""
+    if not provider_capability(repository_root, provider_id, STATIC_PROVIDER):
+        raise StaticProviderArtifactError(
+            f"Static provider artifacts are not enabled for {provider_id}"
+        )
+    if not dates:
+        raise StaticProviderArtifactError("Temporal provider artifact requires dates")
+    structural_mode = structural_context is not None
+    if structural_mode:
+        if normalized_artifact is not None:
+            raise StaticProviderArtifactError(
+                "Structural-sufficient artifacts cannot receive normalized artifact"
+            )
+        if str(structural_context.provider_id) != provider_id:
+            raise StaticProviderArtifactError(
+                f"Structural context provider mismatch: expected={provider_id} "
+                f"actual={structural_context.provider_id}"
+            )
+        structural_input_key = str(structural_context.structural_input_key).strip()
+        stop_set_digest = str(structural_context.stop_set_digest).strip()
+        if not structural_input_key or not stop_set_digest:
+            raise StaticProviderArtifactError(
+                "Structural-sufficient context provenance is incomplete"
+            )
+        normalized_key = ""
+        calendar_fingerprints = dict(structural_context.calendar_fingerprints)
+        context_kind = STRUCTURAL_CONTEXT_KIND
+        structural_builder = _structural_sufficient_builder_fingerprint(repository_root)
+        structural_provenance = dict(structural_context.provenance)
+        if not structural_provenance:
+            raise StaticProviderArtifactError(
+                "Structural-sufficient context provenance is incomplete"
+            )
+    else:
+        if normalized_artifact is None:
+            raise StaticProviderArtifactError(
+                "Normalized artifact context is required for normalized strategy"
+            )
+        structural_input_key = ""
+        stop_set_digest = ""
+        normalized_key = str(normalized_artifact.semantic_key)
+        calendar_fingerprints = {
+            name: normalized_artifact.manifest.get("fileFingerprints", {}).get(name)
+            for name in ("calendar.txt", "calendar_dates.txt")
+        }
+        context_kind = "normalized-required"
+        structural_builder = _builder_fingerprint(repository_root)
+        structural_provenance = {}
+
+    city_ids = {str(city["id"]) for city in cities}
+    projection_fingerprint = _projection_config_fingerprint(source, cities)
+    stop_data_fingerprint = _stop_data_fingerprint(stop_data, city_ids)
+    structural_schema = _structural_schema_fingerprint()
+    structural_dependencies: dict[str, object] = {
+        "providerProjectionConfigFingerprint": projection_fingerprint,
+        "stopDataFingerprint": stop_data_fingerprint,
+        "staticImporterFingerprint": structural_builder,
+        "structuralSchemaFingerprint": structural_schema,
+    }
+    if structural_mode:
+        structural_key = _structural_sufficient_key(
+            provider_id=provider_id,
+            structural_input_key=structural_input_key,
+            stop_set_digest=stop_set_digest,
+            projection_config_fingerprint=projection_fingerprint,
+            stop_data_fingerprint=stop_data_fingerprint,
+            builder_fingerprint=structural_builder,
+            structural_schema_fingerprint=structural_schema,
+        )
+        structural_dependencies.update(
+            {
+                "structuralContextKind": context_kind,
+                "structuralInputKey": structural_input_key,
+                "stopSetDigest": stop_set_digest,
+                "structuralProvenance": _canonical_value(structural_provenance),
+            }
+        )
+        structural_fields = {
+            "structuralContextKind": context_kind,
+            "structuralInputKey": structural_input_key,
+            "stopSetDigest": stop_set_digest,
+        }
+    else:
+        structural_key = _structural_key(
+            provider_id=provider_id,
+            normalized_semantic_key=normalized_key,
+            projection_config_fingerprint=projection_fingerprint,
+            stop_data_fingerprint=stop_data_fingerprint,
+            builder_fingerprint=structural_builder,
+            structural_schema_fingerprint=structural_schema,
+        )
+        structural_fields = {
+            "normalizedArtifactSemanticKey": normalized_key,
+        }
+
+    root = _artifact_root_for(provider_id, repository_root, environ)
+    structural_directory = root / structural_key
+    timezone = str(source["timezone"])
+    temporal_builder = _builder_fingerprint(repository_root, temporal=True)
+    temporal_schema = _temporal_schema_fingerprint()
+    temporal_dependencies: dict[str, object] = {
+        "timezone": timezone,
+        "validFrom": min(dates).isoformat(),
+        "validThrough": max(dates).isoformat(),
+        "calendarSemantics": _canonical_value(calendar_fingerprints),
+        "temporalBuilderFingerprint": temporal_builder,
+        "temporalSchemaFingerprint": temporal_schema,
+    }
+    temporal_key = _temporal_key(
+        provider_id=provider_id,
+        structural_key=structural_key,
+        timezone=timezone,
+        valid_from=min(dates),
+        valid_through=max(dates),
+        calendar_fingerprints=calendar_fingerprints,
+        builder_fingerprint=temporal_builder,
+        temporal_schema_fingerprint=temporal_schema,
+    )
+    return StaticProviderArtifactIdentity(
+        provider_id=provider_id,
+        structural_key=structural_key,
+        structural_directory=structural_directory,
+        structural_dependencies=structural_dependencies,
+        structural_fields=structural_fields,
+        structural_context_kind=context_kind,
+        structural_input_key=structural_input_key,
+        stop_set_digest=stop_set_digest,
+        normalized_semantic_key=normalized_key,
+        structural_provenance=structural_provenance,
+        calendar_fingerprints=calendar_fingerprints,
+        timezone=timezone,
+        temporal_key=temporal_key,
+        temporal_directory=structural_directory / "temporal" / temporal_key,
+        temporal_dependencies=temporal_dependencies,
+    )
+
+
+def _probe_existing_artifact(
+    *,
+    artifact_key: str,
+    artifact_directory: Path,
+    expected_provider_id: str,
+    artifact_type: str,
+    required_tables: tuple[str, ...],
+    required_indexes: tuple[str, ...],
+    expected_schema_version: int,
+    expected_dependencies: Mapping[str, object],
+    expected_fields: Mapping[str, object],
+) -> StaticProviderArtifactProbe:
+    database_path = artifact_directory / "provider.sqlite"
+    if not artifact_directory.exists():
+        return StaticProviderArtifactProbe(
+            status="MISS",
+            reason="artifact directory absent",
+            artifact_key=artifact_key,
+            artifact_directory=artifact_directory,
+            database_path=database_path,
+            manifest=None,
+        )
+    try:
+        manifest = _validate_manifest(
+            artifact_directory,
+            expected_artifact_key=artifact_key,
+            expected_provider_id=expected_provider_id,
+            expected_type=artifact_type,
+            required_tables=required_tables,
+            required_indexes=required_indexes,
+            expected_schema_version=expected_schema_version,
+            expected_dependencies=expected_dependencies,
+            expected_fields=expected_fields,
+        )
+    except StaticProviderArtifactError as error:
+        return StaticProviderArtifactProbe(
+            status="INVALID",
+            reason=str(error),
+            artifact_key=artifact_key,
+            artifact_directory=artifact_directory,
+            database_path=database_path,
+            manifest=None,
+        )
+    return StaticProviderArtifactProbe(
+        status="HIT",
+        reason="validated immutable artifact",
+        artifact_key=artifact_key,
+        artifact_directory=artifact_directory,
+        database_path=database_path,
+        manifest=manifest,
+    )
+
+
+def probe_static_provider_artifacts(
+    *,
+    normalized_artifact=None,
+    structural_context=None,
+    repository_root: Path,
+    provider_id: str,
+    source: Mapping[str, object],
+    cities: list[dict[str, object]],
+    stop_data: Path,
+    dates: list[date],
+    environ: Mapping[str, str] | None = None,
+) -> StaticProviderArtifactProbes:
+    """Probe structural and temporal artifacts without building or mutating cache."""
+    identity = resolve_static_provider_artifact_identity(
+        normalized_artifact=normalized_artifact,
+        structural_context=structural_context,
+        repository_root=repository_root,
+        provider_id=provider_id,
+        source=source,
+        cities=cities,
+        stop_data=stop_data,
+        dates=dates,
+        environ=environ,
+    )
+    structural = _probe_existing_artifact(
+        artifact_key=identity.structural_key,
+        artifact_directory=identity.structural_directory,
+        expected_provider_id=provider_id,
+        artifact_type="structural",
+        required_tables=STRUCTURAL_TABLES,
+        required_indexes=STRUCTURAL_INDEXES,
+        expected_schema_version=STRUCTURAL_SCHEMA_VERSION,
+        expected_dependencies=identity.structural_dependencies,
+        expected_fields=identity.structural_fields,
+    )
+    temporal = _probe_existing_artifact(
+        artifact_key=identity.temporal_key,
+        artifact_directory=identity.temporal_directory,
+        expected_provider_id=provider_id,
+        artifact_type="temporal",
+        required_tables=TEMPORAL_TABLES,
+        required_indexes=(),
+        expected_schema_version=TEMPORAL_SCHEMA_VERSION,
+        expected_dependencies=identity.temporal_dependencies,
+        expected_fields={"structuralArtifactKey": identity.structural_key},
+    )
+    return StaticProviderArtifactProbes(structural=structural, temporal=temporal)
+
+
 def _load_or_build_one(
     *,
     artifact_key: str,
@@ -1187,6 +1471,21 @@ def load_or_build_static_provider_artifacts(
             builder_fingerprint=structural_builder,
             structural_schema_fingerprint=structural_schema,
         )
+    identity = resolve_static_provider_artifact_identity(
+        normalized_artifact=normalized_artifact,
+        structural_context=structural_context,
+        repository_root=repository_root,
+        provider_id=provider_id,
+        source=source,
+        cities=cities,
+        stop_data=stop_data,
+        dates=dates,
+        environ=environ,
+    )
+    structural_key = identity.structural_key
+    structural_dependencies = identity.structural_dependencies
+    structural_provenance = identity.structural_provenance
+    context_kind = identity.structural_context_kind
     root = _artifact_root_for(provider_id, repository_root, environ)
     structural_directory = root / structural_key
     structural = _load_or_build_one(
@@ -1254,7 +1553,10 @@ def load_or_build_static_provider_artifacts(
         builder_fingerprint=temporal_builder,
         temporal_schema_fingerprint=temporal_schema,
     )
-    temporal_directory = structural_directory / "temporal" / temporal_key
+    temporal_key = identity.temporal_key
+    temporal_directory = identity.temporal_directory
+    temporal_dependencies = identity.temporal_dependencies
+    timezone = identity.timezone
     temporal = _load_or_build_one(
         artifact_key=temporal_key,
         artifact_directory=temporal_directory,

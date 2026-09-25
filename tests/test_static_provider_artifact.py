@@ -9,6 +9,7 @@ from contextlib import redirect_stdout
 from datetime import date, timedelta
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 TESTS_ROOT = Path(__file__).resolve().parent
 REPOSITORY_ROOT = TESTS_ROOT.parent
@@ -553,6 +554,89 @@ class StaticProviderArtifactTests(unittest.TestCase):
                 self._build_structural_artifacts(
                     root, feed, source, cities, stop_data, [date(2026, 1, 5)]
                 )
+
+    def test_read_only_probe_hits_without_invoking_builders(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed, source, cities, stop_data = self._prepare_inputs(root)
+            artifacts = self._build_artifacts(
+                root, feed, source, cities, stop_data, [date(2026, 1, 5)]
+            )
+            context, normalized_use = self._build_normalized(root, feed)
+            try:
+                environment = {
+                    static_artifact.ARTIFACT_ROOT_ENV: str(
+                        root / "static-provider-artifacts"
+                    ),
+                }
+                with (
+                    patch.object(
+                        static_artifact,
+                        "_build_structural_database",
+                        side_effect=AssertionError("read-only probe invoked builder"),
+                    ),
+                    patch.object(
+                        static_artifact,
+                        "_build_temporal_database",
+                        side_effect=AssertionError("read-only probe invoked builder"),
+                    ),
+                ):
+                    probes = static_artifact.probe_static_provider_artifacts(
+                        normalized_artifact=normalized_use,
+                        repository_root=REPOSITORY_ROOT,
+                        provider_id="israel-mot",
+                        source=source,
+                        cities=cities,
+                        stop_data=stop_data,
+                        dates=[date(2026, 1, 5)],
+                        environ=environment,
+                    )
+            finally:
+                context.close()
+
+            self.assertEqual(probes.structural.status, "HIT")
+            self.assertEqual(probes.temporal.status, "HIT")
+            self.assertEqual(
+                probes.structural.artifact_key,
+                artifacts.structural.artifact_key,
+            )
+            self.assertEqual(probes.temporal.artifact_key, artifacts.temporal.artifact_key)
+
+    def test_read_only_probe_reports_missing_without_creating_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed, source, cities, stop_data = self._prepare_inputs(root)
+            context, normalized_use = self._build_normalized(root, feed)
+            artifact_root = root / "missing-static-provider-artifacts"
+            try:
+                with (
+                    patch.object(
+                        static_artifact,
+                        "_build_structural_database",
+                        side_effect=AssertionError("read-only probe invoked builder"),
+                    ),
+                    patch.object(
+                        static_artifact,
+                        "_build_temporal_database",
+                        side_effect=AssertionError("read-only probe invoked builder"),
+                    ),
+                ):
+                    probes = static_artifact.probe_static_provider_artifacts(
+                        normalized_artifact=normalized_use,
+                        repository_root=REPOSITORY_ROOT,
+                        provider_id="israel-mot",
+                        source=source,
+                        cities=cities,
+                        stop_data=stop_data,
+                        dates=[date(2026, 1, 5)],
+                        environ={static_artifact.ARTIFACT_ROOT_ENV: str(artifact_root)},
+                    )
+            finally:
+                context.close()
+
+            self.assertEqual(probes.structural.status, "MISS")
+            self.assertEqual(probes.temporal.status, "MISS")
+            self.assertFalse(artifact_root.exists())
 
     def test_anchored_window_reuses_temporal_artifact_within_iso_week(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

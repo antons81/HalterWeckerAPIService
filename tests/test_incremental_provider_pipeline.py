@@ -999,6 +999,120 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
             self.assertEqual(second.structural.bytes_written, 0)
             self.assertEqual(second.temporal.bytes_written, 0)
 
+    def test_full_chain_preflight_marks_structural_miss_no_go(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw_path = root / "sweden.zip"
+            raw_path.write_bytes(b"fixture raw")
+            source = {
+                "timezone": "Europe/Stockholm",
+                "departurePackageDays": 3,
+            }
+            build_key = SimpleNamespace(
+                value="b" * 64,
+                builder_fingerprint="builder-fingerprint",
+                city_ids=("sweden-city",),
+                projection_fingerprint="projection-fingerprint",
+            )
+            build_lookup = SimpleNamespace(
+                status="HIT",
+                reason="validated manifest and artifacts",
+                directory=None,
+            )
+            static_probe = SimpleNamespace(
+                structural=SimpleNamespace(
+                    status="MISS",
+                    reason="artifact directory absent",
+                    artifact_key="structural-key",
+                    artifact_directory=root / "structural",
+                ),
+                temporal=SimpleNamespace(
+                    status="MISS",
+                    reason="artifact directory absent",
+                    artifact_key="temporal-key",
+                    artifact_directory=root / "temporal",
+                ),
+            )
+            archive = Mock()
+            context = SimpleNamespace(close=Mock())
+            with (
+                unittest.mock.patch.object(
+                    incremental,
+                    "provider_selection_plan",
+                    return_value={"selectedProviders": ["sweden"]},
+                ),
+                unittest.mock.patch.object(
+                    incremental,
+                    "validate_incremental_artifact_strategies",
+                    return_value={"sweden": incremental.STRUCTURAL_SUFFICIENT},
+                ),
+                unittest.mock.patch.object(
+                    incremental,
+                    "_source_map",
+                    return_value={"sweden": source},
+                ),
+                unittest.mock.patch.object(
+                    incremental,
+                    "_raw_entry",
+                    return_value=(raw_path, "a" * 64),
+                ),
+                unittest.mock.patch.object(
+                    incremental,
+                    "load_external_cities",
+                    return_value=[{"id": "sweden-city"}],
+                ),
+                unittest.mock.patch.object(
+                    incremental,
+                    "_probe_external_build_cache",
+                    return_value=(build_key, build_lookup, ("sweden-city",)),
+                ),
+                unittest.mock.patch.object(
+                    incremental,
+                    "load_gtfs_archive",
+                    return_value=archive,
+                ),
+                unittest.mock.patch.object(
+                    incremental,
+                    "_archive_member_fingerprints",
+                    return_value={},
+                ),
+                unittest.mock.patch.object(
+                    incremental,
+                    "_stop_data_stop_set_digest",
+                    return_value="c" * 64,
+                ),
+                unittest.mock.patch.object(
+                    incremental,
+                    "StructuralProviderContext",
+                    return_value=context,
+                ),
+                unittest.mock.patch.object(
+                    incremental,
+                    "probe_static_provider_artifacts",
+                    return_value=static_probe,
+                ),
+            ):
+                report = incremental.full_chain_preflight(
+                    repository_root=REPOSITORY_ROOT,
+                    stop_data_root=root / "stop-data",
+                    normalized_cache_root=root / "provider-artifacts" / "normalized",
+                    static_artifact_root=root / "provider-artifacts" / "static",
+                    dates=[date(2026, 9, 21)],
+                    provider_ids=("sweden",),
+                    raw_snapshot={},
+                )
+
+            self.assertEqual(report["status"], "NO-GO")
+            self.assertEqual(report["mandatoryMissCount"], 2)
+            self.assertEqual(
+                {
+                    (item["providerID"], item["stage"])
+                    for item in report["mandatoryMisses"]
+                },
+                {("sweden", "structural"), ("sweden", "temporal")},
+            )
+            archive.close.assert_called_once_with()
+            context.close.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,17 +26,27 @@ try:
     from .common_catalog import build_common_catalog
     from .external_build_cache import (
         CACHEABLE_PROVIDER_CITY_IDS,
+        DeparturePartitionCache,
         TRANSFORMED_CACHE_PROVIDER_IDS,
         ExternalBuildCache,
         cache_enabled,
         cache_key,
         cache_provider_allowed,
         canonical_merge_group_members,
+        departure_partition_key,
+        departure_stop_set_digest,
         transformed_cache_enabled,
     )
-    from .external_gtfs import load_external_cities, load_external_gtfs_sources
+    from .external_gtfs import (
+        _departure_service_dates,
+        load_external_cities,
+        load_external_gtfs_sources,
+    )
     from .external_staging import StructuralProviderContext
-    from .normalized_provider_artifact import load_or_build as load_or_build_normalized
+    from .normalized_provider_artifact import (
+        load_or_build as load_or_build_normalized,
+        probe_existing_for_raw_sha,
+    )
     from .provider_release_assembler import (
         ReleaseAssembly,
         assemble_release,
@@ -52,24 +62,37 @@ try:
         load_raw_snapshot_manifest,
         validate_raw_snapshot_entry,
     )
-    from .static_provider_artifact import load_or_build_static_provider_artifacts
+    from .static_provider_artifact import (
+        load_or_build_static_provider_artifacts,
+        probe_static_provider_artifacts,
+    )
 except ImportError:
     from artifact_provenance import artifact_provenance
     from build_stop_packages import load_gtfs_archive
     from common_catalog import build_common_catalog
     from external_build_cache import (
         CACHEABLE_PROVIDER_CITY_IDS,
+        DeparturePartitionCache,
         TRANSFORMED_CACHE_PROVIDER_IDS,
         ExternalBuildCache,
         cache_enabled,
         cache_key,
         cache_provider_allowed,
         canonical_merge_group_members,
+        departure_partition_key,
+        departure_stop_set_digest,
         transformed_cache_enabled,
     )
-    from external_gtfs import load_external_cities, load_external_gtfs_sources
+    from external_gtfs import (
+        _departure_service_dates,
+        load_external_cities,
+        load_external_gtfs_sources,
+    )
     from external_staging import StructuralProviderContext
-    from normalized_provider_artifact import load_or_build as load_or_build_normalized
+    from normalized_provider_artifact import (
+        load_or_build as load_or_build_normalized,
+        probe_existing_for_raw_sha,
+    )
     from provider_release_assembler import (
         ReleaseAssembly,
         assemble_release,
@@ -82,7 +105,10 @@ except ImportError:
         provider_artifact_strategy,
     )
     from raw_snapshot import load_raw_snapshot_manifest, validate_raw_snapshot_entry
-    from static_provider_artifact import load_or_build_static_provider_artifacts
+    from static_provider_artifact import (
+        load_or_build_static_provider_artifacts,
+        probe_static_provider_artifacts,
+    )
 
 
 INCREMENTAL_PROVIDER_IDS_ENV = "HALTEWECKER_INCREMENTAL_PROVIDER_IDS"
@@ -537,6 +563,48 @@ def _stop_data_stop_set_digest(stop_data_root: Path, city_ids: tuple[str, ...]) 
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _probe_external_build_cache(
+    *,
+    repository_root: Path,
+    provider_id: str,
+    raw_sha: str,
+    source: Mapping[str, object],
+    cities: list[dict[str, object]],
+    sources: Mapping[str, Mapping[str, object]],
+    normalized_cache_root: Path,
+    environ: Mapping[str, str],
+):
+    """Resolve and probe the same transformed cache identity used by runtime."""
+    if not cache_enabled(environ):
+        raise ValueError(
+            f"external build cache is disabled for selected provider: {provider_id}"
+        )
+    if not cache_provider_allowed(provider_id, environ):
+        raise ValueError(
+            f"external build cache is not allowlisted for selected provider: {provider_id}"
+        )
+    city_ids = tuple(str(city["id"]) for city in cities)
+    if not city_ids:
+        raise ValueError(f"provider has no cities: {provider_id}")
+    key = cache_key(
+        repository_root=repository_root,
+        provider_id=provider_id,
+        raw_sha256=raw_sha,
+        source=source,
+        city_id=city_ids[0],
+        city_ids=city_ids,
+        merge_group_members=_merge_group_members(provider_id, source, sources),
+    )
+    cache = ExternalBuildCache(
+        _external_build_cache_root(normalized_cache_root, environ),
+        provider_id=provider_id,
+        city_id=city_ids[0],
+        city_ids=city_ids,
+        include_trip_index=bool(source.get("buildTripIndex", True)),
+    )
+    return key, cache.probe(key), city_ids
+
+
 def _load_structural_provider_context(
     *,
     archive,
@@ -872,6 +940,273 @@ def _build_common_catalog(
         provider_city_stops=provider_city_stops,
         provider_modes=provider_modes,
     )
+
+
+def full_chain_preflight(
+    *,
+    repository_root: Path,
+    stop_data_root: Path,
+    normalized_cache_root: Path,
+    static_artifact_root: Path,
+    dates: list[date],
+    provider_ids: tuple[str, ...],
+    raw_snapshot: Mapping[str, Mapping[str, object]],
+) -> dict[str, object]:
+    """Probe the complete runtime artifact chain without building or mutating cache."""
+    selection_plan = provider_selection_plan(
+        repository_root,
+        provider_ids=provider_ids,
+    )
+    strategies = validate_incremental_artifact_strategies(repository_root, provider_ids)
+    sources = _source_map(repository_root)
+    environment = dict(os.environ)
+    environment["HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT"] = str(
+        normalized_cache_root
+    )
+    environment["HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT"] = str(
+        static_artifact_root
+    )
+    provider_reports: list[dict[str, object]] = []
+    mandatory_misses: list[dict[str, object]] = []
+    rollover_misses: list[dict[str, object]] = []
+
+    for provider_id in provider_ids:
+        source = dict(sources[provider_id])
+        strategy = strategies[provider_id]
+        report: dict[str, object] = {
+            "providerID": provider_id,
+            "strategy": strategy,
+            "raw": {"status": "MISS"},
+            "transformed": {"status": "NOT_PROBED"},
+            "normalized": {"status": "NOT_APPLICABLE"},
+            "structural": {"status": "NOT_PROBED"},
+            "temporal": {"status": "NOT_PROBED"},
+            "departurePartitions": [],
+        }
+        archive = None
+        normalized_use = None
+        structural_context = None
+        try:
+            raw_path, raw_sha = _raw_entry({}, provider_id, raw_snapshot=raw_snapshot)
+            report["raw"] = {
+                "status": "HIT",
+                "sha256": raw_sha,
+                "path": str(raw_path),
+            }
+            cities = load_external_cities(source, repository_root)
+            build_key, build_lookup, city_ids = _probe_external_build_cache(
+                repository_root=repository_root,
+                provider_id=provider_id,
+                raw_sha=raw_sha,
+                source=source,
+                cities=cities,
+                sources=sources,
+                normalized_cache_root=normalized_cache_root,
+                environ=environment,
+            )
+            report["transformed"] = {
+                "status": build_lookup.status,
+                "reason": build_lookup.reason,
+                "key": build_key.value,
+                "builderFingerprint": build_key.builder_fingerprint,
+                "directory": (
+                    str(build_lookup.directory)
+                    if build_lookup.directory is not None
+                    else None
+                ),
+                "mergeGroupMembers": list(build_key.city_ids),
+            }
+            if build_lookup.status not in {"HIT", "HIT_COMPATIBLE"}:
+                mandatory_misses.append(
+                    {
+                        "providerID": provider_id,
+                        "stage": "transformed",
+                        "status": build_lookup.status,
+                        "reason": build_lookup.reason,
+                    }
+                )
+
+            if strategy == NORMALIZED_REQUIRED:
+                try:
+                    normalized_use = probe_existing_for_raw_sha(
+                        repository_root=repository_root,
+                        provider_id=provider_id,
+                        raw_artifact_sha256=raw_sha,
+                        gtfs_cache_root=normalized_cache_root.parent / "gtfs",
+                        environ=environment,
+                    )
+                    report["normalized"] = {
+                        "status": normalized_use.status,
+                        "reason": normalized_use.reason,
+                        "key": normalized_use.semantic_key,
+                        "directory": str(normalized_use.artifact_directory),
+                    }
+                except Exception as error:
+                    report["normalized"] = {
+                        "status": "MISS",
+                        "reason": f"{type(error).__name__}: {error}",
+                    }
+                    mandatory_misses.append(
+                        {
+                            "providerID": provider_id,
+                            "stage": "normalized",
+                            "status": "MISS",
+                            "reason": str(error),
+                        }
+                    )
+            elif (
+                build_lookup.status in {"HIT", "HIT_COMPATIBLE"}
+                and strategy == STRUCTURAL_SUFFICIENT
+            ):
+                archive = load_gtfs_archive(str(raw_path))
+                structural_context = StructuralProviderContext(
+                    archive,
+                    provider_id=provider_id,
+                    structural_input_key=build_key.value,
+                    stop_set_digest=_stop_data_stop_set_digest(
+                        stop_data_root,
+                        city_ids,
+                    ),
+                    calendar_fingerprints=_archive_member_fingerprints(archive),
+                    provenance={
+                        "cacheKey": build_key.value,
+                        "rawSHA256": raw_sha,
+                        "cacheBuilderFingerprint": build_key.builder_fingerprint,
+                        "cacheCityIDs": list(build_key.city_ids),
+                        "cacheProjectionFingerprint": build_key.projection_fingerprint,
+                    },
+                )
+
+            if normalized_use is not None or structural_context is not None:
+                probes = probe_static_provider_artifacts(
+                    normalized_artifact=normalized_use,
+                    structural_context=structural_context,
+                    repository_root=repository_root,
+                    provider_id=provider_id,
+                    source=source,
+                    cities=cities,
+                    stop_data=stop_data_root,
+                    dates=dates,
+                    environ=environment,
+                )
+                report["structural"] = {
+                    "status": probes.structural.status,
+                    "reason": probes.structural.reason,
+                    "key": probes.structural.artifact_key,
+                    "directory": str(probes.structural.artifact_directory),
+                }
+                report["temporal"] = {
+                    "status": probes.temporal.status,
+                    "reason": probes.temporal.reason,
+                    "key": probes.temporal.artifact_key,
+                    "directory": str(probes.temporal.artifact_directory),
+                }
+                for stage, probe in (
+                    ("structural", probes.structural),
+                    ("temporal", probes.temporal),
+                ):
+                    if probe.status != "HIT":
+                        mandatory_misses.append(
+                            {
+                                "providerID": provider_id,
+                                "stage": stage,
+                                "status": probe.status,
+                                "reason": probe.reason,
+                                "key": probe.artifact_key,
+                            }
+                        )
+
+            if build_lookup.directory is not None:
+                departure_cache = DeparturePartitionCache(
+                    Path(_external_build_cache_root(normalized_cache_root, environment)).parent
+                    / "external-departure-partitions",
+                    provider_id,
+                )
+                departure_dates = _departure_service_dates(
+                    str(source["timezone"]),
+                    int(source.get("departurePackageDays", 3)),
+                )
+                for city_id in city_ids:
+                    stop_package = build_lookup.directory / "stops" / f"{city_id}.json"
+                    stop_digest, stop_count = departure_stop_set_digest(stop_package)
+                    for service_date in departure_dates:
+                        partition = departure_partition_key(
+                            repository_root=repository_root,
+                            provider_id=provider_id,
+                            city_id=city_id,
+                            service_date=service_date,
+                            raw_sha256=raw_sha,
+                            structural_input_key=build_key.value,
+                            stop_set_digest=stop_digest,
+                            calendar_fingerprint=raw_sha,
+                            source=source,
+                        )
+                        lookup = departure_cache.probe(partition)
+                        row = {
+                            "cityID": city_id,
+                            "serviceDate": service_date,
+                            "key": partition.value,
+                            "status": lookup.status,
+                            "reason": lookup.reason,
+                            "stopCount": stop_count,
+                        }
+                        report["departurePartitions"].append(row)
+                        if lookup.status == "MISS":
+                            rollover_misses.append(
+                                {
+                                    "providerID": provider_id,
+                                    "cityID": city_id,
+                                    "serviceDate": service_date,
+                                    "key": partition.value,
+                                }
+                            )
+                        elif lookup.status != "HIT":
+                            mandatory_misses.append(
+                                {
+                                    "providerID": provider_id,
+                                    "stage": "departure-partition",
+                                    "status": lookup.status,
+                                    "reason": lookup.reason,
+                                    "key": partition.value,
+                                }
+                            )
+        except Exception as error:
+            report["error"] = f"{type(error).__name__}: {error}"
+            mandatory_misses.append(
+                {
+                    "providerID": provider_id,
+                    "stage": "preflight",
+                    "status": "ERROR",
+                    "reason": str(error),
+                }
+            )
+        finally:
+            if archive is not None:
+                archive.close()
+        provider_reports.append(report)
+        provider_failed = any(
+            item["providerID"] == provider_id for item in mandatory_misses
+        )
+        print(
+            "[NightlyIncremental] stage=full-chain-preflight "
+            f"provider={provider_id} status={'NO-GO' if provider_failed else 'PASS'} "
+            + json.dumps(report, ensure_ascii=False, sort_keys=True),
+            flush=True,
+        )
+
+    return {
+        "status": "PASS" if not mandatory_misses else "NO-GO",
+        "selectionPlan": selection_plan,
+        "providers": provider_reports,
+        "mandatoryMisses": mandatory_misses,
+        "rolloverPartitionMisses": rollover_misses,
+        "mandatoryMissCount": len(mandatory_misses),
+        "rolloverPartitionMissCount": len(rollover_misses),
+        "dates": {
+            "validFrom": dates[0].isoformat(),
+            "validThrough": dates[-1].isoformat(),
+        },
+    }
 
 
 def build_incremental_candidate(
@@ -1274,6 +1609,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--valid-from", type=date.fromisoformat)
     parser.add_argument("--valid-through", type=date.fromisoformat)
     parser.add_argument("--window-days", type=int, default=DEFAULT_WINDOW_DAYS)
+    parser.add_argument("--full-chain-preflight", action="store_true")
     parser.add_argument("--result-json", type=Path)
     parser.add_argument("--selection-plan", action="store_true")
     return parser.parse_args(argv)
@@ -1308,6 +1644,40 @@ def main(argv: list[str] | None = None) -> int:
             f"manifest={args.raw_snapshot_manifest.resolve()} providers={len(raw_snapshot)}",
             flush=True,
         )
+    if args.full_chain_preflight:
+        required_arguments = {
+            "--stop-data": args.stop_data,
+            "--normalized-cache-root": args.normalized_cache_root,
+            "--static-artifact-root": args.static_artifact_root,
+        }
+        missing_arguments = [
+            name for name, value in required_arguments.items() if value is None
+        ]
+        if missing_arguments:
+            raise SystemExit(
+                "full-chain-preflight missing required arguments: "
+                + ", ".join(missing_arguments)
+            )
+        if raw_snapshot is None:
+            raise SystemExit(
+                "full-chain-preflight requires --raw-snapshot-manifest"
+            )
+        dates = service_dates(
+            valid_from=args.valid_from,
+            valid_through=args.valid_through,
+            window_days=args.window_days,
+        )
+        result = full_chain_preflight(
+            repository_root=repository_root,
+            stop_data_root=args.stop_data.resolve(),
+            normalized_cache_root=args.normalized_cache_root.resolve(),
+            static_artifact_root=args.static_artifact_root.resolve(),
+            dates=dates,
+            provider_ids=tuple(selection_plan["selectedProviders"]),
+            raw_snapshot=raw_snapshot,
+        )
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0 if result["status"] == "PASS" else 1
     required_arguments = {
         "--release-id": args.release_id,
         "--releases-root": args.releases_root,
