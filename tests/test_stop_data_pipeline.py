@@ -90,6 +90,15 @@ case \"${1:-}\" in
     ;;
   *run_incremental_provider_pipeline.py)
     printf '%s\n' "$*" >> "$INCREMENTAL_CALLS_LOG"
+    if [ -n "${INCREMENTAL_ENV_CALLS_LOG:-}" ]; then
+      {
+        printf 'HALTEWECKER_EXTERNAL_BUILD_CACHE=%s\n' "${HALTEWECKER_EXTERNAL_BUILD_CACHE:-}"
+        printf 'HALTEWECKER_EXTERNAL_BUILD_CACHE_ROOT=%s\n' "${HALTEWECKER_EXTERNAL_BUILD_CACHE_ROOT:-}"
+        printf 'HALTEWECKER_PROVIDER_ARTIFACT_ROOT=%s\n' "${HALTEWECKER_PROVIDER_ARTIFACT_ROOT:-}"
+        printf 'HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT=%s\n' "${HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT:-}"
+        printf 'HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT=%s\n' "${HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT:-}"
+      } >> "$INCREMENTAL_ENV_CALLS_LOG"
+    fi
     release_root=""
     release_id=""
     stop_data=""
@@ -526,6 +535,7 @@ PY
             "LINK_CALLS_LOG": str(self.root / "link-calls.log"),
             "STATE_WRITE_CALLS_LOG": str(self.root / "state-write-calls.log"),
             "INCREMENTAL_CALLS_LOG": str(self.root / "incremental-calls.log"),
+            "INCREMENTAL_ENV_CALLS_LOG": str(self.root / "incremental-env-calls.log"),
             "STATIC_CALLS_LOG": str(self.root / "static-calls.log"),
             "STAGED_STOP_DATA_LOG": str(self.root / "staged-stop-data.log"),
             "STATIC_DEPARTURES_PIPELINE": str(self.bin_directory / "static-departures-pipeline"),
@@ -821,6 +831,120 @@ PY
         self.assertIn("warning_free_gb=35", result.stdout)
         self.assertIn("minimum_free_gb=30", result.stdout)
         self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)
+
+    def test_manual_incremental_proof_floor_can_be_lowered_to_20_explicitly(self) -> None:
+        result = self.run_pipeline(
+            "--incremental-no-activate",
+            HALTEWECKER_INCREMENTAL_PROOF_OVERRIDE="1",
+            HALTEWECKER_MANUAL_PROOF_MIN_FREE_GB="20",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("warning_free_gb=25", result.stdout)
+        self.assertIn("minimum_free_gb=20", result.stdout)
+        self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)
+
+    def test_manual_incremental_proof_floor_can_be_lowered_to_15_explicitly(self) -> None:
+        result = self.run_pipeline(
+            "--incremental-no-activate",
+            HALTEWECKER_INCREMENTAL_PROOF_OVERRIDE="1",
+            HALTEWECKER_MANUAL_PROOF_MIN_FREE_GB="15",
+            DF_FREE_KB=str(50 * 1024 * 1024),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("warning_free_gb=20", result.stdout)
+        self.assertIn("minimum_free_gb=15", result.stdout)
+        self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)
+
+    def test_manual_floor_does_not_lower_production_shaped_guard_without_override(self) -> None:
+        result = self.run_pipeline(
+            "--incremental-no-activate",
+            HALTEWECKER_MANUAL_PROOF_MIN_FREE_GB="15",
+            DF_FREE_KB=str(55 * 1024 * 1024),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("mode=production-shaped-no-activate", result.stdout)
+        self.assertIn("minimum_free_gb=45", result.stdout)
+        self.assertNotIn("minimum_free_gb=15", result.stdout)
+
+    def test_frozen_contract_is_forwarded_through_real_wrapper_without_provider_build(self) -> None:
+        fingerprint = "f" * 64
+        trusted_common_stop_data = self.root / "trusted-common-stop-data"
+        for relative in (
+            "stops",
+            "routes",
+            "departures",
+            "trips",
+            "transit",
+            "radar",
+            "swiss-static",
+            "provenance",
+        ):
+            (trusted_common_stop_data / relative).mkdir(parents=True, exist_ok=True)
+        (trusted_common_stop_data / "manifest.json").write_text(
+            json.dumps({"releaseID": "frozen", "stopDataFingerprint": fingerprint, "cities": []}),
+            encoding="utf-8",
+        )
+        (trusted_common_stop_data / "transit-radar-cities.json").write_text("{}", encoding="utf-8")
+        (trusted_common_stop_data / "swiss-static" / "manifest.json").write_text("{}", encoding="utf-8")
+        (trusted_common_stop_data / "provenance" / "input-artifacts.json").write_text("{}", encoding="utf-8")
+        raw_manifest = self.root / "raw-manifest.json"
+        raw_manifest.write_text(json.dumps({"schemaVersion": 1, "providers": {}}), encoding="utf-8")
+        cache_root = self.data_root / "cache" / "gtfs"
+        provider_artifact_root = self.data_root / "provider-artifacts"
+
+        result = self.run_pipeline(
+            "--incremental-no-activate",
+            "--raw-snapshot-manifest",
+            str(raw_manifest),
+            "--common-snapshot-fingerprint",
+            fingerprint,
+            "--trusted-common-stop-data",
+            str(trusted_common_stop_data),
+            HALTEWECKER_INCREMENTAL_PROOF_OVERRIDE="1",
+            HALTEWECKER_MANUAL_PROOF_MIN_FREE_GB="15",
+            HALTEWECKER_PROOF_ESTIMATE_MARGIN_GB="0",
+            DF_FREE_KB=str(50 * 1024 * 1024),
+            GTFS_CACHE_ROOT=str(cache_root),
+            HALTEWECKER_PROVIDER_ARTIFACT_ROOT=str(provider_artifact_root),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("minimum_free_gb=15", result.stdout)
+        self.assertIn("stage=stop-data-build status=SKIPPED", result.stdout)
+        self.assertIn("reason=trusted-common-stop-data", result.stdout)
+        self.assertIn("stage=trusted-common-stop-data status=PASS", result.stdout)
+        self.assertIn("stage=nightly-complete status=PASS", result.stdout)
+        self.assertIn("activation=NOT_RUN", result.stdout)
+        self.assertFalse((self.root / "build-calls.log").exists())
+        calls = (self.root / "incremental-calls.log").read_text(encoding="utf-8")
+        self.assertIn("--raw-snapshot-manifest", calls)
+        self.assertIn(str(raw_manifest), calls)
+        self.assertIn("--common-snapshot-fingerprint", calls)
+        self.assertIn(fingerprint, calls)
+        self.assertIn("--trusted-common-stop-data", calls)
+        self.assertIn(str(trusted_common_stop_data), calls)
+        environment = (self.root / "incremental-env-calls.log").read_text(encoding="utf-8")
+        self.assertIn("HALTEWECKER_EXTERNAL_BUILD_CACHE=1", environment)
+        self.assertIn(
+            f"HALTEWECKER_EXTERNAL_BUILD_CACHE_ROOT={cache_root / 'external-build'}",
+            environment,
+        )
+        self.assertIn(
+            f"HALTEWECKER_PROVIDER_ARTIFACT_ROOT={provider_artifact_root}",
+            environment,
+        )
+        self.assertIn(
+            f"HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT={provider_artifact_root / 'normalized'}",
+            environment,
+        )
+        self.assertIn(
+            f"HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT={provider_artifact_root / 'static'}",
+            environment,
+        )
+        self.assertFalse((self.root / "systemctl.log").exists())
 
     def test_production_shaped_incremental_failure_cleans_candidate_and_keeps_pointers(self) -> None:
         result = self.run_pipeline(

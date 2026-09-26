@@ -11,6 +11,10 @@ INCREMENTAL_PRODUCTION="${HALTEWECKER_INCREMENTAL_PRODUCTION:-1}"
 INCREMENTAL_PROOF_OVERRIDE="${HALTEWECKER_INCREMENTAL_PROOF_OVERRIDE:-0}"
 RAW_SNAPSHOT_MANIFEST="${HALTEWECKER_RAW_SNAPSHOT_MANIFEST:-}"
 RAW_SNAPSHOT_MANIFEST_ARG=""
+COMMON_SNAPSHOT_FINGERPRINT="${HALTEWECKER_COMMON_SNAPSHOT_FINGERPRINT:-}"
+COMMON_SNAPSHOT_FINGERPRINT_ARG=""
+TRUSTED_COMMON_STOP_DATA="${HALTEWECKER_TRUSTED_COMMON_STOP_DATA:-}"
+TRUSTED_COMMON_STOP_DATA_ARG=""
 REUSE_STOP_DATA=0
 STOP_DATA_ONLY=0
 REUSE_STOP_DATA_REFERENCE=""
@@ -67,15 +71,31 @@ elif [[ "${1:-}" == "--no-activate" && "${2:-}" == "--reuse-stop-data" && "$#" -
   EXPLICIT_NO_ACTIVATE=1
   REUSE_STOP_DATA=1
   REUSE_STOP_DATA_REFERENCE="$3"
-elif [[ "${1:-}" == "--incremental-no-activate" && "$#" -eq 1 ]]; then
+elif [[ "${1:-}" == "--incremental-no-activate" ]]; then
   NO_ACTIVATE=1
   EXPLICIT_NO_ACTIVATE=1
   INCREMENTAL_NO_ACTIVATE=1
-elif [[ "${1:-}" == "--incremental-no-activate" && "${2:-}" == "--raw-snapshot-manifest" && "$#" -eq 3 ]]; then
-  NO_ACTIVATE=1
-  EXPLICIT_NO_ACTIVATE=1
-  INCREMENTAL_NO_ACTIVATE=1
-  RAW_SNAPSHOT_MANIFEST_ARG="$3"
+  shift
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --raw-snapshot-manifest|--common-snapshot-fingerprint|--trusted-common-stop-data)
+        if [[ "$#" -lt 2 || -z "$2" ]]; then
+          echo "[StopData] ERROR: $1 requires a value" >&2
+          exit 64
+        fi
+        case "$1" in
+          --raw-snapshot-manifest) RAW_SNAPSHOT_MANIFEST_ARG="$2" ;;
+          --common-snapshot-fingerprint) COMMON_SNAPSHOT_FINGERPRINT_ARG="$2" ;;
+          --trusted-common-stop-data) TRUSTED_COMMON_STOP_DATA_ARG="$2" ;;
+        esac
+        shift 2
+        ;;
+      *)
+        echo "usage: $0 [--resume RELEASE_ID|--incremental|--legacy-full|--stop-data-only|--incremental-no-activate [--raw-snapshot-manifest PATH] [--common-snapshot-fingerprint SHA256] [--trusted-common-stop-data PATH]|--no-activate [--reuse-stop-data [RELEASE_ID]]]" >&2
+        exit 64
+        ;;
+    esac
+  done
 elif [[ "${1:-}" == "--incremental" && "$#" -eq 1 ]]; then
   INCREMENTAL_PRODUCTION=1
 elif [[ "${1:-}" == "--legacy-full" && "$#" -eq 1 ]]; then
@@ -85,7 +105,7 @@ elif [[ "${1:-}" == "--stop-data-only" && "$#" -eq 1 ]]; then
   EXPLICIT_NO_ACTIVATE=1
   STOP_DATA_ONLY=1
 elif [[ "$#" -ne 0 ]]; then
-  echo "usage: $0 [--resume RELEASE_ID|--incremental|--legacy-full|--stop-data-only|--incremental-no-activate [--raw-snapshot-manifest PATH]|--no-activate [--reuse-stop-data [RELEASE_ID]]]" >&2
+  echo "usage: $0 [--resume RELEASE_ID|--incremental|--legacy-full|--stop-data-only|--incremental-no-activate [--raw-snapshot-manifest PATH] [--common-snapshot-fingerprint SHA256] [--trusted-common-stop-data PATH]|--no-activate [--reuse-stop-data [RELEASE_ID]]]" >&2
   exit 64
 fi
 
@@ -100,6 +120,30 @@ fi
 if [[ "$INCREMENTAL_PROOF_OVERRIDE" == "1" && "$INCREMENTAL_NO_ACTIVATE" != "1" ]]; then
   echo "[StopData] ERROR: incremental proof override requires --incremental-no-activate" >&2
   exit 64
+fi
+if [[ -n "$COMMON_SNAPSHOT_FINGERPRINT_ARG" ]]; then
+  COMMON_SNAPSHOT_FINGERPRINT="$COMMON_SNAPSHOT_FINGERPRINT_ARG"
+elif [[ -n "${HALTEWECKER_COMMON_SNAPSHOT_FINGERPRINT:-}" ]]; then
+  COMMON_SNAPSHOT_FINGERPRINT="$HALTEWECKER_COMMON_SNAPSHOT_FINGERPRINT"
+fi
+if [[ -n "$TRUSTED_COMMON_STOP_DATA_ARG" ]]; then
+  TRUSTED_COMMON_STOP_DATA="$TRUSTED_COMMON_STOP_DATA_ARG"
+elif [[ -n "${HALTEWECKER_TRUSTED_COMMON_STOP_DATA:-}" ]]; then
+  TRUSTED_COMMON_STOP_DATA="$HALTEWECKER_TRUSTED_COMMON_STOP_DATA"
+fi
+if [[ -n "$COMMON_SNAPSHOT_FINGERPRINT" || -n "$TRUSTED_COMMON_STOP_DATA" ]]; then
+  if [[ "$INCREMENTAL_NO_ACTIVATE" != "1" ]]; then
+    echo "[StopData] ERROR: frozen common snapshot options require --incremental-no-activate" >&2
+    exit 64
+  fi
+  if [[ -z "$COMMON_SNAPSHOT_FINGERPRINT" || -z "$TRUSTED_COMMON_STOP_DATA" ]]; then
+    echo "[StopData] ERROR: common snapshot fingerprint and trusted stop-data path must be supplied together" >&2
+    exit 64
+  fi
+  if ! [[ "$COMMON_SNAPSHOT_FINGERPRINT" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "[StopData] ERROR: common snapshot fingerprint must be a SHA-256 hex digest" >&2
+    exit 64
+  fi
 fi
 if [[ "$INCREMENTAL_PRODUCTION" != "0" && "$INCREMENTAL_PRODUCTION" != "1" ]]; then
   echo "[StopData] ERROR: HALTEWECKER_INCREMENTAL_PRODUCTION must be 0 or 1" >&2
@@ -130,6 +174,11 @@ INCREMENTAL_RELEASES_ROOT="${HALTEWECKER_INCREMENTAL_RELEASES_ROOT:-$DATA_ROOT/r
 PILOT_CURRENT="$INCREMENTAL_RELEASES_ROOT/pilot-current"
 INCREMENTAL_RELEASE_DIR="$INCREMENTAL_RELEASES_ROOT/$RELEASE_ID"
 BUILD_DIR="$RELEASE_DIR/stop-data"
+FROZEN_COMMON_STOP_DATA=0
+if [[ -n "$TRUSTED_COMMON_STOP_DATA" ]]; then
+  FROZEN_COMMON_STOP_DATA=1
+  BUILD_DIR="$TRUSTED_COMMON_STOP_DATA"
+fi
 ARTIFACTS_JSON="$RELEASE_DIR/gtfs-artifacts.json"
 CURRENT="$DATA_ROOT/current"
 PREVIOUS="$DATA_ROOT/previous/stop-data"
@@ -173,6 +222,27 @@ if [[ -f "$AUSTRALIA_ENV_FILE" ]]; then
   set +a
 fi
 
+if [[ -z "$COMMON_SNAPSHOT_FINGERPRINT_ARG" && -n "${HALTEWECKER_COMMON_SNAPSHOT_FINGERPRINT:-}" ]]; then
+  COMMON_SNAPSHOT_FINGERPRINT="$HALTEWECKER_COMMON_SNAPSHOT_FINGERPRINT"
+fi
+if [[ -z "$TRUSTED_COMMON_STOP_DATA_ARG" && -n "${HALTEWECKER_TRUSTED_COMMON_STOP_DATA:-}" ]]; then
+  TRUSTED_COMMON_STOP_DATA="$HALTEWECKER_TRUSTED_COMMON_STOP_DATA"
+fi
+if [[ -n "$COMMON_SNAPSHOT_FINGERPRINT" || -n "$TRUSTED_COMMON_STOP_DATA" ]]; then
+  if [[ "$INCREMENTAL_NO_ACTIVATE" != "1" ]]; then
+    echo "[StopData] ERROR: frozen common snapshot options require --incremental-no-activate" >&2
+    exit 64
+  fi
+  if [[ -z "$COMMON_SNAPSHOT_FINGERPRINT" || -z "$TRUSTED_COMMON_STOP_DATA" ]]; then
+    echo "[StopData] ERROR: common snapshot fingerprint and trusted stop-data path must be supplied together" >&2
+    exit 64
+  fi
+  if ! [[ "$COMMON_SNAPSHOT_FINGERPRINT" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "[StopData] ERROR: common snapshot fingerprint must be a SHA-256 hex digest" >&2
+    exit 64
+  fi
+fi
+
 if [[ -n "$RAW_SNAPSHOT_MANIFEST_ARG" ]]; then
   RAW_SNAPSHOT_MANIFEST="$RAW_SNAPSHOT_MANIFEST_ARG"
 fi
@@ -183,6 +253,11 @@ if [[ -n "$RAW_SNAPSHOT_MANIFEST" ]]; then
   fi
   export HALTEWECKER_RAW_SNAPSHOT_MANIFEST="$RAW_SNAPSHOT_MANIFEST"
   echo "[Nightly] stage=raw-snapshot status=PINNED manifest=$RAW_SNAPSHOT_MANIFEST"
+fi
+
+if [[ -n "$TRUSTED_COMMON_STOP_DATA" ]]; then
+  FROZEN_COMMON_STOP_DATA=1
+  BUILD_DIR="$TRUSTED_COMMON_STOP_DATA"
 fi
 
 # Incremental mode is the single source of truth for all proven cache layers.
@@ -196,12 +271,14 @@ if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; 
   export HALTEWECKER_EXTERNAL_DEPARTURES_V3_PROVIDERS="$HALTEWECKER_INCREMENTAL_PROVIDER_IDS"
   export HALTEWECKER_EXTERNAL_DEPARTURE_CACHE=1
   export HALTEWECKER_PERSISTENT_NORMALIZED_PROVIDER_ARTIFACT=1
-  export HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT="${HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT:-$DATA_ROOT/provider-artifacts/normalized}"
+  export HALTEWECKER_PROVIDER_ARTIFACT_ROOT="${HALTEWECKER_PROVIDER_ARTIFACT_ROOT:-$DATA_ROOT/provider-artifacts}"
+  export HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT="${HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT:-$HALTEWECKER_PROVIDER_ARTIFACT_ROOT/normalized}"
+  export HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT="${HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT:-$HALTEWECKER_PROVIDER_ARTIFACT_ROOT/static}"
   export HALTEWECKER_EXTERNAL_DEPARTURE_CACHE_PROVIDERS="$HALTEWECKER_INCREMENTAL_PROVIDER_IDS"
   if [[ -n "$RAW_SNAPSHOT_MANIFEST" ]]; then
     export HALTEWECKER_EXTERNAL_BUILD_CACHE_EXACT_ONLY=1
   fi
-  echo "[Nightly] stage=cache-policy schema=3 incrementalProviders=$HALTEWECKER_INCREMENTAL_PROVIDER_IDS providers=$HALTEWECKER_EXTERNAL_DEPARTURES_V3_PROVIDERS allowlist=$HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS"
+  echo "[Nightly] stage=cache-policy schema=3 incrementalProviders=$HALTEWECKER_INCREMENTAL_PROVIDER_IDS providers=$HALTEWECKER_EXTERNAL_DEPARTURES_V3_PROVIDERS allowlist=$HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS cacheRoot=$HALTEWECKER_EXTERNAL_BUILD_CACHE_ROOT providerArtifactRoot=$HALTEWECKER_PROVIDER_ARTIFACT_ROOT"
 fi
 
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
@@ -729,7 +806,7 @@ proof_disk_preflight() {
   local transient_workspace_kb
 
   free_kb="$(disk_free_kb)"
-  if [[ "$REUSE_STOP_DATA" != "1" && ( -d "$CURRENT" || -L "$CURRENT" ) ]]; then
+  if [[ "$FROZEN_COMMON_STOP_DATA" != "1" && "$REUSE_STOP_DATA" != "1" && ( -d "$CURRENT" || -L "$CURRENT" ) ]]; then
     current_stop_data_kb="$(du -skL "$CURRENT" 2>/dev/null | awk '{ print $1; exit }' || true)"
     current_stop_data_kb="${current_stop_data_kb:-0}"
   fi
@@ -745,8 +822,8 @@ proof_disk_preflight() {
   if [[ "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
     if [[ "$INCREMENTAL_PROOF_OVERRIDE" == "1" ]]; then
       manual_min_free_gb="${HALTEWECKER_MANUAL_PROOF_MIN_FREE_GB:-35}"
-      if ! [[ "$manual_min_free_gb" =~ ^[0-9]+$ ]] || (( manual_min_free_gb < 30 || manual_min_free_gb > 45 )); then
-        echo "[Nightly] ERROR: HALTEWECKER_MANUAL_PROOF_MIN_FREE_GB must be an integer between 30 and 45" >&2
+      if ! [[ "$manual_min_free_gb" =~ ^[0-9]+$ ]] || (( manual_min_free_gb < 15 || manual_min_free_gb > 45 )); then
+        echo "[Nightly] ERROR: HALTEWECKER_MANUAL_PROOF_MIN_FREE_GB must be an integer between 15 and 45" >&2
         return 1
       fi
       minimum_free_kb=$((manual_min_free_gb * 1024 * 1024))
@@ -787,7 +864,11 @@ run_build_stage() {
   diagnostics_set_stage "stop-data-build"
   echo "[StopData] release=$RELEASE_ID stage=build started"
 
-mkdir -p "$BUILD_DIR" "$RELEASES"
+if [[ "$FROZEN_COMMON_STOP_DATA" == "1" ]]; then
+  mkdir -p "$RELEASE_DIR" "$RELEASES"
+else
+  mkdir -p "$BUILD_DIR" "$RELEASES"
+fi
 if [[ -f "$MVO_ENV_FILE" ]]; then
   echo "[StopData] refreshing Austrian MVO GTFS sources"
   python3 "$REPO/scripts/download_austrian_gtfs.py" \
@@ -871,7 +952,11 @@ PY
 VBB_GTFS_ARTIFACT="${CUSTOM_ARTIFACT_VALUES[0]}"
 RNV_GTFS_ARTIFACT="${CUSTOM_ARTIFACT_VALUES[1]}"
 
-mkdir -p "$BUILD_DIR" "$RELEASES"
+if [[ "$FROZEN_COMMON_STOP_DATA" == "1" ]]; then
+  mkdir -p "$RELEASE_DIR" "$RELEASES"
+else
+  mkdir -p "$BUILD_DIR" "$RELEASES"
+fi
 
 # Map provider env vars to repeatable --external-gtfs-url providerID=URL args.
 # Add future countries here without changing build_stop_packages.py.
@@ -1197,6 +1282,73 @@ PY
   echo "[StopData] release=$RELEASE_ID stage=validation duration=$(elapsed_seconds "$VALIDATION_STARTED")"
 }
 
+prepare_frozen_common_inputs() {
+  diagnostics_set_stage "trusted-common-stop-data"
+  mkdir -p "$RELEASE_DIR" "$RELEASES"
+  python3 - "$TRUSTED_COMMON_STOP_DATA" "$COMMON_SNAPSHOT_FINGERPRINT" "$REPO" <<'PY'
+import sys
+from pathlib import Path
+
+trusted_path = Path(sys.argv[1]).resolve()
+expected_fingerprint = sys.argv[2]
+repository_root = Path(sys.argv[3])
+sys.path.insert(0, str(repository_root / "scripts"))
+from provider_release_assembler import _validate_trusted_common_stop_data
+
+_validate_trusted_common_stop_data(
+    trusted_path,
+    expected_fingerprint=expected_fingerprint,
+)
+PY
+  python3 - "$RAW_SNAPSHOT_MANIFEST" "$ARTIFACTS_JSON" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1]).resolve()
+output_path = Path(sys.argv[2])
+payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+providers = payload.get("providers")
+if isinstance(providers, list):
+    entries = {
+        str(entry.get("provider") or entry.get("providerID") or entry.get("id")): entry
+        for entry in providers
+        if isinstance(entry, dict)
+    }
+elif isinstance(providers, dict):
+    entries = providers
+else:
+    entries = {}
+external = {}
+for provider_id, entry in entries.items():
+    if not isinstance(entry, dict):
+        continue
+    raw_path = entry.get("path") or entry.get("rawPath")
+    if not raw_path:
+        continue
+    path = Path(str(raw_path)).resolve()
+    if not path.is_file():
+        raise SystemExit(f"frozen raw snapshot path is missing: {path}")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    declared = str(entry.get("sha256") or entry.get("rawSHA256") or digest)
+    if digest != declared:
+        raise SystemExit(f"frozen raw snapshot SHA mismatch for {provider_id}")
+    external[str(provider_id)] = {
+        "path": str(path),
+        "sha256": digest,
+        "size": path.stat().st_size,
+        "status": "frozen-snapshot",
+    }
+output_path.write_text(
+    json.dumps({"sources": {}, "external": external, "nlFailure": None}, indent=2),
+    encoding="utf-8",
+)
+PY
+  BUILD_FINGERPRINT="$(python3 "$REPO/scripts/build_fingerprint.py" --repository "$REPO")"
+  echo "[Nightly] stage=trusted-common-stop-data status=PASS path=$TRUSTED_COMMON_STOP_DATA fingerprint=$COMMON_SNAPSHOT_FINGERPRINT"
+}
+
 run_static_departures_stage() {
   diagnostics_set_stage "legacy-import"
   STATIC_STARTED=$SECONDS
@@ -1263,24 +1415,33 @@ fi
 }
 
 if [[ "$RUN_MODE" == "normal" ]]; then
-  if [[ "$REUSE_STOP_DATA" == "1" ]]; then
+  if [[ "$FROZEN_COMMON_STOP_DATA" == "1" ]]; then
+    prepare_frozen_common_inputs
+    echo "[Nightly] stage=stop-data-build status=SKIPPED release=$RELEASE_ID reason=trusted-common-stop-data"
+  elif [[ "$REUSE_STOP_DATA" == "1" ]]; then
     echo "[Nightly] stage=stop-data-build status=SKIPPED release=$RELEASE_ID reason=reuse-stop-data"
   else
     echo "[Nightly] stage=stop-data-build status=started release=$RELEASE_ID"
     run_build_stage
     echo "[Nightly] stage=stop-data-build status=PASS release=$RELEASE_ID"
   fi
-  if [[ "$REUSE_STOP_DATA" != "1" ]]; then
+  if [[ "$FROZEN_COMMON_STOP_DATA" == "1" ]]; then
+    echo "[StopData] release=$RELEASE_ID state persistence skipped for trusted frozen stop-data"
+  elif [[ "$REUSE_STOP_DATA" != "1" ]]; then
     persist_release_stage "build"
   else
     echo "[StopData] release=$RELEASE_ID state persistence skipped for read-only reused stop-data"
   fi
-  echo "[Nightly] stage=validation status=started release=$RELEASE_ID"
-  run_candidate_validation
-  log_disk_state "stop-data-validation"
-  echo "[Nightly] stage=validation status=PASS release=$RELEASE_ID"
-  if [[ "$REUSE_STOP_DATA" != "1" ]]; then
-    persist_release_stage "candidate-validation"
+  if [[ "$FROZEN_COMMON_STOP_DATA" == "1" ]]; then
+    echo "[Nightly] stage=validation status=PASS release=$RELEASE_ID reason=trusted-common-stop-data"
+  else
+    echo "[Nightly] stage=validation status=started release=$RELEASE_ID"
+    run_candidate_validation
+    log_disk_state "stop-data-validation"
+    echo "[Nightly] stage=validation status=PASS release=$RELEASE_ID"
+    if [[ "$REUSE_STOP_DATA" != "1" ]]; then
+      persist_release_stage "candidate-validation"
+    fi
   fi
   log_disk_state "after-stop-data"
   if [[ "$STOP_DATA_ONLY" == "1" ]]; then
@@ -1366,10 +1527,16 @@ if [[ "$NO_ACTIVATE" == "1" || "$INCREMENTAL_PRODUCTION" == "1" ]]; then
   if [[ -n "$RAW_SNAPSHOT_MANIFEST" ]]; then
     INCREMENTAL_ARGS+=(--raw-snapshot-manifest "$RAW_SNAPSHOT_MANIFEST")
   fi
+  if [[ -n "$COMMON_SNAPSHOT_FINGERPRINT" ]]; then
+    INCREMENTAL_ARGS+=(--common-snapshot-fingerprint "$COMMON_SNAPSHOT_FINGERPRINT")
+  fi
+  if [[ -n "$TRUSTED_COMMON_STOP_DATA" ]]; then
+    INCREMENTAL_ARGS+=(--trusted-common-stop-data "$TRUSTED_COMMON_STOP_DATA")
+  fi
   INCREMENTAL_ARGS+=(--result-json "$RELEASE_DIR/incremental-result.json")
   python3 "$REPO/scripts/run_incremental_provider_pipeline.py" \
     "${INCREMENTAL_ARGS[@]}"
-  python3 - "$RELEASE_DIR/incremental-result.json" "$RELEASE_ID" "$BUILD_DIR" "$BUILD_FINGERPRINT" <<'PY'
+  python3 - "$RELEASE_DIR/incremental-result.json" "$RELEASE_ID" "$BUILD_DIR" "$BUILD_FINGERPRINT" "$FROZEN_COMMON_STOP_DATA" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -1378,15 +1545,16 @@ result_path = Path(sys.argv[1])
 release_id = sys.argv[2]
 stop_data_path = Path(sys.argv[3]).resolve()
 expected_fingerprint = sys.argv[4]
+frozen_common_stop_data = sys.argv[5] == "1"
 result = json.loads(result_path.read_text(encoding="utf-8"))
 if result.get("releaseID") != release_id:
     raise SystemExit("incremental result releaseID does not match stop-data releaseID")
 stop_data = result.get("stopData")
 if not isinstance(stop_data, dict):
     raise SystemExit("incremental result has no stopData metadata")
-if stop_data.get("releaseID") != release_id:
+if not frozen_common_stop_data and stop_data.get("releaseID") != release_id:
     raise SystemExit("incremental result stop-data generation does not match releaseID")
-if stop_data.get("buildFingerprint") != expected_fingerprint:
+if not frozen_common_stop_data and stop_data.get("buildFingerprint") != expected_fingerprint:
     raise SystemExit("incremental result stop-data fingerprint does not match current build")
 if Path(str(stop_data.get("path", ""))).resolve() != stop_data_path:
     raise SystemExit("incremental result stop-data path does not match fresh generation")

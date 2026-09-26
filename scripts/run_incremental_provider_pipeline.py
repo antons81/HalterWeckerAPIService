@@ -1236,8 +1236,14 @@ def build_incremental_candidate(
     provider_ids = tuple(selection_plan["selectedProviders"])
     validate_incremental_artifact_strategies(repository_root, provider_ids)
     stop_manifest = _read_json(stop_data_root / "manifest.json")
-    if str(stop_manifest.get("releaseID")) != release_id:
+    if trusted_common_stop_data is None and str(stop_manifest.get("releaseID")) != release_id:
         raise ValueError("stop-data releaseID does not match nightly release ID")
+    if trusted_common_stop_data is not None:
+        trusted_root = trusted_common_stop_data.resolve()
+        if stop_data_root.resolve() != trusted_root:
+            raise ValueError("trusted common stop-data path does not match stop-data root")
+        if common_snapshot_fingerprint is None:
+            raise ValueError("trusted common stop-data requires a snapshot fingerprint")
     artifacts = _read_json(gtfs_artifacts_path)
     sources = _source_map(repository_root)
     missing_sources = sorted(set(provider_ids) - set(sources))
