@@ -144,6 +144,7 @@ class NormalizedArtifactUse:
     database_path: Path
     manifest: dict[str, object]
     duration_seconds: float
+    resolution_status: str = "HIT_EXACT"
 
 
 def feature_enabled(environ: dict[str, str] | None = None) -> bool:
@@ -484,7 +485,10 @@ def _validate_manifest(
         raise NormalizedArtifactError("raw artifact provenance mismatch")
     if manifest.get("normalizedSchemaFingerprint") != _normalized_schema_fingerprint():
         raise NormalizedArtifactError("normalized schema fingerprint mismatch")
-    if manifest.get("builderFingerprint") != builder:
+    if manifest.get("builderFingerprint") != builder and not _manifest_allows_compatible_builder(
+        manifest,
+        builder,
+    ):
         raise NormalizedArtifactError("normalized builder fingerprint mismatch")
     if manifest.get("status") != "complete":
         raise NormalizedArtifactError("artifact is not complete")
@@ -538,6 +542,30 @@ def _read_raw_index(path: Path) -> dict[str, str]:
     return payload
 
 
+def _normalized_provider_root(
+    *,
+    provider_id: str,
+    gtfs_cache_root: Path | None,
+    environ: dict[str, str] | None,
+) -> Path:
+    return default_cache_root(
+        gtfs_cache_root=gtfs_cache_root,
+        environ=environ,
+    ) / provider_id
+
+
+def _manifest_allows_compatible_builder(
+    manifest: dict[str, object],
+    builder: str,
+) -> bool:
+    compatible = manifest.get("compatibleBuilderFingerprints")
+    return (
+        isinstance(compatible, list)
+        and all(isinstance(value, str) for value in compatible)
+        and builder in compatible
+    )
+
+
 def _write_raw_index(path: Path, values: dict[str, str]) -> None:
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
     temporary.write_text(
@@ -564,6 +592,107 @@ def _live_raw_index(path: Path) -> dict[str, str]:
     return live
 
 
+def resolve_normalized_artifact(
+    *,
+    repository_root: Path,
+    provider_id: str,
+    raw_artifact_sha256: str,
+    gtfs_cache_root: Path | None,
+    environ: dict[str, str] | None = None,
+    archive=None,
+) -> NormalizedArtifactUse:
+    """Resolve one normalized artifact without building or mutating cache state."""
+    if not provider_enabled(provider_id, repository_root):
+        raise NormalizedArtifactError(f"provider is not enabled: {provider_id}")
+    raw_sha = str(raw_artifact_sha256 or "").strip()
+    if not raw_sha:
+        raise NormalizedArtifactError("raw artifact SHA-256 is unavailable")
+    started = time.monotonic()
+    provider_root = _normalized_provider_root(
+        provider_id=provider_id,
+        gtfs_cache_root=gtfs_cache_root,
+        environ=environ,
+    )
+    raw_index = _read_raw_index(provider_root / "raw-sha-index.json")
+    semantic_key = raw_index.get(raw_sha)
+    indexed_resolution = semantic_key is not None
+    expected_semantic = None
+    if not semantic_key and archive is not None:
+        expected_semantic = _semantic_manifest(archive)
+        semantic_key = _semantic_key(
+            provider_id=provider_id,
+            builder=builder_fingerprint(repository_root),
+            semantic=expected_semantic,
+        )
+    if not semantic_key:
+        return NormalizedArtifactUse(
+            status="MISS",
+            reason="persistent normalized artifact is absent for raw artifact SHA-256",
+            semantic_key="",
+            artifact_directory=provider_root,
+            database_path=provider_root / "normalized.sqlite",
+            manifest={},
+            duration_seconds=time.monotonic() - started,
+            resolution_status="MISS",
+        )
+    directory = provider_root / semantic_key
+    if not directory.is_dir():
+        return NormalizedArtifactUse(
+            status="MISS",
+            reason=f"normalized artifact directory is absent for key {semantic_key}",
+            semantic_key=semantic_key,
+            artifact_directory=directory,
+            database_path=directory / "normalized.sqlite",
+            manifest={},
+            duration_seconds=time.monotonic() - started,
+            resolution_status="MISS",
+        )
+    try:
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        builder = builder_fingerprint(repository_root)
+        validated = _validate_manifest(
+            manifest,
+            directory=directory,
+            provider_id=provider_id,
+            semantic_key=semantic_key,
+            builder=builder,
+            expected_semantic=expected_semantic,
+            expected_raw_sha256=raw_sha if indexed_resolution else None,
+        )
+    except NormalizedArtifactError as error:
+        if "normalized builder fingerprint mismatch" in str(error):
+            return NormalizedArtifactUse(
+                status="MISS",
+                reason=f"normalized artifact is incompatible: {error}",
+                semantic_key=semantic_key,
+                artifact_directory=directory,
+                database_path=directory / "normalized.sqlite",
+                manifest={},
+                duration_seconds=time.monotonic() - started,
+                resolution_status="MISS",
+            )
+        raise
+    except (OSError, TypeError, ValueError) as error:
+        raise NormalizedArtifactError(
+            f"persistent normalized artifact INVALID: {error}"
+        ) from error
+    exact = manifest.get("builderFingerprint") == builder_fingerprint(repository_root)
+    return NormalizedArtifactUse(
+        status="HIT" if exact else "HIT_COMPATIBLE",
+        reason=(
+            "raw SHA index matched; semantic manifest validated"
+            if exact
+            else "raw SHA index matched; explicitly compatible manifest validated"
+        ),
+        semantic_key=semantic_key,
+        artifact_directory=directory,
+        database_path=directory / "normalized.sqlite",
+        manifest=validated,
+        duration_seconds=time.monotonic() - started,
+        resolution_status="HIT_EXACT" if exact else "HIT_COMPATIBLE",
+    )
+
+
 def load_existing_for_raw_sha(
     *,
     repository_root: Path,
@@ -578,48 +707,17 @@ def load_existing_for_raw_sha(
     except ImportError:
         from external_staging import NormalizedProviderContext
 
-    if not provider_enabled(provider_id, repository_root):
-        raise NormalizedArtifactError(f"provider is not enabled: {provider_id}")
-    raw_sha = str(raw_artifact_sha256 or "").strip()
-    if not raw_sha:
-        raise NormalizedArtifactError("raw artifact SHA-256 is unavailable")
-    started = time.monotonic()
-    provider_root = default_cache_root(
+    resolution = resolve_normalized_artifact(
+        repository_root=repository_root,
+        provider_id=provider_id,
+        raw_artifact_sha256=raw_artifact_sha256,
         gtfs_cache_root=gtfs_cache_root,
         environ=environ,
-    ) / provider_id
-    raw_index = _live_raw_index(provider_root / "raw-sha-index.json")
-    semantic_key = raw_index.get(raw_sha)
-    if not semantic_key:
-        raise NormalizedArtifactError(
-            "persistent normalized artifact is absent for raw artifact SHA-256"
-        )
-    directory = provider_root / semantic_key
-    try:
-        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
-        validated = _validate_manifest(
-            manifest,
-            directory=directory,
-            provider_id=provider_id,
-            semantic_key=semantic_key,
-            builder=builder_fingerprint(repository_root),
-            expected_raw_sha256=raw_sha,
-        )
-    except (OSError, TypeError, ValueError, NormalizedArtifactError) as error:
-        raise NormalizedArtifactError(
-            f"persistent normalized artifact INVALID: {error}"
-        ) from error
-    database_path = directory / "normalized.sqlite"
-    context = NormalizedProviderContext.from_database(database_path)
-    return context, NormalizedArtifactUse(
-        status="HIT",
-        reason="raw SHA index matched; persistent artifact validated",
-        semantic_key=semantic_key,
-        artifact_directory=directory,
-        database_path=database_path,
-        manifest=validated,
-        duration_seconds=time.monotonic() - started,
     )
+    if resolution.resolution_status == "MISS":
+        raise NormalizedArtifactError(resolution.reason)
+    context = NormalizedProviderContext.from_database(resolution.database_path)
+    return context, resolution
 
 
 def probe_existing_for_raw_sha(
@@ -629,49 +727,20 @@ def probe_existing_for_raw_sha(
     raw_artifact_sha256: str,
     gtfs_cache_root: Path | None,
     environ: dict[str, str] | None = None,
+    archive=None,
 ) -> NormalizedArtifactUse:
     """Probe a raw-SHA normalized artifact without mutating or building cache."""
-    if not provider_enabled(provider_id, repository_root):
-        raise NormalizedArtifactError(f"provider is not enabled: {provider_id}")
-    raw_sha = str(raw_artifact_sha256 or "").strip()
-    if not raw_sha:
-        raise NormalizedArtifactError("raw artifact SHA-256 is unavailable")
-    started = time.monotonic()
-    provider_root = default_cache_root(
+    resolution = resolve_normalized_artifact(
+        repository_root=repository_root,
+        provider_id=provider_id,
+        raw_artifact_sha256=raw_artifact_sha256,
         gtfs_cache_root=gtfs_cache_root,
         environ=environ,
-    ) / provider_id
-    raw_index = _read_raw_index(provider_root / "raw-sha-index.json")
-    semantic_key = raw_index.get(raw_sha)
-    if not semantic_key:
-        raise NormalizedArtifactError(
-            "persistent normalized artifact is absent for raw artifact SHA-256"
-        )
-    directory = provider_root / semantic_key
-    try:
-        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
-        validated = _validate_manifest(
-            manifest,
-            directory=directory,
-            provider_id=provider_id,
-            semantic_key=semantic_key,
-            builder=builder_fingerprint(repository_root),
-            expected_raw_sha256=raw_sha,
-        )
-    except (OSError, TypeError, ValueError, NormalizedArtifactError) as error:
-        raise NormalizedArtifactError(
-            f"persistent normalized artifact INVALID: {error}"
-        ) from error
-    database_path = directory / "normalized.sqlite"
-    return NormalizedArtifactUse(
-        status="HIT_COMPATIBLE",
-        reason="raw SHA index matched; persistent artifact validated without build",
-        semantic_key=semantic_key,
-        artifact_directory=directory,
-        database_path=database_path,
-        manifest=validated,
-        duration_seconds=time.monotonic() - started,
+        archive=archive,
     )
+    if resolution.resolution_status == "MISS":
+        raise NormalizedArtifactError(resolution.reason)
+    return resolution
 
 def load_or_build(
     *,
@@ -700,38 +769,23 @@ def load_or_build(
     raw_sha = str(raw_artifact_sha256 or "")
     started = time.monotonic()
 
+    if raw_sha:
+        resolution = resolve_normalized_artifact(
+            repository_root=repository_root,
+            provider_id=provider_id,
+            raw_artifact_sha256=raw_sha,
+            gtfs_cache_root=gtfs_cache_root,
+            environ=environ,
+            archive=archive,
+        )
+        if resolution.resolution_status != "MISS":
+            context = NormalizedProviderContext.from_database(
+                resolution.database_path
+            )
+            return context, resolution
+
     raw_index_path = provider_root / "raw-sha-index.json"
     raw_index = _live_raw_index(raw_index_path)
-    indexed_key = raw_index.get(raw_sha) if raw_sha else None
-    if indexed_key:
-        indexed_directory = provider_root / indexed_key
-        manifest_path = indexed_directory / "manifest.json"
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            validated = _validate_manifest(
-                manifest,
-                directory=indexed_directory,
-                provider_id=provider_id,
-                semantic_key=indexed_key,
-                builder=builder,
-                expected_raw_sha256=raw_sha,
-            )
-        except (OSError, TypeError, ValueError, NormalizedArtifactError) as error:
-            raise NormalizedArtifactError(
-                f"normalized artifact INVALID via raw SHA index: {error}"
-            ) from error
-        context = NormalizedProviderContext.from_database(
-            indexed_directory / "normalized.sqlite"
-        )
-        return context, NormalizedArtifactUse(
-            status="HIT",
-            reason="raw SHA index matched; semantic manifest validated",
-            semantic_key=indexed_key,
-            artifact_directory=indexed_directory,
-            database_path=indexed_directory / "normalized.sqlite",
-            manifest=validated,
-            duration_seconds=time.monotonic() - started,
-        )
 
     semantic = _semantic_manifest(archive)
     semantic_key = _semantic_key(
@@ -768,6 +822,7 @@ def load_or_build(
             database_path=directory / "normalized.sqlite",
             manifest=validated,
             duration_seconds=time.monotonic() - started,
+            resolution_status="HIT_EXACT",
         )
 
     temporary = Path(tempfile.mkdtemp(prefix=f".{semantic_key}.tmp-", dir=provider_root))
@@ -819,6 +874,7 @@ def load_or_build(
             database_path=directory / "normalized.sqlite",
             manifest=manifest,
             duration_seconds=time.monotonic() - started,
+            resolution_status="MISS",
         )
     finally:
         if temporary != Path():

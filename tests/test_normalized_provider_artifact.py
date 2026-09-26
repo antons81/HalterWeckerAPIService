@@ -224,6 +224,160 @@ class NormalizedProviderArtifactTests(unittest.TestCase):
                 )
             self.assertNotEqual(first, second)
 
+    def test_preflight_and_runtime_share_exact_normalized_resolver(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "feed.zip"
+            _write_feed(
+                feed,
+                order=(
+                    "agency.txt",
+                    "stops.txt",
+                    "routes.txt",
+                    "trips.txt",
+                    "stop_times.txt",
+                    "calendar.txt",
+                    "calendar_dates.txt",
+                ),
+                compression=zipfile.ZIP_STORED,
+            )
+            context, built = self._build(root, feed, "6" * 64)
+            context.close()
+
+            probe = artifact.resolve_normalized_artifact(
+                repository_root=REPOSITORY_ROOT,
+                provider_id="israel-mot",
+                raw_artifact_sha256="6" * 64,
+                gtfs_cache_root=root / "gtfs-cache",
+                environ={artifact.FEATURE_GATE: "1"},
+            )
+            self.assertEqual(probe.resolution_status, "HIT_EXACT")
+            self.assertEqual(probe.semantic_key, built.semantic_key)
+
+            with mock.patch.object(
+                NormalizedProviderContext,
+                "from_archive",
+                side_effect=AssertionError("runtime attempted rebuild"),
+            ):
+                archive = zipfile.ZipFile(feed)
+                try:
+                    context, runtime = artifact.load_or_build(
+                        archive=archive,
+                        repository_root=REPOSITORY_ROOT,
+                        provider_id="israel-mot",
+                        raw_artifact_sha256="6" * 64,
+                        gtfs_cache_root=root / "gtfs-cache",
+                        environ={artifact.FEATURE_GATE: "1"},
+                    )
+                finally:
+                    archive.close()
+            context.close()
+            self.assertEqual(runtime.resolution_status, "HIT_EXACT")
+            self.assertEqual(runtime.status, "HIT")
+
+    def test_explicitly_compatible_normalized_artifact_is_reused_without_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "feed.zip"
+            _write_feed(
+                feed,
+                order=(
+                    "agency.txt",
+                    "stops.txt",
+                    "routes.txt",
+                    "trips.txt",
+                    "stop_times.txt",
+                    "calendar.txt",
+                    "calendar_dates.txt",
+                ),
+                compression=zipfile.ZIP_STORED,
+            )
+            context, built = self._build(root, feed, "7" * 64)
+            context.close()
+            manifest_path = built.artifact_directory / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            current_builder = artifact.builder_fingerprint(REPOSITORY_ROOT)
+            manifest["builderFingerprint"] = "legacy-normalized-builder"
+            manifest["compatibleBuilderFingerprints"] = [current_builder]
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            resolved = artifact.resolve_normalized_artifact(
+                repository_root=REPOSITORY_ROOT,
+                provider_id="israel-mot",
+                raw_artifact_sha256="7" * 64,
+                gtfs_cache_root=root / "gtfs-cache",
+                environ={artifact.FEATURE_GATE: "1"},
+            )
+            self.assertEqual(resolved.resolution_status, "HIT_COMPATIBLE")
+
+            with mock.patch.object(
+                NormalizedProviderContext,
+                "from_archive",
+                side_effect=AssertionError("runtime attempted rebuild"),
+            ):
+                archive = zipfile.ZipFile(feed)
+                try:
+                    context, runtime = artifact.load_or_build(
+                        archive=archive,
+                        repository_root=REPOSITORY_ROOT,
+                        provider_id="israel-mot",
+                        raw_artifact_sha256="7" * 64,
+                        gtfs_cache_root=root / "gtfs-cache",
+                        environ={artifact.FEATURE_GATE: "1"},
+                    )
+                finally:
+                    archive.close()
+            context.close()
+            self.assertEqual(runtime.resolution_status, "HIT_COMPATIBLE")
+            self.assertEqual(runtime.status, "HIT_COMPATIBLE")
+
+    def test_incompatible_normalized_artifact_is_a_resolver_miss(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feed = root / "feed.zip"
+            _write_feed(
+                feed,
+                order=(
+                    "agency.txt",
+                    "stops.txt",
+                    "routes.txt",
+                    "trips.txt",
+                    "stop_times.txt",
+                    "calendar.txt",
+                    "calendar_dates.txt",
+                ),
+                compression=zipfile.ZIP_STORED,
+            )
+            context, built = self._build(root, feed, "8" * 64)
+            context.close()
+            manifest_path = built.artifact_directory / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["builderFingerprint"] = "incompatible-normalized-builder"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            resolved = artifact.resolve_normalized_artifact(
+                repository_root=REPOSITORY_ROOT,
+                provider_id="israel-mot",
+                raw_artifact_sha256="8" * 64,
+                gtfs_cache_root=root / "gtfs-cache",
+                environ={artifact.FEATURE_GATE: "1"},
+            )
+            self.assertEqual(resolved.resolution_status, "MISS")
+            self.assertIn("incompatible", resolved.reason)
+
+    def test_missing_normalized_artifact_is_a_non_mutating_resolver_miss(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            resolved = artifact.resolve_normalized_artifact(
+                repository_root=REPOSITORY_ROOT,
+                provider_id="israel-mot",
+                raw_artifact_sha256="9" * 64,
+                gtfs_cache_root=root / "gtfs-cache",
+                environ={artifact.FEATURE_GATE: "1"},
+            )
+            self.assertEqual(resolved.resolution_status, "MISS")
+            self.assertFalse((root / "gtfs-cache").exists())
+
     def test_external_old_and_persistent_normalized_paths_are_equivalent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

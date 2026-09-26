@@ -1029,15 +1029,18 @@ def full_chain_preflight(
 
             if strategy == NORMALIZED_REQUIRED:
                 try:
+                    archive = load_gtfs_archive(str(raw_path))
                     normalized_use = probe_existing_for_raw_sha(
                         repository_root=repository_root,
                         provider_id=provider_id,
                         raw_artifact_sha256=raw_sha,
                         gtfs_cache_root=normalized_cache_root.parent / "gtfs",
                         environ=environment,
+                        archive=archive,
                     )
                     report["normalized"] = {
                         "status": normalized_use.status,
+                        "resolution": normalized_use.resolution_status,
                         "reason": normalized_use.reason,
                         "key": normalized_use.semantic_key,
                         "directory": str(normalized_use.artifact_directory),
@@ -1289,8 +1292,9 @@ def build_incremental_candidate(
                 print(
                     f"[NightlyIncremental] provider={provider_id} stage=normalized-provider "
                     f"strategy={strategy} status={normalized_use.status} "
+                    f"resolution={normalized_use.resolution_status} "
                     f"duration_ms={(time.monotonic() - normalized_started) * 1000:.1f} "
-                    f"bytes_written={0 if normalized_use.status == 'HIT' else normalized_size} "
+                    f"bytes_written={0 if normalized_use.status in {'HIT', 'HIT_COMPATIBLE'} else normalized_size} "
                     f"artifact_key={normalized_use.semantic_key}",
                     flush=True,
                 )
