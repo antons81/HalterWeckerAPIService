@@ -321,7 +321,84 @@ def _artifact_source(
     }
 
 
-def _link_reference(source: Path, destination: Path, *, publish_root: Path) -> None:
+_TRUSTED_STOP_DATA_DIRECTORIES = (
+    "stops",
+    "routes",
+    "departures",
+    "trips",
+    "transit",
+    "radar",
+    "swiss-static",
+    "provenance",
+)
+_TRUSTED_STOP_DATA_FILES = (
+    "manifest.json",
+    "transit-radar-cities.json",
+    "swiss-static/manifest.json",
+    "provenance/input-artifacts.json",
+)
+
+
+def _validate_trusted_common_stop_data(
+    path: Path | str,
+    *,
+    expected_fingerprint: str | None,
+) -> Path:
+    if not isinstance(expected_fingerprint, str) or not expected_fingerprint:
+        raise ReleaseAssemblyError(
+            "trusted common stop-data requires an explicit snapshot fingerprint"
+        )
+
+    candidate = Path(path)
+    if candidate.is_symlink():
+        raise ReleaseAssemblyError(
+            f"trusted common stop-data path must not be a symlink: {candidate}"
+        )
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise ReleaseAssemblyError(
+            f"trusted common stop-data path is unavailable: {candidate}"
+        ) from error
+    if not resolved.is_dir() or not os.access(resolved, os.R_OK | os.X_OK):
+        raise ReleaseAssemblyError(
+            f"trusted common stop-data directory is not readable: {candidate}"
+        )
+
+    manifest_path = resolved / "manifest.json"
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        raise ReleaseAssemblyError(
+            f"trusted common stop-data manifest is missing: {manifest_path}"
+        )
+    manifest = _read_object(manifest_path)
+    actual_fingerprint = manifest.get("stopDataFingerprint")
+    if actual_fingerprint != expected_fingerprint:
+        raise ReleaseAssemblyError(
+            "trusted common stop-data fingerprint mismatch: "
+            f"expected {expected_fingerprint}, got {actual_fingerprint}"
+        )
+    for relative in _TRUSTED_STOP_DATA_DIRECTORIES:
+        directory = resolved / relative
+        if not directory.is_dir() or directory.is_symlink():
+            raise ReleaseAssemblyError(
+                f"trusted common stop-data directory is missing: {directory}"
+            )
+    for relative in _TRUSTED_STOP_DATA_FILES:
+        file_path = resolved / relative
+        if not file_path.is_file() or file_path.is_symlink():
+            raise ReleaseAssemblyError(
+                f"trusted common stop-data file is missing: {file_path}"
+            )
+    return resolved
+
+
+def _link_reference(
+    source: Path,
+    destination: Path,
+    *,
+    publish_root: Path,
+    trusted_external_directory: Path | None = None,
+) -> None:
     source = source.resolve(strict=True)
     publish_root = publish_root.resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -337,6 +414,9 @@ def _link_reference(source: Path, destination: Path, *, publish_root: Path) -> N
     # External immutable files must remain visible inside the container namespace.
     # A host-absolute symlink would resolve outside the published release mount.
     if source.is_dir():
+        if trusted_external_directory is not None and source == trusted_external_directory:
+            os.symlink(str(source), destination)
+            return
         raise ReleaseAssemblyError(
             f"directory reference is outside the publish tree: {source}"
         )
@@ -368,13 +448,18 @@ def _provider_entry(provider_id: str, value: Mapping[str, object]) -> dict[str, 
     }
 
 
-def _stop_data_reference(root: Path) -> dict[str, object]:
+def _stop_data_reference(
+    root: Path,
+    *,
+    storage: str | None = None,
+    snapshot_fingerprint: str | None = None,
+) -> dict[str, object]:
     manifest_path = root / "manifest.json"
     if not root.is_dir() or not manifest_path.is_file():
         raise ReleaseAssemblyError(f"stop-data root is incomplete: {root}")
     manifest = _read_object(manifest_path)
     digest, size = artifact_provenance(root)
-    return {
+    reference: dict[str, object] = {
         "path": "stop-data",
         "manifestPath": "stop-data/manifest.json",
         "sha256": digest,
@@ -382,6 +467,11 @@ def _stop_data_reference(root: Path) -> dict[str, object]:
         "releaseID": manifest.get("releaseID"),
         "version": manifest.get("version"),
     }
+    if storage is not None:
+        reference["storage"] = storage
+    if snapshot_fingerprint is not None:
+        reference["snapshotFingerprint"] = snapshot_fingerprint
+    return reference
 
 
 def _provider_set_fingerprint(providers: Mapping[str, Mapping[str, object]]) -> str:
@@ -539,6 +629,8 @@ def assemble_release(
     stop_data_root: Path | str,
     providers: Mapping[str, Mapping[str, object]],
     created_at: str | None = None,
+    trusted_common_stop_data: Path | str | None = None,
+    common_snapshot_fingerprint: str | None = None,
 ) -> ReleaseAssembly:
     """Build, validate, fsync, and rename one immutable release directory."""
     _validate_release_id(release_id)
@@ -551,6 +643,16 @@ def assemble_release(
     stop_source = Path(stop_data_root).resolve()
     if not common_source.is_file():
         raise ReleaseAssemblyError(f"common database is missing: {common_source}")
+    trusted_stop_source: Path | None = None
+    if trusted_common_stop_data is not None:
+        trusted_stop_source = _validate_trusted_common_stop_data(
+            trusted_common_stop_data,
+            expected_fingerprint=common_snapshot_fingerprint,
+        )
+        if stop_source != trusted_stop_source:
+            raise ReleaseAssemblyError(
+                "stop-data root does not match trusted common stop-data path"
+            )
     normalized: dict[str, dict[str, object]] = {
         provider_id: _provider_entry(provider_id, value)
         for provider_id, value in providers.items()
@@ -573,8 +675,21 @@ def assemble_release(
             shutil.copy2(common_source, staging / "common.sqlite")
             common_digest, common_size = artifact_provenance(staging / "common.sqlite")
         with profiler.stage("stop-data-reference"):
-            _link_reference(stop_source, staging / "stop-data", publish_root=releases)
-            stop_data = _stop_data_reference(staging / "stop-data")
+            _link_reference(
+                stop_source,
+                staging / "stop-data",
+                publish_root=releases,
+                trusted_external_directory=trusted_stop_source,
+            )
+            stop_data = _stop_data_reference(
+                staging / "stop-data",
+                storage=(
+                    "trusted-immutable-external-reference"
+                    if trusted_stop_source is not None
+                    else None
+                ),
+                snapshot_fingerprint=common_snapshot_fingerprint,
+            )
         common_metadata_path = staging / "common-metadata.json"
         with __import__("sqlite3").connect(staging / "common.sqlite") as connection:
             metadata = dict(connection.execute("SELECT key, value FROM metadata"))

@@ -108,6 +108,38 @@ class ProviderReleaseAssemblerTests(unittest.TestCase):
             connection.commit()
         return destination
 
+    @staticmethod
+    def _trusted_stop_data_fixture(
+        source: Path,
+        destination: Path,
+        fingerprint: str,
+    ) -> Path:
+        shutil.copytree(source, destination)
+        for relative in (
+            "stops",
+            "routes",
+            "departures",
+            "trips",
+            "transit",
+            "radar",
+            "swiss-static",
+            "provenance",
+        ):
+            (destination / relative).mkdir(parents=True, exist_ok=True)
+        for relative in (
+            "transit-radar-cities.json",
+            "swiss-static/manifest.json",
+            "provenance/input-artifacts.json",
+        ):
+            path = destination / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}", encoding="utf-8")
+        manifest_path = destination / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["stopDataFingerprint"] = fingerprint
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        return destination
+
     def test_assembly_validates_and_reuses_immutable_provider_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -137,6 +169,101 @@ class ProviderReleaseAssemblerTests(unittest.TestCase):
                 payload["compatibility"]["runtimeSchemaVersion"],
                 1,
             )
+
+    def test_trusted_external_common_stop_data_is_accepted_with_matching_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _legacy, common, stop_data, providers = self._fixture(root / "fixture")
+            fingerprint = "f" * 64
+            trusted = self._trusted_stop_data_fixture(
+                stop_data,
+                root / "rehearsal" / "common-stop-data",
+                fingerprint,
+            )
+            common_copy = self._common_for_release(common, root / "common-a.sqlite", "release-a")
+
+            assembly = assemble_release(
+                root / "releases",
+                "release-a",
+                common_database=common_copy,
+                stop_data_root=trusted,
+                providers=providers,
+                trusted_common_stop_data=trusted,
+                common_snapshot_fingerprint=fingerprint,
+            )
+
+            payload = validate_candidate_release(assembly.release_directory)
+            self.assertEqual(
+                payload["stopData"]["storage"],
+                "trusted-immutable-external-reference",
+            )
+            self.assertEqual(payload["stopData"]["snapshotFingerprint"], fingerprint)
+            self.assertEqual(
+                (assembly.release_directory / "stop-data").resolve(),
+                trusted.resolve(),
+            )
+
+    def test_external_common_stop_data_without_explicit_trust_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _legacy, common, stop_data, providers = self._fixture(root / "fixture")
+            with tempfile.TemporaryDirectory() as outside_temporary:
+                external = Path(outside_temporary) / "other"
+                shutil.copytree(stop_data, external)
+                common_copy = self._common_for_release(
+                    common,
+                    root / "common-a.sqlite",
+                    "release-a",
+                )
+
+                with self.assertRaisesRegex(ReleaseAssemblyError, "outside the publish tree"):
+                    assemble_release(
+                        root / "releases",
+                        "release-a",
+                        common_database=common_copy,
+                        stop_data_root=external,
+                        providers=providers,
+                    )
+
+    def test_trusted_external_common_stop_data_rejects_wrong_fingerprint_and_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _legacy, common, stop_data, providers = self._fixture(root / "fixture")
+            trusted = self._trusted_stop_data_fixture(
+                stop_data,
+                root / "rehearsal" / "common-stop-data",
+                "a" * 64,
+            )
+            manifest_path = trusted / "manifest.json"
+            common_copy = self._common_for_release(common, root / "common-a.sqlite", "release-a")
+
+            with self.assertRaisesRegex(ReleaseAssemblyError, "fingerprint mismatch"):
+                assemble_release(
+                    root / "releases-wrong-fingerprint",
+                    "release-a",
+                    common_database=common_copy,
+                    stop_data_root=trusted,
+                    providers=providers,
+                    trusted_common_stop_data=trusted,
+                    common_snapshot_fingerprint="b" * 64,
+                )
+
+            trusted_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            trusted_manifest["stopDataFingerprint"] = "f" * 64
+            manifest_path.write_text(json.dumps(trusted_manifest), encoding="utf-8")
+            escaped = root / "rehearsal" / "trusted-link"
+            escaped.symlink_to(trusted, target_is_directory=True)
+
+            with self.assertRaisesRegex(ReleaseAssemblyError, "must not be a symlink"):
+                assemble_release(
+                    root / "releases-symlink",
+                    "release-a",
+                    common_database=common_copy,
+                    stop_data_root=escaped,
+                    providers=providers,
+                    trusted_common_stop_data=escaped,
+                    common_snapshot_fingerprint="f" * 64,
+                )
 
     def test_atomic_switch_and_request_leases_keep_generations_isolated(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

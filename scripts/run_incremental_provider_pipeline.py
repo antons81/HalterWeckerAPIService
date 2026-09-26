@@ -1224,6 +1224,7 @@ def build_incremental_candidate(
     provider_ids: tuple[str, ...] | None = None,
     raw_snapshot: Mapping[str, Mapping[str, object]] | None = None,
     common_snapshot_fingerprint: str | None = None,
+    trusted_common_stop_data: Path | None = None,
 ) -> dict[str, object]:
     selection_plan = provider_selection_plan(
         repository_root,
@@ -1426,6 +1427,8 @@ def build_incremental_candidate(
                 common_database=common_path,
                 stop_data_root=stop_data_root,
                 providers=provider_inputs,
+                trusted_common_stop_data=trusted_common_stop_data,
+                common_snapshot_fingerprint=common_snapshot_fingerprint,
             ),
         )
         published_release_directory = _published_release_directory(
@@ -1611,6 +1614,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--static-artifact-root", type=Path)
     parser.add_argument("--raw-snapshot-manifest", type=Path)
     parser.add_argument("--common-snapshot-fingerprint")
+    parser.add_argument("--trusted-common-stop-data", type=Path)
     parser.add_argument("--valid-from", type=date.fromisoformat)
     parser.add_argument("--valid-through", type=date.fromisoformat)
     parser.add_argument("--window-days", type=int, default=DEFAULT_WINDOW_DAYS)
@@ -1725,6 +1729,11 @@ def main(argv: list[str] | None = None) -> int:
             provider_ids=tuple(selection_plan["selectedProviders"]),
             raw_snapshot=raw_snapshot,
             common_snapshot_fingerprint=args.common_snapshot_fingerprint,
+            trusted_common_stop_data=(
+                args.trusted_common_stop_data.resolve()
+                if args.trusted_common_stop_data is not None
+                else None
+            ),
         )
     except Exception as error:
         traceback.print_exc(file=sys.stderr)
