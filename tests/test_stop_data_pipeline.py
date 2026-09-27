@@ -123,7 +123,8 @@ case \"${1:-}\" in
       printf '{"releaseID":"%s","releaseDirectory":"%s","stopData":{"releaseID":"%s","path":"%s","buildFingerprint":"test-build-fingerprint"},"providers":{}}\n' \
         "$release_id" "$release_root/$release_id" "$release_id" "$stop_data" > "$result_json"
       if [ "${INCREMENTAL_FAIL:-0}" != "1" ] && [ "${INCREMENTAL_READINESS_FAIL:-0}" != "1" ]; then
-        printf '{"releaseID":"%s"}\n' "$release_id" > "$release_root/$release_id/release.json"
+        provider_json='{"israel-mot":{},"ttc-surface":{},"ttc-subway":{},"norway":{},"sweden":{},"poland-warsaw":{},"poland-wkd":{},"511-bay-area":{},"australia-translink-seq":{},"australia-transport-nsw":{},"cta-chicago":{},"mbta-boston":{},"stm-montreal":{}}'
+        printf '{"releaseID":"%s","providers":%s}\n' "$release_id" "$provider_json" > "$release_root/$release_id/release.json"
       fi
     fi
     if [ "${REUSE_STOP_DATA:-0}" = "1" ]; then
@@ -661,8 +662,12 @@ PY
             "new",
         )
 
-    def test_default_invocation_uses_incremental_production_mode(self) -> None:
-        result = self.run_pipeline(USE_DEFAULT_PRODUCTION="1")
+    def test_default_invocation_uses_full_incremental_activation_in_dry_run(self) -> None:
+        self.configure_resume_pointer_layout()
+        result = self.run_pipeline(
+            USE_DEFAULT_PRODUCTION="1",
+            HALTEWECKER_ACTIVATION_DRY_RUN="1",
+        )
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
@@ -674,17 +679,45 @@ PY
         )
         self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)
         self.assertIn("reason=incremental-production", result.stdout)
-        self.assertIn("stage=pilot-activation status=PASS", result.stdout)
-        self.assertIn("activation=PILOT_HYBRID", result.stdout)
-        self.assertFalse((self.data_root / "current-release").exists())
-        self.assertFalse((self.data_root / "departures-current.sqlite").exists())
-        pilot_pointer = self.data_root / "releases" / "incremental" / "pilot-current"
-        self.assertTrue(pilot_pointer.is_symlink())
+        self.assertIn("stage=incremental-candidate-validation status=PASS", result.stdout)
+        self.assertIn("stage=activation status=PASS mode=FULL_INCREMENTAL", result.stdout)
+        self.assertIn("activation=FULL_INCREMENTAL", result.stdout)
+        self.assertTrue((self.data_root / "current-release").is_symlink())
+        self.assertIn("/releases/incremental/", os.path.realpath(self.data_root / "current-release"))
+        rollback_pointer = self.data_root / "rollback"
+        self.assertTrue(rollback_pointer.is_symlink())
         self.assertTrue((self.root / "static-calls.log").is_file())
         self.assertEqual(
             (self.root / "static-calls.log").read_text(encoding="utf-8").splitlines(),
             ["1"],
         )
+
+    def test_explicit_migration_floor_is_20_and_does_not_change_scheduled_floor(self) -> None:
+        self.configure_resume_pointer_layout()
+        migration = self.run_pipeline(
+            USE_DEFAULT_PRODUCTION="1",
+            HALTEWECKER_ACTIVATION_DRY_RUN="1",
+            HALTEWECKER_INCREMENTAL_MIGRATION="1",
+            HALTEWECKER_PROOF_ESTIMATE_MARGIN_GB="0",
+            DF_FREE_KB=str(22 * 1024 * 1024),
+        )
+
+        self.assertEqual(migration.returncode, 0, migration.stderr)
+        self.assertIn("mode=incremental-migration", migration.stdout)
+        self.assertIn("minimum_free_gb=20", migration.stdout)
+        self.assertIn("activation=FULL_INCREMENTAL", migration.stdout)
+
+        scheduled = self.run_pipeline(
+            USE_DEFAULT_PRODUCTION="1",
+            HALTEWECKER_ACTIVATION_DRY_RUN="1",
+            HALTEWECKER_PROOF_ESTIMATE_MARGIN_GB="0",
+            DF_FREE_KB=str(44 * 1024 * 1024),
+        )
+
+        self.assertNotEqual(scheduled.returncode, 0)
+        self.assertIn("mode=incremental-production", scheduled.stdout)
+        self.assertIn("minimum_free_gb=45", scheduled.stdout)
+        self.assertIn("insufficient disk for incremental-production", scheduled.stderr)
 
     def test_incremental_cache_policy_overrides_stale_env_allowlist(self) -> None:
         self.environment_file.write_text(
@@ -706,18 +739,17 @@ PY
             result.stdout,
         )
 
-    def test_incremental_production_failure_restores_previous_pilot_pointer(self) -> None:
-        pilot_root = self.data_root / "releases" / "incremental"
-        pilot_root.mkdir(parents=True, exist_ok=True)
-        old_candidate = pilot_root / "old-candidate"
-        old_candidate.mkdir()
-        (pilot_root / "pilot-current").symlink_to("old-candidate")
-
-        result = self.run_pipeline(USE_DEFAULT_PRODUCTION="1", READINESS_FAIL="1")
+    def test_incremental_production_failure_keeps_current_release_unchanged(self) -> None:
+        self.configure_resume_pointer_layout()
+        old_target = os.readlink(self.data_root / "current-release")
+        result = self.run_pipeline(
+            USE_DEFAULT_PRODUCTION="1",
+            HALTEWECKER_ACTIVATION_DRY_RUN="1",
+            READINESS_FAIL="1",
+        )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertTrue((pilot_root / "pilot-current").is_symlink())
-        self.assertEqual(os.readlink(pilot_root / "pilot-current"), "old-candidate")
+        self.assertEqual(os.readlink(self.data_root / "current-release"), old_target)
         self.assertEqual(
             (self.data_root / "current" / "release-marker").read_text(encoding="utf-8"),
             "old",

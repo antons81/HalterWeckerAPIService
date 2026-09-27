@@ -50,6 +50,10 @@ HYBRID_PROVIDER_ENV = "HALTEWECKER_STATIC_DEPARTURES_HYBRID_PROVIDERS"
 HYBRID_RELEASE_POINTER_ENV = "HALTEWECKER_STATIC_DEPARTURES_HYBRID_RELEASE_POINTER"
 HYBRID_MAX_PARALLEL_ENV = "HALTEWECKER_STATIC_DEPARTURES_HYBRID_MAX_PARALLEL_PROVIDER_QUERIES"
 HYBRID_COMPARE_ENV = "HALTEWECKER_STATIC_DEPARTURES_HYBRID_COMPARE_LEGACY"
+PROVIDER_RUNTIME_MODE_ENV = "HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE"
+PROVIDER_RUNTIME_ENV = "HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RUNTIME"
+PROVIDER_PROVIDER_ENV = "HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS"
+PROVIDER_RELEASE_POINTER_ENV = "HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RELEASE_POINTER"
 DEFAULT_HYBRID_PROVIDERS = ("israel-mot", "ttc-surface", "ttc-subway")
 
 GTFS_ROUTE_TYPE_TO_MODE = {
@@ -1902,11 +1906,12 @@ class HybridStaticDeparturesBackend:
 
     def __init__(
         self,
-        legacy: object,
+        legacy: object | None,
         manager: ReleaseManager,
         provider_ids: tuple[str, ...],
         *,
         compare_legacy: bool = False,
+        provider_only: bool = False,
     ) -> None:
         self.legacy = legacy
         self.manager = manager
@@ -1915,6 +1920,9 @@ class HybridStaticDeparturesBackend:
             raise RuntimeUnavailable("hybrid provider runtime requires at least one provider")
         self.eligible_provider_ids = frozenset(self.provider_ids)
         self.compare_legacy = compare_legacy
+        self.provider_only = provider_only
+        if self.provider_only and self.legacy is not None:
+            raise RuntimeUnavailable("provider-only runtime cannot retain a legacy database")
 
     @staticmethod
     def _scope(
@@ -2093,6 +2101,11 @@ class HybridStaticDeparturesBackend:
             )
             self._log_routing(query, scope, release_id=lease.release_id)
             if scope.backend == "legacy":
+                if self.provider_only:
+                    raise RuntimeUnavailable(
+                        f"provider-only runtime cannot serve query={query} "
+                        f"city={scope.city_id or ''} reason={scope.reason}"
+                    )
                 return legacy_call()
             return self._run_shard(
                 lease.snapshot,
@@ -2118,6 +2131,10 @@ class HybridStaticDeparturesBackend:
         )
         if scope.backend == "legacy":
             self._log_routing(query, scope, provider=provider_id)
+            if self.provider_only:
+                raise RuntimeUnavailable(
+                    f"provider-only runtime cannot serve provider={provider_id} query={query}"
+                )
             return legacy_call()
         with self.manager.acquire_snapshot() as lease:
             self._log_routing(query, scope, provider=provider_id, release_id=lease.release_id)
@@ -2131,8 +2148,59 @@ class HybridStaticDeparturesBackend:
                 provider=provider_id,
             )
 
+    def meta(self) -> dict[str, str]:
+        with self.manager.acquire_snapshot() as lease:
+            return lease.snapshot.catalog.metadata()
+
     def resolve_city(self, city_id: str) -> str:
-        return self.legacy.resolve_city(city_id)
+        with self.manager.acquire_snapshot() as lease:
+            return lease.snapshot.catalog.resolve_city(city_id)
+
+    def city_stop_registry(self, city_id: str) -> set[str]:
+        with self.manager.acquire_snapshot() as lease:
+            resolved_city = lease.snapshot.catalog.resolve_city(city_id)
+            return lease.snapshot.catalog.city_stop_registry(resolved_city)
+
+    def city_child_stop_ids(
+        self,
+        city_id: str,
+        stop_ids: set[str],
+        namespace: str,
+        provider_id: str,
+    ) -> set[str]:
+        with self.manager.acquire_snapshot() as lease:
+            snapshot = lease.snapshot
+            resolved_city = snapshot.catalog.resolve_city(city_id)
+            public_ids = snapshot.catalog.city_stop_registry(resolved_city)
+            selected = {str(value) for value in stop_ids if str(value) in public_ids}
+            if not selected:
+                return selected
+            parent_ids = tuple(f"{namespace}{value}" for value in selected)
+            placeholders = ",".join("?" for _ in parent_ids)
+            provider = snapshot.provider(provider_id)
+            connection = provider._connection()
+            try:
+                rows = connection.execute(
+                    f"""
+                    SELECT raw.stop_id
+                    FROM raw_stops AS raw
+                    JOIN provider_entities AS owned
+                      ON owned.entity_type='raw_stops' AND owned.key_1=raw.stop_id
+                    WHERE owned.provider_id=?
+                      AND raw.parent_station IN ({placeholders})
+                    """,
+                    (provider_id, *parent_ids),
+                ).fetchall()
+            finally:
+                connection.close()
+            selected.update(
+                str(row[0])[len(namespace):]
+                for row in rows
+                if row[0] is not None
+                and str(row[0]).startswith(namespace)
+                and str(row[0])[len(namespace):] in public_ids
+            )
+            return selected
 
     def city_has_stop(self, city_id: str, stop_id: str) -> bool:
         return bool(self._run_city(
@@ -2236,6 +2304,10 @@ class HybridStaticDeparturesBackend:
             if provider_id not in self.eligible_provider_ids:
                 scope = _HybridScope("legacy", "non-pilot-provider", city_id, (provider_id,) if provider_id else ())
                 self._log_routing("trip-details", scope, provider=provider_id or "", release_id=lease.release_id)
+                if self.provider_only:
+                    raise RuntimeUnavailable(
+                        f"provider-only runtime cannot serve trip={trip_id}"
+                    )
                 return self.legacy.trip_details(city_id, trip_id, static_root, service_date)
             scope = _HybridScope("shard", "pilot-provider-scope", city_id, (provider_id,))
             self._log_routing("trip-details", scope, provider=provider_id, release_id=lease.release_id)
@@ -2248,6 +2320,67 @@ class HybridStaticDeparturesBackend:
                 lambda: self.legacy.trip_details(city_id, trip_id, static_root, service_date),
                 provider=provider_id,
             )  # type: ignore[return-value]
+
+    def fintraffic_provider_contexts(self, city_id: str) -> tuple[object, ...]:
+        from fintraffic_gateway import FintrafficProviderContext
+
+        with self.manager.acquire_snapshot() as lease:
+            snapshot = lease.snapshot
+            resolved_city = snapshot.catalog.resolve_city(city_id)
+            contexts = []
+            for mode in snapshot.catalog.provider_modes(resolved_city):
+                if not mode.provider_id.startswith("finland-"):
+                    continue
+                trips, routes, route_by_trip, headsign_by_trip = snapshot.provider(
+                    mode.provider_id
+                ).realtime_metadata()
+                contexts.append(
+                    FintrafficProviderContext(
+                        provider_id=mode.provider_id,
+                        identifier_prefix=mode.identifier_prefix,
+                        stop_id_prefix=mode.stop_id_prefix,
+                        trips=frozenset(trips),
+                        routes=frozenset(routes),
+                        route_by_trip=dict(route_by_trip),
+                        stops=frozenset(snapshot.provider(mode.provider_id).stop_registry()),
+                        trip_headsign_by_trip=dict(headsign_by_trip),
+                    )
+                )
+            return tuple(contexts)
+
+    def external_gtfs_provider_contexts(
+        self,
+        city_id: str,
+        provider_id: str,
+    ) -> tuple[object, ...]:
+        from fintraffic_gateway import GTFSRealtimeProviderContext
+
+        with self.manager.acquire_snapshot() as lease:
+            snapshot = lease.snapshot
+            resolved_city = snapshot.catalog.resolve_city(city_id)
+            modes = tuple(
+                mode
+                for mode in snapshot.catalog.provider_modes(resolved_city)
+                if mode.provider_id == provider_id
+            )
+            contexts = []
+            for mode in modes:
+                trips, routes, route_by_trip, headsign_by_trip = snapshot.provider(
+                    provider_id
+                ).realtime_metadata()
+                contexts.append(
+                    GTFSRealtimeProviderContext(
+                        provider_id=provider_id,
+                        identifier_prefix=mode.identifier_prefix,
+                        stop_id_prefix=mode.stop_id_prefix,
+                        trips=frozenset(trips),
+                        routes=frozenset(routes),
+                        route_by_trip=dict(route_by_trip),
+                        stops=frozenset(snapshot.provider(provider_id).stop_registry()),
+                        trip_headsign_by_trip=dict(headsign_by_trip),
+                    )
+                )
+            return tuple(contexts)
 
     def provider_trip_registry(self, provider_id: str) -> tuple[set[str], dict[str, str]]:
         return self._run_provider(
@@ -2314,6 +2447,8 @@ class HybridStaticDeparturesBackend:
                 close()
 
     def __getattr__(self, name: str) -> object:
+        if self.legacy is None:
+            raise AttributeError(name)
         return getattr(self.legacy, name)
 
 
@@ -2326,9 +2461,104 @@ def hybrid_runtime_enabled(*, environ: Mapping[str, str] | None = None) -> bool:
     return _environment_flag(values, HYBRID_ENV)
 
 
+def _is_incremental_release_pointer(pointer: Path) -> bool:
+    manifest_path = pointer / "release.json"
+    if not manifest_path.is_file():
+        return False
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and isinstance(payload.get("providers"), dict)
+        and isinstance(payload.get("common"), dict)
+        and isinstance(payload.get("stopData"), dict)
+    )
+
+
+def provider_runtime_enabled(*, environ: Mapping[str, str] | None = None) -> bool:
+    values = os.environ if environ is None else environ
+    mode = str(values.get(PROVIDER_RUNTIME_MODE_ENV, "")).strip().lower()
+    if mode == "provider":
+        return True
+    if mode in {"legacy", "off", "0", "false"}:
+        return False
+    if _environment_flag(values, PROVIDER_RUNTIME_ENV):
+        return True
+    pointer = str(
+        values.get(PROVIDER_RELEASE_POINTER_ENV, "/data/current-release")
+    ).strip()
+    return bool(pointer) and _is_incremental_release_pointer(Path(pointer))
+
+
 def _configured_provider_ids(values: Mapping[str, str]) -> tuple[str, ...]:
     configured = str(values.get(HYBRID_PROVIDER_ENV, ",".join(DEFAULT_HYBRID_PROVIDERS)))
     return tuple(dict.fromkeys(value.strip() for value in configured.split(",") if value.strip()))
+
+
+def provider_backend_from_environment(
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> HybridStaticDeparturesBackend:
+    values = os.environ if environ is None else environ
+    provider_ids = tuple(
+        dict.fromkeys(
+            value.strip()
+            for value in str(
+                values.get(PROVIDER_PROVIDER_ENV, "")
+            ).split(",")
+            if value.strip()
+        )
+    )
+    if not provider_ids:
+        raise RuntimeUnavailable(f"{PROVIDER_PROVIDER_ENV} requires at least one provider")
+    repository_root = Path(__file__).resolve().parents[1]
+    ineligible = tuple(
+        provider_id
+        for provider_id in provider_ids
+        if not provider_capability(repository_root, provider_id, SHARD_RUNTIME)
+    )
+    if ineligible:
+        raise RuntimeUnavailable(
+            f"provider-only runtime is not enabled for: {', '.join(ineligible)}"
+        )
+    pointer = str(values.get(PROVIDER_RELEASE_POINTER_ENV, "")).strip()
+    if not pointer:
+        raise RuntimeUnavailable(
+            f"{PROVIDER_RELEASE_POINTER_ENV} is required in provider-only mode"
+        )
+    try:
+        max_parallel = max(
+            1, int(values.get(HYBRID_MAX_PARALLEL_ENV, "4"))
+        )
+    except (TypeError, ValueError) as error:
+        raise RuntimeUnavailable(
+            f"{HYBRID_MAX_PARALLEL_ENV} must be a positive integer"
+        ) from error
+    manager = ReleaseManager(
+        pointer,
+        provider_ids=provider_ids,
+        max_provider_connections=max_parallel,
+        max_parallel_provider_queries=max_parallel,
+    )
+    try:
+        with manager.acquire_snapshot() as lease:
+            release_id = lease.release_id
+    except Exception:
+        manager.close()
+        raise
+    LOGGER.info(
+        "event=provider-runtime status=READY providers=%s release_id=%s legacy_fallback=false",
+        ",".join(provider_ids),
+        release_id,
+    )
+    return HybridStaticDeparturesBackend(
+        None,
+        manager,
+        provider_ids,
+        provider_only=True,
+    )
 
 
 def hybrid_backend_from_environment(

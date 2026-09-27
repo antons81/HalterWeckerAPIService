@@ -86,6 +86,8 @@ from static_departures_runtime import (
     RuntimeUnavailable,
     hybrid_backend_from_environment,
     hybrid_runtime_enabled,
+    provider_backend_from_environment,
+    provider_runtime_enabled,
     shadow_backend_from_environment,
 )
 
@@ -2622,22 +2624,30 @@ if __name__ == "__main__":
         ),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    database_path = os.environ.get("DEPARTURES_DATABASE", "/data/departures-current.sqlite")
-    log_memory_stage("before-db-open", database=database_path)
-    database = Database(database_path)
-    if hybrid_runtime_enabled():
-        database = hybrid_backend_from_environment(database)
+    if provider_runtime_enabled():
+        LOGGER.info(
+            "event=provider-runtime startup=provider-only legacy_database_open=false"
+        )
+        database = provider_backend_from_environment()
     else:
-        try:
-            shadow_database = shadow_backend_from_environment(database)
-        except RuntimeUnavailable as error:
-            LOGGER.error(
-                "event=shard-shadow-runtime status=ERROR reason=%s; legacy path remains authoritative",
-                error,
-            )
+        database_path = os.environ.get(
+            "DEPARTURES_DATABASE", "/data/departures-current.sqlite"
+        )
+        log_memory_stage("before-db-open", database=database_path)
+        database = Database(database_path)
+        if hybrid_runtime_enabled():
+            database = hybrid_backend_from_environment(database)
         else:
-            if shadow_database is not None:
-                database = shadow_database
+            try:
+                shadow_database = shadow_backend_from_environment(database)
+            except RuntimeUnavailable as error:
+                LOGGER.error(
+                    "event=shard-shadow-runtime status=ERROR reason=%s; legacy path remains authoritative",
+                    error,
+                )
+            else:
+                if shadow_database is not None:
+                    database = shadow_database
     Handler.database = database
     Handler.external_static_data = ExternalStaticData(
         STATIC_DATA_ROOT,

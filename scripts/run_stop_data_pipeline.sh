@@ -9,6 +9,7 @@ EXPLICIT_NO_ACTIVATE=0
 INCREMENTAL_NO_ACTIVATE=0
 INCREMENTAL_PRODUCTION="${HALTEWECKER_INCREMENTAL_PRODUCTION:-1}"
 INCREMENTAL_PROOF_OVERRIDE="${HALTEWECKER_INCREMENTAL_PROOF_OVERRIDE:-0}"
+INCREMENTAL_MIGRATION="${HALTEWECKER_INCREMENTAL_MIGRATION:-0}"
 RAW_SNAPSHOT_MANIFEST="${HALTEWECKER_RAW_SNAPSHOT_MANIFEST:-}"
 RAW_SNAPSHOT_MANIFEST_ARG=""
 COMMON_SNAPSHOT_FINGERPRINT="${HALTEWECKER_COMMON_SNAPSHOT_FINGERPRINT:-}"
@@ -121,6 +122,14 @@ if [[ "$INCREMENTAL_PROOF_OVERRIDE" == "1" && "$INCREMENTAL_NO_ACTIVATE" != "1" 
   echo "[StopData] ERROR: incremental proof override requires --incremental-no-activate" >&2
   exit 64
 fi
+if [[ "$INCREMENTAL_MIGRATION" != "0" && "$INCREMENTAL_MIGRATION" != "1" ]]; then
+  echo "[StopData] ERROR: HALTEWECKER_INCREMENTAL_MIGRATION must be 0 or 1" >&2
+  exit 64
+fi
+if [[ "$INCREMENTAL_MIGRATION" == "1" && ( "$INCREMENTAL_PRODUCTION" != "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" || "$RUN_MODE" != "normal" ) ]]; then
+  echo "[StopData] ERROR: migration override requires explicit --incremental activation mode" >&2
+  exit 64
+fi
 if [[ -n "$COMMON_SNAPSHOT_FINGERPRINT_ARG" ]]; then
   COMMON_SNAPSHOT_FINGERPRINT="$COMMON_SNAPSHOT_FINGERPRINT_ARG"
 elif [[ -n "${HALTEWECKER_COMMON_SNAPSHOT_FINGERPRINT:-}" ]]; then
@@ -171,7 +180,6 @@ else
 fi
 RELEASE_DIR="$RELEASES/$RELEASE_ID"
 INCREMENTAL_RELEASES_ROOT="${HALTEWECKER_INCREMENTAL_RELEASES_ROOT:-$DATA_ROOT/releases/incremental}"
-PILOT_CURRENT="$INCREMENTAL_RELEASES_ROOT/pilot-current"
 INCREMENTAL_RELEASE_DIR="$INCREMENTAL_RELEASES_ROOT/$RELEASE_ID"
 BUILD_DIR="$RELEASE_DIR/stop-data"
 FROZEN_COMMON_STOP_DATA=0
@@ -323,8 +331,6 @@ DIAGNOSTICS_STAGING_PATH=""
 DIAGNOSTICS_PUBLISHED_PATH=""
 DIAGNOSTICS_PUBLICATION_TRANSITION_MS=""
 BUILD_FINGERPRINT=""
-OLD_PILOT_TARGET=""
-INCREMENTAL_POINTER_CHANGED=0
 DIAGNOSTICS_REPLAY=0
 
 if [[ "$NO_ACTIVATE" == "1" ]]; then
@@ -681,47 +687,129 @@ activate_runtime() {
   echo "[StopData] release=$RELEASE_ID static departures synchronized"
 }
 
-restore_incremental_pilot_pointer() {
-  if [[ "$INCREMENTAL_POINTER_CHANGED" != "1" ]]; then
+validate_incremental_candidate() {
+  if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" == "1" ]]; then
+    python3 - "$INCREMENTAL_RELEASE_DIR/release.json" "$HALTEWECKER_INCREMENTAL_PROVIDER_IDS" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+providers = tuple(value for value in sys.argv[2].split(",") if value)
+actual = tuple((payload.get("providers") or {}).keys())
+if set(actual) != set(providers):
+    raise SystemExit("dry-run candidate does not represent all configured providers")
+print(
+    "[Nightly] stage=incremental-candidate-validation status=PASS "
+    f"release={payload.get('releaseID', '')} providers={len(providers)} mode=dry-run"
+)
+PY
+    return
+  fi
+  python3 - "$INCREMENTAL_RELEASE_DIR" "$HALTEWECKER_INCREMENTAL_PROVIDER_IDS" "$REPO" <<'PY'
+import sys
+from pathlib import Path
+
+repository = Path(sys.argv[3])
+sys.path.insert(0, str(repository / "services"))
+from static_departures_runtime import load_release_manifest
+
+providers = tuple(value for value in sys.argv[2].split(",") if value)
+manifest = load_release_manifest(Path(sys.argv[1]), provider_ids=providers)
+if set(manifest.providers) != set(providers):
+    raise SystemExit("incremental candidate does not contain all configured providers")
+print(
+    "[Nightly] stage=incremental-candidate-validation status=PASS "
+    f"release={manifest.release_id} providers={len(providers)}"
+)
+PY
+}
+
+route_recall_activation() {
+  local compose_file="${HALTEWECKER_ROUTERECALL_COMPOSE_FILE:-/srv/routerecall/RouteRecallAPI/deploy/routerecall-api.compose.yml}"
+  local repository="${HALTEWECKER_ROUTERECALL_REPO:-/srv/routerecall/RouteRecallAPI}"
+  local container="${HALTEWECKER_ROUTERECALL_CONTAINER_NAME:-routerecall-api}"
+  local rollback_container="${container}-rollback-${RELEASE_ID}"
+  rollback_container="${rollback_container:0:63}"
+
+  if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" == "1" ]]; then
+    echo "[Nightly] stage=routerecall-activation status=DRY-RUN container=$container"
     return 0
   fi
-  if [[ -n "$OLD_PILOT_TARGET" ]]; then
-    replace_link "$PILOT_CURRENT" "$OLD_PILOT_TARGET"
-  else
-    rm -f "$PILOT_CURRENT" "$PILOT_CURRENT.next"
-  fi
-  INCREMENTAL_POINTER_CHANGED=0
-  echo "[Nightly] stage=pilot-pointer status=RESTORED target=${OLD_PILOT_TARGET:-none}"
-}
-
-publish_incremental_pilot_pointer() {
-  mkdir -p "$(dirname "$PILOT_CURRENT")"
-  if [[ -e "$PILOT_CURRENT" && ! -L "$PILOT_CURRENT" ]]; then
-    echo "[Nightly] ERROR: incremental pilot pointer is not a symlink: $PILOT_CURRENT" >&2
+  if [[ ! -f "$compose_file" || ! -d "$repository" ]]; then
+    echo "[Nightly] ERROR: RouteRecall production compose is unavailable" >&2
     return 1
   fi
-  if [[ -L "$PILOT_CURRENT" ]]; then
-    OLD_PILOT_TARGET="$(readlink "$PILOT_CURRENT")"
+  if docker inspect "$container" >/dev/null 2>&1; then
+    if docker inspect "$rollback_container" >/dev/null 2>&1; then
+      echo "[Nightly] ERROR: RouteRecall rollback container already exists: $rollback_container" >&2
+      return 1
+    fi
+    docker rename "$container" "$rollback_container"
+    docker stop --time "${HALTEWECKER_ROUTERECALL_STOP_TIMEOUT_SECONDS:-30}" "$rollback_container" >/dev/null
   fi
-  replace_link "$PILOT_CURRENT" "$RELEASE_ID"
-  INCREMENTAL_POINTER_CHANGED=1
-  echo "[Nightly] stage=pilot-pointer status=PUBLISHED release=$RELEASE_ID previous=${OLD_PILOT_TARGET:-none}"
+  if ! docker compose --project-directory "$repository" -f "$compose_file" up -d --build; then
+    if docker inspect "$container" >/dev/null 2>&1; then docker rm -f "$container" >/dev/null 2>&1 || true; fi
+    if docker inspect "$rollback_container" >/dev/null 2>&1; then
+      docker rename "$rollback_container" "$container" >/dev/null
+      docker start "$container" >/dev/null
+    fi
+    return 1
+  fi
+  if ! docker exec "$container" python3 -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8091/routerecall/v1/cities", timeout=5)' >/dev/null 2>&1; then
+    echo "[Nightly] ERROR: RouteRecall provider runtime readiness failed" >&2
+    if docker inspect "$container" >/dev/null 2>&1; then docker rm -f "$container" >/dev/null 2>&1 || true; fi
+    if docker inspect "$rollback_container" >/dev/null 2>&1; then
+      docker rename "$rollback_container" "$container" >/dev/null 2>&1 || true
+      docker start "$container" >/dev/null 2>&1 || true
+    fi
+    return 1
+  fi
+  echo "[Nightly] stage=routerecall-activation status=PASS container=$container"
 }
 
-activate_incremental_runtime() {
-  local container_pointer="/data/releases/incremental/$RELEASE_ID"
-  echo "[Nightly] release=$RELEASE_ID activating hybrid pilot runtime"
-  if ! HALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME=1 \
-    HALTEWECKER_STATIC_DEPARTURES_HYBRID_PROVIDERS="israel-mot,ttc-surface,ttc-subway" \
-    HALTEWECKER_STATIC_DEPARTURES_HYBRID_RELEASE_POINTER="$container_pointer" \
+activate_incremental_production() {
+  local old_target=""
+  local candidate_target="releases/incremental/$RELEASE_ID"
+  local rollback_pointer="${HALTEWECKER_ROLLBACK_POINTER:-$DATA_ROOT/rollback}"
+  if [[ ! -L "$CURRENT_RELEASE" ]]; then
+    echo "[Nightly] ERROR: current-release is not a symlink; refusing incremental activation" >&2
+    return 1
+  fi
+  old_target="$(readlink "$CURRENT_RELEASE")"
+  if [[ -e "$rollback_pointer" && ! -L "$rollback_pointer" ]]; then
+    echo "[Nightly] ERROR: rollback pointer is not a symlink: $rollback_pointer" >&2
+    return 1
+  fi
+  validate_incremental_candidate
+  mkdir -p "$(dirname "$rollback_pointer")"
+  replace_link "$rollback_pointer" "$old_target"
+  replace_link "$CURRENT_RELEASE" "$candidate_target"
+  if ! HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE=provider \
+    HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RUNTIME=1 \
+    HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS="$HALTEWECKER_INCREMENTAL_PROVIDER_IDS" \
+    HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RELEASE_POINTER="/data/current-release" \
     READINESS_ONLY=1 \
-    RELEASE_ID="" \
+    RELEASE_ID="$RELEASE_ID" \
     EXTERNAL_GTFS_ARTIFACTS_JSON="" \
+    STATIC_DATA_ROOT="/data/current-release/stop-data" \
     "$STATIC_DEPARTURES_PIPELINE"; then
-    echo "[Nightly] ERROR: release=$RELEASE_ID hybrid runtime readiness failed" >&2
+    replace_link "$CURRENT_RELEASE" "$old_target"
     return 1
   fi
-  echo "[Nightly] release=$RELEASE_ID hybrid runtime synchronized"
+  if ! route_recall_activation; then
+    replace_link "$CURRENT_RELEASE" "$old_target"
+    local static_container="static-departures-api"
+    local static_rollback="static-departures-api-rollback-${RELEASE_ID}"
+    static_rollback="${static_rollback:0:63}"
+    if docker inspect "$static_container" >/dev/null 2>&1 && docker inspect "$static_rollback" >/dev/null 2>&1; then
+      docker rm -f "$static_container" >/dev/null 2>&1 || true
+      docker rename "$static_rollback" "$static_container" >/dev/null 2>&1 || true
+      docker start "$static_container" >/dev/null 2>&1 || true
+    fi
+    return 1
+  fi
+  echo "[Nightly] stage=activation status=PASS mode=FULL_INCREMENTAL old=$old_target new=$candidate_target rollback=$rollback_pointer"
 }
 
 cd "$REPO"
@@ -744,7 +832,7 @@ directory_size_kb() {
   local path="$1"
   if [[ ! -e "$path" && ! -L "$path" ]]; then
     echo 0
-    return
+    return 0
   fi
   du -skL "$path" 2>/dev/null | awk '{ print $1; exit }' || echo 0
 }
@@ -835,9 +923,15 @@ proof_disk_preflight() {
       disk_mode="production-shaped-no-activate"
     fi
   elif [[ "$INCREMENTAL_PRODUCTION" == "1" ]]; then
-    minimum_free_kb=$((45 * 1024 * 1024))
-    warning_free_kb=$minimum_free_kb
-    disk_mode="incremental-production"
+    if [[ "$INCREMENTAL_MIGRATION" == "1" ]]; then
+      minimum_free_kb=$((20 * 1024 * 1024))
+      warning_free_kb=$minimum_free_kb
+      disk_mode="incremental-migration"
+    else
+      minimum_free_kb=$((45 * 1024 * 1024))
+      warning_free_kb=$minimum_free_kb
+      disk_mode="incremental-production"
+    fi
   else
     minimum_free_kb=$(( ${HALTEWECKER_MIN_FREE_GB:-45} * 1024 * 1024 ))
     warning_free_kb="$minimum_free_kb"
@@ -1588,16 +1682,10 @@ PY
     exit 0
   fi
   if [[ "$INCREMENTAL_PRODUCTION" == "1" ]]; then
-    if ! publish_incremental_pilot_pointer; then
+    if ! activate_incremental_production; then
       exit 1
     fi
-    if ! activate_incremental_runtime; then
-      restore_incremental_pilot_pointer
-      exit 1
-    fi
-    INCREMENTAL_POINTER_CHANGED=0
-    echo "[Nightly] stage=pilot-activation status=PASS release=$RELEASE_ID candidate=$INCREMENTAL_RELEASE_DIR"
-    echo "[Nightly] stage=nightly-complete status=PASS release=$RELEASE_ID mode=incremental-production activation=PILOT_HYBRID"
+    echo "[Nightly] stage=nightly-complete status=PASS release=$RELEASE_ID mode=incremental-production activation=FULL_INCREMENTAL"
     log_disk_state "after"
     log_disk_peak
     exit 0

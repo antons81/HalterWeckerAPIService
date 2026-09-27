@@ -21,7 +21,11 @@ from static_departures_runtime import (  # noqa: E402
     HYBRID_ENV,
     HYBRID_RELEASE_POINTER_ENV,
     ISRAEL_PROVIDER_ID,
+    PROVIDER_RUNTIME_ENV,
+    PROVIDER_RUNTIME_MODE_ENV,
+    PROVIDER_RELEASE_POINTER_ENV,
     HybridStaticDeparturesBackend,
+    provider_runtime_enabled,
     ReleaseSnapshot,
     ReleaseManager,
     RuntimeUnavailable,
@@ -525,6 +529,47 @@ class StaticDeparturesRuntimeTests(unittest.TestCase):
 
     def test_hybrid_flag_is_default_off(self) -> None:
         self.assertIsNone(hybrid_backend_from_environment(object(), environ={}))
+
+    def test_provider_runtime_auto_detects_incremental_release_without_opening_legacy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pointer = Path(temporary) / "current-release"
+            pointer.mkdir()
+            (pointer / "release.json").write_text('{"providers": {}, "common": {}, "stopData": {}}', encoding="utf-8")
+            self.assertTrue(
+                provider_runtime_enabled(
+                    environ={
+                        PROVIDER_RUNTIME_MODE_ENV: "auto",
+                        PROVIDER_RUNTIME_ENV: "0",
+                        PROVIDER_RELEASE_POINTER_ENV: str(pointer),
+                    }
+                )
+            )
+            self.assertFalse(
+                provider_runtime_enabled(
+                    environ={
+                        PROVIDER_RUNTIME_MODE_ENV: "legacy",
+                        PROVIDER_RUNTIME_ENV: "1",
+                        PROVIDER_RELEASE_POINTER_ENV: str(pointer),
+                    }
+                )
+            )
+
+    def test_provider_only_backend_never_uses_legacy_scope(self) -> None:
+        snapshot = _HybridFakeSnapshot(
+            "release-provider",
+            {"provider-city": (ISRAEL_PROVIDER_ID,), "legacy-city": ("legacy",)},
+            {("provider-city", "stop"): (ISRAEL_PROVIDER_ID,)},
+        )
+        backend = HybridStaticDeparturesBackend(
+            None,
+            _HybridFakeManager(snapshot),
+            (ISRAEL_PROVIDER_ID,),
+            provider_only=True,
+        )
+        self.assertEqual(backend.lines("provider-city", "stop")[0]["backend"], "shard")
+        with self.assertRaisesRegex(RuntimeUnavailable, "provider-only runtime"):
+            backend.lines("legacy-city", "stop")
+        backend.close()
 
     def test_hybrid_requires_an_atomic_release_pointer(self) -> None:
         with self.assertRaisesRegex(RuntimeUnavailable, HYBRID_RELEASE_POINTER_ENV):
