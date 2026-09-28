@@ -13,7 +13,7 @@ from typing import Mapping, Sequence
 VALIDATION_RECEIPT_FILE_NAME = "validation-receipt.json"
 VALIDATION_RECEIPT_SCHEMA_VERSION = 1
 VALIDATOR_COMPATIBILITY = "provider-runtime-validation-v1"
-VALIDATOR_FINGERPRINT = "static-departures-runtime-validation-v1"
+VALIDATOR_FINGERPRINT = "static-departures-runtime-validation-v2"
 
 
 class ValidationReceiptError(ValueError):
@@ -75,6 +75,19 @@ def _portable_path(root: Path, path: Path) -> str:
         return path.relative_to(root).as_posix()
     except ValueError:
         return str(path)
+
+
+def _portable_reference(root: Path, value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValidationReceiptError("portable reference is missing")
+    path = Path(raw)
+    if not path.is_absolute():
+        return path.as_posix()
+    try:
+        return path.resolve().relative_to(root).as_posix()
+    except ValueError:
+        return raw
 
 
 def _manifest_path(root: Path, entry: Mapping[str, object], database_path: Path, label: str) -> Path:
@@ -161,8 +174,12 @@ def build_validation_receipt(
             )
             key = f"{provider_id}/{artifact_type}"
             artifacts[key] = {
-                "path": _portable_path(root, database_path),
-                "manifestPath": _portable_path(root, artifact_manifest_path),
+                "path": _portable_reference(
+                    root, reference.get("path") or reference.get("databasePath")
+                ),
+                "manifestPath": _portable_reference(
+                    root, reference.get("manifestPath") or database_path.parent / "manifest.json"
+                ),
                 "manifestSha256": _sha256_file(artifact_manifest_path),
                 "databaseStat": _stat_payload(database_path),
                 "artifactKey": str(reference.get("artifactKey") or manifest.get("artifactKey") or ""),
@@ -183,14 +200,20 @@ def build_validation_receipt(
             "sha256": _sha256_file(manifest_path),
         },
         "common": {
-            "path": _portable_path(root, common_path),
+            "path": _portable_reference(root, common.get("path")),
             "sha256": str(common.get("sha256") or ""),
             "size": int(common.get("size") or 0),
             "databaseStat": _stat_payload(common_path),
         },
         "stopData": {
-            "path": _portable_path(root, stop_data_root),
-            "manifestPath": _portable_path(root, stop_manifest_path),
+            "path": _portable_reference(
+                root, stop_data_entry.get("path") or "stop-data"
+            ),
+            "manifestPath": _portable_reference(
+                root,
+                stop_data_entry.get("manifestPath")
+                or Path(str(stop_data_entry.get("path") or "stop-data")) / "manifest.json"
+            ),
             "manifestSha256": _sha256_file(stop_manifest_path),
             "fingerprint": str(
                 stop_data_entry.get("fingerprint")

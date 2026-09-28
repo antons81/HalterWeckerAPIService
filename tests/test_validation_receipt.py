@@ -1,4 +1,5 @@
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -87,6 +88,18 @@ class ValidationReceiptTests(unittest.TestCase):
                 provider_ids=(self.provider_id,),
             )
             self.assertEqual(receipt["result"], "PASS")
+
+    def test_relative_stop_data_symlink_stays_portable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self._build_fixture(Path(temporary))
+            stop_data = root / "stop-data"
+            target = root / "stop-data-target"
+            shutil.move(stop_data, target)
+            stop_data.symlink_to("stop-data-target", target_is_directory=True)
+            write_validation_receipt(root, provider_ids=(self.provider_id,))
+            receipt = json.loads((root / "validation-receipt.json").read_text())
+            self.assertEqual(receipt["stopData"]["path"], "stop-data")
+            validate_validation_receipt(root, provider_ids=(self.provider_id,))
 
     def test_changed_release_manifest_rejects_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
