@@ -111,7 +111,11 @@ fi
 # supplied STOP_DATA_PATH. Do not search for or reuse artifacts from another release.
 if [[ -n "$RELEASE_ID" && -z "${EXTERNAL_GTFS_ARTIFACTS_JSON:-}" ]]; then
   if [[ -z "$ACTIVE_RELEASE_DIR" ]]; then
-    ACTIVE_RELEASE_DIR="$DATA_ROOT/releases/$RELEASE_ID"
+    if [[ -d "$DATA_ROOT/releases/incremental/$RELEASE_ID" ]]; then
+      ACTIVE_RELEASE_DIR="$DATA_ROOT/releases/incremental/$RELEASE_ID"
+    else
+      ACTIVE_RELEASE_DIR="$DATA_ROOT/releases/$RELEASE_ID"
+    fi
   fi
   EXTERNAL_GTFS_ARTIFACTS_JSON="$ACTIVE_RELEASE_DIR/gtfs-artifacts.json"
 fi
