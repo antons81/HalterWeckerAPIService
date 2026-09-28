@@ -1564,7 +1564,11 @@ def transit_radar_manifest(
                 raise ValueError(f"Unsupported transit radar adapter for {city_id}")
 
             explicit_features = provider_configuration.get("features")
-            if explicit_features is not None:
+            if adapter == "vbb":
+                features = ["firstDepartures", "stopLookup"]
+                supports_live_vehicles = False
+                supports_departures = True
+            elif explicit_features is not None:
                 features = list(explicit_features)
                 supports_live_vehicles = "liveVehicles" in features
                 supports_departures = "realtimeDepartures" in features
@@ -1607,6 +1611,9 @@ def transit_radar_manifest(
                 "isExperimental": bool(provider_configuration.get("isExperimental", True)),
                 "features": features,
                 "statusMessage": provider_configuration.get("statusMessage") or (
+                    f'Scheduled departures for {city["name"]}'
+                    if adapter == "vbb"
+                    else
                     f'Live-Radar und Live-Abfahrten für {city["name"]}'
                     if supports_live_vehicles and supports_departures
                     else f'Live-Abfahrten für {city["name"]}'

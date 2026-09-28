@@ -43,6 +43,11 @@ try:
 except ImportError:
     from scripts.validation_receipt import ValidationReceiptError, validate_validation_receipt
 
+try:
+    from vbb_overlay_provider import VBBOverlayProviderAdapter, VBBOverlayUnavailable, VBB_CITY_ID, VBB_PROVIDER_ID
+except ImportError:
+    from services.vbb_overlay_provider import VBBOverlayProviderAdapter, VBBOverlayUnavailable, VBB_CITY_ID, VBB_PROVIDER_ID
+
 
 LOGGER = logging.getLogger("haltewecker.static_departures_runtime")
 ISRAEL_PROVIDER_ID = "israel-mot"
@@ -1970,8 +1975,25 @@ class HybridStaticDeparturesBackend:
         self.eligible_provider_ids = frozenset(self.provider_ids)
         self.compare_legacy = compare_legacy
         self.provider_only = provider_only
+        self._vbb_adapters: OrderedDict[str, VBBOverlayProviderAdapter] = OrderedDict()
         if self.provider_only and self.legacy is not None:
             raise RuntimeUnavailable("provider-only runtime cannot retain a legacy database")
+
+    def _vbb_adapter(self, snapshot: ReleaseSnapshot) -> VBBOverlayProviderAdapter:
+        release_id = str(snapshot.release_id)
+        adapter = self._vbb_adapters.get(release_id)
+        if adapter is None:
+            stop_data_root = getattr(snapshot, "stop_data_root", None)
+            if stop_data_root is None:
+                raise RuntimeUnavailable("VBB provider requires a release stop-data root")
+            adapter = VBBOverlayProviderAdapter(stop_data_root)
+            self._vbb_adapters[release_id] = adapter
+            while len(self._vbb_adapters) > 2:
+                _old_release_id, old_adapter = self._vbb_adapters.popitem(last=False)
+                old_adapter.close()
+        else:
+            self._vbb_adapters.move_to_end(release_id)
+        return adapter
 
     @staticmethod
     def _scope(
@@ -2139,8 +2161,17 @@ class HybridStaticDeparturesBackend:
         shard_call: Callable[[ReleaseSnapshot], object],
         *,
         allow_multi_provider: bool = True,
+        vbb_call: Callable[[VBBOverlayProviderAdapter], object] | None = None,
     ) -> object:
         with self.manager.acquire_snapshot() as lease:
+            if vbb_call is not None and VBBOverlayProviderAdapter.handles_city(city_id):
+                adapter = self._vbb_adapter(lease.snapshot)
+                scope = _HybridScope("vbb", "vbb-overlay", VBB_CITY_ID, (VBB_PROVIDER_ID,))
+                self._log_routing(query, scope, provider=VBB_PROVIDER_ID, release_id=lease.release_id)
+                try:
+                    return vbb_call(adapter)
+                except VBBOverlayUnavailable as error:
+                    raise RuntimeUnavailable(str(error)) from error
             scope = self._scope(
                 lease.snapshot,
                 city_id,
@@ -2202,11 +2233,15 @@ class HybridStaticDeparturesBackend:
             return lease.snapshot.catalog.metadata()
 
     def resolve_city(self, city_id: str) -> str:
+        if VBBOverlayProviderAdapter.handles_city(city_id):
+            return VBB_CITY_ID
         with self.manager.acquire_snapshot() as lease:
             return lease.snapshot.catalog.resolve_city(city_id)
 
     def city_stop_registry(self, city_id: str) -> set[str]:
         with self.manager.acquire_snapshot() as lease:
+            if VBBOverlayProviderAdapter.handles_city(city_id):
+                return self._vbb_adapter(lease.snapshot).city_stop_registry()
             resolved_city = lease.snapshot.catalog.resolve_city(city_id)
             return lease.snapshot.catalog.city_stop_registry(resolved_city)
 
@@ -2219,6 +2254,9 @@ class HybridStaticDeparturesBackend:
     ) -> set[str]:
         with self.manager.acquire_snapshot() as lease:
             snapshot = lease.snapshot
+            if VBBOverlayProviderAdapter.handles_city(city_id):
+                adapter = self._vbb_adapter(snapshot)
+                return {str(value) for value in stop_ids if adapter.city_has_stop(city_id, str(value))}
             resolved_city = snapshot.catalog.resolve_city(city_id)
             public_ids = snapshot.catalog.city_stop_registry(resolved_city)
             selected = {str(value) for value in stop_ids if str(value) in public_ids}
@@ -2258,6 +2296,7 @@ class HybridStaticDeparturesBackend:
             stop_id,
             lambda: self.legacy.city_has_stop(city_id, stop_id),
             lambda snapshot: snapshot.city_has_stop(city_id, stop_id),
+            vbb_call=lambda adapter: adapter.city_has_stop(city_id, str(stop_id)),
         ))
 
     def city_departure_mode(self, city_id: str) -> tuple[str, str, str, str]:
@@ -2267,6 +2306,7 @@ class HybridStaticDeparturesBackend:
             None,
             lambda: self.legacy.city_departure_mode(city_id),
             lambda snapshot: self._provider_mode(snapshot, city_id),
+            vbb_call=lambda adapter: adapter.city_departure_mode(),
         )  # type: ignore[return-value]
 
     @staticmethod
@@ -2286,6 +2326,7 @@ class HybridStaticDeparturesBackend:
                 tuple(mode.stop_id_prefix for mode in snapshot.provider_modes(city_id)),
                 tuple(mode.identifier_prefix for mode in snapshot.provider_modes(city_id)),
             ),
+            vbb_call=lambda adapter: adapter.city_departure_prefixes(),
         )  # type: ignore[return-value]
 
     def lines(self, city_id: str, stop_id: str) -> list[dict[str, str | None]]:
@@ -2295,6 +2336,7 @@ class HybridStaticDeparturesBackend:
             stop_id,
             lambda: self.legacy.lines(city_id, stop_id),
             lambda snapshot: snapshot.lines(city_id, stop_id),
+            vbb_call=lambda adapter: adapter.lines(city_id, stop_id),
         )  # type: ignore[return-value]
 
     def external_departures_for(
@@ -2316,6 +2358,9 @@ class HybridStaticDeparturesBackend:
             lambda snapshot: snapshot.external_departures_for(
                 city_id, stop_id, limit, from_datetime, timezone_name, now_provider=now_provider
             ),
+            vbb_call=lambda adapter: adapter.external_departures_for(
+                city_id, stop_id, limit, from_datetime, timezone_name, now_provider=now_provider
+            ),
         )  # type: ignore[return-value]
 
     def board(
@@ -2332,6 +2377,7 @@ class HybridStaticDeparturesBackend:
             stop_id,
             lambda: self.legacy.board(city_id, stop_id, limit, from_date, to_date),
             lambda snapshot: snapshot.board(city_id, stop_id, limit, from_date, to_date),
+            vbb_call=lambda adapter: adapter.board(city_id, stop_id, limit, from_date, to_date),
         )  # type: ignore[return-value]
 
     def _trip_provider(self, snapshot: ReleaseSnapshot, city_id: str, trip_id: str) -> str | None:
@@ -2349,6 +2395,14 @@ class HybridStaticDeparturesBackend:
         service_date: str | None = None,
     ) -> dict[str, object] | None:
         with self.manager.acquire_snapshot() as lease:
+            if VBBOverlayProviderAdapter.handles_city(city_id):
+                adapter = self._vbb_adapter(lease.snapshot)
+                scope = _HybridScope("vbb", "vbb-overlay", VBB_CITY_ID, (VBB_PROVIDER_ID,))
+                self._log_routing("trip-details", scope, provider=VBB_PROVIDER_ID, release_id=lease.release_id)
+                try:
+                    return adapter.trip_details(city_id, trip_id, static_root, service_date)
+                except VBBOverlayUnavailable as error:
+                    raise RuntimeUnavailable(str(error)) from error
             provider_id = self._trip_provider(lease.snapshot, city_id, trip_id)
             if provider_id not in self.eligible_provider_ids:
                 scope = _HybridScope("legacy", "non-pilot-provider", city_id, (provider_id,) if provider_id else ())
@@ -2489,6 +2543,9 @@ class HybridStaticDeparturesBackend:
 
     def close(self) -> None:
         try:
+            for adapter in self._vbb_adapters.values():
+                adapter.close()
+            self._vbb_adapters.clear()
             self.manager.close()
         finally:
             close = getattr(self.legacy, "close", None)

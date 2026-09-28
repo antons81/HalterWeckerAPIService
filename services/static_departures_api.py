@@ -90,6 +90,10 @@ from static_departures_runtime import (
     provider_runtime_enabled,
     shadow_backend_from_environment,
 )
+try:
+    from vbb_overlay_provider import normalize_vbb_radar_manifest
+except ImportError:
+    from services.vbb_overlay_provider import normalize_vbb_radar_manifest
 
 
 DEFAULT_TIMEZONE = "Europe/Berlin"
@@ -1985,6 +1989,21 @@ class Handler(BaseHTTPRequestHandler):
         if not candidate.is_file() or candidate.suffix != ".json":
             return self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
         try:
+            if relative == "transit-radar-cities.json":
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+                normalized = normalize_vbb_radar_manifest(payload)
+                if normalized != payload:
+                    body = json.dumps(normalized, ensure_ascii=False, indent=2).encode("utf-8")
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "public, max-age=300, stale-while-revalidate=60")
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except OSError:
+                        pass
+                    return
             size = candidate.stat().st_size
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")

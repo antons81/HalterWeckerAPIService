@@ -417,13 +417,11 @@ class CityLineCatalogTests(unittest.TestCase):
         self.assertEqual(
             provider["features"],
             [
-                "liveVehicles",
-                "realtimeDepartures",
                 "firstDepartures",
-                "stopLookup",
-                "realtimeDelay"
+                "stopLookup"
             ]
         )
+        self.assertEqual(provider["statusMessage"], "Scheduled departures for Berlin")
 
     def test_rnv_assets_cover_every_municipality_with_an_rnv_stop(self) -> None:
         archive_data = io.BytesIO()
