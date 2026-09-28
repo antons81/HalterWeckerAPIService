@@ -782,15 +782,20 @@ route_recall_activation() {
     fi
     return 1
   fi
-  if ! docker exec "$container" python3 -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8091/routerecall/v1/cities", timeout=5)' >/dev/null 2>&1; then
-    echo "[Nightly] ERROR: RouteRecall provider runtime readiness failed" >&2
-    if docker inspect "$container" >/dev/null 2>&1; then docker rm -f "$container" >/dev/null 2>&1 || true; fi
-    if docker inspect "$rollback_container" >/dev/null 2>&1; then
-      docker rename "$rollback_container" "$container" >/dev/null 2>&1 || true
-      docker start "$container" >/dev/null 2>&1 || true
+  local readiness_timeout="${ROUTERECALL_READINESS_TIMEOUT_SECONDS:-60}"
+  local readiness_deadline=$((SECONDS + readiness_timeout))
+  while ! docker exec "$container" python3 -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8091/routerecall/v1/cities", timeout=5)' >/dev/null 2>&1; do
+    if (( SECONDS >= readiness_deadline )); then
+      echo "[Nightly] ERROR: RouteRecall provider runtime readiness failed after ${readiness_timeout}s" >&2
+      if docker inspect "$container" >/dev/null 2>&1; then docker rm -f "$container" >/dev/null 2>&1 || true; fi
+      if docker inspect "$rollback_container" >/dev/null 2>&1; then
+        docker rename "$rollback_container" "$container" >/dev/null 2>&1 || true
+        docker start "$container" >/dev/null 2>&1 || true
+      fi
+      return 1
     fi
-    return 1
-  fi
+    sleep 2
+  done
   echo "[Nightly] stage=routerecall-activation status=PASS container=$container"
 }
 
