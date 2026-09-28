@@ -53,6 +53,7 @@ try:
         readiness_probe,
         validate_candidate_release,
     )
+    from .validation_receipt import write_validation_receipt
     from .provider_artifact_capabilities import (
         NORMALIZED_REQUIRED,
         STRUCTURAL_SUFFICIENT,
@@ -99,6 +100,7 @@ except ImportError:
         readiness_probe,
         validate_candidate_release,
     )
+    from validation_receipt import write_validation_receipt
     from provider_artifact_capabilities import (
         NORMALIZED_REQUIRED,
         STRUCTURAL_SUFFICIENT,
@@ -1462,6 +1464,18 @@ def build_incremental_candidate(
         _stage(
             "validation",
             lambda: validate_candidate_release(published_release_directory),
+        )
+        validation_receipt_path = _stage(
+            "validation-receipt",
+            lambda: write_validation_receipt(
+                published_release_directory,
+                provider_ids=provider_ids,
+            ),
+        )
+        print(
+            "[NightlyIncremental] stage=validation-receipt status=PASS "
+            f"path={validation_receipt_path}",
+            flush=True,
         )
         _disk_telemetry(
             stage="validation",

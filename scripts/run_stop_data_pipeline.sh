@@ -10,6 +10,7 @@ INCREMENTAL_NO_ACTIVATE=0
 INCREMENTAL_PRODUCTION="${HALTEWECKER_INCREMENTAL_PRODUCTION:-1}"
 INCREMENTAL_PROOF_OVERRIDE="${HALTEWECKER_INCREMENTAL_PROOF_OVERRIDE:-0}"
 INCREMENTAL_MIGRATION="${HALTEWECKER_INCREMENTAL_MIGRATION:-0}"
+ACTIVATE_EXISTING_RELEASE_ID=""
 RAW_SNAPSHOT_MANIFEST="${HALTEWECKER_RAW_SNAPSHOT_MANIFEST:-}"
 RAW_SNAPSHOT_MANIFEST_ARG=""
 COMMON_SNAPSHOT_FINGERPRINT="${HALTEWECKER_COMMON_SNAPSHOT_FINGERPRINT:-}"
@@ -92,12 +93,16 @@ elif [[ "${1:-}" == "--incremental-no-activate" ]]; then
         shift 2
         ;;
       *)
-        echo "usage: $0 [--resume RELEASE_ID|--incremental|--legacy-full|--stop-data-only|--incremental-no-activate [--raw-snapshot-manifest PATH] [--common-snapshot-fingerprint SHA256] [--trusted-common-stop-data PATH]|--no-activate [--reuse-stop-data [RELEASE_ID]]]" >&2
+        echo "usage: $0 [--resume RELEASE_ID|--incremental|--activate-existing-candidate RELEASE_ID|--legacy-full|--stop-data-only|--incremental-no-activate [--raw-snapshot-manifest PATH] [--common-snapshot-fingerprint SHA256] [--trusted-common-stop-data PATH]|--no-activate [--reuse-stop-data [RELEASE_ID]]]" >&2
         exit 64
         ;;
     esac
   done
 elif [[ "${1:-}" == "--incremental" && "$#" -eq 1 ]]; then
+  INCREMENTAL_PRODUCTION=1
+elif [[ "${1:-}" == "--activate-existing-candidate" && "$#" -eq 2 ]]; then
+  RUN_MODE="activate-existing"
+  ACTIVATE_EXISTING_RELEASE_ID="$2"
   INCREMENTAL_PRODUCTION=1
 elif [[ "${1:-}" == "--legacy-full" && "$#" -eq 1 ]]; then
   INCREMENTAL_PRODUCTION=0
@@ -106,7 +111,7 @@ elif [[ "${1:-}" == "--stop-data-only" && "$#" -eq 1 ]]; then
   EXPLICIT_NO_ACTIVATE=1
   STOP_DATA_ONLY=1
 elif [[ "$#" -ne 0 ]]; then
-  echo "usage: $0 [--resume RELEASE_ID|--incremental|--legacy-full|--stop-data-only|--incremental-no-activate [--raw-snapshot-manifest PATH] [--common-snapshot-fingerprint SHA256] [--trusted-common-stop-data PATH]|--no-activate [--reuse-stop-data [RELEASE_ID]]]" >&2
+  echo "usage: $0 [--resume RELEASE_ID|--incremental|--activate-existing-candidate RELEASE_ID|--legacy-full|--stop-data-only|--incremental-no-activate [--raw-snapshot-manifest PATH] [--common-snapshot-fingerprint SHA256] [--trusted-common-stop-data PATH]|--no-activate [--reuse-stop-data [RELEASE_ID]]]" >&2
   exit 64
 fi
 
@@ -169,12 +174,16 @@ REPO="${REPO:-/srv/haltewecker/pipeline/HalterWeckerAPIService}"
 DATA_ROOT="${DATA_ROOT:-/srv/haltewecker/data}"
 CACHE_ROOT="${GTFS_CACHE_ROOT:-$DATA_ROOT/cache/gtfs}"
 RELEASES="$DATA_ROOT/releases"
-if [[ "$RUN_MODE" == "resume" ]]; then
-  if ! [[ "$RESUME_RELEASE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-    echo "[StopData] ERROR: invalid release ID for resume: $RESUME_RELEASE_ID" >&2
+if [[ "$RUN_MODE" == "resume" || "$RUN_MODE" == "activate-existing" ]]; then
+  TARGET_RELEASE_ID="$RESUME_RELEASE_ID"
+  if [[ "$RUN_MODE" == "activate-existing" ]]; then
+    TARGET_RELEASE_ID="$ACTIVATE_EXISTING_RELEASE_ID"
+  fi
+  if ! [[ "$TARGET_RELEASE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "[StopData] ERROR: invalid release ID: $TARGET_RELEASE_ID" >&2
     exit 64
   fi
-  RELEASE_ID="$RESUME_RELEASE_ID"
+  RELEASE_ID="$TARGET_RELEASE_ID"
 else
   RELEASE_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 fi
@@ -713,14 +722,31 @@ from pathlib import Path
 repository = Path(sys.argv[3])
 sys.path.insert(0, str(repository / "services"))
 from static_departures_runtime import load_release_manifest
+from validation_receipt import (
+    ValidationReceiptError,
+    validate_validation_receipt,
+    write_validation_receipt,
+)
 
+release_root = Path(sys.argv[1])
 providers = tuple(value for value in sys.argv[2].split(",") if value)
-manifest = load_release_manifest(Path(sys.argv[1]), provider_ids=providers)
+try:
+    validate_validation_receipt(release_root, provider_ids=providers)
+    receipt_status = "REUSED"
+except ValidationReceiptError:
+    receipt_status = "CREATED"
+manifest = load_release_manifest(release_root, provider_ids=providers)
 if set(manifest.providers) != set(providers):
     raise SystemExit("incremental candidate does not contain all configured providers")
+receipt_path = (
+    release_root / "validation-receipt.json"
+    if receipt_status == "REUSED"
+    else write_validation_receipt(release_root, provider_ids=providers)
+)
 print(
     "[Nightly] stage=incremental-candidate-validation status=PASS "
-    f"release={manifest.release_id} providers={len(providers)}"
+    f"release={manifest.release_id} providers={len(providers)} "
+    f"receipt={receipt_status} receiptPath={receipt_path}"
 )
 PY
 }
@@ -813,6 +839,20 @@ activate_incremental_production() {
 }
 
 cd "$REPO"
+if [[ "$RUN_MODE" == "activate-existing" ]]; then
+  if [[ ! -d "$INCREMENTAL_RELEASE_DIR" || ! -f "$INCREMENTAL_RELEASE_DIR/release.json" ]]; then
+    echo "[Nightly] ERROR: existing incremental candidate is missing: $INCREMENTAL_RELEASE_DIR" >&2
+    exit 1
+  fi
+  echo "[Nightly] stage=activation-only status=started release=$RELEASE_ID candidate=$INCREMENTAL_RELEASE_DIR"
+  validate_incremental_candidate
+  if ! activate_incremental_production; then
+    echo "[Nightly] stage=activation-only status=FAIL release=$RELEASE_ID" >&2
+    exit 1
+  fi
+  echo "[Nightly] stage=nightly-complete status=PASS release=$RELEASE_ID mode=activation-only activation=FULL_INCREMENTAL"
+  exit 0
+fi
 TOTAL_STARTED=$SECONDS
 PEAK_USED_KB=0
 PEAK_FREE_KB=0

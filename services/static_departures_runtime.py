@@ -38,6 +38,11 @@ try:
 except ImportError:
     from scripts.artifact_trust import trusted_artifact
 
+try:
+    from validation_receipt import ValidationReceiptError, validate_validation_receipt
+except ImportError:
+    from scripts.validation_receipt import ValidationReceiptError, validate_validation_receipt
+
 
 LOGGER = logging.getLogger("haltewecker.static_departures_runtime")
 ISRAEL_PROVIDER_ID = "israel-mot"
@@ -247,6 +252,7 @@ def _validate_artifact(
     artifact_type: str,
     value: object,
     validation_observer: ValidationObserver | None = None,
+    receipt_entry: Mapping[str, object] | None = None,
 ) -> ArtifactReference:
     if not isinstance(value, dict):
         raise RuntimeUnavailable(
@@ -307,7 +313,8 @@ def _validate_artifact(
         )
     expected_digest = str(value.get("sha256") or sqlite_provenance.get("sha256") or "")
     expected_size = int(value.get("size") or sqlite_provenance.get("size") or 0)
-    trusted = trusted_artifact(
+    receipt_trusted = receipt_entry is not None
+    trusted = receipt_trusted or trusted_artifact(
         database_path=database_path,
         manifest_path=manifest_path,
         manifest=manifest,
@@ -316,8 +323,8 @@ def _validate_artifact(
         "stage=artifact-validation provider=%s artifact_type=%s status=%s reason=%s",
         provider_id,
         artifact_type,
-        "HIT" if trusted else "FULL",
-        "trusted-reuse" if trusted else "full-revalidation",
+        "RECEIPT" if receipt_trusted else ("HIT" if trusted else "FULL"),
+        "validation-receipt" if receipt_trusted else ("trusted-reuse" if trusted else "full-revalidation"),
     )
     if trusted:
         try:
@@ -395,15 +402,41 @@ def load_release_manifest(
     release_id = str(payload.get("releaseID") or "").strip()
     if not release_id:
         raise RuntimeUnavailable("releaseID is missing")
+    receipt: Mapping[str, object] | None = None
+    try:
+        receipt = validate_validation_receipt(
+            root,
+            provider_ids=provider_ids,
+            payload=payload,
+        )
+        LOGGER.info(
+            "stage=release-validation status=RECEIPT release=%s reason=validated-candidate",
+            release_id,
+        )
+    except ValidationReceiptError as error:
+        LOGGER.info(
+            "stage=release-validation status=FULL release=%s reason=%s",
+            release_id,
+            error,
+        )
     common = payload.get("common")
     if not isinstance(common, dict):
         raise RuntimeUnavailable("common DB reference is missing")
     common_path = _resolve_reference(root, common.get("path"), "common DB")
-    common_digest, common_size = _sha256_file(
-        common_path,
-        observer=validation_observer,
-        stage="common-catalog-validation",
-    )
+    if receipt is not None:
+        common_digest = str(common.get("sha256") or "")
+        common_size = int(common.get("size") or 0)
+        try:
+            with sqlite3.connect(f"file:{common_path}?mode=ro", uri=True) as connection:
+                connection.execute("SELECT 1").fetchone()
+        except sqlite3.Error as error:
+            raise RuntimeUnavailable(f"common DB cannot be opened: {common_path}") from error
+    else:
+        common_digest, common_size = _sha256_file(
+            common_path,
+            observer=validation_observer,
+            stage="common-catalog-validation",
+        )
     if common_digest != str(common.get("sha256") or "") or common_size != int(common.get("size") or 0):
         raise RuntimeUnavailable("common DB hash/size mismatch")
     stop_data = payload.get("stopData")
@@ -411,10 +444,14 @@ def load_release_manifest(
     stop_data_root = (root / str(stop_data_reference or "stop-data")).resolve()
     if not stop_data_root.is_dir() or not (stop_data_root / "manifest.json").is_file():
         raise RuntimeUnavailable("release stop-data root or manifest is missing")
-    missing_common = COMMON_TABLES - _sqlite_tables(
-        common_path,
-        observer=validation_observer,
-        stage="common-catalog-validation",
+    missing_common = (
+        COMMON_TABLES - _sqlite_tables(
+            common_path,
+            observer=validation_observer,
+            stage="common-catalog-validation",
+        )
+        if receipt is None
+        else set()
     )
     if missing_common:
         raise RuntimeUnavailable(f"common DB missing tables: {sorted(missing_common)}")
@@ -442,12 +479,19 @@ def load_release_manifest(
         entry = provider_payload.get(provider_id)
         if not isinstance(entry, dict):
             raise RuntimeUnavailable(f"provider={provider_id} is missing from release")
+        receipt_artifacts = receipt.get("artifacts") if isinstance(receipt, Mapping) else None
+        receipt_entries = receipt_artifacts if isinstance(receipt_artifacts, Mapping) else {}
         structural = _validate_artifact(
             root,
             provider_id,
             "structural",
             entry.get("structural"),
             validation_observer=validation_observer,
+            receipt_entry=(
+                receipt_entries.get(f"{provider_id}/structural")
+                if isinstance(receipt_entries, Mapping)
+                else None
+            ),
         )
         temporal = _validate_artifact(
             root,
@@ -455,6 +499,11 @@ def load_release_manifest(
             "temporal",
             entry.get("temporal"),
             validation_observer=validation_observer,
+            receipt_entry=(
+                receipt_entries.get(f"{provider_id}/temporal")
+                if isinstance(receipt_entries, Mapping)
+                else None
+            ),
         )
         structural_key = temporal.manifest.get("structuralArtifactKey")
         if structural_key != structural.artifact_key:

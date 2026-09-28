@@ -5,6 +5,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import date, datetime
 from io import StringIO
 from pathlib import Path
@@ -35,6 +36,7 @@ from static_departures_runtime import (  # noqa: E402
     shadow_backend_from_environment,
 )
 import test_static_provider_artifact as static_provider_tests  # noqa: E402
+from validation_receipt import write_validation_receipt  # noqa: E402
 
 
 class _HybridFakeCatalog:
@@ -428,6 +430,19 @@ class StaticDeparturesRuntimeTests(unittest.TestCase):
                 )
             finally:
                 snapshot.close()
+
+    def test_validation_receipt_skips_full_artifact_hash_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _legacy_path, release, _stop_data = self._build_fixture(Path(temporary))
+            write_validation_receipt(release, provider_ids=(ISRAEL_PROVIDER_ID,))
+            with patch(
+                "static_departures_runtime._sha256_file",
+                side_effect=AssertionError(
+                    "receipt path must not hash runtime artifacts"
+                ),
+            ):
+                snapshot = ReleaseSnapshot.open(release)
+            snapshot.close()
 
     def test_invalid_release_references_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
