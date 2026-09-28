@@ -4,6 +4,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY services/static_departures_api.py /app/static_departures_api.py
 COPY services/static_departures_runtime.py /app/static_departures_runtime.py
+COPY services/vbb_overlay_provider.py /app/vbb_overlay_provider.py
 COPY services/validation_receipt.py /app/validation_receipt.py
 COPY services/apple_store_notifications.py /app/apple_store_notifications.py
 COPY services/apple_store_business_events.py /app/apple_store_business_events.py
