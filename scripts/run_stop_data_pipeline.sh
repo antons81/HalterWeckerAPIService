@@ -774,7 +774,7 @@ route_recall_activation() {
     docker rename "$container" "$rollback_container"
     docker stop --time "${HALTEWECKER_ROUTERECALL_STOP_TIMEOUT_SECONDS:-30}" "$rollback_container" >/dev/null
   fi
-  if ! docker compose --project-directory "$repository" -f "$compose_file" up -d --build; then
+  if ! docker compose --project-directory "$repository/deploy" -f "$compose_file" up -d --build; then
     if docker inspect "$container" >/dev/null 2>&1; then docker rm -f "$container" >/dev/null 2>&1 || true; fi
     if docker inspect "$rollback_container" >/dev/null 2>&1; then
       docker rename "$rollback_container" "$container" >/dev/null
