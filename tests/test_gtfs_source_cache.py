@@ -15,7 +15,7 @@ from unittest.mock import patch
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from gtfs_source_cache import GTFSArtifactCache
+from gtfs_source_cache import GTFSArtifactCache, default_cache_root
 from gtfs_source_cache import ArtifactResult
 from external_gtfs import validate_kyiv_gtfs_archive
 from download_austrian_gtfs import download_source
@@ -56,6 +56,82 @@ class FakeResponse:
         size = _args[0] if _args else len(self.body)
         chunk, self.body = self.body[:size], self.body[size:]
         return chunk
+
+
+class GTFSCacheRootTests(unittest.TestCase):
+    def test_default_cache_root_without_environment_uses_canonical_production_path(self) -> None:
+        self.assertEqual(
+            default_cache_root({}),
+            Path("/srv/haltewecker/data/cache/gtfs"),
+        )
+
+    def test_default_cache_root_uses_data_root_when_override_is_absent(self) -> None:
+        self.assertEqual(
+            default_cache_root({"DATA_ROOT": "/srv/haltewecker/data"}),
+            Path("/srv/haltewecker/data/cache/gtfs"),
+        )
+
+    def test_explicit_gtfs_cache_root_override_takes_priority(self) -> None:
+        self.assertEqual(
+            default_cache_root({
+                "DATA_ROOT": "/srv/haltewecker/data",
+                "GTFS_CACHE_ROOT": "/mnt/custom/gtfs",
+            }),
+            Path("/mnt/custom/gtfs"),
+        )
+
+    def test_cleanup_cli_without_cache_argument_uses_data_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp) / "data"
+            source_directory = data_root / "cache" / "gtfs" / "default-source"
+            source_directory.mkdir(parents=True)
+            (source_directory / ".lock").touch()
+            environment = os.environ.copy()
+            environment.pop("GTFS_CACHE_ROOT", None)
+            environment["DATA_ROOT"] = str(data_root)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parents[1] / "scripts" / "gtfs_source_cache.py"),
+                    "cleanup",
+                    "--dry-run",
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn("source=default-source status=skipped reason=current-missing-or-nonregular", result.stdout)
+
+    def test_cleanup_cli_preserves_explicit_cache_root_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = Path(temp) / "data"
+            override_root = Path(temp) / "custom-cache"
+            source_directory = override_root / "override-source"
+            source_directory.mkdir(parents=True)
+            (source_directory / ".lock").touch()
+            environment = os.environ.copy()
+            environment["DATA_ROOT"] = str(data_root)
+            environment["GTFS_CACHE_ROOT"] = str(override_root)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parents[1] / "scripts" / "gtfs_source_cache.py"),
+                    "cleanup",
+                    "--dry-run",
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn("source=override-source status=skipped reason=current-missing-or-nonregular", result.stdout)
 
 
 class GTFSArtifactCacheTests(unittest.TestCase):
@@ -610,6 +686,45 @@ class GTFSArtifactCacheTests(unittest.TestCase):
             self.assertEqual(result.status, "skipped")
             self.assertEqual(result.reason, "current-missing-or-nonregular")
             self.assertTrue(only_copy.exists())
+
+    def test_cleanup_skips_missing_or_nonregular_lock_without_creating_it(self) -> None:
+        for lock_kind in ("missing", "symlink", "directory"):
+            with self.subTest(lock_kind=lock_kind), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "cache"
+                directory = root / "sweden"
+                directory.mkdir(parents=True)
+                lock_path = directory / ".lock"
+                if lock_kind == "symlink":
+                    target = Path(temp) / "lock-target"
+                    target.touch()
+                    lock_path.symlink_to(target)
+                elif lock_kind == "directory":
+                    lock_path.mkdir()
+
+                result = GTFSArtifactCache(root).cleanup_source("sweden")
+
+                self.assertEqual(result.status, "skipped")
+                self.assertEqual(result.reason, "lock-missing-or-nonregular")
+                if lock_kind == "missing":
+                    self.assertFalse(lock_path.exists())
+
+    def test_cleanup_still_skips_kyiv_state_hash_inode_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "cache"
+            source = Path(temp) / "source.zip"
+            write_gtfs(source)
+            cache = GTFSArtifactCache(root)
+            result = cache.resolve("kyiv", str(source), metadata_probe=False)
+            directory = root / "kyiv"
+            expected_hash = directory / f"{result.state['sha256']}.zip"
+            expected_hash.write_bytes(b"same name, different inode")
+
+            cleanup = cache.cleanup_source("kyiv")
+
+            self.assertEqual(cleanup.status, "skipped")
+            self.assertEqual(cleanup.reason, "state-hash-inode-mismatch")
+            self.assertTrue((directory / "current.zip").exists())
+            self.assertTrue(expected_hash.exists())
 
     def test_http_304_and_checksum_hit_remove_download_temporary_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

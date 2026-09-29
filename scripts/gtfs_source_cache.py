@@ -25,7 +25,16 @@ from typing import Callable, Mapping
 from urllib.parse import urlsplit
 
 
-DEFAULT_CACHE_ROOT = Path("/srv/haltewecker/cache/gtfs")
+def default_cache_root(environ: Mapping[str, str] | None = None) -> Path:
+    values = os.environ if environ is None else environ
+    override = values.get("GTFS_CACHE_ROOT")
+    if override:
+        return Path(override)
+    data_root = Path(values.get("DATA_ROOT", "/srv/haltewecker/data"))
+    return data_root / "cache" / "gtfs"
+
+
+DEFAULT_CACHE_ROOT = default_cache_root()
 REQUIRED_GTFS_FILES = {"stops.txt", "routes.txt", "trips.txt", "stop_times.txt"}
 DEFAULT_REQUEST_HEADERS = {"User-Agent": "HalteWeckerStopPipeline/1.0"}
 SAFE_SOURCE_ID = re.compile(r"^[A-Za-z0-9_-]+$")

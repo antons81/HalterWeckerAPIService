@@ -19,6 +19,67 @@ def write_gtfs(path: Path) -> None:
 
 
 class HalteWeckerCleanupTests(unittest.TestCase):
+    def test_cleanup_and_pipeline_share_the_canonical_default_root(self) -> None:
+        cleanup_source = CLEANUP_SCRIPT.read_text(encoding="utf-8")
+        pipeline_source = (REPOSITORY_ROOT / "scripts" / "run_stop_data_pipeline.sh").read_text(encoding="utf-8")
+
+        self.assertIn('GTFS_CACHE_ROOT="${GTFS_CACHE_ROOT:-$DATA/cache/gtfs}"', cleanup_source)
+        self.assertIn('CACHE_ROOT="${GTFS_CACHE_ROOT:-$DATA_ROOT/cache/gtfs}"', pipeline_source)
+
+    def test_repo_cleanup_uses_data_root_cache_when_gtfs_override_is_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            releases = data_root / "releases"
+            current_release = releases / "current-fixture"
+            current_release.mkdir(parents=True)
+            (data_root / "current-release").symlink_to("releases/current-fixture")
+            published_release = releases / "vbb-refresh-20260928T000000Z-100-fixture"
+            (published_release / "stop-data").mkdir(parents=True)
+            (published_release / "departures.sqlite").write_bytes(b"fixture")
+            (published_release / "release-metadata.json").write_text("{}\n", encoding="utf-8")
+            cache_root = data_root / "cache" / "gtfs"
+            source_directory = cache_root / "sweden"
+            source_directory.mkdir(parents=True)
+            (source_directory / ".lock").touch()
+            systemctl = root / "systemctl"
+            systemctl.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            systemctl.chmod(0o755)
+            flock = root / "flock"
+            flock.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            flock.chmod(0o755)
+
+            environment = os.environ.copy()
+            environment.pop("GTFS_CACHE_ROOT", None)
+            environment.update(
+                {
+                    "DATA_ROOT": str(data_root),
+                    "HALTEWECKER_PIPELINE_REPO": str(REPOSITORY_ROOT),
+                    "HALTEWECKER_CLEANUP_LOCKS": f"{root / 'stop.lock'}:{root / 'static.lock'}:{root / 'vbb.lock'}",
+                    "SYSTEMCTL_BIN": str(systemctl),
+                    "FLOCK_BIN": str(flock),
+                    "HALTEWECKER_CLEANUP_DRY_RUN": "1",
+                }
+            )
+            for lock_name in ("stop.lock", "static.lock", "vbb.lock"):
+                (root / lock_name).touch()
+
+            result = subprocess.run(
+                [str(CLEANUP_SCRIPT)],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn(
+                f"GTFS cache cleanup root={cache_root.resolve()}",
+                result.stdout,
+                f"returncode={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}",
+            )
+            self.assertIn("source=sweden status=skipped reason=current-missing-or-nonregular", result.stdout)
+
     def test_repo_cleanup_removes_gtfs_history_preserves_services_and_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -97,6 +158,7 @@ class HalteWeckerCleanupTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+            self.assertIn(f"GTFS cache cleanup root={cache_root}", first.stdout)
             self.assertIn("source=sweden", first.stdout, first.stderr + first.stdout)
             self.assertIn("orphan_temp_removed=1", first.stdout)
             self.assertTrue(current.exists())

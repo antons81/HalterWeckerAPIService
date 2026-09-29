@@ -14,7 +14,7 @@ VALIDATION_MAX_AGE_HOURS="${HALTEWECKER_VALIDATION_MAX_AGE_HOURS:-48}"
 STAGING_MAX_AGE_HOURS="${HALTEWECKER_STAGING_MAX_AGE_HOURS:-24}"
 LEGACY_EXTRA_BACKUP_MAX_AGE_HOURS="${HALTEWECKER_LEGACY_EXTRA_BACKUP_MAX_AGE_HOURS:-48}"
 PIPELINE_REPO="${HALTEWECKER_PIPELINE_REPO:-/srv/haltewecker/pipeline/HalterWeckerAPIService}"
-GTFS_CACHE_ROOT="${GTFS_CACHE_ROOT:-/srv/haltewecker/cache/gtfs}"
+GTFS_CACHE_ROOT="${GTFS_CACHE_ROOT:-$DATA/cache/gtfs}"
 GTFS_ORPHAN_TEMP_MAX_AGE_HOURS="${HALTEWECKER_GTFS_ORPHAN_TEMP_MAX_AGE_HOURS:-24}"
 RECLAIMABLE_BYTES=0
 
@@ -636,6 +636,8 @@ cleanup_gtfs_cache() {
         echo "GTFS cache cleanup skipped reason=helper-missing path=$helper"
         return 0
     fi
+
+    echo "GTFS cache cleanup root=$GTFS_CACHE_ROOT"
 
     local -a command=(
         python3 "$helper" cleanup
