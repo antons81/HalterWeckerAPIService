@@ -720,9 +720,9 @@ import sys
 from pathlib import Path
 
 repository = Path(sys.argv[3])
-sys.path.insert(0, str(repository / "services"))
-from static_departures_runtime import load_release_manifest
-from validation_receipt import (
+sys.path.insert(0, str(repository))
+from services.static_departures_runtime import load_release_manifest
+from services.validation_receipt import (
     ValidationReceiptError,
     validate_validation_receipt,
     write_validation_receipt,

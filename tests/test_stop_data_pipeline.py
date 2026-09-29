@@ -594,6 +594,34 @@ PY
         self.assertNotIn("EnvironmentFile=", service)
         self.assertNotIn("update_stop_data.sh", service)
 
+    def test_activation_validation_uses_package_runtime_without_pythonpath(self) -> None:
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        script = f"""
+import sys
+from pathlib import Path
+repository = Path({str(REPOSITORY_ROOT)!r})
+sys.path.insert(0, str(repository))
+from services.static_departures_runtime import load_release_manifest
+from services.validation_receipt import validate_validation_receipt
+assert callable(load_release_manifest)
+assert callable(validate_validation_receipt)
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=self.root,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        source = PIPELINE.read_text(encoding="utf-8")
+        self.assertIn("sys.path.insert(0, str(repository))", source)
+        self.assertIn("from services.static_departures_runtime import load_release_manifest", source)
+        self.assertIn("from services.validation_receipt import (", source)
+
     def test_nightly_timer_is_non_persistent(self) -> None:
         timer = NIGHTLY_TIMER.read_text(encoding="utf-8")
 
