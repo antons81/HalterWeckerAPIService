@@ -78,6 +78,27 @@ def _distance(first: dict[str, object], second: dict[str, object]) -> float:
     return 6_371_000 * 2 * math.asin(math.sqrt(min(1.0, value)))
 
 
+_VBB_PUBLIC_STOP_REPLACEMENTS = {
+    "476861": "de:11000:900110505::7",
+}
+
+
+def _transport_mode(route_type: object) -> str:
+    try:
+        value = int(route_type)
+    except (TypeError, ValueError):
+        return "unknown"
+    return {
+        0: "tram",
+        1: "subway",
+        2: "train",
+        3: "bus",
+        400: "subway",
+        700: "bus",
+        900: "tram",
+    }.get(value, "unknown")
+
+
 def _day(value: object) -> date:
     try:
         return datetime.strptime(str(value or ""), "%Y%m%d").date()
@@ -222,7 +243,23 @@ class VBBOverlayProviderAdapter:
 
     def _native_ids(self, requested: str, payloads: tuple[dict[str, object], ...]) -> tuple[str, ...]:
         native = self._payload_stops(payloads)
+        replacement = _VBB_PUBLIC_STOP_REPLACEMENTS.get(requested)
+        if replacement is not None:
+            if replacement not in native:
+                raise VBBOverlayUnavailable(
+                    f"configured replacement stop unavailable for Berlin stop={requested}"
+                )
+            return (replacement,)
         if requested in native:
+            prefix, separator, platform = requested.rpartition("::")
+            if separator and prefix and platform:
+                family_prefix = f"{prefix}::"
+                siblings = tuple(sorted(
+                    stop_id for stop_id in native
+                    if stop_id.startswith(family_prefix) and stop_id[len(family_prefix):]
+                ))
+                if siblings:
+                    return siblings
             return (requested,)
         public = next((item for item in self._stops_catalog() if str(item.get("id")) == requested), None)
         if public is None:
@@ -266,10 +303,7 @@ class VBBOverlayProviderAdapter:
         route_id, line = str(trip.get("routeID") or ""), str(trip.get("lineName") or trip.get("routeID") or "")
         direction = str(trip.get("directionName") or "") or None
         route_type = trip.get("routeType")
-        try:
-            mode = {0: "tram", 1: "subway", 2: "train", 3: "bus"}[int(route_type)]
-        except (KeyError, TypeError, ValueError):
-            mode = "unknown"
+        mode = _transport_mode(route_type)
         metadata = self._line_metadata(line, route_type)
         return {
             "serviceDate": _day(trip.get("serviceDate")).isoformat(),
@@ -388,10 +422,7 @@ class VBBOverlayProviderAdapter:
                 if not isinstance(trip, dict) or str(trip.get("id") or "") != requested:
                     continue
                 route_type = trip.get("routeType")
-                try:
-                    mode = {0: "tram", 1: "subway", 2: "train", 3: "bus"}[int(route_type)]
-                except (KeyError, TypeError, ValueError):
-                    mode = "unknown"
+                mode = _transport_mode(route_type)
                 ordered = []
                 for stop_time in self._trip_times(trip):
                     native_id = str(stop_time.get("stopID") or "")
