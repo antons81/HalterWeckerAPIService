@@ -1673,8 +1673,11 @@ if [[ "$NO_ACTIVATE" == "1" || "$INCREMENTAL_PRODUCTION" == "1" ]]; then
     INCREMENTAL_ARGS+=(--trusted-common-stop-data "$TRUSTED_COMMON_STOP_DATA")
   fi
   INCREMENTAL_ARGS+=(--result-json "$RELEASE_DIR/incremental-result.json")
-  python3 "$REPO/scripts/run_incremental_provider_pipeline.py" \
-    "${INCREMENTAL_ARGS[@]}"
+  (
+    cd "$REPO"
+    python3 -m scripts.run_incremental_provider_pipeline \
+      "${INCREMENTAL_ARGS[@]}"
+  )
   python3 - "$RELEASE_DIR/incremental-result.json" "$RELEASE_ID" "$BUILD_DIR" "$BUILD_FINGERPRINT" "$FROZEN_COMMON_STOP_DATA" <<'PY'
 import json
 import sys

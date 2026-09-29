@@ -28,10 +28,10 @@ from services.static_departures_runtime import (  # noqa: E402
     load_release_manifest,
 )
 
-try:
+if __package__:
     from .artifact_provenance import artifact_provenance
     from .artifact_trust import trusted_artifact
-except ImportError:
+else:
     from artifact_provenance import artifact_provenance
     from artifact_trust import trusted_artifact
 

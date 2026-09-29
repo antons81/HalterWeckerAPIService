@@ -65,6 +65,12 @@ exec /bin/ln "$@"
         self.write_mock("python3", """#!/usr/bin/env bash
 set -euo pipefail
 
+if [ "${1:-}" = "-m" ] && [ "${2:-}" = "scripts.run_incremental_provider_pipeline" ]; then
+  printf 'module=%s cwd=%s pythonpath=%s\n' "$2" "$PWD" "${PYTHONPATH:-}" >> "$INCREMENTAL_MODULE_CALLS_LOG"
+  shift 2
+  set -- "$REPO/scripts/run_incremental_provider_pipeline.py" "$@"
+fi
+
 case \"${1:-}\" in
   *release_state.py)
     stage=\"\"
@@ -536,6 +542,7 @@ PY
             "LINK_CALLS_LOG": str(self.root / "link-calls.log"),
             "STATE_WRITE_CALLS_LOG": str(self.root / "state-write-calls.log"),
             "INCREMENTAL_CALLS_LOG": str(self.root / "incremental-calls.log"),
+            "INCREMENTAL_MODULE_CALLS_LOG": str(self.root / "incremental-module-calls.log"),
             "INCREMENTAL_ENV_CALLS_LOG": str(self.root / "incremental-env-calls.log"),
             "STATIC_CALLS_LOG": str(self.root / "static-calls.log"),
             "STAGED_STOP_DATA_LOG": str(self.root / "staged-stop-data.log"),
@@ -817,6 +824,11 @@ PY
 
         calls = (self.root / "incremental-calls.log").read_text(encoding="utf-8")
         self.assertIn("--result-json", calls)
+        module_call = (self.root / "incremental-module-calls.log").read_text(encoding="utf-8")
+        self.assertEqual(
+            module_call.strip(),
+            f"module=scripts.run_incremental_provider_pipeline cwd={REPOSITORY_ROOT} pythonpath=",
+        )
         release_id = next(
             path.name
             for path in (self.data_root / "releases").iterdir()

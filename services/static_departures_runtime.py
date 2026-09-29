@@ -20,33 +20,34 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
-try:
-    from provider_artifact_capabilities import (
-        HYBRID_RUNTIME,
-        SHARD_RUNTIME,
-        provider_capability,
-    )
-except ImportError:
+if __package__:
     from scripts.provider_artifact_capabilities import (
         HYBRID_RUNTIME,
         SHARD_RUNTIME,
         provider_capability,
     )
-
-try:
-    from artifact_trust import trusted_artifact
-except ImportError:
     from scripts.artifact_trust import trusted_artifact
-
-try:
+    from .validation_receipt import ValidationReceiptError, validate_validation_receipt
+    from .vbb_overlay_provider import (
+        VBBOverlayProviderAdapter,
+        VBBOverlayUnavailable,
+        VBB_CITY_ID,
+        VBB_PROVIDER_ID,
+    )
+else:
+    from provider_artifact_capabilities import (
+        HYBRID_RUNTIME,
+        SHARD_RUNTIME,
+        provider_capability,
+    )
+    from artifact_trust import trusted_artifact
     from validation_receipt import ValidationReceiptError, validate_validation_receipt
-except ImportError:
-    from scripts.validation_receipt import ValidationReceiptError, validate_validation_receipt
-
-try:
-    from vbb_overlay_provider import VBBOverlayProviderAdapter, VBBOverlayUnavailable, VBB_CITY_ID, VBB_PROVIDER_ID
-except ImportError:
-    from services.vbb_overlay_provider import VBBOverlayProviderAdapter, VBBOverlayUnavailable, VBB_CITY_ID, VBB_PROVIDER_ID
+    from vbb_overlay_provider import (
+        VBBOverlayProviderAdapter,
+        VBBOverlayUnavailable,
+        VBB_CITY_ID,
+        VBB_PROVIDER_ID,
+    )
 
 
 LOGGER = logging.getLogger("haltewecker.static_departures_runtime")

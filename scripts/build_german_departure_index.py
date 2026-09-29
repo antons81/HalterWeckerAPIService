@@ -15,10 +15,16 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from build_stop_packages import load_gtfs_archive, normalized
-from gtfs_csv import normalized_dict_reader
-from static_departures_ownership import ensure_ownership_schema, register_entities
-from gtfs_stop_metadata import display_stop_metadata
+if __package__:
+    from .build_stop_packages import load_gtfs_archive, normalized
+    from .gtfs_csv import normalized_dict_reader
+    from .static_departures_ownership import ensure_ownership_schema, register_entities
+    from .gtfs_stop_metadata import display_stop_metadata
+else:
+    from build_stop_packages import load_gtfs_archive, normalized
+    from gtfs_csv import normalized_dict_reader
+    from static_departures_ownership import ensure_ownership_schema, register_entities
+    from gtfs_stop_metadata import display_stop_metadata
 
 
 SCHEMA_VERSION = 1

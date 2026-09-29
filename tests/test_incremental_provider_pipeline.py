@@ -1,7 +1,9 @@
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,14 +14,70 @@ from pathlib import Path
 from types import SimpleNamespace
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPOSITORY_ROOT))
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 sys.path.insert(0, str(REPOSITORY_ROOT / "tests"))
 
-import run_incremental_provider_pipeline as incremental  # noqa: E402
+import scripts.run_incremental_provider_pipeline as incremental  # noqa: E402
 from test_static_provider_artifact import StaticProviderArtifactTests  # noqa: E402
 
 
 class IncrementalProviderPipelineTests(unittest.TestCase):
+    def test_package_entrypoint_imports_without_pythonpath(self):
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import scripts.run_incremental_provider_pipeline; "
+                "import scripts.provider_release_assembler; "
+                "import scripts.normalized_provider_artifact; "
+                "import scripts.static_provider_artifact; "
+                "import services.static_departures_runtime; "
+                "import services.validation_receipt",
+            ],
+            cwd=REPOSITORY_ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_module_entrypoint_help_works_without_pythonpath(self):
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        result = subprocess.run(
+            [sys.executable, "-m", "scripts.run_incremental_provider_pipeline", "--help"],
+            cwd=REPOSITORY_ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--release-id", result.stdout)
+
+    def test_standalone_entrypoint_works_outside_repository_without_pythonpath(self):
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        with tempfile.TemporaryDirectory() as outside_repository:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPOSITORY_ROOT / "scripts" / "run_incremental_provider_pipeline.py"),
+                    "--help",
+                ],
+                cwd=outside_repository,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--release-id", result.stdout)
+
     MIXED_PROVIDER_IDS = (
         "israel-mot",
         "ttc-surface",

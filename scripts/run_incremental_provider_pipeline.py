@@ -20,97 +20,58 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Mapping
 
-try:
-    from .artifact_provenance import artifact_provenance
-    from .build_stop_packages import load_gtfs_archive
-    from .common_catalog import build_common_catalog
-    from .external_build_cache import (
-        CACHEABLE_PROVIDER_CITY_IDS,
-        DeparturePartitionCache,
-        TRANSFORMED_CACHE_PROVIDER_IDS,
-        ExternalBuildCache,
-        cache_enabled,
-        cache_key,
-        cache_provider_allowed,
-        canonical_merge_group_members,
-        departure_partition_key,
-        departure_stop_set_digest,
-        transformed_cache_enabled,
-    )
-    from .external_gtfs import (
-        _departure_service_dates,
-        load_external_cities,
-        load_external_gtfs_sources,
-    )
-    from .external_staging import StructuralProviderContext
-    from .normalized_provider_artifact import (
-        load_or_build as load_or_build_normalized,
-        probe_existing_for_raw_sha,
-    )
-    from .provider_release_assembler import (
-        ReleaseAssembly,
-        assemble_release,
-        readiness_probe,
-        validate_candidate_release,
-    )
-    from .validation_receipt import write_validation_receipt
-    from .provider_artifact_capabilities import (
-        NORMALIZED_REQUIRED,
-        STRUCTURAL_SUFFICIENT,
-        provider_artifact_strategy,
-    )
-    from .raw_snapshot import (
-        load_raw_snapshot_manifest,
-        validate_raw_snapshot_entry,
-    )
-    from .static_provider_artifact import (
-        load_or_build_static_provider_artifacts,
-        probe_static_provider_artifacts,
-    )
-except ImportError:
-    from artifact_provenance import artifact_provenance
-    from build_stop_packages import load_gtfs_archive
-    from common_catalog import build_common_catalog
-    from external_build_cache import (
-        CACHEABLE_PROVIDER_CITY_IDS,
-        DeparturePartitionCache,
-        TRANSFORMED_CACHE_PROVIDER_IDS,
-        ExternalBuildCache,
-        cache_enabled,
-        cache_key,
-        cache_provider_allowed,
-        canonical_merge_group_members,
-        departure_partition_key,
-        departure_stop_set_digest,
-        transformed_cache_enabled,
-    )
-    from external_gtfs import (
-        _departure_service_dates,
-        load_external_cities,
-        load_external_gtfs_sources,
-    )
-    from external_staging import StructuralProviderContext
-    from normalized_provider_artifact import (
-        load_or_build as load_or_build_normalized,
-        probe_existing_for_raw_sha,
-    )
-    from provider_release_assembler import (
-        ReleaseAssembly,
-        assemble_release,
-        readiness_probe,
-        validate_candidate_release,
-    )
-    from validation_receipt import write_validation_receipt
-    from provider_artifact_capabilities import (
-        NORMALIZED_REQUIRED,
-        STRUCTURAL_SUFFICIENT,
-        provider_artifact_strategy,
-    )
-    from raw_snapshot import load_raw_snapshot_manifest, validate_raw_snapshot_entry
-    from static_provider_artifact import (
-        load_or_build_static_provider_artifacts,
-        probe_static_provider_artifacts,
-    )
+if not __package__:
+    repository_root = str(Path(__file__).resolve().parents[1])
+    if repository_root not in sys.path:
+        sys.path.insert(0, repository_root)
+    __package__ = "scripts"
+
+from .artifact_provenance import artifact_provenance
+from .build_stop_packages import load_gtfs_archive
+from .common_catalog import build_common_catalog
+from .external_build_cache import (
+    CACHEABLE_PROVIDER_CITY_IDS,
+    DeparturePartitionCache,
+    TRANSFORMED_CACHE_PROVIDER_IDS,
+    ExternalBuildCache,
+    cache_enabled,
+    cache_key,
+    cache_provider_allowed,
+    canonical_merge_group_members,
+    departure_partition_key,
+    departure_stop_set_digest,
+    transformed_cache_enabled,
+)
+from .external_gtfs import (
+    _departure_service_dates,
+    load_external_cities,
+    load_external_gtfs_sources,
+)
+from .external_staging import StructuralProviderContext
+from .normalized_provider_artifact import (
+    load_or_build as load_or_build_normalized,
+    probe_existing_for_raw_sha,
+)
+from .provider_release_assembler import (
+    ReleaseAssembly,
+    assemble_release,
+    readiness_probe,
+    validate_candidate_release,
+)
+from services.validation_receipt import write_validation_receipt
+from .provider_artifact_capabilities import (
+    NORMALIZED_REQUIRED,
+    STRUCTURAL_SUFFICIENT,
+    provider_artifact_strategy,
+)
+from .raw_snapshot import (
+    load_raw_snapshot_manifest,
+    validate_raw_snapshot_entry,
+)
+from .static_provider_artifact import (
+    load_or_build_static_provider_artifacts,
+    probe_static_provider_artifacts,
+)
 
 
 INCREMENTAL_PROVIDER_IDS_ENV = "HALTEWECKER_INCREMENTAL_PROVIDER_IDS"
