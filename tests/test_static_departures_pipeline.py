@@ -11,6 +11,16 @@ PIPELINE = REPOSITORY_ROOT / "scripts" / "run_static_departures_pipeline.sh"
 
 
 class StaticDeparturesPipelineTests(unittest.TestCase):
+    def test_provider_runtime_mounts_data_root_without_legacy_database_file(self) -> None:
+        compose_file = REPOSITORY_ROOT / "deploy" / "static-departures.compose.yml"
+        compose = compose_file.read_text(encoding="utf-8")
+
+        self.assertIn("- /srv/haltewecker/data:/data:ro", compose)
+        self.assertNotIn(
+            "/srv/haltewecker/data/departures-current.sqlite:/data/departures-current.sqlite:ro",
+            compose,
+        )
+
     def _run_readiness_with_mock_docker(
         self, root: Path, *, health_release_id: str
     ) -> tuple[subprocess.CompletedProcess[str], Path]:

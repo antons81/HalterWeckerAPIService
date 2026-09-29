@@ -30,7 +30,6 @@ services:
       PORT: "8080"
     volumes:
       - /srv/haltewecker/data:/data:ro
-      - /srv/haltewecker/data/departures-current.sqlite:/data/departures-current.sqlite:ro
       - /srv/haltewecker/data/ireland/realtime:/data/ireland/realtime:ro
       - /srv/haltewecker/data/apple-store-notifications:/data/apple-store-notifications:rw
     restart: unless-stopped
