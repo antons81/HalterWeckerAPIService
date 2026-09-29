@@ -3,6 +3,7 @@ set -euo pipefail
 
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 FLOCK_BIN="${FLOCK_BIN:-flock}"
+LSOF_BIN="${LSOF_BIN:-lsof}"
 DATA_ROOT="${DATA_ROOT:-/srv/haltewecker/data}"
 DATA="$(cd "$DATA_ROOT" && pwd -P)"
 RELEASES="$DATA/releases"
@@ -136,6 +137,12 @@ retention_count="$configured_retention"
 
 declare -a KEEP_NAMES=()
 declare -a KEEP_REASONS=()
+declare -a PROTECTED_DEPENDENCY_PATHS=()
+declare -a PROTECTED_DEPENDENCY_REASONS=()
+declare -a PROTECTED_DEPENDENCY_SEEN=()
+declare -a PROTECTED_DEPENDENCY_QUEUE=()
+declare -a PROTECTED_DEPENDENCY_QUEUE_REASONS=()
+DEPENDENCY_GRAPH_UNRESOLVED=0
 
 append_reason() {
     local release_name="$1"
@@ -186,6 +193,164 @@ protect_reference() {
     append_reason "$release_name" "$reason"
 }
 
+dependency_mark_path() {
+    local path="$1"
+    local reason="$2"
+    local index
+    [[ -n "$path" ]] || return 0
+    for index in "${!PROTECTED_DEPENDENCY_PATHS[@]}"; do
+        [[ "${PROTECTED_DEPENDENCY_PATHS[$index]}" == "$path" ]] && return 0
+    done
+    PROTECTED_DEPENDENCY_PATHS+=("$path")
+    PROTECTED_DEPENDENCY_REASONS+=("$reason")
+}
+
+dependency_reason_for_path() {
+    local candidate="$1"
+    local index protected reason
+    candidate="$(readlink -m -- "$candidate" 2>/dev/null || true)"
+    [[ -n "$candidate" ]] || return 1
+    for index in "${!PROTECTED_DEPENDENCY_PATHS[@]}"; do
+        protected="${PROTECTED_DEPENDENCY_PATHS[$index]}"
+        if [[ "$protected" == "$candidate" || "$protected" == "$candidate/"* ]]; then
+            reason="${PROTECTED_DEPENDENCY_REASONS[$index]}"
+            printf '%s\n' "$reason"
+            return 0
+        fi
+    done
+    return 1
+}
+
+dependency_enqueue() {
+    local path="$1"
+    local reason="$2"
+    local target raw_target lexical_target
+
+    if [[ -L "$path" ]]; then
+        raw_target="$(readlink -- "$path" 2>/dev/null || true)"
+        target="$(readlink -f -- "$path" 2>/dev/null || true)"
+        if [[ -z "$target" ]]; then
+            lexical_target="$(readlink -m -- "$(dirname "$path")/$raw_target" 2>/dev/null || true)"
+            DEPENDENCY_GRAPH_UNRESOLVED=1
+            dependency_mark_path "$lexical_target" "$reason;unresolved-dependency"
+            echo "KEEP   $lexical_target reason=$reason;unresolved-dependency"
+            return 0
+        fi
+    else
+        target="$(readlink -f -- "$path" 2>/dev/null || true)"
+        if [[ -z "$target" ]]; then
+            DEPENDENCY_GRAPH_UNRESOLVED=1
+            dependency_mark_path "$(readlink -m -- "$path" 2>/dev/null || true)" "$reason;unresolved-dependency"
+            echo "KEEP   $path reason=$reason;unresolved-dependency"
+            return 0
+        fi
+    fi
+
+    dependency_mark_path "$target" "$reason"
+    case "$target" in
+        "$DATA"|"$DATA/"*) ;;
+        *) return 0 ;;
+    esac
+    for seen in "${PROTECTED_DEPENDENCY_SEEN[@]-}"; do
+        [[ "$seen" == "$target" ]] && return 0
+    done
+    PROTECTED_DEPENDENCY_SEEN+=("$target")
+    PROTECTED_DEPENDENCY_QUEUE+=("$target")
+    PROTECTED_DEPENDENCY_QUEUE_REASONS+=("$reason")
+}
+
+manifest_dependency_paths() {
+    local manifest="$1"
+    python3 - "$manifest" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        payload = json.load(handle)
+except Exception:
+    raise SystemExit(2)
+
+def walk(value):
+    if isinstance(value, str) and value.startswith("/"):
+        print(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            walk(item)
+    elif isinstance(value, list):
+        for item in value:
+            walk(item)
+
+walk(payload)
+PY
+}
+
+dependency_build_graph() {
+    local queue_index=0
+    local entry reason link manifest dependency_paths dependency_path
+
+    if [[ -e "$DATA/current-release" || -L "$DATA/current-release" ]]; then
+        dependency_enqueue "$DATA/current-release" "referenced-by-current-release"
+    fi
+    if [[ -e "$DATA/rollback" || -L "$DATA/rollback" ]]; then
+        dependency_enqueue "$DATA/rollback" "referenced-by-rollback"
+    fi
+    if [[ -e "$DATA/pilot-current" || -L "$DATA/pilot-current" ]]; then
+        dependency_enqueue "$DATA/pilot-current" "referenced-by-pilot-current"
+    fi
+
+    while (( queue_index < ${#PROTECTED_DEPENDENCY_QUEUE[@]} )); do
+        entry="${PROTECTED_DEPENDENCY_QUEUE[$queue_index]}"
+        reason="${PROTECTED_DEPENDENCY_QUEUE_REASONS[$queue_index]}"
+        queue_index=$((queue_index + 1))
+        [[ -d "$entry" ]] || continue
+
+        while IFS= read -r -d '' link; do
+            dependency_enqueue "$link" "$reason"
+        done < <(find "$entry" -xdev -type l -print0 2>/dev/null)
+
+        while IFS= read -r -d '' manifest; do
+            if ! dependency_paths="$(manifest_dependency_paths "$manifest")"; then
+                DEPENDENCY_GRAPH_UNRESOLVED=1
+                echo "KEEP   $manifest reason=unresolved-dependency"
+                continue
+            fi
+            while IFS= read -r dependency_path; do
+                [[ -n "$dependency_path" ]] || continue
+                dependency_enqueue "$dependency_path" "$reason;manifest-dependency:$manifest"
+            done <<< "$dependency_paths"
+        done < <(
+            find "$entry" -xdev -type f \
+                \( -iname 'release*.json' -o -iname '*manifest*.json' \
+                -o -iname '*artifact*.json' -o -iname '*state*.json' \
+                -o -iname '*provenance*.json' \) -print0 2>/dev/null
+        )
+    done
+}
+
+emit_unresolved_dependency_keeps() {
+    local index protected relative release_name release_path reason
+    for index in "${!PROTECTED_DEPENDENCY_PATHS[@]}"; do
+        protected="${PROTECTED_DEPENDENCY_PATHS[$index]}"
+        case "$protected" in
+            "$RELEASES"/*)
+                relative="${protected#"$RELEASES/"}"
+                release_name="${relative%%/*}"
+                release_path="$RELEASES/$release_name"
+                reason="${PROTECTED_DEPENDENCY_REASONS[$index]}"
+                echo "KEEP   $release_path reason=$reason"
+                ;;
+        esac
+    done
+}
+
+dependency_build_graph
+if (( DEPENDENCY_GRAPH_UNRESOLVED == 1 )); then
+    emit_unresolved_dependency_keeps
+    echo "CLEANUP_SKIPPED reason=dependency-graph-unresolved"
+    exit 0
+fi
+
 protect_reference "$DATA/current-release" "current-release"
 
 while IFS= read -r -d '' symlink_path; do
@@ -194,6 +359,14 @@ while IFS= read -r -d '' symlink_path; do
     esac
     protect_reference "$symlink_path" "active-symlink:$symlink_path"
 done < <(find "$DATA" -path "$RELEASES" -prune -o -type l -print0)
+
+while IFS= read -r -d '' symlink_path; do
+    if [[ "$symlink_path" == "$RELEASES/pilot-current" ]]; then
+        protect_reference "$symlink_path" "protected-by-pilot-current"
+    else
+        protect_reference "$symlink_path" "protected-pointer:$symlink_path"
+    fi
+done < <(find "$RELEASES" -mindepth 1 -maxdepth 1 -type l -print0)
 
 rollback_release_is_referenced() {
     local release_name="$1"
@@ -299,6 +472,116 @@ is_published_release() {
     return 0
 }
 
+is_known_abandoned_build_name() {
+    case "$1" in
+        build-*|candidate-*|staging-*|rehearsal-*|verification-*|incremental|incremental-*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+build_state_for() {
+    local build_path="$1"
+    local metadata contents
+    local saw_metadata=0
+    local saw_incomplete=0
+    local saw_success=0
+
+    while IFS= read -r -d '' metadata; do
+        saw_metadata=1
+        contents="$(head -c 65536 -- "$metadata" 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+        if printf '%s' "$contents" | grep -Eiq '(^|[^[:alpha:]])(failed|failure|incomplete|partial|aborted|cancelled|canceled|interrupted)([^[:alpha:]]|$)'; then
+            saw_incomplete=1
+        fi
+        if printf '%s' "$contents" | grep -Eiq '(^|[^[:alpha:]])(published|success|succeeded|completed|finalized|committed|ready)([^[:alpha:]]|$)'; then
+            saw_success=1
+        fi
+    done < <(
+        find "$build_path" -mindepth 1 -maxdepth 2 -type f \
+            \( -iname '*manifest*' -o -iname '*metadata*' -o -iname '*state*' -o -iname '*status*' -o -iname '*result*' \) -print0
+    )
+
+    if is_published_release "$build_path" || (( saw_success == 1 )); then
+        printf '%s\n' "published"
+    elif (( saw_incomplete == 1 )); then
+        printf '%s\n' "incomplete"
+    elif (( saw_metadata == 0 )); then
+        printf '%s\n' "absent"
+    else
+        printf '%s\n' "unknown"
+    fi
+}
+
+open_files_for() {
+    local build_path="$1"
+    command -v "$LSOF_BIN" >/dev/null 2>&1 || return 2
+    "$LSOF_BIN" -nP -w +D -- "$build_path" 2>/dev/null || true
+}
+
+classify_nonstandard_release() {
+    local release_path="$1"
+    local release_name="${release_path##*/}"
+    local age_seconds build_state open_files reason bytes
+
+    if reason="$(dependency_reason_for_path "$release_path" 2>/dev/null)"; then
+        echo "KEEP   $release_path reason=$reason"
+        return 0
+    fi
+
+    reason="$(reason_for "$release_name" 2>/dev/null || true)"
+    if [[ -n "$reason" ]]; then
+        echo "KEEP   $release_path reason=$reason"
+        return 0
+    fi
+    if ! is_known_abandoned_build_name "$release_name"; then
+        echo "KEEP   $release_path reason=unknown-state"
+        return 0
+    fi
+    if ! path_is_strictly_inside "$release_path" "$RELEASES"; then
+        echo "KEEP   $release_path reason=unknown-state"
+        return 0
+    fi
+    if ! age_seconds="$(artifact_age_seconds "$release_path")"; then
+        echo "KEEP   $release_path reason=unknown-state"
+        return 0
+    fi
+    if (( age_seconds < $(ttl_seconds_from_hours "$ABANDONED_RELEASE_MAX_AGE_HOURS") )); then
+        echo "KEEP   $release_path reason=recent-abandoned-build age=$(format_age_hours "$age_seconds")h"
+        return 0
+    fi
+
+    build_state="$(build_state_for "$release_path")"
+    if [[ "$build_state" == "published" ]]; then
+        echo "KEEP   $release_path reason=published-state"
+        return 0
+    fi
+    if [[ "$build_state" == "unknown" ]]; then
+        echo "KEEP   $release_path reason=unknown-state"
+        return 0
+    fi
+
+    if ! command -v "$LSOF_BIN" >/dev/null 2>&1; then
+        echo "KEEP   $release_path reason=unknown-state"
+        return 0
+    fi
+    open_files="$(open_files_for "$release_path")"
+    if [[ -n "$open_files" ]]; then
+        echo "KEEP   $release_path reason=open-by-process"
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        bytes="$(path_size_bytes "$release_path")"
+        [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+        RECLAIMABLE_BYTES=$((RECLAIMABLE_BYTES + bytes))
+        echo "DELETE-CANDIDATE $release_path reason=abandoned-build age=$(format_age_hours "$age_seconds")h size=$(format_size "$bytes")"
+    else
+        echo "DELETE $release_path reason=abandoned-build age=$(format_age_hours "$age_seconds")h"
+        rm -rf -- "$release_path"
+    fi
+}
+
 ordered_candidates="$(mktemp "${TMPDIR:-/tmp}/haltewecker-release-retention.XXXXXX")"
 trap 'rm -f -- "$ordered_candidates"' EXIT
 
@@ -337,14 +620,23 @@ for release_path in "${release_entries[@]}"; do
     release_name="${release_path##*/}"
 
     if [[ -L "$release_path" ]]; then
-        echo "KEEP   $release_path reason=release-entry-is-symlink"
+        echo "KEEP   $release_path reason=protected-pointer/symlink"
         continue
     fi
     if [[ ! -d "$release_path" ]]; then
         continue
     fi
+    if reason="$(dependency_reason_for_path "$release_path" 2>/dev/null)"; then
+        echo "KEEP   $release_path reason=$reason"
+        continue
+    fi
+    reason="$(reason_for "$release_name" 2>/dev/null || true)"
+    if [[ -n "$reason" ]]; then
+        echo "KEEP   $release_path reason=$reason"
+        continue
+    fi
     if ! is_release_name "$release_name"; then
-        echo "KEEP   $release_path reason=not-a-published-release-name"
+        classify_nonstandard_release "$release_path"
         continue
     fi
     if reason="$(reason_for "$release_name")"; then
@@ -404,6 +696,10 @@ cleanup_expired_artifacts() {
     ttl_seconds="$(ttl_seconds_from_hours "$ttl_hours")"
     echo "Artifact retention: directory=$root max-age-hours=$ttl_hours"
     while IFS= read -r -d '' entry; do
+        if dependency_reason="$(dependency_reason_for_path "$entry" 2>/dev/null)"; then
+            echo "KEEP   $entry reason=$dependency_reason"
+            continue
+        fi
         if [[ -L "$entry" ]]; then
             echo "KEEP   $entry reason=symlink-entry"
             continue

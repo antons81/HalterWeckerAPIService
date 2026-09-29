@@ -19,6 +19,44 @@ def write_gtfs(path: Path) -> None:
 
 
 class HalteWeckerCleanupTests(unittest.TestCase):
+    def run_cleaner(self, root: Path, data_root: Path, dry_run: bool = True) -> subprocess.CompletedProcess[str]:
+        systemctl = root / "systemctl"
+        systemctl.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        systemctl.chmod(0o755)
+        flock = root / "flock"
+        flock.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        flock.chmod(0o755)
+        lsof = root / "lsof"
+        lsof.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        lsof.chmod(0o755)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "DATA_ROOT": str(data_root),
+                "GTFS_CACHE_ROOT": str(root / "cache" / "gtfs"),
+                "HALTEWECKER_PIPELINE_REPO": str(REPOSITORY_ROOT),
+                "HALTEWECKER_CLEANUP_LOCKS": f"{root / 'stop.lock'}:{root / 'static.lock'}:{root / 'vbb.lock'}",
+                "SYSTEMCTL_BIN": str(systemctl),
+                "FLOCK_BIN": str(flock),
+                "LSOF_BIN": str(lsof),
+                "HALTEWECKER_CLEANUP_DRY_RUN": "1" if dry_run else "0",
+            }
+        )
+        for lock in (root / "stop.lock", root / "static.lock", root / "vbb.lock"):
+            lock.touch()
+        return subprocess.run(
+            [str(CLEANUP_SCRIPT)],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    @staticmethod
+    def make_old(path: Path, age_days: int = 2) -> None:
+        old_time = time.time() - age_days * 24 * 60 * 60
+        os.utime(path, (old_time, old_time))
+
     def test_cleanup_and_pipeline_share_the_canonical_default_root(self) -> None:
         cleanup_source = CLEANUP_SCRIPT.read_text(encoding="utf-8")
         pipeline_source = (REPOSITORY_ROOT / "scripts" / "run_stop_data_pipeline.sh").read_text(encoding="utf-8")
@@ -79,6 +117,69 @@ class HalteWeckerCleanupTests(unittest.TestCase):
                 f"returncode={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}",
             )
             self.assertIn("source=sweden status=skipped reason=current-missing-or-nonregular", result.stdout)
+
+    def test_nonstandard_abandoned_build_classification_is_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            releases = data_root / "releases"
+            releases.mkdir(parents=True)
+
+            current = releases / "20260923T000000Z-current"
+            current.joinpath("stop-data").mkdir(parents=True)
+            (current / "departures.sqlite").write_bytes(b"fixture")
+            (current / "release-metadata.json").write_text('{"status":"published"}\n', encoding="utf-8")
+            (data_root / "current-release").symlink_to("releases/20260923T000000Z-current")
+
+            failed = releases / "build-failed-1"
+            failed.mkdir()
+            (failed / "build-state.json").write_text('{"status":"failed"}\n', encoding="utf-8")
+            self.make_old(failed)
+
+            incomplete = releases / "staging-old-1"
+            incomplete.mkdir()
+            self.make_old(incomplete)
+
+            recent = releases / "candidate-recent"
+            recent.mkdir()
+            (recent / "state.json").write_text('{"status":"incomplete"}\n', encoding="utf-8")
+
+            unknown = releases / "mystery-directory"
+            unknown.mkdir()
+            (unknown / "payload.bin").write_bytes(b"unknown")
+            self.make_old(unknown)
+
+            published_nonstandard = releases / "candidate-published"
+            published_nonstandard.joinpath("stop-data").mkdir(parents=True)
+            (published_nonstandard / "departures.sqlite").write_bytes(b"fixture")
+            (published_nonstandard / "release-metadata.json").write_text(
+                '{"status":"published"}\n', encoding="utf-8"
+            )
+            self.make_old(published_nonstandard)
+
+            current_target = releases / "build-current"
+            current_target.mkdir()
+            (current_target / "state.json").write_text('{"status":"failed"}\n', encoding="utf-8")
+            self.make_old(current_target)
+            (data_root / "active-release").symlink_to("releases/build-current")
+
+            pilot_target = releases / "incremental-packaged" / "20260923T000000Z-proof"
+            pilot_target.mkdir(parents=True)
+            (releases / "pilot-current").symlink_to("incremental-packaged/20260923T000000Z-proof")
+
+            result = self.run_cleaner(root, data_root)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn("DELETE-CANDIDATE " + str(failed) + " reason=abandoned-build", output)
+            self.assertIn("DELETE-CANDIDATE " + str(incomplete) + " reason=abandoned-build", output)
+            self.assertIn("KEEP   " + str(recent) + " reason=recent-abandoned-build", output)
+            self.assertIn("KEEP   " + str(unknown) + " reason=unknown-state", output)
+            self.assertIn("KEEP   " + str(published_nonstandard) + " reason=published-state", output)
+            self.assertIn("KEEP   " + str(current_target) + " reason=active-symlink:", output)
+            self.assertIn("KEEP   " + str(releases / "pilot-current") + " reason=protected-pointer/symlink", output)
+            self.assertIn("KEEP   " + str(releases / "incremental-packaged") + " reason=protected-by-pilot-current", output)
+            self.assertTrue(failed.exists())
+            self.assertTrue(pilot_target.exists())
 
     def test_repo_cleanup_removes_gtfs_history_preserves_services_and_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -181,6 +282,57 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
             self.assertIn("removed=0", second.stdout)
             self.assertIn("orphan_temp_removed=0", second.stdout)
+
+    def test_transitive_current_release_dependency_is_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            releases = data_root / "releases"
+            releases.mkdir(parents=True)
+
+            current_root = releases / "incremental" / "20260927T000000Z-current"
+            current_root.mkdir(parents=True)
+            target = releases / "20260926T000000Z-stale"
+            target.joinpath("stop-data").mkdir(parents=True)
+            (target / "departures.sqlite").write_bytes(b"fixture")
+            (target / "release-metadata.json").write_text("{}\n", encoding="utf-8")
+            (current_root / "stop-data").symlink_to("../../20260926T000000Z-stale/stop-data")
+            (data_root / "current-release").symlink_to("releases/incremental/20260927T000000Z-current")
+
+            newer = releases / "20260928T000000Z-newer"
+            newer.joinpath("stop-data").mkdir(parents=True)
+            (newer / "departures.sqlite").write_bytes(b"fixture")
+            (newer / "release-metadata.json").write_text("{}\n", encoding="utf-8")
+            self.make_old(newer)
+            self.make_old(target)
+
+            result = self.run_cleaner(root, data_root)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn(
+                "KEEP   " + str(target) + " reason=referenced-by-current-release",
+                output,
+            )
+            self.assertNotIn("WOULD_DELETE " + str(target), output)
+
+    def test_unresolved_protected_dependency_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            releases = data_root / "releases"
+            releases.mkdir(parents=True)
+
+            current_root = releases / "20260927T000000Z-current"
+            current_root.mkdir()
+            (current_root / "stop-data").symlink_to("../20260926T000000Z-missing/stop-data")
+            (data_root / "current-release").symlink_to("releases/20260927T000000Z-current")
+
+            result = self.run_cleaner(root, data_root)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn("unresolved-dependency", output)
+            self.assertIn("CLEANUP_SKIPPED reason=dependency-graph-unresolved", output)
+            self.assertNotIn("DELETE ", output)
 
 
 if __name__ == "__main__":
