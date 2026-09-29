@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 import zipfile
 from unittest.mock import Mock
@@ -77,6 +78,56 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--release-id", result.stdout)
+
+    def test_package_mode_structural_builder_resolves_nested_local_import(self):
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        script = textwrap.dedent(
+            """
+            from pathlib import Path
+            from scripts import import_static_departures_database as importer
+            from scripts import static_provider_artifact as artifact
+
+            class Connection:
+                def execute(self, *args, **kwargs):
+                    return self
+
+                def commit(self):
+                    pass
+
+                def close(self):
+                    pass
+
+            connection = Connection()
+            artifact.connect = lambda path: connection
+            artifact.populate_gtfs = lambda *args, **kwargs: None
+            artifact.resolve_canonical_stops = lambda *args, **kwargs: None
+            artifact.update_terminal_stops = lambda *args, **kwargs: None
+            artifact.register_city_mode = lambda *args, **kwargs: None
+            artifact._provider_city_prefixes = lambda *args, **kwargs: ({}, {})
+            importer.populate_provider_city_memberships = lambda *args, **kwargs: None
+
+            artifact._build_structural_database(
+                Path("unused.sqlite"),
+                repository_root=Path.cwd(),
+                normalized_context=None,
+                source={"identifierPrefix": "", "timezone": "UTC"},
+                cities=[],
+                stop_data=Path.cwd(),
+                provider_id="import-smoke",
+                city_ids=set(),
+            )
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=REPOSITORY_ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     MIXED_PROVIDER_IDS = (
         "israel-mot",

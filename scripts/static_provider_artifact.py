@@ -18,7 +18,7 @@ from datetime import date
 from pathlib import Path
 from typing import Iterable, Mapping
 
-try:
+if __package__:
     from .artifact_provenance import artifact_provenance
     from .artifact_trust import trusted_artifact, write_trust_record
     from .build_german_departure_index import (
@@ -28,7 +28,7 @@ try:
         update_terminal_stops,
     )
     from .static_departures_ownership import register_city_mode
-except ImportError:
+else:
     from artifact_provenance import artifact_provenance
     from artifact_trust import trusted_artifact, write_trust_record
     from build_german_departure_index import (
@@ -39,9 +39,9 @@ except ImportError:
     )
     from static_departures_ownership import register_city_mode
 
-try:
+if __package__:
     from .provider_artifact_capabilities import STATIC_PROVIDER, provider_capability
-except ImportError:
+else:
     from provider_artifact_capabilities import STATIC_PROVIDER, provider_capability
 
 
@@ -807,10 +807,16 @@ def _build_structural_database(
             "ON raw_stops(canonical_stop_id, stop_id)"
         )
 
-        from import_static_departures_database import (
-            CityScopedStopIDPrefixes,
-            populate_provider_city_memberships,
-        )
+        if __package__:
+            from .import_static_departures_database import (
+                CityScopedStopIDPrefixes,
+                populate_provider_city_memberships,
+            )
+        else:
+            from import_static_departures_database import (
+                CityScopedStopIDPrefixes,
+                populate_provider_city_memberships,
+            )
 
         mode = str(source.get("staticDepartureMode", "canonical")).strip() or "canonical"
         # Multi-namespace city modes keep provider identifiers public. The legacy

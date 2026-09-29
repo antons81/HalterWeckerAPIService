@@ -15,43 +15,82 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
 
-from build_german_departure_index import (
-    DEFAULT_TIMEZONE, connect, load_city_aliases,
-    ImportStageRunner, populate_active_services, populate_gtfs, resolve_canonical_stops,
-    service_window, update_terminal_stops,
-)
-from build_stop_packages import load_cities, load_gtfs_archive, nl_city_ids
-from artifact_provenance import artifact_provenance
-from austrian_sources import DEFAULT_REGISTRY, load_austrian_sources, public_stop_id
-from gtfs_agency import agency_scoped_archive
+if __package__:
+    from .build_german_departure_index import (
+        DEFAULT_TIMEZONE, connect, load_city_aliases,
+        ImportStageRunner, populate_active_services, populate_gtfs, resolve_canonical_stops,
+        service_window, update_terminal_stops,
+    )
+    from .build_stop_packages import load_cities, load_gtfs_archive, nl_city_ids
+    from .artifact_provenance import artifact_provenance
+    from .austrian_sources import DEFAULT_REGISTRY, load_austrian_sources, public_stop_id
+    from .gtfs_agency import agency_scoped_archive
 
-from normalized_provider_artifact import (
-    NormalizedArtifactError,
-    load_existing_for_raw_sha,
-    provider_enabled as normalized_artifact_provider_enabled,
-    static_departures_feature_enabled,
-)
-from static_provider_artifact import (
-    feature_enabled as static_provider_artifact_feature_enabled,
-    load_or_build_static_provider_artifacts,
-)
+    from .normalized_provider_artifact import (
+        NormalizedArtifactError,
+        load_existing_for_raw_sha,
+        provider_enabled as normalized_artifact_provider_enabled,
+        static_departures_feature_enabled,
+    )
+    from .static_provider_artifact import (
+        feature_enabled as static_provider_artifact_feature_enabled,
+        load_or_build_static_provider_artifacts,
+    )
 
-from external_gtfs import (
-    authenticated_external_request,
-    external_city_ids,
-    load_external_cities,
-    load_external_gtfs_sources,
-    parse_external_gtfs_url_args,
-    validate_external_gtfs_source,
-)
-from static_departures_ownership import (
-    ensure_provider_entity_lookup_index,
-    has_ownership_schema,
-    rebuild_city_departure_modes,
-    rebuild_city_stops,
-    register_city_mode,
-    register_city_stops,
-)
+    from .external_gtfs import (
+        authenticated_external_request,
+        external_city_ids,
+        load_external_cities,
+        load_external_gtfs_sources,
+        parse_external_gtfs_url_args,
+        validate_external_gtfs_source,
+    )
+    from .static_departures_ownership import (
+        ensure_provider_entity_lookup_index,
+        has_ownership_schema,
+        rebuild_city_departure_modes,
+        rebuild_city_stops,
+        register_city_mode,
+        register_city_stops,
+    )
+else:
+    from build_german_departure_index import (
+        DEFAULT_TIMEZONE, connect, load_city_aliases,
+        ImportStageRunner, populate_active_services, populate_gtfs, resolve_canonical_stops,
+        service_window, update_terminal_stops,
+    )
+    from build_stop_packages import load_cities, load_gtfs_archive, nl_city_ids
+    from artifact_provenance import artifact_provenance
+    from austrian_sources import DEFAULT_REGISTRY, load_austrian_sources, public_stop_id
+    from gtfs_agency import agency_scoped_archive
+
+    from normalized_provider_artifact import (
+        NormalizedArtifactError,
+        load_existing_for_raw_sha,
+        provider_enabled as normalized_artifact_provider_enabled,
+        static_departures_feature_enabled,
+    )
+    from static_provider_artifact import (
+        feature_enabled as static_provider_artifact_feature_enabled,
+        load_or_build_static_provider_artifacts,
+    )
+
+    from external_gtfs import (
+        authenticated_external_request,
+        external_city_ids,
+        load_external_cities,
+        load_external_gtfs_sources,
+        parse_external_gtfs_url_args,
+        validate_external_gtfs_source,
+    )
+    from static_departures_ownership import (
+        ensure_provider_entity_lookup_index,
+        has_ownership_schema,
+        rebuild_city_departure_modes,
+        rebuild_city_stops,
+        register_city_mode,
+        register_city_stops,
+    )
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
