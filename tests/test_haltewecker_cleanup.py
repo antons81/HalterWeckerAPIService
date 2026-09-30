@@ -419,6 +419,39 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             self.assertIn("WOULD_DELETE " + str(successful.resolve()) + " reason=expired-staging", output)
             self.assertIn("KEEP   " + str(failed.resolve()) + " reason=recent-staging", output)
 
+    def test_release_scoped_staging_uses_success_state_or_six_hour_failure_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            releases = data_root / "releases"
+            published = releases / "20260930T000000Z-published"
+            published.mkdir(parents=True)
+            (published / "state.json").write_text('{"status":"published"}\n', encoding="utf-8")
+            successful_staging = published / "departures-next.sqlite"
+            successful_staging.write_bytes(b"staged")
+            self.make_age_hours(successful_staging, 0.1)
+
+            failed = releases / "20260930T000001Z-failed"
+            failed.mkdir(parents=True)
+            (failed / "state.json").write_text('{"status":"failed"}\n', encoding="utf-8")
+            failed_staging = failed / "departures-next.sqlite"
+            failed_staging.write_bytes(b"staged")
+            self.make_age_hours(failed_staging, 5.9)
+
+            result = self.run_cleaner(root, data_root)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn(
+                "WOULD_DELETE " + str(successful_staging.resolve())
+                + " reason=successful-release-publication",
+                output,
+            )
+            self.assertIn(
+                "ACTIVE STAGING " + str(failed_staging.resolve())
+                + " status=KEEP reason=inside-failed-staging-window",
+                output,
+            )
+
     def test_failed_validation_is_retained_until_twelve_hour_diagnostic_ttl(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

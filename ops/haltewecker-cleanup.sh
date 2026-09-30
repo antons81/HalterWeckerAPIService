@@ -836,7 +836,7 @@ staging_reference_for() {
 }
 
 cleanup_release_scoped_staging() {
-    local staging_path release_name open_pids resume_marker references bytes
+    local staging_path release_name release_state disposition open_pids resume_marker references bytes
     [[ -d "$RELEASES" ]] || return 0
 
     while IFS= read -r -d '' staging_path; do
@@ -871,22 +871,36 @@ cleanup_release_scoped_staging() {
             continue
         fi
 
-        if ! age_seconds="$(artifact_age_seconds "$staging_path")"; then
-            echo "ACTIVE STAGING $staging_path status=KEEP reason=unreliable-mtime"
-            continue
-        fi
-        if (( age_seconds < $(ttl_seconds_from_hours "$STAGING_MAX_AGE_HOURS") )); then
-            echo "ACTIVE STAGING $staging_path status=KEEP reason=inside-failed-staging-window age=$(format_age_hours "$age_seconds")h"
-            continue
-        fi
+        release_state="$(build_state_for "$RELEASES/$release_name")"
+        case "$release_state" in
+            published)
+                age_seconds="$(artifact_age_seconds "$staging_path" || printf '0')"
+                disposition="successful-release-publication"
+                ;;
+            incomplete|absent)
+                if ! age_seconds="$(artifact_age_seconds "$staging_path")"; then
+                    echo "ACTIVE STAGING $staging_path status=KEEP reason=unreliable-mtime"
+                    continue
+                fi
+                if (( age_seconds < $(ttl_seconds_from_hours "$STAGING_MAX_AGE_HOURS") )); then
+                    echo "ACTIVE STAGING $staging_path status=KEEP reason=inside-failed-staging-window age=$(format_age_hours "$age_seconds")h"
+                    continue
+                fi
+                disposition="failed-or-interrupted-without-resume"
+                ;;
+            *)
+                echo "ACTIVE STAGING $staging_path status=KEEP reason=unknown-release-state"
+                continue
+                ;;
+        esac
 
-        echo "ABANDONED STAGING $staging_path status=RECLAIMABLE reason=failed-or-interrupted-without-resume"
+        echo "ORPHANED STAGING $staging_path status=RECLAIMABLE reason=$disposition"
         bytes="$(path_size_bytes "$staging_path")"
         if [[ "$DRY_RUN" == "1" ]]; then
             age_seconds="$(artifact_age_seconds "$staging_path" || printf '0')"
-            emit_would_delete "$staging_path" "abandoned-static-departures-staging" "$age_seconds"
+            emit_would_delete "$staging_path" "$disposition" "$age_seconds"
         else
-            echo "DELETE $staging_path size=$bytes reason=abandoned-static-departures-staging"
+            echo "DELETE $staging_path size=$bytes reason=$disposition"
             rm -f -- "$staging_path"
         fi
     done < <(find "$RELEASES" -mindepth 2 -maxdepth 2 -type f -name 'departures-next.sqlite' -print0)
