@@ -22,7 +22,7 @@ from provider_artifact_capabilities import (  # noqa: E402
 
 class ProviderArtifactCapabilityTests(unittest.TestCase):
     def test_enabled_providers_are_explicit_and_unlisted_providers_fail_closed(self) -> None:
-        for provider_id in ("israel-mot", "ttc-surface", "ttc-subway"):
+        for provider_id in ("israel-mot", "ttc-surface", "ttc-subway", "germany"):
             self.assertTrue(provider_artifact_eligible(REPOSITORY_ROOT, provider_id))
             self.assertTrue(provider_capability(REPOSITORY_ROOT, provider_id, HYBRID_RUNTIME))
         self.assertFalse(provider_capability(REPOSITORY_ROOT, "swiss", STATIC_PROVIDER))
@@ -49,7 +49,7 @@ class ProviderArtifactCapabilityTests(unittest.TestCase):
             )
 
     def test_capability_strategy_regression_matrix(self) -> None:
-        for provider_id in ("israel-mot", "ttc-surface", "ttc-subway"):
+        for provider_id in ("israel-mot", "ttc-surface", "ttc-subway", "germany"):
             self.assertEqual(
                 provider_artifact_strategy(REPOSITORY_ROOT, provider_id),
                 "normalized-required",

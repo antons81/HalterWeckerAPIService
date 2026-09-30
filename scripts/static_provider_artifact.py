@@ -394,20 +394,32 @@ def _provider_city_prefixes(
     cities: list[dict[str, object]],
     source: Mapping[str, object],
 ) -> tuple[dict[str, list[dict[str, object]]], dict[str, str]]:
-    registry_path = repository_root / "config" / "external-gtfs-sources.json"
-    try:
-        registry = json.loads(registry_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise StaticProviderArtifactError(
-            f"Cannot read external GTFS source registry: {registry_path}"
-        ) from error
-    if not isinstance(registry, list):
-        raise StaticProviderArtifactError("External GTFS source registry must be a list")
-    sources = {
-        str(item.get("id")): item
-        for item in registry
-        if isinstance(item, Mapping) and item.get("id")
-    }
+    sources: dict[str, Mapping[str, object]] = {}
+    for registry_path in (
+        repository_root / "config" / "external-gtfs-sources.json",
+        repository_root / "config" / "incremental-provider-sources.json",
+    ):
+        if not registry_path.is_file():
+            continue
+        try:
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise StaticProviderArtifactError(
+                f"Cannot read provider source registry: {registry_path}"
+            ) from error
+        if not isinstance(registry, list):
+            raise StaticProviderArtifactError(
+                f"Provider source registry must be a list: {registry_path}"
+            )
+        for item in registry:
+            if not isinstance(item, Mapping) or not item.get("id"):
+                continue
+            provider_key = str(item["id"])
+            if provider_key in sources:
+                raise StaticProviderArtifactError(
+                    f"Duplicate provider source id: {provider_key}"
+                )
+            sources[provider_key] = item
     provider_cities: dict[str, list[dict[str, object]]] = {}
     prefixes: dict[str, str] = {}
     for city in cities:
@@ -426,7 +438,7 @@ def _provider_city_prefixes(
                 or configured_source.get("identifierPrefix")
                 or ""
             )
-            if not prefix:
+            if not prefix and not configured_source.get("preserveNativeIDs", False):
                 raise StaticProviderArtifactError(
                     f"Provider {configured_id} has no static stop ID prefix"
                 )
@@ -443,7 +455,7 @@ def _provider_city_prefixes(
         or source.get("identifierPrefix")
         or ""
     )
-    if not current_prefix:
+    if not current_prefix and not source.get("preserveNativeIDs", False):
         raise StaticProviderArtifactError(
             f"Provider {provider_id} has no static stop ID prefix"
         )

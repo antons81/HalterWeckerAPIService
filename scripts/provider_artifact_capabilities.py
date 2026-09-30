@@ -44,6 +44,10 @@ def _sources_path(repository_root: Path) -> Path:
     return Path("/app/config/external-gtfs-sources.json")
 
 
+def _incremental_sources_path(repository_root: Path) -> Path:
+    return repository_root / "config" / "incremental-provider-sources.json"
+
+
 def _source_capabilities(repository_root: Path, provider_id: str) -> Mapping[str, object]:
     try:
         payload = json.loads(_sources_path(repository_root).read_text(encoding="utf-8"))
@@ -59,6 +63,27 @@ def _source_capabilities(repository_root: Path, provider_id: str) -> Mapping[str
         ),
         None,
     )
+    if source is None:
+        incremental_path = _incremental_sources_path(repository_root)
+        if incremental_path.is_file():
+            try:
+                incremental_payload = json.loads(
+                    incremental_path.read_text(encoding="utf-8")
+                )
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    "Incremental provider source registry is unavailable"
+                ) from error
+            if not isinstance(incremental_payload, list):
+                raise ValueError("Incremental provider sources must be a list")
+            source = next(
+                (
+                    item
+                    for item in incremental_payload
+                    if isinstance(item, dict) and item.get("id") == provider_id
+                ),
+                None,
+            )
     if source is None:
         return {}
     capabilities = source.get(CAPABILITIES_FIELD, {})

@@ -23,7 +23,7 @@ NIGHTLY_TIMER = REPOSITORY_ROOT / "deploy" / "systemd" / "haltewecker-stop-data.
 MIXED_INCREMENTAL_PROVIDERS = (
     "israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd,"
     "511-bay-area,australia-translink-seq,australia-transport-nsw,cta-chicago,"
-    "mbta-boston,stm-montreal"
+    "mbta-boston,stm-montreal,germany"
 )
 
 
@@ -720,12 +720,37 @@ assert callable(validate_validation_receipt)
         self.assertTrue((self.data_root / "current-release").is_symlink())
         self.assertIn("/releases/incremental/", os.path.realpath(self.data_root / "current-release"))
         rollback_pointer = self.data_root / "rollback"
-        self.assertTrue(rollback_pointer.is_symlink())
+        self.assertFalse(os.path.lexists(rollback_pointer))
+        self.assertIn("rollback=NONE", result.stdout)
         self.assertTrue((self.root / "static-calls.log").is_file())
         self.assertEqual(
             (self.root / "static-calls.log").read_text(encoding="utf-8").splitlines(),
             ["1"],
         )
+
+    def test_successful_incremental_activation_removes_retained_rollback_pointer(self) -> None:
+        self.configure_resume_pointer_layout()
+        rollback = self.data_root / "rollback"
+        rollback.symlink_to(os.readlink(self.data_root / "current-release"))
+        result = self.run_pipeline(
+            USE_DEFAULT_PRODUCTION="1", HALTEWECKER_ACTIVATION_DRY_RUN="1",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(os.path.lexists(rollback))
+
+    def test_failed_incremental_activation_preserves_current_and_existing_rollback(self) -> None:
+        self.configure_resume_pointer_layout()
+        current = self.data_root / "current-release"
+        previous_target = os.readlink(current)
+        rollback = self.data_root / "rollback"
+        rollback.symlink_to(previous_target)
+        result = self.run_pipeline(
+            USE_DEFAULT_PRODUCTION="1", HALTEWECKER_ACTIVATION_DRY_RUN="1",
+            READINESS_FAIL="1",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(os.readlink(current), previous_target)
+        self.assertEqual(os.readlink(rollback), previous_target)
 
     def test_explicit_migration_floor_is_20_and_does_not_change_scheduled_floor(self) -> None:
         self.configure_resume_pointer_layout()

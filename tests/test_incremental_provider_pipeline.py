@@ -143,6 +143,7 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
         "cta-chicago",
         "mbta-boston",
         "stm-montreal",
+        "germany",
     )
 
     @classmethod
@@ -157,7 +158,7 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
             incremental.DEPARTURE_CACHE_PROVIDER_IDS_ENV: configured,
         }
 
-    def test_production_selection_contains_exact_mixed_thirteen(self):
+    def test_production_selection_contains_exact_mixed_fourteen(self):
         plan = incremental.provider_selection_plan(
             REPOSITORY_ROOT,
             environ=self._selection_environment(),
@@ -178,7 +179,76 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
             environ=self._selection_environment(),
         )
         self.assertNotEqual(plan["selectedProviders"], ["israel-mot", "ttc-surface", "ttc-subway"])
-        self.assertEqual(len(plan["selectedProviders"]), 13)
+        self.assertEqual(len(plan["selectedProviders"]), 14)
+
+    def test_germany_provider_uses_prepared_source_artifact_and_de_city_scope(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "manifest.json").write_text(
+                json.dumps({
+                    "cities": [
+                        {"id": "wuppertal", "country": "DE", "url": "stops/wuppertal.json", "aliases": ["Wuppertal", "Shared"]},
+                        {"id": "tuebingen", "country": "DE", "url": "stops/tuebingen.json", "aliases": ["Tübingen", "Shared"]},
+                        {"id": "utrecht", "country": "NL", "url": "stops/utrecht.json"},
+                    ]
+                }),
+                encoding="utf-8",
+            )
+            cities = incremental._provider_cities(
+                {"id": "germany", "cityCountry": "DE"},
+                REPOSITORY_ROOT,
+                root,
+            )
+            self.assertEqual([city["id"] for city in cities], ["wuppertal", "tuebingen"])
+            self.assertTrue(all(city["packageMode"] == "external" for city in cities))
+            self.assertTrue(all(city["externalGTFSProvider"] == "germany" for city in cities))
+            self.assertEqual(cities[0]["aliases"], ["Wuppertal", "Shared"])
+            self.assertEqual(cities[1]["aliases"], ["Tübingen", "Shared"])
+
+            archive_path = root / "germany.zip"
+            archive_path.write_bytes(b"prepared germany gtfs")
+            digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+            path, actual_digest = incremental._raw_entry(
+                {
+                    "sources": {
+                        "germany": {
+                            "path": str(archive_path),
+                            "sha256": digest,
+                            "size": archive_path.stat().st_size,
+                        }
+                    }
+                },
+                "germany",
+                raw_snapshot={},
+                artifact_group="sources",
+            )
+            self.assertEqual(path, archive_path.resolve())
+            self.assertEqual(actual_digest, digest)
+
+    def test_common_catalog_omits_only_ambiguous_germany_aliases(self):
+        aliases = [
+            ("Aach", "aach-bw"),
+            ("Aach", "aach-rp"),
+            ("Wuppertal", "wuppertal"),
+            ("External collision", "germany-city"),
+            ("External collision", "external-city"),
+            ("Other collision", "external-a"),
+            ("Other collision", "external-b"),
+        ]
+
+        result = incremental._exclude_ambiguous_germany_aliases(
+            aliases,
+            {"aach-bw", "aach-rp", "wuppertal", "germany-city"},
+        )
+
+        self.assertEqual(
+            result,
+            [
+                ("Wuppertal", "wuppertal"),
+                ("Other collision", "external-a"),
+                ("Other collision", "external-b"),
+            ],
+        )
 
     def test_unknown_provider_fails_closed(self):
         environment = self._selection_environment(selected=("unknown-provider",))

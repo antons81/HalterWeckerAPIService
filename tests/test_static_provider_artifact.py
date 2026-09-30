@@ -28,6 +28,32 @@ from test_static_departures_normalized import write_feed  # noqa: E402
 
 
 class StaticProviderArtifactTests(unittest.TestCase):
+    def test_germany_native_stop_ids_allow_an_empty_city_scoped_prefix(self) -> None:
+        source = next(
+            item
+            for item in json.loads(
+                (REPOSITORY_ROOT / "config" / "incremental-provider-sources.json")
+                .read_text(encoding="utf-8")
+            )
+            if item["id"] == "germany"
+        )
+        cities = [
+            {
+                "id": "fixture-germany",
+                "externalGTFSProvider": "germany",
+            }
+        ]
+
+        provider_cities, prefixes = static_artifact._provider_city_prefixes(
+            REPOSITORY_ROOT,
+            "germany",
+            cities,
+            source,
+        )
+
+        self.assertEqual(provider_cities["germany"], cities)
+        self.assertEqual(prefixes["germany"], "")
+
     def _prepare_inputs(self, root: Path) -> tuple[Path, dict, list[dict], Path]:
         feed = root / "israel.zip"
         write_feed(feed)

@@ -283,7 +283,7 @@ if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; 
   export HALTEWECKER_EXTERNAL_BUILD_CACHE=1
   export HALTEWECKER_EXTERNAL_TRANSFORMED_BUILD_CACHE=1
   export HALTEWECKER_EXTERNAL_BUILD_CACHE_ROOT="$CACHE_ROOT/external-build"
-  export HALTEWECKER_INCREMENTAL_PROVIDER_IDS="${HALTEWECKER_INCREMENTAL_PROVIDER_IDS-israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd,511-bay-area,australia-translink-seq,australia-transport-nsw,cta-chicago,mbta-boston,stm-montreal}"
+  export HALTEWECKER_INCREMENTAL_PROVIDER_IDS="${HALTEWECKER_INCREMENTAL_PROVIDER_IDS-israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd,511-bay-area,australia-translink-seq,australia-transport-nsw,cta-chicago,mbta-boston,stm-montreal,germany}"
   export HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS="$HALTEWECKER_INCREMENTAL_PROVIDER_IDS"
   export HALTEWECKER_EXTERNAL_DEPARTURES_V3_PROVIDERS="$HALTEWECKER_INCREMENTAL_PROVIDER_IDS"
   export HALTEWECKER_EXTERNAL_DEPARTURE_CACHE=1
@@ -813,8 +813,8 @@ activate_incremental_production() {
     return 1
   fi
   validate_incremental_candidate
-  mkdir -p "$(dirname "$rollback_pointer")"
-  replace_link "$rollback_pointer" "$old_target"
+  # Keep the previous target in memory for failed activation recovery only.
+  # Successful production activation must not retain a rollback release pointer.
   replace_link "$CURRENT_RELEASE" "$candidate_target"
   if ! HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE=provider \
     HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RUNTIME=1 \
@@ -840,7 +840,10 @@ activate_incremental_production() {
     fi
     return 1
   fi
-  echo "[Nightly] stage=activation status=PASS mode=FULL_INCREMENTAL old=$old_target new=$candidate_target rollback=$rollback_pointer"
+  if [[ -L "$rollback_pointer" ]]; then
+    unlink "$rollback_pointer"
+  fi
+  echo "[Nightly] stage=activation status=PASS mode=FULL_INCREMENTAL old=$old_target new=$candidate_target rollback=NONE"
 }
 
 cd "$REPO"

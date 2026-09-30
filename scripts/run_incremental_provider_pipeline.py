@@ -256,7 +256,60 @@ def _source_map(repository_root: Path) -> dict[str, dict[str, object]]:
     sources = load_external_gtfs_sources(
         repository_root / "config" / "external-gtfs-sources.json"
     )
-    return {str(source["id"]): source for source in sources}
+    source_map = {str(source["id"]): source for source in sources}
+    incremental_path = repository_root / "config" / "incremental-provider-sources.json"
+    if incremental_path.is_file():
+        incremental_sources = json.loads(incremental_path.read_text(encoding="utf-8"))
+        if not isinstance(incremental_sources, list):
+            raise ValueError("Incremental provider sources must be a list")
+        for source in incremental_sources:
+            if not isinstance(source, Mapping) or not source.get("id"):
+                raise ValueError("Incremental provider source entry is invalid")
+            provider_id = str(source["id"])
+            if provider_id in source_map:
+                raise ValueError(f"Duplicate provider source id: {provider_id}")
+            source_map[provider_id] = dict(source)
+    return source_map
+
+
+def _provider_cities(
+    source: Mapping[str, object],
+    repository_root: Path,
+    stop_data_root: Path,
+) -> list[dict[str, object]]:
+    country = str(source.get("cityCountry", "")).strip().upper()
+    if not country:
+        return load_external_cities(dict(source), repository_root)
+
+    manifest_path = stop_data_root / "manifest.json"
+    manifest = _read_json(manifest_path)
+    cities = manifest.get("cities")
+    if not isinstance(cities, list):
+        raise ValueError(f"stop-data manifest has no city list: {manifest_path}")
+    provider_id = str(source["id"])
+    selected: list[dict[str, object]] = []
+    for item in cities:
+        if not isinstance(item, Mapping) or str(item.get("country", "")).upper() != country:
+            continue
+        city = dict(item)
+        city["packageMode"] = "external"
+        city["externalGTFSProvider"] = provider_id
+        selected.append(city)
+    if not selected:
+        raise ValueError(f"stop-data has no cities for provider country {country}")
+    return selected
+
+
+def _raw_snapshot_provider_ids(
+    repository_root: Path,
+    provider_ids: Iterable[str],
+) -> tuple[str, ...]:
+    sources = _source_map(repository_root)
+    return tuple(
+        provider_id
+        for provider_id in provider_ids
+        if not sources[provider_id].get("artifactGroup")
+    )
 
 
 def _normalize_provider_ids(
@@ -418,19 +471,21 @@ def _raw_entry(
     provider_id: str,
     *,
     raw_snapshot: Mapping[str, Mapping[str, object]] | None = None,
+    artifact_group: str = "external",
 ) -> tuple[Path, str]:
     if raw_snapshot is not None:
         entry = raw_snapshot.get(provider_id)
-        if not isinstance(entry, Mapping):
+        if isinstance(entry, Mapping):
+            try:
+                return validate_raw_snapshot_entry(provider_id, entry)
+            except ValueError as error:
+                raise ValueError(str(error)) from error
+        if artifact_group == "external":
             raise ValueError(f"provider={provider_id} is missing from raw snapshot")
-        try:
-            return validate_raw_snapshot_entry(provider_id, entry)
-        except ValueError as error:
-            raise ValueError(str(error)) from error
-    external = artifacts.get("external")
-    if not isinstance(external, Mapping):
-        raise ValueError("GTFS artifact manifest has no external section")
-    entry = external.get(provider_id)
+    artifact_sources = artifacts.get(artifact_group)
+    if not isinstance(artifact_sources, Mapping):
+        raise ValueError(f"GTFS artifact manifest has no {artifact_group} section")
+    entry = artifact_sources.get(provider_id)
     if not isinstance(entry, Mapping) or not entry.get("path"):
         raise ValueError(f"provider={provider_id} raw artifact is missing")
     path = Path(str(entry["path"])).resolve()
@@ -836,6 +891,25 @@ def _first_trip_case(
     }
 
 
+def _exclude_ambiguous_germany_aliases(
+    aliases: Iterable[tuple[str, str]],
+    germany_city_ids: set[str],
+) -> list[tuple[str, str]]:
+    alias_targets: dict[str, set[str]] = {}
+    for alias, city_id in aliases:
+        alias_targets.setdefault(alias, set()).add(city_id)
+    ambiguous_aliases = {
+        alias
+        for alias, city_ids in alias_targets.items()
+        if len(city_ids) > 1 and city_ids.intersection(germany_city_ids)
+    }
+    return [
+        (alias, city_id)
+        for alias, city_id in aliases
+        if alias not in ambiguous_aliases
+    ]
+
+
 def _build_common_catalog(
     *,
     output: Path,
@@ -847,8 +921,11 @@ def _build_common_catalog(
     city_stops: set[tuple[str, str]] = set()
     provider_city_stops: list[tuple[str, str, str]] = []
     provider_modes: list[dict[str, object]] = []
+    germany_city_ids: set[str] = set()
 
     for provider_order, item in enumerate(provider_builds):
+        if item.provider_id == "germany":
+            germany_city_ids.update(str(city["id"]) for city in item.cities)
         structural_reference = _manifest_reference(item.structural)
         temporal_reference = _manifest_reference(item.temporal)
         providers[item.provider_id] = {
@@ -894,6 +971,8 @@ def _build_common_catalog(
             for alias in city.get("aliases", ()) or ():
                 aliases.append((str(alias), city_id))
 
+    aliases = _exclude_ambiguous_germany_aliases(aliases, germany_city_ids)
+
     build_common_catalog(
         output,
         release_id=release_id,
@@ -914,6 +993,7 @@ def full_chain_preflight(
     dates: list[date],
     provider_ids: tuple[str, ...],
     raw_snapshot: Mapping[str, Mapping[str, object]],
+    gtfs_artifacts: Mapping[str, object] | None = None,
     common_snapshot_fingerprint: str | None = None,
 ) -> dict[str, object]:
     """Probe the complete runtime artifact chain without building or mutating cache."""
@@ -951,13 +1031,18 @@ def full_chain_preflight(
         normalized_use = None
         structural_context = None
         try:
-            raw_path, raw_sha = _raw_entry({}, provider_id, raw_snapshot=raw_snapshot)
+            raw_path, raw_sha = _raw_entry(
+                gtfs_artifacts or {},
+                provider_id,
+                raw_snapshot=raw_snapshot,
+                artifact_group=str(source.get("artifactGroup", "external")),
+            )
             report["raw"] = {
                 "status": "HIT",
                 "sha256": raw_sha,
                 "path": str(raw_path),
             }
-            cities = load_external_cities(source, repository_root)
+            cities = _provider_cities(source, repository_root, stop_data_root)
             build_key, build_lookup, city_ids = _probe_external_build_cache(
                 repository_root=repository_root,
                 provider_id=provider_id,
@@ -1235,10 +1320,11 @@ def build_incremental_candidate(
                 artifacts,
                 provider_id,
                 raw_snapshot=raw_snapshot,
+                artifact_group=str(sources[provider_id].get("artifactGroup", "external")),
             ),
         )
         source = dict(source)
-        cities = load_external_cities(source, repository_root)
+        cities = _provider_cities(source, repository_root, stop_data_root)
         archive = None
         normalized_context = None
         structural_context = None
@@ -1628,7 +1714,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             raw_snapshot = load_raw_snapshot_manifest(
                 args.raw_snapshot_manifest,
-                required_provider_ids=selection_plan["selectedProviders"],
+                required_provider_ids=_raw_snapshot_provider_ids(
+                    repository_root,
+                    selection_plan["selectedProviders"],
+                ),
             )
         except Exception:
             traceback.print_exc(file=sys.stderr)
@@ -1643,6 +1732,7 @@ def main(argv: list[str] | None = None) -> int:
             "--stop-data": args.stop_data,
             "--normalized-cache-root": args.normalized_cache_root,
             "--static-artifact-root": args.static_artifact_root,
+            "--gtfs-artifacts": args.gtfs_artifacts,
         }
         missing_arguments = [
             name for name, value in required_arguments.items() if value is None
@@ -1656,6 +1746,7 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(
                 "full-chain-preflight requires --raw-snapshot-manifest"
             )
+        gtfs_artifacts = _read_json(args.gtfs_artifacts.resolve())
         dates = service_dates(
             valid_from=args.valid_from,
             valid_through=args.valid_through,
@@ -1669,6 +1760,7 @@ def main(argv: list[str] | None = None) -> int:
             dates=dates,
             provider_ids=tuple(selection_plan["selectedProviders"]),
             raw_snapshot=raw_snapshot,
+            gtfs_artifacts=gtfs_artifacts,
             common_snapshot_fingerprint=args.common_snapshot_fingerprint,
         )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))

@@ -1,0 +1,25 @@
+[
+  {
+    "id": "germany",
+    "artifactGroup": "sources",
+    "artifactID": "germany",
+    "cityCountry": "DE",
+    "timezone": "Europe/Berlin",
+    "preserveNativeIDs": true,
+    "identifierPrefix": "",
+    "stopIDMode": "exact",
+    "buildStops": true,
+    "buildRoutes": true,
+    "buildDepartures": true,
+    "buildTripIndex": true,
+    "artifactCapabilities": {
+      "persistentNormalizedArtifactEligible": true,
+      "staticProviderArtifactEligible": true,
+      "shardRuntimeEligible": true,
+      "authoritativeHybridRuntimeEligible": true
+    },
+    "country": "DE",
+    "sourceName": "German nationwide GTFS",
+    "sourceType": "official"
+  }
+]
