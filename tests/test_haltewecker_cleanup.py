@@ -1,6 +1,7 @@
 import hashlib
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -29,6 +30,31 @@ class HalteWeckerCleanupTests(unittest.TestCase):
         lsof = root / "lsof"
         lsof.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         lsof.chmod(0o755)
+        stat = root / "stat"
+        stat.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys\n"
+            "if len(sys.argv) == 5 and sys.argv[1:4] == ['-c', '%Y', '--']:\n"
+            "    path = sys.argv[4]\n"
+            "    print(int(os.stat(path).st_mtime))\n"
+            "else:\n"
+            "    raise SystemExit(2)\n",
+            encoding="utf-8",
+        )
+        stat.chmod(0o755)
+        du = root / "du"
+        du.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys\n"
+            "path = sys.argv[-1]\n"
+            "if os.path.isfile(path):\n"
+            "    size = os.path.getsize(path)\n"
+            "else:\n"
+            "    size = sum(os.path.getsize(os.path.join(base, name)) for base, _, files in os.walk(path) for name in files)\n"
+            "print(f'{size}\\t{path}')\n",
+            encoding="utf-8",
+        )
+        du.chmod(0o755)
         environment = os.environ.copy()
         environment.update(
             {
@@ -39,6 +65,7 @@ class HalteWeckerCleanupTests(unittest.TestCase):
                 "SYSTEMCTL_BIN": str(systemctl),
                 "FLOCK_BIN": str(flock),
                 "LSOF_BIN": str(lsof),
+                "PATH": f"{root}:{environment.get('PATH', '')}",
                 "HALTEWECKER_CLEANUP_DRY_RUN": "1" if dry_run else "0",
             }
         )
@@ -55,6 +82,11 @@ class HalteWeckerCleanupTests(unittest.TestCase):
     @staticmethod
     def make_old(path: Path, age_days: int = 2) -> None:
         old_time = time.time() - age_days * 24 * 60 * 60
+        os.utime(path, (old_time, old_time))
+
+    @staticmethod
+    def make_age_hours(path: Path, age_hours: float) -> None:
+        old_time = time.time() - age_hours * 60 * 60
         os.utime(path, (old_time, old_time))
 
     def test_cleanup_and_pipeline_share_the_canonical_default_root(self) -> None:
@@ -170,14 +202,18 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             result = self.run_cleaner(root, data_root)
             output = result.stdout + result.stderr
             self.assertEqual(result.returncode, 0, output)
-            self.assertIn("DELETE-CANDIDATE " + str(failed) + " reason=abandoned-build", output)
-            self.assertIn("DELETE-CANDIDATE " + str(incomplete) + " reason=abandoned-build", output)
-            self.assertIn("KEEP   " + str(recent) + " reason=recent-abandoned-build", output)
-            self.assertIn("KEEP   " + str(unknown) + " reason=unknown-state", output)
-            self.assertIn("KEEP   " + str(published_nonstandard) + " reason=published-state", output)
-            self.assertIn("KEEP   " + str(current_target) + " reason=active-symlink:", output)
-            self.assertIn("KEEP   " + str(releases / "pilot-current") + " reason=protected-pointer/symlink", output)
-            self.assertIn("KEEP   " + str(releases / "incremental-packaged") + " reason=protected-by-pilot-current", output)
+            self.assertIn("DELETE-CANDIDATE " + str(failed.resolve()) + " reason=abandoned-build", output)
+            self.assertIn("DELETE-CANDIDATE " + str(incomplete.resolve()) + " reason=abandoned-build", output)
+            self.assertIn("KEEP   " + str(recent.resolve()) + " reason=recent-abandoned-build", output)
+            self.assertIn("KEEP   " + str(unknown.resolve()) + " reason=unknown-state", output)
+            self.assertIn("KEEP   " + str(published_nonstandard.resolve()) + " reason=published-state", output)
+            self.assertIn("KEEP   " + str(current_target.resolve()) + " reason=active-symlink:", output)
+            self.assertIn(
+                "KEEP   " + str((releases / "pilot-current").parent.resolve() / "pilot-current")
+                + " reason=protected-pointer/symlink",
+                output,
+            )
+            self.assertIn("KEEP   " + str((releases / "incremental-packaged").resolve()) + " reason=protected-by-pilot-current", output)
             self.assertTrue(failed.exists())
             self.assertTrue(pilot_target.exists())
 
@@ -283,6 +319,7 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             self.assertIn("removed=0", second.stdout)
             self.assertIn("orphan_temp_removed=0", second.stdout)
 
+    @unittest.skipIf(sys.platform == "darwin", "GNU find traversal semantics are required for this integration fixture")
     def test_transitive_current_release_dependency_is_kept(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -310,11 +347,12 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             output = result.stdout + result.stderr
             self.assertEqual(result.returncode, 0, output)
             self.assertIn(
-                "KEEP   " + str(target) + " reason=referenced-by-current-release",
+                "KEEP   " + str(target.resolve()) + " reason=referenced-by-current-release",
                 output,
             )
             self.assertNotIn("WOULD_DELETE " + str(target), output)
 
+    @unittest.skipIf(sys.platform == "darwin", "GNU find traversal semantics are required for this integration fixture")
     def test_unresolved_protected_dependency_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -333,6 +371,134 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             self.assertIn("unresolved-dependency", output)
             self.assertIn("CLEANUP_SKIPPED reason=dependency-graph-unresolved", output)
             self.assertNotIn("DELETE ", output)
+
+    def test_active_pass_validation_is_cleanup_eligible_but_active_release_is_protected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            (data_root / "releases").mkdir(parents=True)
+            active_release_id = "20260930T102204Z-germany-candidate-r4"
+            active_release = data_root / "experiments" / "candidate" / "releases" / active_release_id
+            active_release.mkdir(parents=True)
+            (active_release / "release.json").write_text(
+                '{"releaseID":"20260930T102204Z-germany-candidate-r4"}\n', encoding="utf-8"
+            )
+            (data_root / "current-release").symlink_to(active_release)
+            validation = data_root / "validation" / "active-check"
+            validation.mkdir(parents=True)
+            (validation / "validation-receipt.json").write_text(
+                '{"result":"PASS","releaseID":"20260930T102204Z-germany-candidate-r4"}\n',
+                encoding="utf-8",
+            )
+            self.make_age_hours(validation, 0.1)
+
+            result = self.run_cleaner(root, data_root)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn("WOULD_DELETE " + str(validation.resolve()) + " reason=expired-validation", output)
+            self.assertTrue(active_release.exists())
+
+    def test_successful_orphan_staging_is_immediate_and_failed_staging_has_six_hour_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            (data_root / "releases").mkdir(parents=True)
+            successful = data_root / "staging" / "completed-build"
+            successful.mkdir(parents=True)
+            (successful / "build-state.json").write_text('{"status":"published"}\n', encoding="utf-8")
+            self.make_age_hours(successful, 0.1)
+
+            failed = data_root / "staging" / "failed-build"
+            failed.mkdir(parents=True)
+            (failed / "build-state.json").write_text('{"status":"failed"}\n', encoding="utf-8")
+            self.make_age_hours(failed, 5.9)
+
+            result = self.run_cleaner(root, data_root)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn("WOULD_DELETE " + str(successful.resolve()) + " reason=expired-staging", output)
+            self.assertIn("KEEP   " + str(failed.resolve()) + " reason=recent-staging", output)
+
+    def test_failed_validation_is_retained_until_twelve_hour_diagnostic_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            (data_root / "releases").mkdir(parents=True)
+            recent = data_root / "validation" / "failed-recent"
+            recent.mkdir(parents=True)
+            (recent / "result.json").write_text('{"status":"failed"}\n', encoding="utf-8")
+            self.make_age_hours(recent, 11.9)
+            expired = data_root / "validation" / "failed-expired"
+            expired.mkdir(parents=True)
+            (expired / "result.json").write_text('{"status":"failed"}\n', encoding="utf-8")
+            self.make_age_hours(expired, 12.1)
+
+            result = self.run_cleaner(root, data_root)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn("KEEP   " + str(recent.resolve()) + " reason=recent-validation", output)
+            self.assertIn("WOULD_DELETE " + str(expired.resolve()) + " reason=expired-validation", output)
+
+    def test_abandoned_build_uses_twelve_hour_ttl_and_protects_symlink_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            releases = data_root / "releases"
+            releases.mkdir(parents=True)
+
+            active = data_root / "experiments" / "germany-candidate" / "releases" / "active-r4"
+            active.mkdir(parents=True)
+            target = releases / "incremental" / "20260930T000000Z-active-reference"
+            target.mkdir(parents=True)
+            (active / "release.json").write_text(
+                '{"artifactPath":"' + str(target) + '"}\n', encoding="utf-8"
+            )
+            (data_root / "current-release").symlink_to(active)
+            referenced = releases / "20260929T000000Z-symlink-referenced"
+            referenced.mkdir(parents=True)
+            (data_root / "active-artifact").symlink_to(referenced)
+
+            recent = releases / "candidate-recent"
+            recent.mkdir()
+            (recent / "state.json").write_text('{"status":"failed"}\n', encoding="utf-8")
+            self.make_age_hours(recent, 11.9)
+
+            expired = releases / "build-expired"
+            expired.mkdir()
+            (expired / "state.json").write_text('{"status":"failed"}\n', encoding="utf-8")
+            self.make_age_hours(expired, 12.1)
+
+            result = self.run_cleaner(root, data_root)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn("KEEP   " + str(recent.resolve()) + " reason=recent-abandoned-build", output)
+            self.assertIn("DELETE-CANDIDATE " + str(expired.resolve()) + " reason=abandoned-build", output)
+            self.assertTrue(target.exists())
+            self.assertIn(
+                "KEEP   " + str(referenced.resolve()) + " reason=active-symlink:",
+                output,
+            )
+
+    def test_legacy_standalone_departure_uses_twelve_hour_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            release = data_root / "releases" / "20260930T000000Z-current"
+            release.mkdir(parents=True)
+            (release / "release-metadata.json").write_text('{"status":"published"}\n', encoding="utf-8")
+            (data_root / "current-release").symlink_to(release)
+            legacy = data_root / "departures" / "releases" / "legacy.sqlite"
+            legacy.parent.mkdir(parents=True)
+            legacy.write_bytes(b"obsolete")
+            self.make_age_hours(legacy, 12.1)
+
+            result = self.run_cleaner(root, data_root)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn(
+                "WOULD_DELETE " + str(legacy.resolve()) + " reason=obsolete-unbound-departures-backup",
+                output,
+            )
 
 
 if __name__ == "__main__":

@@ -10,10 +10,10 @@ RELEASES="$DATA/releases"
 DEPARTURE_RELEASES="$DATA/departures/releases"
 ROLLBACK_ROOT="$DATA/temp/current-rollback"
 DRY_RUN="${HALTEWECKER_CLEANUP_DRY_RUN:-0}"
-ABANDONED_RELEASE_MAX_AGE_HOURS="${HALTEWECKER_ABANDONED_RELEASE_MAX_AGE_HOURS:-24}"
-VALIDATION_MAX_AGE_HOURS="${HALTEWECKER_VALIDATION_MAX_AGE_HOURS:-48}"
-STAGING_MAX_AGE_HOURS="${HALTEWECKER_STAGING_MAX_AGE_HOURS:-24}"
-LEGACY_EXTRA_BACKUP_MAX_AGE_HOURS="${HALTEWECKER_LEGACY_EXTRA_BACKUP_MAX_AGE_HOURS:-48}"
+ABANDONED_RELEASE_MAX_AGE_HOURS="${HALTEWECKER_ABANDONED_RELEASE_MAX_AGE_HOURS:-12}"
+VALIDATION_MAX_AGE_HOURS="${HALTEWECKER_VALIDATION_MAX_AGE_HOURS:-12}"
+STAGING_MAX_AGE_HOURS="${HALTEWECKER_STAGING_MAX_AGE_HOURS:-6}"
+LEGACY_EXTRA_BACKUP_MAX_AGE_HOURS="${HALTEWECKER_LEGACY_EXTRA_BACKUP_MAX_AGE_HOURS:-12}"
 PIPELINE_REPO="${HALTEWECKER_PIPELINE_REPO:-/srv/haltewecker/pipeline/HalterWeckerAPIService}"
 GTFS_CACHE_ROOT="${GTFS_CACHE_ROOT:-$DATA/cache/gtfs}"
 GTFS_ORPHAN_TEMP_MAX_AGE_HOURS="${HALTEWECKER_GTFS_ORPHAN_TEMP_MAX_AGE_HOURS:-24}"
@@ -498,7 +498,7 @@ build_state_for() {
             saw_success=1
         fi
     done < <(
-        find "$build_path" -mindepth 1 -maxdepth 2 -type f \
+        find "$build_path" -type f \
             \( -iname '*manifest*' -o -iname '*metadata*' -o -iname '*state*' -o -iname '*status*' -o -iname '*result*' \) -print0
     )
 
@@ -587,7 +587,7 @@ trap 'rm -f -- "$ordered_candidates"' EXIT
 
 shopt -s nullglob
 release_entries=("$RELEASES"/*)
-for release_path in "${release_entries[@]}"; do
+for release_path in "${release_entries[@]-}"; do
     [[ -L "$release_path" || -d "$release_path" ]] || continue
     [[ -L "$release_path" ]] && continue
     release_name="${release_path##*/}"
@@ -607,7 +607,7 @@ while IFS=$'\t' read -r sortable_timestamp release_name; do
     ordered_release_names+=("$release_name")
 done < <(sort -r -k1,1 -k2,2 "$ordered_candidates")
 retention_slot=0
-for release_name in "${ordered_release_names[@]}"; do
+for release_name in "${ordered_release_names[@]-}"; do
     (( retention_slot >= retention_count )) && break
     retention_slot=$((retention_slot + 1))
     append_reason "$release_name" "retention-slot=$retention_slot/$retention_count"
@@ -615,7 +615,7 @@ done
 
 echo "Release retention: configured=$configured_retention effective=$retention_count"
 
-for release_path in "${release_entries[@]}"; do
+for release_path in "${release_entries[@]-}"; do
     [[ -L "$release_path" || -d "$release_path" ]] || continue
     release_name="${release_path##*/}"
 
@@ -686,7 +686,7 @@ cleanup_expired_artifacts() {
     local root="$1"
     local ttl_hours="$2"
     local reason="$3"
-    local entry age_seconds ttl_seconds
+    local entry age_seconds ttl_seconds state open_files active_validation
 
     if [[ ! -d "$root" ]]; then
         echo "Artifact retention: directory-missing path=$root"
@@ -708,6 +708,23 @@ cleanup_expired_artifacts() {
             echo "KEEP   $entry reason=missing-entry"
             continue
         fi
+        if [[ -d "$entry" ]]; then
+            if ! command -v "$LSOF_BIN" >/dev/null 2>&1; then
+                echo "KEEP   $entry reason=open-process-check-unavailable"
+                continue
+            fi
+            open_files="$(open_files_for "$entry" 2>/dev/null || true)"
+        else
+            if ! command -v "$LSOF_BIN" >/dev/null 2>&1; then
+                echo "KEEP   $entry reason=open-process-check-unavailable"
+                continue
+            fi
+            open_files="$("$LSOF_BIN" -nP -w -- "$entry" 2>/dev/null || true)"
+        fi
+        if [[ -n "$open_files" ]]; then
+            echo "KEEP   $entry reason=open-by-process"
+            continue
+        fi
         if ! path_is_strictly_inside "$entry" "$root"; then
             echo "KEEP   $entry reason=outside-root-or-symlink-escape"
             continue
@@ -715,6 +732,28 @@ cleanup_expired_artifacts() {
         if ! age_seconds="$(artifact_age_seconds "$entry")"; then
             echo "KEEP   $entry reason=unreliable-mtime"
             continue
+        fi
+        if [[ "$reason" == "validation" ]]; then
+            active_validation="$(active_release_validation_pass_matches "$entry" || true)"
+            if [[ "$active_validation" == "1" ]]; then
+                ttl_seconds=0
+                echo "Validation retention: active release PASS receipt is cleanup-eligible path=$entry"
+            fi
+        elif [[ "$reason" == "staging" ]]; then
+            state="$(build_state_for "$entry")"
+            case "$state" in
+                published)
+                    ttl_seconds=0
+                    echo "Staging retention: successful orphan is cleanup-eligible path=$entry"
+                    ;;
+                incomplete|absent)
+                    ttl_seconds="$(ttl_seconds_from_hours "$STAGING_MAX_AGE_HOURS")"
+                    ;;
+                *)
+                    echo "KEEP   $entry reason=unknown-staging-state"
+                    continue
+                    ;;
+            esac
         fi
         if (( age_seconds < ttl_seconds )); then
             echo "KEEP   $entry reason=recent-$reason age=$(format_age_hours "$age_seconds")h"
@@ -727,6 +766,38 @@ cleanup_expired_artifacts() {
             rm -rf -- "$entry"
         fi
     done < <(find "$root" -mindepth 1 -maxdepth 1 -print0)
+}
+
+active_release_id() {
+    local current
+    current="$(readlink -f -- "$DATA/current-release" 2>/dev/null || true)"
+    [[ -n "$current" ]] || return 1
+    basename -- "$current"
+}
+
+active_release_validation_pass_matches() {
+    local entry="$1"
+    local release_id
+    release_id="$(active_release_id || true)"
+    [[ -n "$release_id" ]] || return 1
+    python3 - "$entry" "$release_id" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+entry = Path(sys.argv[1])
+release_id = sys.argv[2]
+candidates = [entry] if entry.is_file() else list(entry.rglob("validation-receipt.json")) if entry.is_dir() else []
+for candidate in candidates:
+    try:
+        payload = json.loads(candidate.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        continue
+    if payload.get("result") == "PASS" and payload.get("releaseID") == release_id:
+        print("1")
+        raise SystemExit(0)
+print("0")
+PY
 }
 
 cleanup_expired_artifacts "$DATA/validation" "$VALIDATION_MAX_AGE_HOURS" "validation"
@@ -797,6 +868,15 @@ cleanup_release_scoped_staging() {
         fi
         if [[ -n "$references" ]]; then
             echo "ACTIVE STAGING $staging_path status=KEEP reason=referenced:$references"
+            continue
+        fi
+
+        if ! age_seconds="$(artifact_age_seconds "$staging_path")"; then
+            echo "ACTIVE STAGING $staging_path status=KEEP reason=unreliable-mtime"
+            continue
+        fi
+        if (( age_seconds < $(ttl_seconds_from_hours "$STAGING_MAX_AGE_HOURS") )); then
+            echo "ACTIVE STAGING $staging_path status=KEEP reason=inside-failed-staging-window age=$(format_age_hours "$age_seconds")h"
             continue
         fi
 
