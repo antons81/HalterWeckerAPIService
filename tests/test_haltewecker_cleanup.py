@@ -1,7 +1,7 @@
 import hashlib
+import json
 import os
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -20,7 +20,10 @@ def write_gtfs(path: Path) -> None:
 
 
 class HalteWeckerCleanupTests(unittest.TestCase):
-    def run_cleaner(self, root: Path, data_root: Path, dry_run: bool = True) -> subprocess.CompletedProcess[str]:
+    def run_cleaner(
+        self, root: Path, data_root: Path, dry_run: bool = True,
+        open_paths: tuple[Path, ...] = (),
+    ) -> subprocess.CompletedProcess[str]:
         systemctl = root / "systemctl"
         systemctl.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         systemctl.chmod(0o755)
@@ -28,8 +31,31 @@ class HalteWeckerCleanupTests(unittest.TestCase):
         flock.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         flock.chmod(0o755)
         lsof = root / "lsof"
-        lsof.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        lsof.write_text(
+            "#!/usr/bin/env python3\nimport sys\n"
+            f"paths = {tuple(str(path.resolve()) for path in open_paths)!r}\n"
+            "if '-Fn' in sys.argv:\n"
+            "    for path in paths: print('n' + path)\n"
+            "    raise SystemExit(0 if paths else 1)\n"
+            "raise SystemExit(1)\n",
+            encoding="utf-8",
+        )
         lsof.chmod(0o755)
+        # Emulate GNU readlink consistently on macOS and Linux.
+        readlink = root / "readlink"
+        readlink.write_text(
+            "#!/usr/bin/env python3\nimport os, sys\n"
+            "path = sys.argv[-1]\n"
+            "if '-m' in sys.argv or '-f' in sys.argv:\n"
+            "    resolved = os.path.realpath(path)\n"
+            "    if '-f' in sys.argv and not os.path.isdir(os.path.dirname(resolved)):\n"
+            "        raise SystemExit(1)\n"
+            "    print(resolved)\n"
+            "else:\n"
+            "    print(os.readlink(path))\n",
+            encoding="utf-8",
+        )
+        readlink.chmod(0o755)
         stat = root / "stat"
         stat.write_text(
             "#!/usr/bin/env python3\n"
@@ -319,7 +345,6 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             self.assertIn("removed=0", second.stdout)
             self.assertIn("orphan_temp_removed=0", second.stdout)
 
-    @unittest.skipIf(sys.platform == "darwin", "GNU find traversal semantics are required for this integration fixture")
     def test_transitive_current_release_dependency_is_kept(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -352,7 +377,6 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             )
             self.assertNotIn("WOULD_DELETE " + str(target), output)
 
-    @unittest.skipIf(sys.platform == "darwin", "GNU find traversal semantics are required for this integration fixture")
     def test_unresolved_protected_dependency_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -397,6 +421,74 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, output)
             self.assertIn("WOULD_DELETE " + str(validation.resolve()) + " reason=expired-validation", output)
             self.assertTrue(active_release.exists())
+
+    def test_missing_provenance_allows_obsolete_release_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            active = data_root / "releases" / "active-r4"
+            active.mkdir(parents=True)
+            (data_root / "current-release").symlink_to(active)
+            obsolete = data_root / "releases" / "build-obsolete"
+            obsolete.mkdir()
+            (obsolete / "build-state.json").write_text('{"status":"failed"}')
+            self.make_age_hours(obsolete, 13)
+            missing = obsolete / "external-artifacts" / "ireland"
+            record = {"path": str(missing), "sourceID": "ireland"}
+            (active / "manifest.json").write_text(json.dumps({"inputProvenance": {"ireland": record}}))
+            (active / "provenance").mkdir()
+            (active / "provenance" / "input-artifacts.json").write_text(json.dumps({"sources": {"ireland": record}}))
+
+            result = self.run_cleaner(root, data_root, dry_run=False)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertEqual(output.count("reason=missing-provenance-source"), 2, output)
+            self.assertNotIn("dependency-graph-unresolved", output)
+            self.assertFalse(obsolete.exists(), output)
+            self.assertTrue(active.exists())
+            self.assertTrue((active / "manifest.json").exists())
+
+    def test_missing_relative_runtime_database_blocks_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            active = data_root / "releases" / "active-r4"
+            active.mkdir(parents=True)
+            (data_root / "current-release").symlink_to(active)
+            (active / "release.json").write_text(json.dumps({"common": {"path": "common.sqlite"}}))
+
+            result = self.run_cleaner(root, data_root)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn("CLEANUP_SKIPPED reason=dependency-graph-unresolved", output)
+            self.assertIn("common.sqlite", output)
+            self.assertNotIn("DELETE ", output)
+
+    def test_runtime_database_and_open_provenance_artifact_are_protected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            active = data_root / "releases" / "active-r4"
+            active.mkdir(parents=True)
+            (data_root / "current-release").symlink_to(active)
+            runtime = data_root / "releases" / "build-runtime"
+            opened = data_root / "releases" / "build-opened"
+            for directory in (runtime, opened):
+                directory.mkdir()
+                (directory / "provider.sqlite").write_bytes(b"fixture")
+                (directory / "build-state.json").write_text('{"status":"failed"}')
+                self.make_age_hours(directory, 13)
+            (active / "release.json").write_text(json.dumps({"common": {"path": str(runtime / "provider.sqlite")}}))
+            (active / "manifest.json").write_text(json.dumps({"inputProvenance": {"path": str(opened / "provider.sqlite")}}))
+
+            result = self.run_cleaner(root, data_root, dry_run=False, open_paths=(opened / "provider.sqlite",))
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertNotIn("dependency-graph-unresolved", output)
+            self.assertTrue(active.exists())
+            self.assertTrue(runtime.exists(), output)
+            self.assertTrue(opened.exists(), output)
+            self.assertIn("active-runtime-open-file", output)
 
     def test_successful_orphan_staging_is_immediate_and_failed_staging_has_six_hour_ttl(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -229,7 +229,7 @@ dependency_enqueue() {
     if [[ -L "$path" ]]; then
         raw_target="$(readlink -- "$path" 2>/dev/null || true)"
         target="$(readlink -f -- "$path" 2>/dev/null || true)"
-        if [[ -z "$target" ]]; then
+        if [[ -z "$target" || ! -e "$path" ]]; then
             lexical_target="$(readlink -m -- "$(dirname "$path")/$raw_target" 2>/dev/null || true)"
             DEPENDENCY_GRAPH_UNRESOLVED=1
             dependency_mark_path "$lexical_target" "$reason;unresolved-dependency"
@@ -238,7 +238,7 @@ dependency_enqueue() {
         fi
     else
         target="$(readlink -f -- "$path" 2>/dev/null || true)"
-        if [[ -z "$target" ]]; then
+        if [[ -z "$target" || ! -e "$path" ]]; then
             DEPENDENCY_GRAPH_UNRESOLVED=1
             dependency_mark_path "$(readlink -m -- "$path" 2>/dev/null || true)" "$reason;unresolved-dependency"
             echo "KEEP   $path reason=$reason;unresolved-dependency"
@@ -264,6 +264,10 @@ manifest_dependency_paths() {
     python3 - "$manifest" <<'PY'
 import json
 import sys
+from pathlib import Path
+
+manifest = Path(sys.argv[1])
+provenance_file = "provenance" in manifest.parts or "provenance" in manifest.name.lower()
 
 try:
     with open(sys.argv[1], encoding="utf-8") as handle:
@@ -271,15 +275,23 @@ try:
 except Exception:
     raise SystemExit(2)
 
-def walk(value):
-    if isinstance(value, str) and value.startswith("/"):
-        print(value)
+def walk(value, provenance=provenance_file, key=""):
+    if isinstance(value, str):
+        # Relative runtime references are declared by the published release contract.
+        relative_runtime = manifest.name == "release.json" and key in {"path", "manifestPath"}
+        if value.startswith("/") or (relative_runtime and value):
+            path = value if value.startswith("/") else str(manifest.parent / value)
+            print(("provenance" if provenance else "runtime") + "\t" + path)
     elif isinstance(value, dict):
-        for item in value.values():
-            walk(item)
+        for name, item in value.items():
+            historical = provenance or name in {"inputProvenance", "provenance", "inputArtifacts"}
+            # Explicit runtime declarations take precedence over historical context.
+            if name == "runtimeDependencies":
+                historical = False
+            walk(item, historical, name)
     elif isinstance(value, list):
         for item in value:
-            walk(item)
+            walk(item, provenance, key)
 
 walk(payload)
 PY
@@ -287,7 +299,17 @@ PY
 
 dependency_build_graph() {
     local queue_index=0
-    local entry reason link manifest dependency_paths dependency_path
+    local entry reason link manifest dependency_paths dependency_path dependency_kind open_path
+
+    # Open files are runtime evidence even when a manifest records them as provenance.
+    while IFS= read -r open_path; do
+        [[ "$open_path" == n/* ]] || continue
+        open_path="${open_path#n}"
+        open_path="${open_path% (deleted)}"
+        case "$open_path" in
+            "$DATA/"*) dependency_enqueue "$open_path" "active-runtime-open-file" ;;
+        esac
+    done < <("$LSOF_BIN" -nP -Fn 2>/dev/null || true)
 
     if [[ -e "$DATA/current-release" || -L "$DATA/current-release" ]]; then
         dependency_enqueue "$DATA/current-release" "referenced-by-current-release"
@@ -306,18 +328,33 @@ dependency_build_graph() {
         [[ -d "$entry" ]] || continue
 
         while IFS= read -r -d '' link; do
-            dependency_enqueue "$link" "$reason"
+            case "$link" in
+                */provenance/*)
+                    [[ -e "$link" ]] || echo "WARNING $link reason=missing-provenance-source"
+                    ;;
+                *) dependency_enqueue "$link" "$reason" ;;
+            esac
         done < <(find "$entry" -xdev -type l -print0 2>/dev/null)
 
         while IFS= read -r -d '' manifest; do
             if ! dependency_paths="$(manifest_dependency_paths "$manifest")"; then
+                case "$manifest" in
+                    */provenance/*|*provenance*.json)
+                        echo "WARNING $manifest reason=unreadable-provenance"
+                        continue
+                        ;;
+                esac
                 DEPENDENCY_GRAPH_UNRESOLVED=1
                 echo "KEEP   $manifest reason=unresolved-dependency"
                 continue
             fi
-            while IFS= read -r dependency_path; do
+            while IFS=$'\t' read -r dependency_kind dependency_path; do
                 [[ -n "$dependency_path" ]] || continue
-                dependency_enqueue "$dependency_path" "$reason;manifest-dependency:$manifest"
+                if [[ "$dependency_kind" == provenance ]]; then
+                    [[ -e "$dependency_path" ]] || echo "WARNING $dependency_path reason=missing-provenance-source manifest=$manifest"
+                else
+                    dependency_enqueue "$dependency_path" "$reason;manifest-dependency:$manifest"
+                fi
             done <<< "$dependency_paths"
         done < <(
             find "$entry" -xdev -type f \
