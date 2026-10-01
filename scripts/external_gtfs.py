@@ -2898,14 +2898,14 @@ def _build_external_departure_partitions(
             )
             stop_set_digests[city_id] = digest
 
-    misses: set[str] = set()
+    missing_dates_by_city: dict[str, set[str]] = {}
     lookups: dict[tuple[str, str], object] = {}
     keys: dict[tuple[str, str], object] = {}
     for city in cities:
         city_id = str(city["id"])
         for service_date in service_dates:
             if cache is None:
-                misses.add(service_date)
+                missing_dates_by_city.setdefault(city_id, set()).add(service_date)
                 continue
             key = departure_partition_key(
                 repository_root=repository_root,
@@ -2919,25 +2919,28 @@ def _build_external_departure_partitions(
                 source=source,
             )
             lookup = cache.lookup(key)
-            if lookup.status == "INVALID":
-                raise ValueError(
-                    f"provider={provider_id} date={service_date} departure cache INVALID: {lookup.reason}"
-                )
             keys[(city_id, service_date)] = key
             lookups[(city_id, service_date)] = lookup
             if lookup.status != "HIT":
-                misses.add(service_date)
+                missing_dates_by_city.setdefault(city_id, set()).add(service_date)
             print(
                 f"[StopData] source={provider_id} stage=departures-partition "
-                f"serviceDate={service_date} status={lookup.status if cache else 'MISS'} "
+                f"cityID={city_id} serviceDate={service_date} status={lookup.status if cache else 'MISS'} "
                 f"key={key.value[:12] if cache else 'n/a'}",
                 flush=True,
             )
 
-    if misses:
+    # Group cities with identical missing dates without rewriting valid partitions.
+    rebuild_groups: dict[tuple[str, ...], list[dict[str, object]]] = {}
+    for city in cities:
+        missing_dates = missing_dates_by_city.get(str(city["id"]), set())
+        if missing_dates:
+            dates = tuple(date for date in service_dates if date in missing_dates)
+            rebuild_groups.setdefault(dates, []).append(city)
+    for dates, rebuild_cities in rebuild_groups.items():
         build_external_departure_index(
             archive,
-            cities,
+            rebuild_cities,
             output,
             timezone_name=timezone_name,
             namespace=namespace,
@@ -2945,7 +2948,7 @@ def _build_external_departure_partitions(
             context=context,
             output_schema_version=2,
             now=build_now,
-            write_service_dates=tuple(date for date in service_dates if date in misses),
+            write_service_dates=dates,
         )
     for city in cities:
         city_id = str(city["id"])
@@ -2963,6 +2966,13 @@ def _build_external_departure_partitions(
             key = keys.get((city_id, service_date))
             if cache is not None and key is not None and lookup is not None and lookup.status != "HIT":
                 cache.persist(key, destination)
+                saved = cache.probe(key)
+                if saved.status != "HIT":
+                    raise ValueError(
+                        f"provider={provider_id} city={city_id} date={service_date} "
+                        f"departure cache save failed: {saved.reason} "
+                        f"path={cache._directory(key).absolute()}"
+                    )
         effective_date = build_now.astimezone(ZoneInfo(timezone_name)).strftime("%Y-%m-%d")
         _write_departures_v2_manifest(
             output,

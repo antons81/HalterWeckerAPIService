@@ -351,23 +351,54 @@ class DeparturePartitionCache:
         """Validate an exact partition key without building or mutating cache state."""
         return self._lookup(key, remove_invalid=False)
 
+    def _invalid_lookup(
+        self,
+        key: DeparturePartitionKey,
+        directory: Path,
+        reason: str,
+        *,
+        remove_invalid: bool,
+    ) -> DeparturePartitionLookup:
+        if remove_invalid:
+            print(
+                f"[StopData] source={self.provider_id} stage=departures-partition "
+                f"cityID={key.city_id} serviceDate={key.service_date} status=INVALID "
+                f"key={key.value[:12]} action=remove-and-rebuild reason={reason}",
+                flush=True,
+            )
+            # Removal errors must stop recovery before rebuilding or publishing.
+            shutil.rmtree(directory)
+        return DeparturePartitionLookup("INVALID", reason, key)
+
     def _lookup(
         self,
         key: DeparturePartitionKey,
         *,
         remove_invalid: bool,
     ) -> DeparturePartitionLookup:
-        directory = self._directory(key)
+        directory = self._directory(key).absolute()
         if not directory.is_dir():
             return DeparturePartitionLookup("MISS", "cache key not found", key)
+        manifest_path = directory / "manifest.json"
         try:
-            manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
-            partition = directory / "partition.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as error:
+            return self._invalid_lookup(
+                key, directory,
+                f"partition cache is unreadable: path={manifest_path} "
+                f"error={type(error).__name__}: {error}",
+                remove_invalid=remove_invalid,
+            )
+        partition = directory / "partition.json"
+        try:
             digest, size = artifact_provenance(partition)
-        except (OSError, ValueError, TypeError):
-            if remove_invalid:
-                shutil.rmtree(directory, ignore_errors=True)
-            return DeparturePartitionLookup("INVALID", "partition cache is unreadable", key)
+        except (OSError, ValueError, TypeError) as error:
+            return self._invalid_lookup(
+                key, directory,
+                f"partition cache is unreadable: path={partition} "
+                f"error={type(error).__name__}: {error}",
+                remove_invalid=remove_invalid,
+            )
         expected = {
             "cacheSchemaVersion": DEPARTURE_CACHE_SCHEMA_VERSION,
             "outputSchemaVersion": DEPARTURE_OUTPUT_SCHEMA_VERSION,
@@ -383,14 +414,34 @@ class DeparturePartitionCache:
             "builderFingerprint": key.builder_fingerprint,
             "departureConfigFingerprint": key.config_fingerprint,
         }
-        if not isinstance(manifest, dict) or any(manifest.get(name) != value for name, value in expected.items()):
-            if remove_invalid:
-                shutil.rmtree(directory, ignore_errors=True)
-            return DeparturePartitionLookup("INVALID", "partition manifest mismatch", key)
+        if not isinstance(manifest, dict):
+            return self._invalid_lookup(
+                key, directory,
+                f"partition manifest mismatch: path={manifest_path} "
+                f"expected=object actual={type(manifest).__name__}",
+                remove_invalid=remove_invalid,
+            )
+        mismatches = [
+            f"{name}: expected={value!r} actual={manifest.get(name)!r}"
+            for name, value in expected.items()
+            if manifest.get(name) != value
+        ]
+        if mismatches:
+            return self._invalid_lookup(
+                key, directory,
+                f"partition manifest mismatch: path={manifest_path} "
+                + "; ".join(mismatches),
+                remove_invalid=remove_invalid,
+            )
         if manifest.get("status") != "complete" or manifest.get("sha256") != digest or manifest.get("size") != size:
-            if remove_invalid:
-                shutil.rmtree(directory, ignore_errors=True)
-            return DeparturePartitionLookup("INVALID", "partition provenance mismatch", key)
+            return self._invalid_lookup(
+                key, directory,
+                f"partition provenance mismatch: path={partition} manifestPath={manifest_path} "
+                f"status={manifest.get('status')!r} "
+                f"sha256: expected={manifest.get('sha256')!r} actual={digest!r} "
+                f"size: expected={manifest.get('size')!r} actual={size}",
+                remove_invalid=remove_invalid,
+            )
         return DeparturePartitionLookup("HIT", "validated partition", key, directory)
 
     def restore(self, lookup: DeparturePartitionLookup, destination: Path) -> None:

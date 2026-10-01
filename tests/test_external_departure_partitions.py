@@ -1,15 +1,19 @@
+import io
 import json
 import sys
 import tempfile
 import unittest
 import zipfile
+from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))
 
+import external_build_cache
 import external_gtfs
 from external_build_cache import (
     DeparturePartitionCache,
@@ -568,6 +572,228 @@ class ExternalDeparturePartitionTests(unittest.TestCase):
                 json.loads((root / "trips" / "fixture-city.json").read_text()),
                 {"T1": {"r": "R1", "h": "Selected terminal"}},
             )
+
+    def _recovery_fixture(
+        self, base: Path, *, city_ids: tuple[str, ...] = ("fixture-city",),
+    ) -> tuple[Path, dict, DeparturePartitionCache, dict]:
+        archive_path = base / "fixture.zip"
+        self._feed(archive_path)
+        source = {"id": "fixture", "timezone": "America/Toronto", "departurePackageDays": 3}
+        cities = [{"id": city_id, "name": city_id} for city_id in city_ids]
+        for output in (base / "seed", base / "recovered"):
+            (output / "stops").mkdir(parents=True)
+            for city_id in city_ids:
+                (output / "stops" / f"{city_id}.json").write_text(
+                    json.dumps([{"id": "stop", "name": "Stop", "latitude": 43.0, "longitude": -79.0}]),
+                    encoding="utf-8",
+                )
+        gtfs_cache = GTFSArtifactCache(base / "gtfs-cache")
+        kwargs = dict(
+            cities=cities, output=base / "seed", timezone_name="America/Toronto",
+            namespace="", departure_window_days=3, context=None, output_schema_version=3,
+            provider_id="fixture", source=source,
+            repository_root=Path(__file__).resolve().parents[1],
+            raw_artifact_digest="b" * 64, structural_input_key="structural",
+            gtfs_cache=gtfs_cache, environ={
+                "HALTEWECKER_EXTERNAL_DEPARTURE_CACHE": "1",
+                "HALTEWECKER_EXTERNAL_DEPARTURE_CACHE_PROVIDERS": "fixture",
+            },
+            now=datetime(2026, 9, 14, 12, tzinfo=ZoneInfo("America/Toronto")),
+        )
+        self._run_recovery_build(archive_path, kwargs)
+        kwargs["output"] = base / "recovered"
+        cache = DeparturePartitionCache(gtfs_cache.root / "external-departure-partitions", "fixture")
+        keys = {}
+        for city_id in city_ids:
+            stop_digest, _ = departure_stop_set_digest(kwargs["output"] / "stops" / f"{city_id}.json")
+            for service_date in ("20260913", "20260914", "20260915"):
+                keys[(city_id, service_date)] = departure_partition_key(
+                    repository_root=kwargs["repository_root"], provider_id="fixture",
+                    city_id=city_id, service_date=service_date, raw_sha256="b" * 64,
+                    structural_input_key="structural", stop_set_digest=stop_digest,
+                    calendar_fingerprint="b" * 64, source=source,
+                )
+        return archive_path, kwargs, cache, keys
+
+    def _run_recovery_build(self, archive_path: Path, kwargs: dict) -> str:
+        logs = io.StringIO()
+        with zipfile.ZipFile(archive_path) as archive, redirect_stdout(logs):
+            external_gtfs._build_external_departure_partitions(archive=archive, **kwargs)
+        return logs.getvalue()
+
+    def _cache_snapshot(self, cache: DeparturePartitionCache, keys: dict) -> dict:
+        snapshot = {}
+        for identity, key in keys.items():
+            for name in ("manifest.json", "partition.json"):
+                path = cache._directory(key) / name
+                stat = path.stat()
+                snapshot[(identity, name)] = (path.read_bytes(), stat.st_ino, stat.st_mtime_ns)
+        return snapshot
+
+    def test_invalid_partition_diagnostics_include_error_and_full_path(self) -> None:
+        cases = (
+            ("manifest-json", "manifest.json", "JSONDecodeError"),
+            ("manifest-encoding", "manifest.json", "UnicodeDecodeError"),
+            ("partition-content", "partition.json", "partition provenance mismatch"),
+            ("partition-missing", "partition.json", "ValueError"),
+            ("partition-unreadable", "partition.json", "PermissionError"),
+        )
+        for case, filename, expected_error in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                _, _, cache, keys = self._recovery_fixture(Path(temporary))
+                key = keys[("fixture-city", "20260914")]
+                directory = cache._directory(key)
+                damaged = directory / filename
+                if case == "manifest-encoding":
+                    damaged.write_bytes(b"\xff")
+                elif case == "partition-missing":
+                    damaged.unlink()
+                elif case != "partition-unreadable":
+                    damaged.write_text("{broken", encoding="utf-8")
+                healthy = {identity: value for identity, value in keys.items() if value != key}
+                snapshot = self._cache_snapshot(cache, healthy)
+                real_provenance = external_build_cache.artifact_provenance
+
+                def read_provenance(path):
+                    if case == "partition-unreadable" and path == damaged:
+                        raise PermissionError(13, "fixture read denied", str(path))
+                    return real_provenance(path)
+
+                logs = io.StringIO()
+                with patch.object(external_build_cache, "artifact_provenance", side_effect=read_provenance):
+                    with redirect_stdout(logs):
+                        probe = cache.probe(key)
+                        self.assertEqual(probe.status, "INVALID")
+                        self.assertTrue(directory.is_dir())
+                        self.assertEqual(logs.getvalue(), "")
+                        lookup = cache.lookup(key)
+                self.assertEqual(lookup.status, "INVALID")
+                self.assertIn(str(damaged.absolute()), lookup.reason)
+                self.assertIn(expected_error, lookup.reason)
+                self.assertIn(lookup.reason, logs.getvalue())
+                self.assertIn("cityID=fixture-city serviceDate=20260914 status=INVALID", logs.getvalue())
+                self.assertFalse(directory.exists())
+                self.assertEqual(self._cache_snapshot(cache, healthy), snapshot)
+
+    def test_corrupt_partition_is_rebuilt_without_touching_valid_city_or_dates(self) -> None:
+        for filename in ("manifest.json", "partition.json"):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as temporary:
+                archive_path, kwargs, cache, keys = self._recovery_fixture(
+                    Path(temporary), city_ids=("fixture-city", "other-city"),
+                )
+                key = keys[("fixture-city", "20260914")]
+                directory = cache._directory(key)
+                original = json.loads((directory / "partition.json").read_text())
+                (directory / filename).write_text("{broken", encoding="utf-8")
+                healthy = {identity: value for identity, value in keys.items() if value != key}
+                snapshot = self._cache_snapshot(cache, healthy)
+                real_build = external_gtfs.build_external_departure_index
+
+                def rebuild(*args, **build_kwargs):
+                    self.assertFalse(directory.exists())
+                    self.assertEqual(args[1], [kwargs["cities"][0]])
+                    self.assertEqual(build_kwargs["write_service_dates"], ("20260914",))
+                    return real_build(*args, **build_kwargs)
+
+                with patch.object(external_gtfs, "build_external_departure_index", side_effect=rebuild) as builder:
+                    logs = self._run_recovery_build(archive_path, kwargs)
+                builder.assert_called_once()
+                self.assertIn("status=INVALID", logs)
+                self.assertIn(str((directory / filename).absolute()), logs)
+                self.assertEqual(cache.probe(key).status, "HIT")
+                self.assertEqual(self._cache_snapshot(cache, healthy), snapshot)
+                rebuilt = json.loads((directory / "partition.json").read_text())
+                self.assertEqual(rebuilt["stops"], original["stops"])
+                manifest_path = kwargs["output"] / "departures-v2" / "fixture-city" / "manifest.json"
+                self.assertEqual(json.loads(manifest_path.read_text())["schemaVersion"], 3)
+                for (city_id, service_date), healthy_key in healthy.items():
+                    output_path = kwargs["output"] / "departures-v2" / city_id / f"{service_date}.json"
+                    self.assertEqual(output_path.read_bytes(), (cache._directory(healthy_key) / "partition.json").read_bytes())
+                with patch.object(external_gtfs, "build_external_departure_index") as builder:
+                    self._run_recovery_build(archive_path, kwargs)
+                builder.assert_not_called()
+
+    def test_recovery_build_failure_propagates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive_path, kwargs, cache, keys = self._recovery_fixture(Path(temporary))
+            key = keys[("fixture-city", "20260914")]
+            (cache._directory(key) / "manifest.json").write_text("{broken")
+            with patch.object(external_gtfs, "build_external_departure_index", side_effect=RuntimeError("fixture rebuild failed")):
+                with self.assertRaisesRegex(RuntimeError, "fixture rebuild failed"):
+                    self._run_recovery_build(archive_path, kwargs)
+            self.assertFalse(cache._directory(key).exists())
+            self.assertFalse((kwargs["output"] / "departures-v2" / "fixture-city" / "manifest.json").exists())
+
+    def test_recovery_without_readable_gtfs_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive_path, kwargs, cache, keys = self._recovery_fixture(Path(temporary))
+            key = keys[("fixture-city", "20260914")]
+            (cache._directory(key) / "manifest.json").write_text("{broken")
+            with zipfile.ZipFile(archive_path) as archive:
+                pass
+            with redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "ZIP archive.*closed"):
+                external_gtfs._build_external_departure_partitions(archive=archive, **kwargs)
+            self.assertFalse(cache._directory(key).exists())
+
+    def test_recovery_cache_write_failure_propagates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive_path, kwargs, cache, keys = self._recovery_fixture(Path(temporary))
+            key = keys[("fixture-city", "20260914")]
+            directory = cache._directory(key)
+            (directory / "manifest.json").write_text("{broken")
+            real_replace = external_build_cache.os.replace
+
+            def replace(source, destination):
+                if Path(destination) == directory:
+                    raise PermissionError(13, "fixture cache write denied", str(destination))
+                return real_replace(source, destination)
+
+            with patch.object(external_build_cache.os, "replace", side_effect=replace):
+                with self.assertRaisesRegex(PermissionError, "fixture cache write denied"):
+                    self._run_recovery_build(archive_path, kwargs)
+            self.assertFalse(directory.exists())
+            self.assertEqual(list(directory.parent.glob(".*")), [])
+            manifest = kwargs["output"] / "departures-v2" / "fixture-city" / "manifest.json"
+            self.assertEqual(json.loads(manifest.read_text())["schemaVersion"], 2)
+
+    def test_recovery_rejects_missing_or_invalid_saved_cache(self) -> None:
+        for case in ("missing", "invalid"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                archive_path, kwargs, cache, keys = self._recovery_fixture(Path(temporary))
+                key = keys[("fixture-city", "20260914")]
+                directory = cache._directory(key)
+                (directory / "manifest.json").write_text("{broken")
+                real_persist = DeparturePartitionCache.persist
+
+                def persist(instance, saved_key, source):
+                    if case == "invalid":
+                        real_persist(instance, saved_key, source)
+                        (instance._directory(saved_key) / "manifest.json").write_text("{broken")
+
+                with patch.object(DeparturePartitionCache, "persist", autospec=True, side_effect=persist):
+                    with self.assertRaisesRegex(ValueError, "departure cache save failed") as raised:
+                        self._run_recovery_build(archive_path, kwargs)
+                self.assertIn(str(directory.absolute()), str(raised.exception))
+                manifest = kwargs["output"] / "departures-v2" / "fixture-city" / "manifest.json"
+                self.assertEqual(json.loads(manifest.read_text())["schemaVersion"], 2)
+
+    def test_recovery_removal_failure_stops_before_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive_path, kwargs, cache, keys = self._recovery_fixture(Path(temporary))
+            key = keys[("fixture-city", "20260914")]
+            directory = cache._directory(key)
+            damaged = directory / "manifest.json"
+            damaged.write_text("{broken")
+            logs = io.StringIO()
+            with patch.object(external_build_cache.shutil, "rmtree", side_effect=PermissionError(13, "fixture removal denied", str(directory))):
+                with patch.object(external_gtfs, "build_external_departure_index") as builder:
+                    with zipfile.ZipFile(archive_path) as archive, redirect_stdout(logs):
+                        with self.assertRaisesRegex(PermissionError, "fixture removal denied"):
+                            external_gtfs._build_external_departure_partitions(archive=archive, **kwargs)
+                    builder.assert_not_called()
+            self.assertTrue(directory.is_dir())
+            self.assertIn(str(damaged.absolute()), logs.getvalue())
+            self.assertIn("JSONDecodeError", logs.getvalue())
 
     def test_partition_key_excludes_release_identity_and_cache_restores(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
