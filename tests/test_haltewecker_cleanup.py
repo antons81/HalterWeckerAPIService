@@ -122,6 +122,18 @@ class HalteWeckerCleanupTests(unittest.TestCase):
         self.assertIn('GTFS_CACHE_ROOT="${GTFS_CACHE_ROOT:-$DATA/cache/gtfs}"', cleanup_source)
         self.assertIn('CACHE_ROOT="${GTFS_CACHE_ROOT:-$DATA_ROOT/cache/gtfs}"', pipeline_source)
 
+    def test_published_artifact_retention_is_wired_to_locked_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data = root / 'data'
+            active = data / 'releases/active'
+            active.mkdir(parents=True)
+            (data / 'current-release').symlink_to(active)
+            result = self.run_cleaner(root, data)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn('[ArtifactRetention] summary=', result.stdout)
+            self.assertIn('"dry_run":true', result.stdout)
+
     def test_repo_cleanup_uses_data_root_cache_when_gtfs_override_is_absent(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

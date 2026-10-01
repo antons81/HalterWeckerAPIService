@@ -17,6 +17,7 @@ LEGACY_EXTRA_BACKUP_MAX_AGE_HOURS="${HALTEWECKER_LEGACY_EXTRA_BACKUP_MAX_AGE_HOU
 PIPELINE_REPO="${HALTEWECKER_PIPELINE_REPO:-/srv/haltewecker/pipeline/HalterWeckerAPIService}"
 GTFS_CACHE_ROOT="${GTFS_CACHE_ROOT:-$DATA/cache/gtfs}"
 GTFS_ORPHAN_TEMP_MAX_AGE_HOURS="${HALTEWECKER_GTFS_ORPHAN_TEMP_MAX_AGE_HOURS:-24}"
+PARTITION_MAX_AGE_HOURS="${HALTEWECKER_PARTITION_MAX_AGE_HOURS:-12}"
 RECLAIMABLE_BYTES=0
 
 ttl_seconds_from_hours() {
@@ -68,7 +69,7 @@ artifact_age_seconds() {
     printf '%s\n' "$((now - mtime))"
 }
 
-for ttl_name in ABANDONED_RELEASE_MAX_AGE_HOURS VALIDATION_MAX_AGE_HOURS STAGING_MAX_AGE_HOURS LEGACY_EXTRA_BACKUP_MAX_AGE_HOURS; do
+for ttl_name in ABANDONED_RELEASE_MAX_AGE_HOURS VALIDATION_MAX_AGE_HOURS STAGING_MAX_AGE_HOURS LEGACY_EXTRA_BACKUP_MAX_AGE_HOURS PARTITION_MAX_AGE_HOURS; do
     ttl_value="${!ttl_name}"
     if ! ttl_seconds_from_hours "$ttl_value" >/dev/null; then
         echo "Invalid TTL: ${ttl_name}=${ttl_value}" >&2
@@ -1086,6 +1087,40 @@ cleanup_gtfs_cache() {
 }
 
 cleanup_gtfs_cache
+
+cleanup_published_artifacts() {
+    local helper="$PIPELINE_REPO/scripts/published_artifact_retention.py"
+    local output summary reclaimed index
+    if [[ ! -f "$helper" ]]; then
+        echo "Published artifact retention skipped reason=helper-missing path=$helper"
+        return 0
+    fi
+    local -a command=(
+        python3 "$helper" --data-root "$DATA"
+        --cache-root "$GTFS_CACHE_ROOT/external-departure-partitions"
+        --cache-ttl-hours "$PARTITION_MAX_AGE_HOURS"
+    )
+    for index in "${!PROTECTED_DEPENDENCY_PATHS[@]}"; do
+        command+=(--runtime-path "${PROTECTED_DEPENDENCY_PATHS[$index]}")
+    done
+    if [[ "$DRY_RUN" == "1" ]]; then
+        command+=(--dry-run)
+    else
+        command+=(--apply)
+    fi
+    if ! output="$("${command[@]}")"; then
+        echo "Published artifact retention skipped reason=helper-failed"
+        return 0
+    fi
+    printf '%s\n' "$output"
+    summary="$(printf '%s\n' "$output" | sed -n 's/^\[ArtifactRetention\] summary=//p' | tail -n 1)"
+    reclaimed="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["reclaimable_bytes"])' "$summary")"
+    if [[ "$reclaimed" =~ ^[0-9]+$ ]]; then
+        RECLAIMABLE_BYTES=$((RECLAIMABLE_BYTES + reclaimed))
+    fi
+}
+
+cleanup_published_artifacts
 
 echo "Cleanup reclaimable size: $(format_size "$RECLAIMABLE_BYTES") ($RECLAIMABLE_BYTES bytes)"
 
