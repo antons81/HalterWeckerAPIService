@@ -795,6 +795,16 @@ def atomic_switch_current_release(
     validate_candidate_release(target)
     pointer.parent.mkdir(parents=True, exist_ok=True)
     relative_target = os.path.relpath(target, pointer.parent)
+    if pointer.name == "current-release":
+        alias = pointer.parent / "current"
+        if alias.exists() and not alias.is_symlink():
+            raise ReleaseAssemblyError("current is not a symlink; refusing to overwrite stop-data")
+        temporary_alias = pointer.parent / f".current.tmp-{uuid.uuid4().hex}"
+        os.symlink("current-release/stop-data", temporary_alias)
+        try:
+            os.replace(temporary_alias, alias)
+        finally:
+            temporary_alias.unlink(missing_ok=True)
     temporary = pointer.parent / f".{pointer.name}.tmp-{uuid.uuid4().hex}"
     os.symlink(relative_target, temporary)
     try:

@@ -129,11 +129,15 @@ case \"${1:-}\" in
       printf '{"releaseID":"%s","releaseDirectory":"%s","stopData":{"releaseID":"%s","path":"%s","buildFingerprint":"test-build-fingerprint"},"providers":{}}\n' \
         "$release_id" "$release_root/$release_id" "$release_id" "$stop_data" > "$result_json"
       if [ "${INCREMENTAL_FAIL:-0}" != "1" ] && [ "${INCREMENTAL_READINESS_FAIL:-0}" != "1" ]; then
-        provider_json='{"israel-mot":{},"ttc-surface":{},"ttc-subway":{},"norway":{},"sweden":{},"poland-warsaw":{},"poland-wkd":{},"511-bay-area":{},"australia-translink-seq":{},"australia-transport-nsw":{},"cta-chicago":{},"mbta-boston":{},"stm-montreal":{}}'
+        provider_json='{"israel-mot":{},"ttc-surface":{},"ttc-subway":{},"norway":{},"sweden":{},"poland-warsaw":{},"poland-wkd":{},"511-bay-area":{},"australia-translink-seq":{},"australia-transport-nsw":{},"cta-chicago":{},"mbta-boston":{},"stm-montreal":{},"germany":{}}'
+        if [ "${INCREMENTAL_CANDIDATE_INVALID:-0}" = "1" ]; then provider_json='{}'; fi
+        if [ "${INCREMENTAL_CANDIDATE_WITHOUT_GERMANY:-0}" = "1" ]; then
+          provider_json=$("$REAL_PYTHON" -c 'import json,sys; value=json.loads(sys.argv[1]); value.pop("germany",None); print(json.dumps(value))' "$provider_json")
+        fi
         printf '{"releaseID":"%s","providers":%s}\n' "$release_id" "$provider_json" > "$release_root/$release_id/release.json"
       fi
     fi
-    if [ "${REUSE_STOP_DATA:-0}" = "1" ]; then
+    if [ -n "$result_json" ] || [ "${REUSE_STOP_DATA:-0}" = "1" ]; then
       ln -s "$stop_data" "$release_root/$release_id/stop-data"
     fi
     if [ "${INCREMENTAL_FAIL:-0}" = "1" ] || [ "${INCREMENTAL_READINESS_FAIL:-0}" = "1" ]; then
@@ -376,6 +380,7 @@ exit 64
 set -euo pipefail
 
 printf '%s\\n' "${READINESS_ONLY:-0}" >> "$STATIC_CALLS_LOG"
+printf '%s\\n' "${HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS:-}" >> "$RUNTIME_PROVIDER_CALLS_LOG"
 if [ "${READINESS_ONLY:-0}" = "1" ]; then
   [ "${READINESS_FAIL:-0}" != "1" ] || exit 1
   exit 0
@@ -545,6 +550,7 @@ PY
             "INCREMENTAL_MODULE_CALLS_LOG": str(self.root / "incremental-module-calls.log"),
             "INCREMENTAL_ENV_CALLS_LOG": str(self.root / "incremental-env-calls.log"),
             "STATIC_CALLS_LOG": str(self.root / "static-calls.log"),
+            "RUNTIME_PROVIDER_CALLS_LOG": str(self.root / "runtime-provider-calls.log"),
             "STAGED_STOP_DATA_LOG": str(self.root / "staged-stop-data.log"),
             "STATIC_DEPARTURES_PIPELINE": str(self.bin_directory / "static-departures-pipeline"),
             "HALTEWECKER_DIAGNOSTICS_DISABLE_TEE": "1",
@@ -719,6 +725,10 @@ assert callable(validate_validation_receipt)
         self.assertIn("activation=FULL_INCREMENTAL", result.stdout)
         self.assertTrue((self.data_root / "current-release").is_symlink())
         self.assertIn("/releases/incremental/", os.path.realpath(self.data_root / "current-release"))
+        self.assertEqual(os.readlink(self.data_root / "current"), "current-release/stop-data")
+        self.assertEqual(
+            (self.data_root / "current" / "release-marker").read_text(), "new",
+        )
         rollback_pointer = self.data_root / "rollback"
         self.assertFalse(os.path.lexists(rollback_pointer))
         self.assertIn("rollback=NONE", result.stdout)
@@ -727,6 +737,52 @@ assert callable(validate_validation_receipt)
             (self.root / "static-calls.log").read_text(encoding="utf-8").splitlines(),
             ["1"],
         )
+
+    def test_invalid_incremental_candidate_does_not_switch_published_pointers(self) -> None:
+        self.configure_resume_pointer_layout()
+        old_release = os.readlink(self.data_root / "current-release")
+        old_stops = os.readlink(self.data_root / "current")
+        result = self.run_pipeline(
+            USE_DEFAULT_PRODUCTION="1",
+            HALTEWECKER_ACTIVATION_DRY_RUN="1",
+            INCREMENTAL_CANDIDATE_INVALID="1",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(os.readlink(self.data_root / "current-release"), old_release)
+        self.assertEqual(os.readlink(self.data_root / "current"), old_stops)
+
+    def test_configured_provider_override_cannot_activate_without_germany(self) -> None:
+        self.configure_resume_pointer_layout()
+        previous_release = os.readlink(self.data_root / "current-release")
+        previous_stops = os.readlink(self.data_root / "current")
+        result = self.run_pipeline(
+            USE_DEFAULT_PRODUCTION="1", HALTEWECKER_ACTIVATION_DRY_RUN="1",
+            HALTEWECKER_INCREMENTAL_PROVIDER_IDS=MIXED_INCREMENTAL_PROVIDERS.removesuffix(",germany"),
+            INCREMENTAL_CANDIDATE_WITHOUT_GERMANY="1",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mandatory build provider germany is missing", result.stderr)
+        self.assertEqual(os.readlink(self.data_root / "current-release"), previous_release)
+        self.assertEqual(os.readlink(self.data_root / "current"), previous_stops)
+
+    def test_build_providers_are_not_forwarded_to_runtime(self) -> None:
+        self.configure_resume_pointer_layout()
+        result = self.run_pipeline(USE_DEFAULT_PRODUCTION="1", HALTEWECKER_ACTIVATION_DRY_RUN="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "runtime-provider-calls.log").read_text().strip(),
+                         MIXED_INCREMENTAL_PROVIDERS.removesuffix(",germany"))
+        self.assertIn("buildProviders=" + MIXED_INCREMENTAL_PROVIDERS, result.stdout)
+
+    def test_runtime_provider_outside_build_does_not_switch_pointer(self) -> None:
+        self.configure_resume_pointer_layout()
+        previous = os.readlink(self.data_root / "current-release")
+        result = self.run_pipeline(
+            USE_DEFAULT_PRODUCTION="1", HALTEWECKER_ACTIVATION_DRY_RUN="1",
+            HALTEWECKER_RUNTIME_PROVIDER_IDS="unconfigured-provider",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("runtime providers are absent from the build", result.stderr)
+        self.assertEqual(os.readlink(self.data_root / "current-release"), previous)
 
     def test_successful_incremental_activation_removes_retained_rollback_pointer(self) -> None:
         self.configure_resume_pointer_layout()

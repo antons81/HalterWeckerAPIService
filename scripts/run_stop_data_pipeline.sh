@@ -284,6 +284,9 @@ if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; 
   export HALTEWECKER_EXTERNAL_TRANSFORMED_BUILD_CACHE=1
   export HALTEWECKER_EXTERNAL_BUILD_CACHE_ROOT="$CACHE_ROOT/external-build"
   export HALTEWECKER_INCREMENTAL_PROVIDER_IDS="${HALTEWECKER_INCREMENTAL_PROVIDER_IDS-israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd,511-bay-area,australia-translink-seq,australia-transport-nsw,cta-chicago,mbta-boston,stm-montreal,germany}"
+  BUILD_PROVIDER_IDS="$HALTEWECKER_INCREMENTAL_PROVIDER_IDS"
+  HALTEWECKER_RUNTIME_PROVIDER_IDS="${HALTEWECKER_RUNTIME_PROVIDER_IDS-israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd,511-bay-area,australia-translink-seq,australia-transport-nsw,cta-chicago,mbta-boston,stm-montreal}"
+  export HALTEWECKER_RUNTIME_PROVIDER_IDS
   export HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS="$HALTEWECKER_INCREMENTAL_PROVIDER_IDS"
   export HALTEWECKER_EXTERNAL_DEPARTURES_V3_PROVIDERS="$HALTEWECKER_INCREMENTAL_PROVIDER_IDS"
   export HALTEWECKER_EXTERNAL_DEPARTURE_CACHE=1
@@ -698,16 +701,24 @@ activate_runtime() {
 
 validate_incremental_candidate() {
   if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" == "1" ]]; then
-    python3 - "$INCREMENTAL_RELEASE_DIR/release.json" "$HALTEWECKER_INCREMENTAL_PROVIDER_IDS" <<'PY'
+    python3 - "$INCREMENTAL_RELEASE_DIR/release.json" "$BUILD_PROVIDER_IDS" "$HALTEWECKER_RUNTIME_PROVIDER_IDS" "$REPO" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+sys.path.insert(0, sys.argv[4])
+from services.release_activation_requirements import validate_provider_contract
+from scripts.provider_artifact_capabilities import provider_capability, SHARD_RUNTIME
 providers = tuple(value for value in sys.argv[2].split(",") if value)
+runtime = tuple(value for value in sys.argv[3].split(",") if value)
+supported = tuple(value for value in runtime if provider_capability(Path(sys.argv[4]), value, SHARD_RUNTIME))
+validate_provider_contract(providers, runtime, supported)
 actual = tuple((payload.get("providers") or {}).keys())
 if set(actual) != set(providers):
     raise SystemExit("dry-run candidate does not represent all configured providers")
+if "germany" not in actual:
+    raise SystemExit("mandatory production provider germany is missing")
 print(
     "[Nightly] stage=incremental-candidate-validation status=PASS "
     f"release={payload.get('releaseID', '')} providers={len(providers)} mode=dry-run"
@@ -722,6 +733,7 @@ from pathlib import Path
 repository = Path(sys.argv[3])
 sys.path.insert(0, str(repository))
 from services.static_departures_runtime import load_release_manifest
+from services.release_activation_requirements import validate_shared_release
 from services.validation_receipt import (
     ValidationReceiptError,
     validate_validation_receipt,
@@ -738,6 +750,8 @@ except ValidationReceiptError:
 manifest = load_release_manifest(release_root, provider_ids=providers)
 if set(manifest.providers) != set(providers):
     raise SystemExit("incremental candidate does not contain all configured providers")
+requirements = validate_shared_release(release_root)
+print(f"[Nightly] stage=shared-release-requirements status=PASS details={requirements}")
 receipt_path = (
     release_root / "validation-receipt.json"
     if receipt_status == "REUSED"
@@ -749,6 +763,17 @@ print(
     f"receipt={receipt_status} receiptPath={receipt_path}"
 )
 PY
+}
+
+validate_incremental_consumers() {
+  if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" == "1" ]]; then
+    echo "[Nightly] stage=consumer-preflight status=DRY-RUN buildProviders=$BUILD_PROVIDER_IDS runtimeProviders=$HALTEWECKER_RUNTIME_PROVIDER_IDS"
+    return 0
+  fi
+  python3 "$REPO/scripts/validate_shared_release_consumers.py" \
+    --release "$INCREMENTAL_RELEASE_DIR" \
+    --build-providers "$BUILD_PROVIDER_IDS" \
+    --runtime-providers "$HALTEWECKER_RUNTIME_PROVIDER_IDS"
 }
 
 route_recall_activation() {
@@ -784,7 +809,24 @@ route_recall_activation() {
   fi
   local readiness_timeout="${ROUTERECALL_READINESS_TIMEOUT_SECONDS:-60}"
   local readiness_deadline=$((SECONDS + readiness_timeout))
-  while ! docker exec "$container" python3 -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8091/routerecall/v1/cities", timeout=5)' >/dev/null 2>&1; do
+  while ! docker exec "$container" python3 -c '
+import json
+from urllib.parse import quote, urlencode
+from urllib.request import urlopen
+root = "http://127.0.0.1:8091/routerecall/v1"
+for city, line in (("berlin", "100"), ("wuppertal", "635")):
+    with urlopen(root + "/lines/search?" + urlencode({"city": city, "line": line}), timeout=15) as response:
+        lines = json.load(response)["lines"]
+    matching = [item for item in lines if item.get("providerID") == "germany" and item.get("patterns")]
+    if not matching:
+        raise RuntimeError("Germany search/pattern readiness failed: " + city + " " + line)
+    item = matching[0]
+    pattern = item["patterns"][0]
+    path = "/lines/" + quote(item["id"], safe="") + "/patterns/" + quote(pattern["id"], safe="")
+    with urlopen(root + path + "?" + urlencode({"city": city}), timeout=15) as response:
+        if not json.load(response)["pattern"].get("stops"):
+            raise RuntimeError("Germany pattern has no stops")
+' >/dev/null 2>&1; do
     if (( SECONDS >= readiness_deadline )); then
       echo "[Nightly] ERROR: RouteRecall provider runtime readiness failed after ${readiness_timeout}s" >&2
       if docker inspect "$container" >/dev/null 2>&1; then docker rm -f "$container" >/dev/null 2>&1 || true; fi
@@ -812,13 +854,20 @@ activate_incremental_production() {
     echo "[Nightly] ERROR: rollback pointer is not a symlink: $rollback_pointer" >&2
     return 1
   fi
-  validate_incremental_candidate
+  validate_incremental_candidate || return 1
+  validate_incremental_consumers || return 1
+  if [[ -e "$CURRENT" && ! -L "$CURRENT" ]]; then
+    echo "[Nightly] ERROR: current is not a symlink; refusing to overwrite stop-data" >&2
+    return 1
+  fi
+  # Static HTTP consumers follow the same atomic generation pointer as the API.
+  replace_link "$CURRENT" "current-release/stop-data" || return 1
   # Keep the previous target in memory for failed activation recovery only.
   # Successful production activation must not retain a rollback release pointer.
-  replace_link "$CURRENT_RELEASE" "$candidate_target"
+  replace_link "$CURRENT_RELEASE" "$candidate_target" || return 1
   if ! HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE=provider \
     HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RUNTIME=1 \
-    HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS="$HALTEWECKER_INCREMENTAL_PROVIDER_IDS" \
+    HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS="$HALTEWECKER_RUNTIME_PROVIDER_IDS" \
     HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RELEASE_POINTER="/data/current-release" \
     READINESS_ONLY=1 \
     RELEASE_ID="$RELEASE_ID" \
@@ -853,7 +902,7 @@ if [[ "$RUN_MODE" == "activate-existing" ]]; then
     exit 1
   fi
   echo "[Nightly] stage=activation-only status=started release=$RELEASE_ID candidate=$INCREMENTAL_RELEASE_DIR"
-  validate_incremental_candidate
+  validate_incremental_candidate || exit 1
   if ! activate_incremental_production; then
     echo "[Nightly] stage=activation-only status=FAIL release=$RELEASE_ID" >&2
     exit 1
@@ -1776,15 +1825,15 @@ if [[ -z "$OLD_RELEASE_TARGET" && -e "$ROLLBACK/stop-data" ]]; then
 fi
 COMMIT_STARTED=$SECONDS
 echo "[StopData] release=$RELEASE_ID stage=commit started"
+replace_link "$CURRENT" "current-release/stop-data"
 replace_link "$CURRENT_RELEASE" "releases/$RELEASE_ID"
-replace_link "$CURRENT" "releases/$RELEASE_ID/stop-data"
 replace_link "$DEPARTURES_CURRENT" "releases/$RELEASE_ID/departures.sqlite"
 
 if ! activate_runtime; then
   echo "[StopData] ERROR: release=$RELEASE_ID readiness failed; restoring previous release" >&2
   if [[ -n "$OLD_RELEASE_TARGET" ]]; then
     replace_link "$CURRENT_RELEASE" "$OLD_RELEASE_TARGET"
-    replace_link "$CURRENT" "$OLD_RELEASE_TARGET/stop-data"
+    replace_link "$CURRENT" "current-release/stop-data"
     replace_link "$DEPARTURES_CURRENT" "$OLD_RELEASE_TARGET/departures.sqlite"
   else
     rm -f "$CURRENT_RELEASE" "$CURRENT" "$DEPARTURES_CURRENT"

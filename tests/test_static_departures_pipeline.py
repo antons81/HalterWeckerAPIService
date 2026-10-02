@@ -22,7 +22,7 @@ class StaticDeparturesPipelineTests(unittest.TestCase):
         )
 
     def _run_readiness_with_mock_docker(
-        self, root: Path, *, health_release_id: str
+        self, root: Path, *, health_release_id: str, runtime_providers: str | None = None
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         docker_log = root / "docker.log"
         docker_state = root / "docker-state"
@@ -47,7 +47,9 @@ class StaticDeparturesPipelineTests(unittest.TestCase):
             "fi\n"
             "if [[ \"$1\" == rm ]]; then printf '%s\\n' rollback > \"$state\"; exit 0; fi\n"
             "if [[ \"$1\" == stop || \"$1\" == start ]]; then exit 0; fi\n"
-            "if [[ \"$1\" == compose ]]; then printf '%s\\n' canonical > \"$state\"; exit 0; fi\n"
+            "if [[ \"$1\" == compose ]]; then "
+            f"printf '%s\\n' \"${{HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS:-}}\" > {str(root / 'runtime-providers.log')!r}; "
+            "printf '%s\\n' canonical > \"$state\"; exit 0; fi\n"
             "if [[ \"$1\" == exec ]]; then\n"
             f"  printf '%s\\n' '{{\"status\":\"ok\",\"database\":{{\"releaseID\":\"{health_release_id}\"}}}}'\n"
             "  exit 0\n"
@@ -58,12 +60,16 @@ class StaticDeparturesPipelineTests(unittest.TestCase):
         mock_docker.chmod(0o755)
         environment_file = root / "haltewecker-stop-data.env"
         environment_file.write_text(
-            "GTFS_URL=https://example.invalid/german.zip\n",
+            "GTFS_URL=https://example.invalid/german.zip\n" + (
+                "HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS=israel-mot,germany\n" if runtime_providers else ""
+            ),
             encoding="utf-8",
         )
         wmata_file = root / "wmata.env"
         wmata_file.write_text("WMATA_API_KEY=test-secret\n", encoding="utf-8")
         environment = os.environ.copy()
+        if runtime_providers is not None:
+            environment["HALTEWECKER_RUNTIME_PROVIDER_IDS"] = runtime_providers
         environment.update(
             {
                 "REPO": str(REPOSITORY_ROOT),
@@ -84,6 +90,15 @@ class StaticDeparturesPipelineTests(unittest.TestCase):
             check=False,
         )
         return result, docker_log
+
+    def test_runtime_contract_overrides_stale_build_provider_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result, _ = self._run_readiness_with_mock_docker(
+                root, health_release_id="release-a", runtime_providers="israel-mot",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((root / "runtime-providers.log").read_text().strip(), "israel-mot")
 
     def test_canonical_readiness_preserves_existing_container(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -148,6 +163,30 @@ class StaticDeparturesPipelineTests(unittest.TestCase):
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("no successful stop-data handoff", result.stderr)
+
+    def test_standalone_run_rejects_handoff_from_previous_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "releases" / "old").mkdir(parents=True)
+            (root / "releases" / "active").mkdir()
+            (root / "static-departures-release").symlink_to("releases/old")
+            (root / "current-release").symlink_to("releases/active")
+            environment_file = root / "stop-data.env"
+            environment_file.write_text("GTFS_URL=https://example.invalid/german.zip\nWMATA_API_KEY=test\n")
+            environment = os.environ.copy()
+            environment.update({
+                "REPO": str(REPOSITORY_ROOT),
+                "DATA_ROOT": str(root),
+                "STOP_DATA_ENV_FILE": str(environment_file),
+                "WMATA_SECRET_FILE": str(root / "missing-wmata.env"),
+                "RELEASE_ID": "",
+            })
+            result = subprocess.run(
+                ["bash", str(PIPELINE)], cwd=REPOSITORY_ROOT, env=environment,
+                text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("refusing stale standalone import", result.stderr)
 
     def test_release_scoped_nightly_run_derives_artifacts_from_same_release(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

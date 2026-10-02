@@ -451,8 +451,8 @@ def activate_candidate(data_root: Path, repository_root: Path, candidate: Path) 
     }
     target = _relative_target(data_root, candidate)
     try:
+        _replace_link(data_root / "current", "current-release/stop-data")
         _replace_link(data_root / "current-release", target)
-        _replace_link(data_root / "current", f"{target}/stop-data")
         _replace_link(data_root / "departures-current.sqlite", f"{target}/departures.sqlite")
         environment = dict(os.environ)
         environment["STATIC_DATA_ROOT"] = "/data/current-release/stop-data"

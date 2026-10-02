@@ -42,6 +42,10 @@ if [[ -f "$AUSTRALIA_ENV_FILE" ]]; then
 fi
 
 DATA_ROOT="${DATA_ROOT:-/srv/haltewecker/data}"
+if [[ -n "${HALTEWECKER_RUNTIME_PROVIDER_IDS:-}" ]]; then
+  # The activator's consumer list is independent of the release build list.
+  export HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS="$HALTEWECKER_RUNTIME_PROVIDER_IDS"
+fi
 GTFS_URL="${GTFS_URL:?GTFS_URL is required}"
 STOP_DATA_PATH="${STOP_DATA_PATH:-$DATA_ROOT/current}"
 NEXT_DATABASE_PATH="${NEXT_DATABASE_PATH:-$DATA_ROOT/staging/departures-next.sqlite}"
@@ -94,6 +98,11 @@ preserve_existing_container() {
 if [[ -z "$RELEASE_ID" ]]; then
   if [[ ! -L "$STATIC_DEPARTURES_RELEASE" ]]; then
     echo "$LOG_PREFIX ERROR: no successful stop-data handoff for standalone release-scoped import" >&2
+    exit 1
+  fi
+  if [[ -L "$DATA_ROOT/current-release" ]] && \
+     [[ "$(readlink -f "$STATIC_DEPARTURES_RELEASE")" != "$(readlink -f "$DATA_ROOT/current-release")" ]]; then
+    echo "$LOG_PREFIX ERROR: stop-data handoff is not the active release; refusing stale standalone import" >&2
     exit 1
   fi
   ACTIVE_RELEASE_DIR="$STATIC_DEPARTURES_RELEASE"

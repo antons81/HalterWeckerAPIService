@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -25,13 +26,25 @@ from provider_release_assembler import (  # noqa: E402
     readiness_probe,
     validate_candidate_release,
 )
-from static_departures_runtime import ReleaseManager  # noqa: E402
+from static_departures_runtime import ReleaseManager, load_release_manifest  # noqa: E402
+from validation_receipt import write_validation_receipt  # noqa: E402
 from test_static_departures_multi_provider import (  # noqa: E402
     StaticDeparturesMultiProviderTests,
 )
 
 
 class ProviderReleaseAssemblerTests(unittest.TestCase):
+    def test_release_receipt_is_reused_for_runtime_provider_subset(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, release = StaticDeparturesMultiProviderTests()._build_fixture(Path(temporary), provider_count=2)
+            write_validation_receipt(release, provider_ids=("israel-mot", "synthetic-2"))
+            with mock.patch("static_departures_runtime._sha256_file", side_effect=AssertionError(
+                "runtime subset must reuse the validated build receipt"
+            )):
+                manifest = load_release_manifest(release, provider_ids=("israel-mot",))
+            self.assertEqual(set(manifest.providers), {"israel-mot"})
+            self.assertIn("synthetic-2", manifest.payload["providers"])
+
     def test_assembler_runtime_imports_from_repository_root(self) -> None:
         environment = os.environ.copy()
         environment.pop("PYTHONPATH", None)
@@ -297,6 +310,8 @@ class ProviderReleaseAssemblerTests(unittest.TestCase):
             self.assertEqual(lease_a.release_id, "release-a")
 
             atomic_switch_current_release(pointer, release_b.release_directory)
+            self.assertEqual(os.readlink(root / "current"), "current-release/stop-data")
+            self.assertEqual((root / "current").resolve(), (release_b.release_directory / "stop-data").resolve())
             lease_b = manager.acquire_snapshot()
             self.assertEqual(lease_b.release_id, "release-b")
             self.assertEqual(lease_a.release_id, "release-a")

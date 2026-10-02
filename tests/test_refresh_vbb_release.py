@@ -156,6 +156,7 @@ class VBBRefreshTests(unittest.TestCase):
                 refresh.activate_candidate(root, Path(temporary), candidate)
 
             self.assertEqual((root / "current-release").resolve(), candidate.resolve())
+            self.assertEqual(os.readlink(root / "current"), "current-release/stop-data")
             self.assertEqual((root / "current").resolve(), (candidate / "stop-data").resolve())
             self.assertEqual(
                 (root / "departures-current.sqlite").resolve(),

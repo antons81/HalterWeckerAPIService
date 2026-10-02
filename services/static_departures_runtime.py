@@ -412,7 +412,9 @@ def load_release_manifest(
     try:
         receipt = validate_validation_receipt(
             root,
-            provider_ids=provider_ids,
+            # A receipt certifies the build release, not a consumer's whitelist.
+            # Keep exact receipt validation; open only the selected providers below.
+            provider_ids=tuple(payload["providers"]) if isinstance(payload.get("providers"), dict) else provider_ids,
             payload=payload,
         )
         LOGGER.info(
