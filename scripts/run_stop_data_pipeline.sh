@@ -777,72 +777,66 @@ validate_incremental_consumers() {
 }
 
 route_recall_activation() {
-  local compose_file="${HALTEWECKER_ROUTERECALL_COMPOSE_FILE:-/srv/routerecall/RouteRecallAPI/deploy/routerecall-api.compose.yml}"
-  local repository="${HALTEWECKER_ROUTERECALL_REPO:-/srv/routerecall/RouteRecallAPI}"
   local container="${HALTEWECKER_ROUTERECALL_CONTAINER_NAME:-routerecall-api}"
-  local rollback_container="${container}-rollback-${RELEASE_ID}"
-  rollback_container="${rollback_container:0:63}"
-
   if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" == "1" ]]; then
     echo "[Nightly] stage=routerecall-activation status=DRY-RUN container=$container"
     return 0
   fi
-  if [[ ! -f "$compose_file" || ! -d "$repository" ]]; then
-    echo "[Nightly] ERROR: RouteRecall production compose is unavailable" >&2
-    return 1
-  fi
-  if docker inspect "$container" >/dev/null 2>&1; then
-    if docker inspect "$rollback_container" >/dev/null 2>&1; then
-      echo "[Nightly] ERROR: RouteRecall rollback container already exists: $rollback_container" >&2
-      return 1
-    fi
-    docker rename "$container" "$rollback_container"
-    docker stop --time "${HALTEWECKER_ROUTERECALL_STOP_TIMEOUT_SECONDS:-30}" "$rollback_container" >/dev/null
-  fi
-  if ! docker compose --project-directory "$repository/deploy" -f "$compose_file" up -d --build; then
-    if docker inspect "$container" >/dev/null 2>&1; then docker rm -f "$container" >/dev/null 2>&1 || true; fi
-    if docker inspect "$rollback_container" >/dev/null 2>&1; then
-      docker rename "$rollback_container" "$container" >/dev/null
-      docker start "$container" >/dev/null
-    fi
-    return 1
-  fi
-  local readiness_timeout="${ROUTERECALL_READINESS_TIMEOUT_SECONDS:-60}"
-  local readiness_deadline=$((SECONDS + readiness_timeout))
-  while ! docker exec "$container" python3 -c '
-import json
-from urllib.parse import quote, urlencode
-from urllib.request import urlopen
-root = "http://127.0.0.1:8091/routerecall/v1"
-for city, line in (("berlin", "100"), ("wuppertal", "635")):
-    with urlopen(root + "/lines/search?" + urlencode({"city": city, "line": line}), timeout=15) as response:
-        lines = json.load(response)["lines"]
-    matching = [item for item in lines if item.get("providerID") == "germany" and item.get("patterns")]
-    if not matching:
-        raise RuntimeError("Germany search/pattern readiness failed: " + city + " " + line)
-    item = matching[0]
-    pattern = item["patterns"][0]
-    path = "/lines/" + quote(item["id"], safe="") + "/patterns/" + quote(pattern["id"], safe="")
-    with urlopen(root + path + "?" + urlencode({"city": city}), timeout=15) as response:
-        if not json.load(response)["pattern"].get("stops"):
-            raise RuntimeError("Germany pattern has no stops")
-' >/dev/null 2>&1; do
-    if (( SECONDS >= readiness_deadline )); then
-      echo "[Nightly] ERROR: RouteRecall provider runtime readiness failed after ${readiness_timeout}s" >&2
-      if docker inspect "$container" >/dev/null 2>&1; then docker rm -f "$container" >/dev/null 2>&1 || true; fi
-      if docker inspect "$rollback_container" >/dev/null 2>&1; then
-        docker rename "$rollback_container" "$container" >/dev/null 2>&1 || true
-        docker start "$container" >/dev/null 2>&1 || true
-      fi
+  local deadline=$((SECONDS + ${ROUTERECALL_READINESS_TIMEOUT_SECONDS:-60}))
+  until python3 "$REPO/scripts/active_release_readiness.py" route \
+      --container "$container" --image "$ROUTERECALL_ACTIVATION_IMAGE" \
+      --container-id "$ROUTERECALL_ACTIVATION_CONTAINER_ID"; do
+    if [[ "$(docker inspect --format '{{.Image}}' "$container" 2>/dev/null)" != "$ROUTERECALL_ACTIVATION_IMAGE" ]] || \
+       [[ "$(docker inspect --format '{{.Id}}' "$container" 2>/dev/null)" != "$ROUTERECALL_ACTIVATION_CONTAINER_ID" ]] || \
+       (( SECONDS >= deadline )); then
+      echo "[Nightly] ERROR: RouteRecall readiness/image invariant failed" >&2
       return 1
     fi
     sleep 2
   done
-  echo "[Nightly] stage=routerecall-activation status=PASS container=$container"
+  echo "[Nightly] stage=routerecall-activation status=PASS action=READINESS_ONLY image=$ROUTERECALL_ACTIVATION_IMAGE"
+}
+
+haltewecker_activation_readiness() {
+  local expected_release="$1"
+  if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" == "1" ]]; then
+    return 0
+  fi
+  python3 "$REPO/scripts/active_release_readiness.py" haltewecker \
+    --container static-departures-api --release-id "$expected_release" \
+    --providers "$HALTEWECKER_RUNTIME_PROVIDER_IDS"
+}
+
+rollback_incremental_consumers() {
+  local previous_target="$1"
+  local previous_release="$2"
+  local reload_option=""
+  if [[ "$ROUTERECALL_ACTIVATION_RELOAD" == "1" ]]; then reload_option="--reload"; fi
+  replace_link "$CURRENT_RELEASE" "$previous_target" || return 1
+  if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" != "1" ]]; then
+    local container="static-departures-api"
+    local preserved="${container}-rollback-${RELEASE_ID}"
+    preserved="${preserved:0:63}"
+    if docker inspect "$preserved" >/dev/null 2>&1; then
+      if docker inspect "$container" >/dev/null 2>&1; then
+        docker stop --time 10 "$container" >/dev/null || return 1
+        docker rename "$container" "${container}-failed-${RELEASE_ID:0:30}" || return 1
+      fi
+      docker rename "$preserved" "$container" || return 1
+      docker start "$container" >/dev/null || return 1
+    fi
+    python3 "$REPO/scripts/active_release_readiness.py" restore-route \
+      --container "${HALTEWECKER_ROUTERECALL_CONTAINER_NAME:-routerecall-api}" \
+      --image "$ROUTERECALL_ACTIVATION_IMAGE" \
+      --container-id "$ROUTERECALL_ACTIVATION_CONTAINER_ID" \
+      ${reload_option:+"$reload_option"} || return 1
+  fi
+  route_recall_activation && haltewecker_activation_readiness "$previous_release"
 }
 
 activate_incremental_production() {
   local old_target=""
+  local old_release=""
   local candidate_target="releases/incremental/$RELEASE_ID"
   local rollback_pointer="${HALTEWECKER_ROLLBACK_POINTER:-$DATA_ROOT/rollback}"
   if [[ ! -L "$CURRENT_RELEASE" ]]; then
@@ -856,6 +850,20 @@ activate_incremental_production() {
   fi
   validate_incremental_candidate || return 1
   validate_incremental_consumers || return 1
+  ROUTERECALL_ACTIVATION_RELOAD=0
+  old_release="$(basename "$(readlink -f "$CURRENT_RELEASE")")"
+  if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" != "1" ]]; then
+    old_release="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["releaseID"])' "$CURRENT_RELEASE/release.json")" || return 1
+    ROUTERECALL_ACTIVATION_IMAGE="$(docker inspect --format '{{.Image}}' "${HALTEWECKER_ROUTERECALL_CONTAINER_NAME:-routerecall-api}")" || return 1
+    ROUTERECALL_ACTIVATION_CONTAINER_ID="$(docker inspect --format '{{.Id}}' "${HALTEWECKER_ROUTERECALL_CONTAINER_NAME:-routerecall-api}")" || return 1
+    [[ -n "$ROUTERECALL_ACTIVATION_IMAGE" && -n "$ROUTERECALL_ACTIVATION_CONTAINER_ID" ]] || return 1
+    ROUTERECALL_ACTIVATION_STOP_DATA_ROOT="$(python3 "$REPO/scripts/active_release_readiness.py" stop-data-root --release-root "$CURRENT_RELEASE")" || return 1
+    local candidate_stop_data_root
+    candidate_stop_data_root="$(python3 "$REPO/scripts/active_release_readiness.py" stop-data-root --release-root "$INCREMENTAL_RELEASE_DIR")" || return 1
+    if [[ "$candidate_stop_data_root" != "$ROUTERECALL_ACTIVATION_STOP_DATA_ROOT" ]]; then
+      ROUTERECALL_ACTIVATION_RELOAD=1
+    fi
+  fi
   if [[ -e "$CURRENT" && ! -L "$CURRENT" ]]; then
     echo "[Nightly] ERROR: current is not a symlink; refusing to overwrite stop-data" >&2
     return 1
@@ -865,6 +873,17 @@ activate_incremental_production() {
   # Keep the previous target in memory for failed activation recovery only.
   # Successful production activation must not retain a rollback release pointer.
   replace_link "$CURRENT_RELEASE" "$candidate_target" || return 1
+  # The DB adapter hot-reloads; the API's resolved stop-data root is startup-bound.
+  if [[ "$ROUTERECALL_ACTIVATION_RELOAD" == "1" ]]; then
+    if ! python3 "$REPO/scripts/active_release_readiness.py" reload-route \
+        --container "${HALTEWECKER_ROUTERECALL_CONTAINER_NAME:-routerecall-api}" \
+        --image "$ROUTERECALL_ACTIVATION_IMAGE" \
+        --container-id "$ROUTERECALL_ACTIVATION_CONTAINER_ID"; then
+      rollback_incremental_consumers "$old_target" "$old_release" || echo "[Nightly] ERROR: rollback readiness failed; operator recovery required" >&2
+      return 1
+    fi
+    echo "[Nightly] stage=routerecall-reload status=PASS action=RESTART_SAME_CONTAINER image=$ROUTERECALL_ACTIVATION_IMAGE"
+  fi
   if ! HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE=provider \
     HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RUNTIME=1 \
     HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS="$HALTEWECKER_RUNTIME_PROVIDER_IDS" \
@@ -874,19 +893,16 @@ activate_incremental_production() {
     EXTERNAL_GTFS_ARTIFACTS_JSON="" \
     STATIC_DATA_ROOT="/data/current-release/stop-data" \
     "$STATIC_DEPARTURES_PIPELINE"; then
-    replace_link "$CURRENT_RELEASE" "$old_target"
+    rollback_incremental_consumers "$old_target" "$old_release" || echo "[Nightly] ERROR: rollback readiness failed; operator recovery required" >&2
     return 1
   fi
+  if ! route_recall_activation || ! haltewecker_activation_readiness "$RELEASE_ID"; then
+    rollback_incremental_consumers "$old_target" "$old_release" || echo "[Nightly] ERROR: rollback readiness failed; operator recovery required" >&2
+    return 1
+  fi
+  # Recheck after every consumer gate; release publication cannot change the app.
   if ! route_recall_activation; then
-    replace_link "$CURRENT_RELEASE" "$old_target"
-    local static_container="static-departures-api"
-    local static_rollback="static-departures-api-rollback-${RELEASE_ID}"
-    static_rollback="${static_rollback:0:63}"
-    if docker inspect "$static_container" >/dev/null 2>&1 && docker inspect "$static_rollback" >/dev/null 2>&1; then
-      docker rm -f "$static_container" >/dev/null 2>&1 || true
-      docker rename "$static_rollback" "$static_container" >/dev/null 2>&1 || true
-      docker start "$static_container" >/dev/null 2>&1 || true
-    fi
+    rollback_incremental_consumers "$old_target" "$old_release" || echo "[Nightly] ERROR: rollback readiness failed; operator recovery required" >&2
     return 1
   fi
   if [[ -L "$rollback_pointer" ]]; then
