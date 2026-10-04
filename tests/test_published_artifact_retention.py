@@ -27,7 +27,7 @@ class PublishedArtifactRetentionTests(unittest.TestCase):
 
     def entry(self, kind="cache", name="unrelated-name", age=24, day="20260901"):
         if kind == "cache":
-            path = self.cache / "provider" / "city" / "unrelated-date-directory" / name
+            path = self.cache / "provider" / "city" / day / name
             main = "partition.json"
             manifest = dict(providerID="provider", status="complete", serviceDate=day, size=4096)
         else:
@@ -40,6 +40,12 @@ class PublishedArtifactRetentionTests(unittest.TestCase):
         for file in path.iterdir():
             os.utime(file, (self.now - age * 3600, self.now - age * 3600))
         return path
+
+    @staticmethod
+    def proc_status(proc, uid=None):
+        uid = os.getuid() if uid is None else uid
+        proc.mkdir(parents=True, exist_ok=True)
+        (proc / 'status').write_text(f'Name:\ttest\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n')
 
     def retain(self, *, processes=None, apply=False):
         process = Processes() if processes is None else processes
@@ -58,10 +64,11 @@ class PublishedArtifactRetentionTests(unittest.TestCase):
         os.link(entry / 'partition.json', self.active / 'published.json')
         self.assertEqual(self.row(self.retain(), entry)['reason'], 'runtime-inode-reference')
 
-    def test_fd_and_mmap_scanner_protects_cache(self):
+    def test_process_fd_and_mmap_protect_the_matching_artifact(self):
         entry = self.entry()
         proc = self.data / 'proc/123'
         (proc / 'fd').mkdir(parents=True)
+        self.proc_status(proc)
         (proc / 'cwd').symlink_to(self.data)
         (proc / 'cmdline').write_bytes(b'build\0')
         (proc / 'fd/5').symlink_to(entry / 'partition.json')
@@ -75,6 +82,100 @@ class PublishedArtifactRetentionTests(unittest.TestCase):
         snapshot = Processes.scan(proc.parent)
         self.assertEqual(self.row(self.retain(processes=snapshot), entry)['reason'], 'open-fd-or-mmap')
 
+    def test_unrelated_uid_permission_denied_does_not_block_cleanup(self):
+        entry = self.entry()
+        proc = self.data / 'proc/123'
+        (proc / 'fd').mkdir(parents=True)
+        self.proc_status(proc, uid=os.getuid() + 1)
+        (proc / 'cmdline').write_bytes(b'unrelated-service\0')
+        (proc / 'maps').write_text('')
+        original_iterdir = Path.iterdir
+
+        def iterdir(path):
+            if path == proc / 'fd':
+                raise PermissionError(13, 'permission denied', str(path))
+            return original_iterdir(path)
+
+        with patch.object(Path, 'iterdir', iterdir):
+            snapshot = Processes.scan(proc.parent)
+        self.assertEqual(snapshot.errors, [])
+        self.assertEqual(snapshot.relevant_pids, 0)
+        self.assertEqual(snapshot.ignored_unrelated_pids, 1)
+
+        report = self.retain(processes=snapshot)
+        self.assertEqual(self.row(report, entry)['decision'], 'DELETE')
+        self.assertEqual(report['summary']['process_scan']['ignored_unrelated_pids'], 1)
+
+        applied = self.retain(processes=snapshot, apply=True)
+        self.assertFalse(entry.exists())
+        self.assertEqual(applied['applied']['skipped'], [])
+
+    def test_proc_permission_denied_does_not_block_old_safe_candidate(self):
+        entry = self.entry()
+        proc = self.data / 'proc/123'
+        (proc / 'fd').mkdir(parents=True)
+        self.proc_status(proc)
+        (proc / 'cmdline').write_bytes(b'deploy-service\0')
+        (proc / 'cwd').symlink_to(self.data)
+        original_iterdir = Path.iterdir
+
+        def iterdir(path):
+            if path == proc / 'fd':
+                raise PermissionError(13, 'permission denied', str(path))
+            return original_iterdir(path)
+
+        with patch.object(Path, 'iterdir', iterdir):
+            snapshot = Processes.scan(proc.parent)
+        self.assertEqual(snapshot.relevant_pids, 1)
+        self.assertEqual(snapshot.permission_denied_pids, 1)
+        report = self.retain(processes=snapshot)
+        self.assertEqual(self.row(report, entry)['decision'], 'DELETE')
+        self.assertEqual(report['summary']['deletable_candidates'], 1)
+        applied = self.retain(processes=snapshot, apply=True)
+        self.assertFalse(entry.exists())
+        self.assertTrue(applied['summary']['errors'])
+
+    def test_cwd_permission_error_does_not_prevent_remaining_proc_diagnostics(self):
+        entry = self.entry()
+        proc = self.data / 'proc/123'
+        (proc / 'fd').mkdir(parents=True)
+        self.proc_status(proc)
+        (proc / 'cmdline').write_bytes(b'deploy-service\0')
+        unrelated = self.data / 'unrelated-open-file'
+        unrelated.write_text('in use elsewhere')
+        (proc / 'fd/5').symlink_to(unrelated)
+        (proc / 'maps').write_text('')
+        original_readlink = os.readlink
+
+        def readlink(path, *args, **kwargs):
+            if Path(path) == proc / 'cwd':
+                raise PermissionError(13, 'permission denied', str(path))
+            return original_readlink(path, *args, **kwargs)
+
+        with patch('scripts.published_artifact_retention.os.readlink', side_effect=readlink):
+            snapshot = Processes.scan(proc.parent)
+        self.assertEqual(snapshot.cwd_permission_denied, 1)
+        self.assertEqual(len(snapshot.errors), 1)
+        self.assertIn(identity(unrelated), snapshot.inodes)
+        self.assertEqual(self.row(self.retain(processes=snapshot), entry)['decision'], 'DELETE')
+
+    def test_process_disappearing_during_scan_is_ignored(self):
+        proc = self.data / 'proc/123'
+        proc.mkdir(parents=True)
+        self.proc_status(proc)
+        (proc / 'cwd').symlink_to(self.data)
+        original_read_bytes = Path.read_bytes
+
+        def read_bytes(path):
+            if path.name == 'cmdline':
+                raise FileNotFoundError(2, 'process disappeared', str(path))
+            return original_read_bytes(path)
+
+        with patch.object(Path, 'read_bytes', read_bytes):
+            snapshot = Processes.scan(proc.parent)
+        self.assertFalse(snapshot.errors)
+        self.assertEqual(snapshot.commands, [])
+
     def test_cache_younger_than_twelve_hours_is_kept(self):
         entry = self.entry(age=11.9)
         self.assertEqual(self.row(self.retain(), entry)['reason'], 'inside-cache-ttl')
@@ -84,6 +185,64 @@ class PublishedArtifactRetentionTests(unittest.TestCase):
         report = self.retain(apply=True)
         self.assertEqual(len(report['applied']['deleted']), 2)
         self.assertFalse((entry / 'partition.json').exists())
+        self.assertFalse(entry.exists())
+
+    def test_old_incomplete_orphan_is_a_candidate_but_fresh_one_is_kept(self):
+        old = self.entry(name='old-orphan')
+        (old / 'manifest.json').unlink()
+        old_time = self.now - 13 * 3600
+        os.utime(old / 'partition.json', (old_time, old_time))
+        os.utime(old, (old_time, old_time))
+
+        fresh = self.entry(name='fresh-orphan')
+        (fresh / 'manifest.json').unlink()
+
+        report = self.retain()
+        self.assertEqual(self.row(report, old)['reason'], 'stale-incomplete-orphan')
+        self.assertEqual(self.row(report, old)['decision'], 'DELETE')
+        self.assertEqual(self.row(report, fresh)['reason'], 'incomplete-too-new')
+        self.assertEqual(self.row(report, fresh)['decision'], 'KEEP')
+
+        applied = self.retain(apply=True)
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
+        self.assertEqual(applied['applied']['skipped'], [])
+
+    def test_old_empty_incomplete_directory_is_a_candidate(self):
+        empty = self.cache / 'provider' / 'city' / '20260901' / 'empty-orphan'
+        empty.mkdir(parents=True)
+        old_time = self.now - 13 * 3600
+        os.utime(empty, (old_time, old_time))
+
+        report = self.retain()
+        row = self.row(report, empty)
+        self.assertEqual(row['decision'], 'DELETE')
+        self.assertTrue(row['candidate'])
+        self.assertEqual(row['reason'], 'stale-incomplete-orphan')
+        self.assertEqual(row['logical_bytes'], 0)
+        self.assertTrue(empty.exists())
+
+        applied = self.retain(apply=True)
+        self.assertFalse(empty.exists())
+        self.assertEqual(applied['applied']['skipped'], [])
+
+    def test_old_cache_temp_directory_is_removed_and_dry_run_matches_apply(self):
+        temporary = self.cache / 'provider' / 'city' / '20260901' / ('.' + 'a' * 64 + '.abcdefgh')
+        temporary.mkdir(parents=True)
+        (temporary / 'partition.json').write_bytes(b'orphan')
+        old_time = self.now - 13 * 3600
+        os.utime(temporary / 'partition.json', (old_time, old_time))
+        os.utime(temporary, (old_time, old_time))
+
+        dry = self.retain()
+        row = self.row(dry, temporary)
+        self.assertEqual(row['decision'], 'DELETE')
+        self.assertEqual(row['reason'], 'stale-incomplete-orphan')
+        self.assertTrue(temporary.exists())
+
+        applied = self.retain(apply=True)
+        self.assertFalse(temporary.exists())
+        self.assertEqual(applied['applied']['skipped'], [])
 
     def test_missing_and_nonregular_locks_do_not_keep_orphans(self):
         entry = self.entry()
@@ -93,13 +252,16 @@ class PublishedArtifactRetentionTests(unittest.TestCase):
         (entry / '.lock').mkdir()
         self.assertEqual(self.row(self.retain(), entry)['decision'], 'DELETE')
 
-    def test_held_entry_lock_protects_in_progress_build(self):
+    def test_held_entry_lock_blocks_delete(self):
         import fcntl
         entry = self.entry()
         (entry / '.lock').touch()
         with (entry / '.lock').open('rb') as handle:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.assertEqual(self.row(self.retain(), entry)['reason'], 'running-build')
+            applied = self.retain(apply=True)
+            self.assertTrue((entry / 'partition.json').exists())
+            self.assertEqual(applied['applied']['deleted'], [])
 
     def test_current_date_uses_provider_timezone(self):
         owner = Retention(self.data, self.cache, now=self.now, processes=Processes())
@@ -119,10 +281,14 @@ class PublishedArtifactRetentionTests(unittest.TestCase):
         self.assertTrue(row['reason'].startswith('incomplete-or-unreadable'))
 
     def test_current_and_future_dates_are_kept(self):
+        entries = []
         for day in ('20261001', '20990101'):
             with self.subTest(day=day):
                 entry = self.entry(name=day, day=day)
+                entries.append(entry)
                 self.assertEqual(self.row(self.retain(), entry)['reason'], 'current-or-future-service-date')
+        self.retain(apply=True)
+        self.assertTrue(all(entry.exists() for entry in entries))
 
     def test_shared_source_lock_is_not_reacquired_by_static_scan(self):
         self.entry()
@@ -161,6 +327,11 @@ class PublishedArtifactRetentionTests(unittest.TestCase):
         self.assertEqual(self.row(report, active)['decision'], 'KEEP')
         self.assertEqual(self.row(report, fallback)['reason'], 'latest-fallback')
         self.assertEqual(self.row(report, obsolete)['decision'], 'DELETE')
+        applied = self.retain(apply=True)
+        self.assertTrue(active.exists())
+        self.assertTrue(fallback.exists())
+        self.assertFalse(obsolete.exists())
+        self.assertEqual(applied['applied']['skipped'], [])
 
     def test_active_hardlinked_inode_survives_old_static_path_unlink(self):
         obsolete = self.entry('static', 'old', age=30)
@@ -214,11 +385,42 @@ class PublishedArtifactRetentionTests(unittest.TestCase):
         self.assertEqual((normalized / 'data').read_bytes(), b'keep')
         self.assertTrue((static / 'provider.sqlite').exists())
 
-    def test_incomplete_process_scan_fails_closed(self):
+    def test_proc_scan_errors_are_reported_but_candidate_is_deleted(self):
         entry = self.entry()
         report = self.retain(processes=Processes(errors=['permission denied']), apply=True)
-        self.assertEqual(self.row(report, entry)['reason'], 'safety-scan-incomplete')
-        self.assertTrue((entry / 'partition.json').exists())
+        row = self.row(report, entry)
+        self.assertEqual(row['decision'], 'DELETE')
+        self.assertTrue(row['candidate'])
+        self.assertEqual(row['candidate_reason'], 'expired-unreferenced-cache')
+        self.assertEqual(row['reason'], 'expired-unreferenced-cache')
+        self.assertEqual(report['summary']['candidates'], 1)
+        self.assertEqual(report['summary']['deletable_candidates'], 1)
+        self.assertEqual(report['summary']['safety_blocked_candidates'], 0)
+        self.assertFalse(entry.exists())
+
+    def test_proc_scan_failure_during_apply_is_diagnostic_only(self):
+        entry = self.entry()
+        owner = Retention(self.data, self.cache, now=self.now, processes=Processes())
+        report = owner.run()
+        self.assertEqual(self.row(report, entry)['decision'], 'DELETE')
+        with patch('scripts.published_artifact_retention.Processes.scan', return_value=Processes(errors=['proc-root-denied'])):
+            owner.apply(report)
+        self.assertFalse(entry.exists())
+        self.assertEqual(report['applied']['skipped'], [])
+
+    def test_active_artifact_remains_protected_when_other_orphan_is_removed(self):
+        active = self.entry('static', 'active')
+        self.set_active_key('active')
+        orphan = self.entry(name='orphan')
+        (orphan / 'manifest.json').unlink()
+        old_time = self.now - 13 * 3600
+        os.utime(orphan / 'partition.json', (old_time, old_time))
+        os.utime(orphan, (old_time, old_time))
+
+        report = self.retain(apply=True)
+        self.assertTrue((active / 'provider.sqlite').exists())
+        self.assertEqual(self.row(report, active)['reason'], 'active-artifact-key')
+        self.assertFalse(orphan.exists())
 
     def test_missing_runtime_dependency_fails_closed(self):
         entry = self.entry()
@@ -235,6 +437,73 @@ class PublishedArtifactRetentionTests(unittest.TestCase):
             owner.apply(report)
         self.assertEqual(len(report['applied']['deleted']), 0)
         self.assertEqual(len(report['applied']['skipped']), 1)
+
+    def test_new_file_after_plan_skips_candidate(self):
+        entry = self.entry()
+        owner = Retention(self.data, self.cache, now=self.now, processes=Processes())
+        report = owner.run()
+        (entry / 'new-file').write_text('late write')
+        old_time = self.now - 13 * 3600
+        os.utime(entry / 'new-file', (old_time, old_time))
+        with patch('scripts.published_artifact_retention.Processes.scan', return_value=Processes()):
+            owner.apply(report)
+        self.assertTrue((entry / 'partition.json').exists())
+        self.assertTrue((entry / 'new-file').exists())
+        self.assertEqual(report['applied']['deleted'], [])
+        self.assertEqual(report['applied']['skipped'][0]['reason'], 'entry-contents-changed')
+
+    def test_new_entry_lock_after_plan_skips_candidate(self):
+        import fcntl
+        entry = self.entry()
+        owner = Retention(self.data, self.cache, now=self.now, processes=Processes())
+        report = owner.run()
+        lock = entry / '.lock'
+        lock.touch()
+        with lock.open('rb') as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch('scripts.published_artifact_retention.Processes.scan', return_value=Processes()):
+                owner.apply(report)
+        self.assertTrue((entry / 'partition.json').exists())
+        self.assertEqual(report['applied']['deleted'], [])
+        self.assertEqual(report['applied']['skipped'][0]['reason'], 'candidate-no-longer-eligible')
+
+    def test_new_active_reference_after_plan_skips_candidate(self):
+        entry = self.entry()
+        owner = Retention(self.data, self.cache, now=self.now, processes=Processes())
+        report = owner.run()
+        (self.active / 'release.json').write_text(json.dumps({
+            'runtimeDependencies': {'late-reference': {'path': str(entry / 'partition.json')}}
+        }))
+        with patch('scripts.published_artifact_retention.Processes.scan', return_value=Processes()):
+            owner.apply(report)
+        self.assertTrue((entry / 'partition.json').exists())
+        self.assertEqual(report['applied']['deleted'], [])
+        self.assertEqual(report['applied']['skipped'][0]['reason'], 'candidate-no-longer-eligible')
+
+    def test_expired_cache_orphan_and_temp_are_removed_after_ttl(self):
+        orphan = self.entry(name='orphan')
+        (orphan / 'manifest.json').unlink()
+        old_time = self.now - 13 * 3600
+        os.utime(orphan / 'partition.json', (old_time, old_time))
+        os.utime(orphan, (old_time, old_time))
+        temporary = self.cache / 'provider' / 'city' / '20260901' / ('.' + 'b' * 64 + '.temp')
+        temporary.mkdir(parents=True)
+        (temporary / 'partition.json').write_bytes(b'temporary')
+        os.utime(temporary / 'partition.json', (old_time, old_time))
+        os.utime(temporary, (old_time, old_time))
+        expired = self.entry(name='expired-cache')
+
+        report = self.retain()
+        self.assertEqual(self.row(report, orphan)['decision'], 'DELETE')
+        self.assertEqual(self.row(report, temporary)['decision'], 'DELETE')
+        self.assertEqual(self.row(report, expired)['decision'], 'DELETE')
+        self.assertTrue(orphan.exists() and temporary.exists() and expired.exists())
+
+        applied = self.retain(apply=True)
+        self.assertFalse(orphan.exists())
+        self.assertFalse(temporary.exists())
+        self.assertFalse(expired.exists())
+        self.assertEqual(applied['applied']['skipped'], [])
 
 
 if __name__ == '__main__':

@@ -42,6 +42,13 @@ class Processes:
     workspaces: list[str] = field(default_factory=list)
     commands: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    cwd_permission_denied: int = 0
+    relevant_pids: int = 0
+    ignored_unrelated_pids: int = 0
+    permission_denied_pids: int = 0
+    permission_denied_checks: dict[str, int] = field(default_factory=dict)
+    _permission_denied_pid_ids: set[str] = field(default_factory=set, repr=False)
+    _recorded_permission_errors: set[tuple[str, str]] = field(default_factory=set, repr=False)
     filesystem_prefix: str = ""
 
     def uses(self, path: Path) -> bool:
@@ -55,6 +62,7 @@ class Processes:
     @classmethod
     def scan(cls, root: Path) -> Processes:
         result = cls()
+        cleaner_uid = os.getuid()
         try:
             processes = list(root.iterdir())
         except OSError as error:
@@ -64,30 +72,83 @@ class Processes:
             if not process.name.isdigit():
                 continue
             try:
-                result.commands.append((process / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace"))
+                status = (process / "status").read_text(encoding="utf-8", errors="replace")
+                uid_line = next((line for line in status.splitlines() if line.startswith("Uid:")), None)
+                if uid_line is None:
+                    raise ValueError("missing Uid in proc status")
+                uid_values = uid_line.split()[1:]
+                if len(uid_values) != 4:
+                    raise ValueError("invalid Uid in proc status")
+                process_uids = {int(value) for value in uid_values}
+                if cleaner_uid not in process_uids:
+                    result.ignored_unrelated_pids += 1
+                    continue
+                result.relevant_pids += 1
+                try:
+                    result.commands.append((process / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace"))
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+                except OSError as error:
+                    cls.record_process_error(result, process.name, process / "cmdline", error)
                 try:
                     result.workspaces.append(os.readlink(process / "cwd"))
                 except FileNotFoundError:
                     pass
-                for descriptor in (process / "fd").iterdir():
+                except OSError as error:
+                    cls.record_process_error(result, process.name, process / "cwd", error)
+                try:
+                    descriptors = (process / "fd").iterdir()
+                    for descriptor in descriptors:
+                        try:
+                            value = descriptor.stat()
+                            if stat.S_ISREG(value.st_mode):
+                                result.inodes.add((value.st_dev, value.st_ino))
+                            elif stat.S_ISDIR(value.st_mode):
+                                result.workspaces.append(os.readlink(descriptor))
+                        except FileNotFoundError:
+                            pass
+                        except OSError as error:
+                            cls.record_process_error(result, process.name, descriptor, error)
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    cls.record_process_error(result, process.name, process / "fd", error)
+                try:
+                    maps = (process / "maps").read_text().splitlines()
+                except FileNotFoundError:
+                    maps = []
+                except OSError as error:
+                    cls.record_process_error(result, process.name, process / "maps", error)
+                    maps = []
+                for line in maps:
                     try:
-                        value = descriptor.stat()
-                        if stat.S_ISREG(value.st_mode):
-                            result.inodes.add((value.st_dev, value.st_ino))
-                        elif stat.S_ISDIR(value.st_mode):
-                            result.workspaces.append(os.readlink(descriptor))
-                    except FileNotFoundError:
-                        pass
-                for line in (process / "maps").read_text().splitlines():
-                    fields = line.split(None, 5)
-                    if len(fields) >= 5 and int(fields[4]):
-                        major, minor = (int(v, 16) for v in fields[3].split(":"))
-                        result.inodes.add((os.makedev(major, minor), int(fields[4])))
+                        fields = line.split(None, 5)
+                        if len(fields) >= 5 and int(fields[4]):
+                            major, minor = (int(v, 16) for v in fields[3].split(":"))
+                            result.inodes.add((os.makedev(major, minor), int(fields[4])))
+                    except (ValueError, IndexError) as error:
+                        cls.record_process_error(result, process.name, process / "maps", error)
             except (FileNotFoundError, ProcessLookupError):
                 pass
             except (OSError, ValueError) as error:
-                result.errors.append(f"pid={process.name}:{error}")
+                cls.record_process_error(result, process.name, process, error)
         return result
+
+    @staticmethod
+    def record_process_error(result: Processes, pid: str, path: Path, error: OSError | ValueError) -> None:
+        if isinstance(error, PermissionError):
+            check = "fd" if "fd" in path.parts else path.name
+            result.permission_denied_checks[check] = result.permission_denied_checks.get(check, 0) + 1
+            if pid not in result._permission_denied_pid_ids:
+                result._permission_denied_pid_ids.add(pid)
+                result.permission_denied_pids += 1
+            if check == "cwd":
+                result.cwd_permission_denied += 1
+            key = pid, check
+            if key in result._recorded_permission_errors:
+                return
+            result._recorded_permission_errors.add(key)
+        result.errors.append(f"pid={pid}:{error}")
 
 
 @dataclass
@@ -121,7 +182,12 @@ class Entry:
     manifest: dict
     files: list[File]
     published: float
+    directories: list[tuple[Path, int, int]] = field(default_factory=list)
+    complete: bool = False
+    safely_scannable: bool = False
     reason: str = "incomplete-or-unreadable"
+    candidate_reason: str = ""
+    candidate: bool = False
     delete: bool = False
 
 
@@ -148,6 +214,7 @@ class Retention:
         self.locked_providers: set[str] = set()
         self.pointer_snapshot: dict[Path, Path] = {}
         self.checked_locks: set[Path] = set()
+        self.acquired_locks: set[Path] = set()
         self.locked_entries: set[Path] = set()
         self.filesystem_prefix = filesystem_prefix.rstrip("/")
 
@@ -206,6 +273,8 @@ class Retention:
             self.reference(path)
 
     def lock_busy(self, path: Path) -> bool:
+        if path in self.acquired_locks:
+            return False
         if path in self.checked_locks:
             return False
         self.checked_locks.add(path)
@@ -214,10 +283,27 @@ class Retention:
                 return False
             handle = self.stack.enter_context(path.open("rb"))
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.acquired_locks.add(path)
         except BlockingIOError:
             return True
         except OSError as error:
             self.errors.append(f"lock-check:{path}:{error}")
+        return False
+
+    def lock_busy_now(self, path: Path, lock_stack: ExitStack) -> bool:
+        if path in self.acquired_locks or path.is_symlink() or not path.is_file():
+            return False
+        handle = path.open("rb")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            return True
+        except OSError:
+            handle.close()
+            raise
+        lock_stack.enter_context(handle)
+        self.acquired_locks.add(path)
         return False
 
     def provider_locks(self, provider: str, directory: Path) -> None:
@@ -227,8 +313,11 @@ class Retention:
 
     def capture(self, path: Path, provider: str, kind: str) -> Entry:
         files = []
+        captured_directories: list[tuple[Path, int, int]] = []
         manifest = {}
         published = 0.0
+        observed = 0.0
+        safely_scannable = False
         try:
             def fail_walk(error):
                 raise error
@@ -240,7 +329,18 @@ class Retention:
                 names = [name for name in names if name != ".lock"]
                 if any((Path(directory) / name).is_symlink() for name in directories):
                     raise ValueError("symlink directory")
+                directory_path = Path(directory)
+                directory_stat = directory_path.lstat()
+                if not stat.S_ISDIR(directory_stat.st_mode):
+                    raise ValueError(f"non-directory entry: {directory_path}")
+                captured_directories.append((directory_path, directory_stat.st_dev, directory_stat.st_ino))
+                observed = max(observed, directory_stat.st_mtime_ns / 1e9)
                 files.extend(File.capture(Path(directory) / name) for name in names)
+                if files:
+                    observed = max(observed, max(file.mtime_ns / 1e9 for file in files))
+            safely_scannable = True
+            published = max((f.mtime_ns / 1e9 for f in files), default=path.stat().st_mtime)
+            observed = max(observed, published)
             manifest = read_object(path / "manifest.json")
             if manifest.get("providerID") != provider or manifest.get("status") != "complete":
                 raise ValueError("incomplete or provider mismatch")
@@ -252,9 +352,14 @@ class Retention:
             if kind == "static":
                 # New temporal children do not make an old structural version newer.
                 published = (path / "manifest.json").stat().st_mtime
-            entry = Entry(path, provider, kind, manifest, files, published, "complete")
+            entry = Entry(path, provider, kind, manifest, files, published,
+                          captured_directories, True, True, "complete")
         except (OSError, ValueError, TypeError) as error:
-            entry = Entry(path, provider, kind, manifest, files, published, f"incomplete-or-unreadable:{error}")
+            # If tree enumeration completed, an unreadable/missing manifest is still
+            # a safely enumerable orphan. Symlinks and walk/stat failures stay protected.
+            entry = Entry(path, provider, kind, manifest, files, max(published, observed),
+                          captured_directories, False, safely_scannable,
+                          f"incomplete-or-unreadable:{error}")
         return entry
 
     def collect(self) -> None:
@@ -288,7 +393,7 @@ class Retention:
         processes.filesystem_prefix = self.filesystem_prefix
         self.processes = processes
         for entry in self.entries:
-            if self.errors or processes.errors:
+            if self.errors:
                 entry.reason = "safety-scan-incomplete"
             elif entry.provider in self.locked_providers or entry.path in self.locked_entries or processes.uses(entry.path):
                 entry.reason = "running-build"
@@ -301,7 +406,27 @@ class Retention:
                 entry.reason = "runtime-inode-reference"
             elif entry.kind == "static" and (entry.provider, str(entry.manifest.get("artifactKey", ""))) in self.active_keys:
                 entry.reason = "active-artifact-key"
-            elif entry.reason == "complete":
+            elif entry.kind == "static" and (entry.provider, entry.path.name) in self.active_keys:
+                entry.reason = "active-artifact-key"
+            elif not entry.complete:
+                if not entry.safely_scannable:
+                    continue
+                if entry.kind == "cache":
+                    try:
+                        day = datetime.strptime(entry.path.parent.name, "%Y%m%d").date()
+                    except ValueError:
+                        entry.reason = "invalid-service-date"
+                        continue
+                    if day >= self.current_date(entry.provider):
+                        entry.reason = "current-or-future-service-date"
+                        continue
+                if self.now - entry.published < self.ttl:
+                    entry.reason = "incomplete-too-new"
+                else:
+                    entry.candidate = True
+                    entry.candidate_reason = "stale-incomplete-orphan"
+                    entry.reason = entry.candidate_reason
+            elif entry.complete:
                 if entry.kind == "cache":
                     try:
                         day = datetime.strptime(str(entry.manifest["serviceDate"]), "%Y%m%d").date()
@@ -310,62 +435,128 @@ class Retention:
                         elif self.now - entry.published < self.ttl:
                             entry.reason = "inside-cache-ttl"
                         else:
-                            entry.reason = "expired-unreferenced-cache"
-                            entry.delete = True
+                            entry.candidate = True
+                            entry.candidate_reason = "expired-unreferenced-cache"
+                            entry.reason = entry.candidate_reason
                     except (KeyError, ValueError):
                         entry.reason = "invalid-service-date"
                 else:
-                    entry.reason = "superseded-unreferenced-static"
-                    entry.delete = True
+                    entry.candidate = True
+                    entry.candidate_reason = "superseded-unreferenced-static"
+                    entry.reason = entry.candidate_reason
         for provider in {e.provider for e in self.entries if e.kind == "static"}:
-            candidates = [e for e in self.entries if e.kind == "static" and e.provider == provider and e.delete]
+            candidates = [e for e in self.entries
+                          if e.kind == "static" and e.provider == provider and e.candidate and e.complete]
             if candidates:
                 fallback = max(candidates, key=lambda e: (e.published, str(e.path)))
+                fallback.candidate = False
+                fallback.candidate_reason = ""
                 fallback.delete = False
                 fallback.reason = "latest-fallback"
+        for entry in self.entries:
+            if entry.candidate:
+                entry.delete = True
 
     def plan(self) -> dict:
-        counts = collections.Counter(f.key for e in self.entries if e.delete for f in e.files)
+        counts = collections.Counter(f.key for e in self.entries if e.candidate for f in e.files)
         seen = set()
         rows = []
         for entry in self.entries:
             physical = 0
             for item in entry.files:
-                if entry.delete and item.key not in seen and counts[item.key] == item.links:
+                if entry.candidate and item.key not in seen and counts[item.key] == item.links:
                     physical += item.allocated
                     seen.add(item.key)
             rows.append(dict(path=str(entry.path), provider=entry.provider, kind=entry.kind,
-                decision="DELETE" if entry.delete else "KEEP", reason=entry.reason,
+                decision="DELETE" if entry.delete else "BLOCKED" if entry.candidate else "KEEP",
+                candidate=entry.candidate, candidate_reason=entry.candidate_reason,
+                reason=entry.reason,
                 logical_bytes=sum(f.size for f in entry.files), reclaimable_bytes=physical,
                 files=[dict(path=str(f.path), device=f.device, inode=f.inode, links=f.links,
                             logical_bytes=f.size, allocated_bytes=f.allocated) for f in entry.files]))
-        return dict(entries=rows, summary=dict(candidates=sum(e.delete for e in self.entries),
-            candidate_files=sum(len(e.files) for e in self.entries if e.delete),
-            logical_bytes=sum(sum(f.size for f in e.files) for e in self.entries if e.delete),
+        reasons = collections.Counter(e.reason for e in self.entries if not e.delete)
+        return dict(entries=rows, summary=dict(candidates=sum(e.candidate for e in self.entries),
+            deletable_candidates=sum(e.delete for e in self.entries),
+            safety_blocked_candidates=sum(e.candidate and not e.delete for e in self.entries),
+            candidate_files=sum(len(e.files) for e in self.entries if e.candidate),
+            logical_bytes=sum(sum(f.size for f in e.files) for e in self.entries if e.candidate),
             reclaimable_bytes=sum(row["reclaimable_bytes"] for row in rows),
+            skipped_by_reason=dict(sorted(reasons.items())),
+            process_scan=dict(
+                relevant_pids=self.processes.relevant_pids if self.processes else 0,
+                ignored_unrelated_pids=self.processes.ignored_unrelated_pids if self.processes else 0,
+                permission_denied_pids=self.processes.permission_denied_pids if self.processes else 0,
+                permission_denied_checks=self.processes.permission_denied_checks if self.processes else {},
+                cwd_permission_denied_pids=self.processes.cwd_permission_denied if self.processes else 0,
+            ),
             errors=self.errors + (self.processes.errors if self.processes else [])))
 
     def apply(self, report: dict) -> None:
-        # Recheck immutable entries and process state after planning, before unlinking.
+        # Process scan results are diagnostic only; filesystem references and locks
+        # are refreshed before applying the immutable plan.
         fresh = Processes.scan(self.proc_root)
         fresh.filesystem_prefix = self.filesystem_prefix
+        refreshed_state = Retention(
+            self.data, self.cache, now=self.now, proc_root=self.proc_root,
+            runtime_paths=self.runtime_paths, processes=fresh,
+            ttl_hours=self.ttl / 3600, filesystem_prefix=self.filesystem_prefix,
+        )
+        refreshed_state.acquired_locks = self.acquired_locks.copy()
+        for operation in (refreshed_state.references, refreshed_state.collect):
+            try:
+                operation()
+            except (OSError, ValueError, TypeError, AttributeError) as error:
+                refreshed_state.errors.append(str(error))
+        refreshed_state.classify()
+        current_entries = {entry.path: entry for entry in refreshed_state.entries}
+        apply_locks = refreshed_state.stack.pop_all()
+        self.acquired_locks.update(refreshed_state.acquired_locks)
         removed = collections.Counter()
         released = 0
         deleted = []
+        deleted_directories = []
         skipped = []
+        retained_directories = []
+        report["summary"].setdefault("process_scan", {})["apply_cwd_permission_denied_pids"] = fresh.cwd_permission_denied
+        report["summary"]["process_scan"].update(
+            apply_relevant_pids=fresh.relevant_pids,
+            apply_ignored_unrelated_pids=fresh.ignored_unrelated_pids,
+            apply_permission_denied_pids=fresh.permission_denied_pids,
+            apply_permission_denied_checks=fresh.permission_denied_checks,
+        )
         for entry in self.entries:
             if not entry.delete:
                 continue
             try:
-                if fresh.errors or fresh.uses(entry.path) or any(f.key in fresh.inodes for f in entry.files):
-                    raise ValueError("process-state-changed")
+                current = current_entries.get(entry.path)
+                if refreshed_state.errors:
+                    raise ValueError("filesystem-safety-state-incomplete")
+                if current is None or not current.delete:
+                    raise ValueError("candidate-no-longer-eligible")
+                provider_directory = self.cache / entry.provider if entry.kind == "cache" else self.static / entry.provider
+                lock_paths = {
+                    self.cache.parent / entry.provider / ".lock",
+                    provider_directory / ".lock",
+                    entry.path / ".lock",
+                }
+                if any(self.lock_busy_now(path, apply_locks) for path in lock_paths):
+                    raise ValueError("lock-became-active")
                 if any(p.resolve(strict=True) != target for p, target in self.pointer_snapshot.items()):
                     raise ValueError("runtime-pointer-changed")
                 if entry.path.resolve(strict=True) != entry.path:
                     raise ValueError("entry-path-changed")
                 refreshed = self.capture(entry.path, entry.provider, entry.kind)
-                if refreshed.reason != "complete" or {f.path for f in refreshed.files} != {f.path for f in entry.files}:
+                refreshed_is_eligible = (
+                    refreshed.complete if entry.complete else
+                    refreshed.safely_scannable and not refreshed.complete
+                    and self.now - refreshed.published >= self.ttl
+                )
+                if not refreshed_is_eligible or {f.path for f in refreshed.files} != {f.path for f in entry.files}:
                     raise ValueError("entry-contents-changed")
+                if not current.candidate:
+                    raise ValueError("candidate-no-longer-eligible")
+                if refreshed.directories != entry.directories:
+                    raise ValueError("entry-directories-changed")
                 for item in entry.files:
                     latest = File.capture(item.path)
                     expected_links = item.links - removed[item.key]
@@ -379,9 +570,28 @@ class Retention:
                     removed[item.key] += 1
                     released += latest.allocated if latest.links == 1 else 0
                     deleted.append(str(item.path))
+                for directory, device, inode in sorted(
+                    entry.directories, key=lambda value: len(value[0].parts), reverse=True
+                ):
+                    try:
+                        latest_directory = directory.lstat()
+                        if (latest_directory.st_dev, latest_directory.st_ino) != (device, inode):
+                            retained_directories.append(dict(path=str(directory), reason="directory-identity-changed"))
+                            continue
+                        directory.rmdir()
+                        deleted_directories.append(str(directory))
+                    except FileNotFoundError:
+                        continue
+                    except OSError as error:
+                        # Non-empty directories can contain lock metadata or files
+                        # introduced after the snapshot; never recurse into them.
+                        retained_directories.append(dict(path=str(directory), reason=f"directory-not-empty-or-unavailable:{error}"))
             except (OSError, ValueError) as error:
                 skipped.append(dict(path=str(entry.path), reason=str(error)))
-        report["applied"] = dict(deleted=deleted, skipped=skipped, reclaimed_bytes=released)
+        report["applied"] = dict(deleted=deleted, skipped=skipped,
+                                  deleted_directories=deleted_directories,
+                                  retained_directories=retained_directories, reclaimed_bytes=released)
+        apply_locks.close()
 
     def run(self, *, dry_run: bool = True) -> dict:
         with self.stack:
