@@ -542,7 +542,7 @@ is_published_incremental_release() {
     [[ "$(dirname "$release_path")" == "$RELEASES/incremental" &&
        -f "$release_path/release.json" &&
        -f "$release_path/validation-receipt.json" &&
-       -e "$release_path/stop-data" ]] || return 1
+       ( -e "$release_path/stop-data" || -L "$release_path/stop-data" ) ]] || return 1
     python3 - "$release_path" <<'PY'
 import json
 import sys
@@ -554,7 +554,10 @@ try:
     receipt = json.loads((release_path / "validation-receipt.json").read_text(encoding="utf-8"))
 except (OSError, UnicodeDecodeError, json.JSONDecodeError):
     raise SystemExit(1)
-raise SystemExit(0 if release.get("releaseID") == release_path.name
+# A historical PASS generation can retain a dangling legacy stop-data symlink.
+# Protected runtime dependencies are resolved separately by the cleanup preflight.
+raise SystemExit(0 if isinstance(release, dict) and isinstance(receipt, dict)
+                 and release.get("releaseID") == release_path.name
                  and receipt.get("releaseID") == release_path.name
                  and receipt.get("result") == "PASS" else 1)
 PY
@@ -787,6 +790,10 @@ for release_path in "${release_entries[@]-}"; do
         continue
     fi
     if ! is_published_release_candidate "$release_path"; then
+        if [[ "$(dirname "$release_path")" == "$RELEASES/incremental" ]]; then
+            echo "KEEP   $release_path reason=unvalidated-incremental-generation"
+            continue
+        fi
         if ! path_is_strictly_inside "$release_path" "$RELEASES"; then
             echo "KEEP   $release_path reason=outside-root-or-symlink-escape"
             continue
@@ -1235,7 +1242,7 @@ cleanup_published_artifacts() {
             return 0
         fi
         summary="$(printf '%s\n' "$output" | sed -n 's/^\[ArtifactRetention\] summary=//p' | tail -n 1)"
-        errors_json="$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1]).get("errors", [])))' "$summary")"
+        errors_json="$(printf '%s\n' "$summary" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin).get("errors", [])))')"
         if [[ "$errors_json" != "[]" ]]; then
             printf '%s\n' "$output"
             echo "CLEANUP_SKIPPED reason=physical-accounting-or-retention-errors errors=$errors_json"
@@ -1254,15 +1261,15 @@ cleanup_published_artifacts() {
         echo "Published artifact retention skipped reason=summary-missing"
         return 0
     fi
-    errors_json="$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1]).get("errors", [])))' "$summary")"
+    errors_json="$(printf '%s\n' "$summary" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin).get("errors", [])))')"
     if [[ "$errors_json" != "[]" ]]; then
         echo "CLEANUP_SKIPPED reason=physical-accounting-or-retention-errors errors=$errors_json"
         return 0
     fi
     RELEASE_APPLY_ALLOWED=1
     printf '%s\n' "$output"
-    reclaimed="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["reclaimable_bytes"])' "$summary")"
-    physical_reclaimable="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("physical_accounting", {}).get("union_reclaimable_bytes", 0))' "$summary")"
+    reclaimed="$(printf '%s\n' "$summary" | python3 -c 'import json,sys; print(json.load(sys.stdin)["reclaimable_bytes"])')"
+    physical_reclaimable="$(printf '%s\n' "$summary" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("physical_accounting", {}).get("union_reclaimable_bytes", 0))')"
     if [[ "$physical_reclaimable" =~ ^[0-9]+$ ]]; then
         echo "Combined physical reclaimable estimate (inode union): $physical_reclaimable bytes"
     fi

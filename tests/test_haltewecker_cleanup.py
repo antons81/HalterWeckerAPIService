@@ -24,6 +24,7 @@ class HalteWeckerCleanupTests(unittest.TestCase):
         self, root: Path, data_root: Path, dry_run: bool = True,
         open_paths: tuple[Path, ...] = (),
         retention_count: int = 1,
+        pipeline_repo: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         systemctl = root / "systemctl"
         systemctl.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
@@ -87,7 +88,7 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             {
                 "DATA_ROOT": str(data_root),
                 "GTFS_CACHE_ROOT": str(root / "cache" / "gtfs"),
-                "HALTEWECKER_PIPELINE_REPO": str(REPOSITORY_ROOT),
+                "HALTEWECKER_PIPELINE_REPO": str(pipeline_repo or REPOSITORY_ROOT),
                 "HALTEWECKER_CLEANUP_LOCKS": f"{root / 'stop.lock'}:{root / 'static.lock'}:{root / 'vbb.lock'}",
                 "SYSTEMCTL_BIN": str(systemctl),
                 "FLOCK_BIN": str(flock),
@@ -420,6 +421,142 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             self.assertFalse((releases / "incremental" / "20260925T000000Z-a").exists())
             self.assertFalse((releases / "incremental" / "20260926T000000Z-b").exists())
             self.assertTrue(current.exists())
+
+    @staticmethod
+    def make_historical_incremental_release(path: Path) -> None:
+        HalteWeckerCleanupTests.make_incremental_release(path, path.name)
+        (path / 'stop-data').rmdir()
+        (path / 'stop-data').symlink_to('../../' + path.name + '/stop-data')
+        (path / 'release.json').write_text(json.dumps({
+            'releaseID': path.name, 'stopData': {'path': 'stop-data'},
+        }))
+        HalteWeckerCleanupTests.make_old(path)
+
+    @staticmethod
+    def make_summary_helper(root: Path, *, errors: tuple[str, ...] = ()) -> Path:
+        pipeline = root / 'fixture-pipeline'
+        scripts = pipeline / 'scripts'
+        scripts.mkdir(parents=True)
+        helper = scripts / 'published_artifact_retention.py'
+        helper.write_text(
+            "import json\nimport sys\nfrom pathlib import Path\n"
+            "calls = Path(__file__).with_suffix('.calls')\n"
+            "with calls.open('a') as handle:\n"
+            "    handle.write(('apply' if '--apply' in sys.argv else 'dry-run') + '\\n')\n"
+            "summary = {'reclaimable_bytes': 11, "
+            "'physical_accounting': {'union_reclaimable_bytes': 13}, "
+            f"'errors': {list(errors)!r}, 'padding': 'x' * (2 * 1024 * 1024)}}\n"
+            "print('[ArtifactRetention] summary=' + json.dumps(summary))\n",
+            encoding='utf-8',
+        )
+        return pipeline
+
+    def test_pass_incremental_with_dangling_stop_data_obeys_retention_and_inode_accounting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data = root / 'data'
+            releases = data / 'releases/incremental'
+            old = releases / '20260925T000000Z-old'
+            current = releases / '20260927T000000Z-current'
+            self.make_historical_incremental_release(old)
+            self.make_incremental_release(current, current.name)
+            (data / 'current-release').symlink_to(current)
+            result = self.run_cleaner(root, data)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn('WOULD_DELETE ' + str(old.resolve()) + ' reason=outside-retention-and-unreferenced', output)
+            self.assertNotIn('reason=abandoned-unpublished', output)
+            summary_line = next(line for line in result.stdout.splitlines()
+                                if line.startswith('[ArtifactRetention] summary='))
+            summary = json.loads(summary_line.split('summary=', 1)[1])
+            physical = summary['physical_accounting']
+            self.assertIn(str(old.resolve()), [row['path'] for row in physical['candidate_roots']])
+            self.assertGreater(physical['union_reclaimable_bytes'], 0)
+            self.assertTrue(old.exists())
+            self.assertTrue(current.exists())
+
+    def test_referenced_historical_pass_with_dangling_stop_data_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data = root / 'data'
+            releases = data / 'releases/incremental'
+            old = releases / '20260925T000000Z-old'
+            current = releases / '20260927T000000Z-current'
+            self.make_historical_incremental_release(old)
+            self.make_incremental_release(current, current.name)
+            (current / 'release.json').write_text(json.dumps({
+                'releaseID': current.name,
+                'runtimeDependencies': [{'path': str(old)}],
+            }))
+            (data / 'current-release').symlink_to(current)
+            result = self.run_cleaner(root, data, dry_run=False)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn('CLEANUP_SKIPPED reason=dependency-graph-unresolved', output)
+            self.assertNotIn('DELETE ' + str(old.resolve()), output)
+            self.assertTrue(old.exists())
+            self.assertTrue(current.exists())
+
+    def test_historical_pass_incremental_is_not_deleted_before_failed_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data = root / 'data'
+            releases = data / 'releases/incremental'
+            old = releases / '20260925T000000Z-old'
+            current = releases / '20260927T000000Z-current'
+            self.make_historical_incremental_release(old)
+            self.make_incremental_release(current, current.name)
+            (data / 'current-release').symlink_to(current)
+            pipeline = self.make_summary_helper(root, errors=('unsafe-runtime-dependency',))
+            result = self.run_cleaner(root, data, dry_run=False, pipeline_repo=pipeline)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('CLEANUP_SKIPPED reason=physical-accounting-or-retention-errors', output)
+            self.assertIn('KEEP   ' + str(old.resolve()) + ' reason=retention-preflight-not-complete', output)
+            self.assertTrue(old.exists())
+            self.assertTrue(current.exists())
+            self.assertEqual((pipeline / 'scripts/published_artifact_retention.calls').read_text(), 'dry-run\n')
+
+    def test_summary_larger_than_argument_limit_is_streamed_in_dry_run_and_apply(self) -> None:
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                data = root / 'data'
+                old = data / 'releases/incremental/20260925T000000Z-old'
+                current = data / 'releases/incremental/20260927T000000Z-current'
+                self.make_historical_incremental_release(old)
+                self.make_incremental_release(current, current.name)
+                (data / 'current-release').symlink_to(current)
+                pipeline = self.make_summary_helper(root)
+                result = self.run_cleaner(root, data, dry_run=dry_run, pipeline_repo=pipeline)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn('Argument list too long', result.stderr)
+                self.assertIn('Combined physical reclaimable estimate (inode union): 13 bytes', result.stdout)
+                expected_calls = 'dry-run\n' if dry_run else 'dry-run\napply\n'
+                self.assertEqual((pipeline / 'scripts/published_artifact_retention.calls').read_text(), expected_calls)
+                self.assertTrue(current.exists())
+                self.assertEqual(old.exists(), dry_run)
+
+    def test_unvalidated_nested_incremental_is_kept_instead_of_abandoned_cleanup(self) -> None:
+        invalid_payloads = ({'releaseID': 'wrong', 'result': 'PASS'},
+                            {'releaseID': '20260925T000000Z-old', 'result': 'FAIL'}, [])
+        for receipt in invalid_payloads:
+            with self.subTest(receipt=receipt), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                data = root / 'data'
+                releases = data / 'releases/incremental'
+                old = releases / '20260925T000000Z-old'
+                current = releases / '20260927T000000Z-current'
+                self.make_historical_incremental_release(old)
+                (old / 'validation-receipt.json').write_text(json.dumps(receipt))
+                self.make_incremental_release(current, current.name)
+                (data / 'current-release').symlink_to(current)
+                result = self.run_cleaner(root, data, dry_run=False)
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 0, output)
+                self.assertIn('KEEP   ' + str(old.resolve()) + ' reason=unvalidated-incremental-generation', output)
+                self.assertTrue(old.exists())
+                self.assertTrue(current.exists())
 
     def test_retention_slot_prioritizes_current_when_newer_unreferenced_generation_exists(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
