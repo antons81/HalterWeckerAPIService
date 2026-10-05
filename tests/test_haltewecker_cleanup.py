@@ -23,6 +23,7 @@ class HalteWeckerCleanupTests(unittest.TestCase):
     def run_cleaner(
         self, root: Path, data_root: Path, dry_run: bool = True,
         open_paths: tuple[Path, ...] = (),
+        retention_count: int = 1,
     ) -> subprocess.CompletedProcess[str]:
         systemctl = root / "systemctl"
         systemctl.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
@@ -93,6 +94,7 @@ class HalteWeckerCleanupTests(unittest.TestCase):
                 "LSOF_BIN": str(lsof),
                 "PATH": f"{root}:{environment.get('PATH', '')}",
                 "HALTEWECKER_CLEANUP_DRY_RUN": "1" if dry_run else "0",
+                "HALTEWECKER_RELEASE_RETENTION_COUNT": str(retention_count),
             }
         )
         for lock in (root / "stop.lock", root / "static.lock", root / "vbb.lock"):
@@ -114,6 +116,15 @@ class HalteWeckerCleanupTests(unittest.TestCase):
     def make_age_hours(path: Path, age_hours: float) -> None:
         old_time = time.time() - age_hours * 60 * 60
         os.utime(path, (old_time, old_time))
+
+    @staticmethod
+    def make_incremental_release(path: Path, release_id: str) -> None:
+        path.mkdir(parents=True)
+        (path / "stop-data").mkdir()
+        (path / "release.json").write_text(json.dumps({"releaseID": release_id}), encoding="utf-8")
+        (path / "validation-receipt.json").write_text(
+            json.dumps({"releaseID": release_id, "result": "PASS"}), encoding="utf-8"
+        )
 
     def test_cleanup_and_pipeline_share_the_canonical_default_root(self) -> None:
         cleanup_source = CLEANUP_SCRIPT.read_text(encoding="utf-8")
@@ -322,6 +333,7 @@ class HalteWeckerCleanupTests(unittest.TestCase):
                     "FLOCK_BIN": str(flock),
                     "HALTEWECKER_GTFS_ORPHAN_TEMP_MAX_AGE_HOURS": "1",
                     "HALTEWECKER_CLEANUP_DRY_RUN": "0",
+                    "HALTEWECKER_RELEASE_RETENTION_COUNT": "2",
                 }
             )
 
@@ -366,6 +378,10 @@ class HalteWeckerCleanupTests(unittest.TestCase):
 
             current_root = releases / "incremental" / "20260927T000000Z-current"
             current_root.mkdir(parents=True)
+            (current_root / "release.json").write_text(json.dumps({"releaseID": current_root.name}), encoding="utf-8")
+            (current_root / "validation-receipt.json").write_text(
+                json.dumps({"releaseID": current_root.name, "result": "PASS"}), encoding="utf-8"
+            )
             target = releases / "20260926T000000Z-stale"
             target.joinpath("stop-data").mkdir(parents=True)
             (target / "departures.sqlite").write_bytes(b"fixture")
@@ -383,11 +399,148 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             result = self.run_cleaner(root, data_root)
             output = result.stdout + result.stderr
             self.assertEqual(result.returncode, 0, output)
-            self.assertIn(
-                "KEEP   " + str(target.resolve()) + " reason=referenced-by-current-release",
-                output,
-            )
+            self.assertIn("KEEP   " + str(target.resolve()), output)
             self.assertNotIn("WOULD_DELETE " + str(target), output)
+            self.assertIn("WOULD_DELETE " + str(newer.resolve()), output)
+
+    def test_incremental_release_retention_one_deletes_older_unreferenced_generations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            releases = data_root / "releases"
+            self.make_incremental_release(releases / "incremental" / "20260925T000000Z-a", "20260925T000000Z-a")
+            self.make_incremental_release(releases / "incremental" / "20260926T000000Z-b", "20260926T000000Z-b")
+            current = releases / "incremental" / "20260927T000000Z-c"
+            self.make_incremental_release(current, current.name)
+            (data_root / "current-release").symlink_to("releases/incremental/" + current.name)
+
+            result = self.run_cleaner(root, data_root, dry_run=False)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertFalse((releases / "incremental" / "20260925T000000Z-a").exists())
+            self.assertFalse((releases / "incremental" / "20260926T000000Z-b").exists())
+            self.assertTrue(current.exists())
+
+    def test_retention_slot_prioritizes_current_when_newer_unreferenced_generation_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            releases = data_root / "releases"
+            current = releases / "incremental" / "20260927T000000Z-current"
+            newer = releases / "20260928T000000Z-newer"
+            self.make_incremental_release(current, current.name)
+            newer.joinpath("stop-data").mkdir(parents=True)
+            (newer / "departures.sqlite").write_bytes(b"fixture")
+            (newer / "release-metadata.json").write_text("{}\n", encoding="utf-8")
+            (data_root / "current-release").symlink_to("releases/incremental/" + current.name)
+
+            result = self.run_cleaner(root, data_root, dry_run=True)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn("KEEP   " + str(current.resolve()), output)
+            self.assertNotIn("WOULD_DELETE " + str(current), output)
+            self.assertIn("WOULD_DELETE " + str(newer.resolve()) + " reason=outside-retention-and-unreferenced", output)
+
+    def test_same_id_direct_build_does_not_displace_current_incremental_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            releases = data_root / "releases"
+            release_id = "20260927T000000Z-sameid"
+            direct = releases / release_id
+            direct.joinpath("stop-data").mkdir(parents=True)
+            (direct / "departures.sqlite").write_bytes(b"direct")
+            (direct / "release-metadata.json").write_text("{}\n", encoding="utf-8")
+            nested = releases / "incremental" / release_id
+            self.make_incremental_release(nested, release_id)
+            (data_root / "current-release").symlink_to("releases/incremental/" + release_id)
+
+            result = self.run_cleaner(root, data_root, dry_run=False)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertFalse(direct.exists(), output)
+            self.assertTrue(nested.exists())
+
+    def test_nested_runtime_manifest_path_is_resolved_relative_to_its_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            releases = data_root / "releases"
+            current = releases / "incremental" / "20260927T000000Z-current"
+            self.make_incremental_release(current, current.name)
+            stale = releases / "20260926T000000Z-stale"
+            stale.mkdir(parents=True)
+            (stale / "stop-data").mkdir()
+            (stale / "departures.sqlite").write_bytes(b"fixture")
+            (stale / "release-metadata.json").write_text("{}\n", encoding="utf-8")
+            runtime_manifest = current / "providers" / "runtime" / "manifest.json"
+            runtime_manifest.parent.mkdir(parents=True)
+            (runtime_manifest).write_text(json.dumps({
+                "runtimeDependencies": [{"path": "../../../../20260926T000000Z-stale/stop-data"}]
+            }), encoding="utf-8")
+            (data_root / "current-release").symlink_to("releases/incremental/" + current.name)
+
+            result = self.run_cleaner(root, data_root, dry_run=True)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn("KEEP   " + str(stale.resolve()), output)
+
+    def test_nested_previous_rollback_and_pilot_references_are_kept(self) -> None:
+        for pointer_name in ('previous/stop-data', 'rollback', 'pilot-current'):
+            with self.subTest(pointer=pointer_name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                data_root = root / 'data'
+                releases = data_root / 'releases/incremental'
+                previous = releases / '20260926T000000Z-previous'
+                current = releases / '20260927T000000Z-current'
+                self.make_incremental_release(previous, previous.name)
+                self.make_incremental_release(current, current.name)
+                (data_root / 'current-release').symlink_to(current)
+                pointer = data_root / pointer_name
+                pointer.parent.mkdir(parents=True, exist_ok=True)
+                pointer.symlink_to(previous / 'stop-data' if pointer_name.startswith('previous/') else previous)
+                result = self.run_cleaner(root, data_root)
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 0, output)
+                self.assertIn('KEEP   ' + str(previous.resolve()), output)
+                self.assertNotIn('WOULD_DELETE ' + str(previous.resolve()), output)
+
+    def test_unfinished_rollback_marker_protects_nested_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / 'data'
+            releases = data_root / 'releases/incremental'
+            previous = releases / '20260926T000000Z-previous'
+            current = releases / '20260927T000000Z-current'
+            self.make_incremental_release(previous, previous.name)
+            self.make_incremental_release(current, current.name)
+            (data_root / 'current-release').symlink_to(current)
+            marker = data_root / 'temp/current-rollback' / previous.name
+            marker.mkdir(parents=True)
+            (marker / 'state.json').write_text('{"state":"pending"}')
+            result = self.run_cleaner(root, data_root)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn('KEEP   ' + str(previous.resolve()) + ' reason=rollback-release:', output)
+            self.assertNotIn('WOULD_DELETE ' + str(previous.resolve()), output)
+
+    def test_broken_previous_pointer_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            current = data_root / "releases" / "20260927T000000Z-current"
+            current.mkdir(parents=True)
+            (current / "stop-data").mkdir()
+            (current / "departures.sqlite").write_bytes(b"fixture")
+            (current / "release-metadata.json").write_text("{}\n", encoding="utf-8")
+            (data_root / "current-release").symlink_to("releases/" + current.name)
+            (data_root / "previous").mkdir()
+            (data_root / "previous" / "stop-data").symlink_to("../releases/missing/stop-data")
+
+            result = self.run_cleaner(root, data_root, dry_run=True)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn("CLEANUP_SKIPPED reason=dependency-graph-unresolved", output)
 
     def test_unresolved_protected_dependency_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

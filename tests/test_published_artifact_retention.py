@@ -7,10 +7,11 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.published_artifact_retention import Processes, Retention, identity
+from scripts.published_artifact_retention import Processes, Retention, identity, physical_accounting
 
 
 class PublishedArtifactRetentionTests(unittest.TestCase):
@@ -41,6 +42,53 @@ class PublishedArtifactRetentionTests(unittest.TestCase):
             os.utime(file, (self.now - age * 3600, self.now - age * 3600))
         return path
 
+    def transformed_entry(self, name, age=24):
+        path = self.cache.parent / 'external-build/provider' / name
+        path.mkdir(parents=True)
+        (path / 'export.json').write_bytes(b'x' * 4096)
+        (path / 'manifest.json').write_text(json.dumps({
+            'providerID': 'provider', 'status': 'complete', 'key': name,
+            'cachedOutputs': [{'path': 'export.json', 'size': 4096, 'sha256': 'a' * 64}],
+        }))
+        for file in path.iterdir():
+            os.utime(file, (self.now - age * 3600, self.now - age * 3600))
+        return path
+
+    def test_superseded_transformed_generations_are_deleted_and_latest_is_kept(self):
+        oldest = self.transformed_entry('oldest', age=48)
+        previous = self.transformed_entry('previous', age=24)
+        latest = self.transformed_entry('latest', age=13)
+        dry = self.retain()
+        self.assertEqual(self.row(dry, oldest)['decision'], 'DELETE')
+        self.assertEqual(self.row(dry, previous)['decision'], 'DELETE')
+        self.assertEqual(self.row(dry, latest)['reason'], 'latest-transformed-generation')
+        applied = self.retain(apply=True)
+        self.assertFalse(oldest.exists())
+        self.assertFalse(previous.exists())
+        self.assertTrue(latest.exists())
+        self.assertEqual(applied['applied']['skipped'], [])
+
+    def test_transformed_runtime_dependency_and_open_file_are_protected(self):
+        referenced = self.transformed_entry('referenced', age=48)
+        opened = self.transformed_entry('opened', age=24)
+        self.transformed_entry('latest', age=13)
+        (self.active / 'release.json').write_text(json.dumps({
+            'runtimeDependencies': [{'path': str(referenced)}],
+        }))
+        snapshot = Processes(inodes={identity(opened / 'export.json')})
+        report = self.retain(processes=snapshot)
+        self.assertEqual(self.row(report, referenced)['reason'], 'runtime-path-reference')
+        self.assertEqual(self.row(report, opened)['reason'], 'open-fd-or-mmap')
+
+    def test_recent_and_unvalidated_transformed_generations_are_kept(self):
+        fresh = self.transformed_entry('fresh', age=1)
+        invalid = self.transformed_entry('invalid', age=48)
+        (invalid / 'export.json').write_bytes(b'invalid-size')
+        report = self.retain()
+        self.assertEqual(self.row(report, fresh)['reason'], 'inside-transformed-ttl')
+        self.assertEqual(self.row(report, invalid)['reason'], 'unvalidated-transformed-generation')
+        self.assertEqual(self.row(report, invalid)['decision'], 'KEEP')
+
     @staticmethod
     def proc_status(proc, uid=None):
         uid = os.getuid() if uid is None else uid
@@ -58,6 +106,70 @@ class PublishedArtifactRetentionTests(unittest.TestCase):
 
     def set_active_key(self, key):
         (self.active / "release.json").write_text(json.dumps({"providers": {"provider": {"structural": {"artifactKey": key}}}}))
+
+    def test_physical_accounting_deduplicates_hardlinks_across_candidate_roots(self):
+        first = self.data / "release-a"
+        second = self.data / "release-b"
+        first.mkdir()
+        second.mkdir()
+        shared = first / "shared.sqlite"
+        shared.write_bytes(b"x" * 8192)
+        os.link(shared, second / "shared.sqlite")
+        outside = self.data / "retained-provider-artifact.sqlite"
+        os.link(shared, outside)
+        unique = second / "unique.sqlite"
+        unique.write_bytes(b"y" * 4096)
+
+        report = physical_accounting((first, second))
+
+        shared_bytes = shared.stat().st_blocks * 512
+        unique_bytes = unique.stat().st_blocks * 512
+        directory_bytes = sum(path.stat().st_blocks * 512 for path in (first, second))
+        self.assertEqual(report["union_allocated_bytes"], shared_bytes + unique_bytes)
+        self.assertEqual(report["shared_outside_candidate_roots_bytes"], shared_bytes)
+        self.assertEqual(report["union_directory_allocated_bytes"], directory_bytes)
+        self.assertEqual(report["union_reclaimable_bytes"], unique_bytes + directory_bytes)
+        self.assertEqual(report["union_inode_count"], 2)
+        self.assertEqual(report["candidate_roots"][0]["shared_with_other_candidate_roots_bytes"], shared_bytes)
+        self.assertEqual(report["candidate_roots"][0]["shared_anywhere_bytes"], shared_bytes)
+
+    def test_physical_accounting_excludes_retained_lock_metadata(self):
+        entry = self.entry()
+        lock = entry / '.lock'
+        lock.write_bytes(b'lock metadata' * 1024)
+        dry = self.retain()
+        physical = dry['summary']['physical_accounting']
+        expected = sum(path.stat().st_blocks * 512
+                       for path in (entry / 'partition.json', entry / 'manifest.json'))
+        self.assertEqual(physical['union_reclaimable_bytes'], expected)
+        applied = self.retain(apply=True)
+        self.assertTrue(lock.exists())
+        self.assertEqual(applied['applied']['reclaimed_bytes'], expected)
+
+    def test_root_process_scan_failure_keeps_candidates(self):
+        entry = self.entry()
+        with patch('scripts.published_artifact_retention.os.getuid', return_value=0):
+            report = self.retain(processes=Processes(errors=['proc-root-denied']))
+        self.assertEqual(self.row(report, entry)['reason'], 'safety-scan-incomplete')
+        self.assertEqual(report['summary']['deletable_candidates'], 0)
+        self.assertTrue(entry.exists())
+
+    def test_physical_accounting_uses_allocated_blocks_for_sparse_files(self):
+        candidate = self.data / "sparse-candidate"
+        candidate.mkdir()
+        sparse = candidate / "sparse.bin"
+        with sparse.open("wb") as handle:
+            handle.seek(1024 * 1024 * 1024 - 1)
+            handle.write(b"x")
+
+        report = physical_accounting((candidate,))
+
+        self.assertEqual(report["union_allocated_bytes"], sparse.stat().st_blocks * 512)
+        self.assertLess(report["union_allocated_bytes"], sparse.stat().st_size)
+        self.assertEqual(
+            report["union_reclaimable_bytes"],
+            sparse.stat().st_blocks * 512 + candidate.stat().st_blocks * 512,
+        )
 
     def test_referenced_cache_inode_is_kept(self):
         entry = self.entry()
@@ -81,6 +193,21 @@ class PublishedArtifactRetentionTests(unittest.TestCase):
         (proc / 'fd/5').unlink()
         snapshot = Processes.scan(proc.parent)
         self.assertEqual(self.row(self.retain(processes=snapshot), entry)['reason'], 'open-fd-or-mmap')
+
+    def test_root_scan_protects_artifacts_open_by_another_uid(self):
+        entry = self.entry()
+        proc = self.data / 'proc/123'
+        (proc / 'fd').mkdir(parents=True)
+        self.proc_status(proc, uid=1001)
+        (proc / 'cmdline').write_bytes(b'provider-api\0')
+        (proc / 'maps').write_text('')
+        (proc / 'fd/5').symlink_to(entry / 'partition.json')
+        with patch('scripts.published_artifact_retention.os.getuid', return_value=0):
+            snapshot = Processes.scan(proc.parent)
+        self.assertEqual(snapshot.ignored_unrelated_pids, 0)
+        self.assertIn(identity(entry / 'partition.json'), snapshot.inodes)
+        report = self.retain(processes=snapshot)
+        self.assertEqual(self.row(report, entry)['reason'], 'open-fd-or-mmap')
 
     def test_unrelated_uid_permission_denied_does_not_block_cleanup(self):
         entry = self.entry()
@@ -289,6 +416,79 @@ class PublishedArtifactRetentionTests(unittest.TestCase):
                 self.assertEqual(self.row(self.retain(), entry)['reason'], 'current-or-future-service-date')
         self.retain(apply=True)
         self.assertTrue(all(entry.exists() for entry in entries))
+
+    def test_daily_partition_growth_plateaus_with_fixed_future_horizon_and_ttl(self):
+        start = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
+        retained_counts = []
+        daily_accounting = []
+        physical_deltas = []
+        self.cache.mkdir(parents=True)
+
+        def allocated_bytes():
+            report = physical_accounting((self.cache,))
+            return report['union_allocated_bytes'] + report['union_directory_allocated_bytes']
+
+        for offset in range(7):
+            now = start + timedelta(days=offset)
+            now_timestamp = now.timestamp()
+            current_date = now.date()
+            before_bytes = allocated_bytes()
+            added = 0
+            for future_offset in range(3):
+                service_date = current_date + timedelta(days=future_offset)
+                day = service_date.strftime('%Y%m%d')
+                path = self.cache / 'provider' / 'city' / day / f'partition-key-{offset}'
+                path.mkdir(parents=True)
+                (path / 'partition.json').write_bytes(b'x' * 8192)
+                (path / 'manifest.json').write_text(json.dumps({
+                    'providerID': 'provider', 'status': 'complete',
+                    'serviceDate': day, 'size': 8192,
+                }))
+                os.utime(path / 'partition.json', (now_timestamp, now_timestamp))
+                os.utime(path / 'manifest.json', (now_timestamp, now_timestamp))
+                os.utime(path, (now_timestamp, now_timestamp))
+                added += 1
+
+            after_build_bytes = allocated_bytes()
+            planner = Retention(self.data, self.cache, now=now_timestamp, processes=Processes())
+            planner.timezones['provider'] = 'UTC'
+            dry = planner.run(dry_run=True)
+            delete_rows = [row for row in dry['entries'] if row['decision'] == 'DELETE']
+            reclaimed_bytes = dry['summary']['physical_accounting']['union_reclaimable_bytes']
+
+            applier = Retention(self.data, self.cache, now=now_timestamp, processes=Processes())
+            applier.timezones['provider'] = 'UTC'
+            with patch('scripts.published_artifact_retention.Processes.scan', return_value=Processes()):
+                applied = applier.run(dry_run=False)
+            after_cleanup_bytes = allocated_bytes()
+            physical_deltas.append((after_build_bytes - before_bytes,
+                                    after_build_bytes - after_cleanup_bytes,
+                                    after_cleanup_bytes - before_bytes))
+            self.assertEqual(applied['applied']['reclaimed_bytes'], reclaimed_bytes)
+            self.assertEqual(after_build_bytes - after_cleanup_bytes, reclaimed_bytes)
+            retained = list((self.cache / 'provider' / 'city').glob('*/*'))
+            retained_counts.append(len(retained))
+            retained_date_directories = list((self.cache / 'provider' / 'city').glob('*'))
+            daily_accounting.append((added, len(delete_rows), reclaimed_bytes,
+                                     len(applied.get('applied', {}).get('deleted', [])),
+                                     applied.get('applied', {}).get('skipped', []),
+                                     applied.get('reclaimable_date_directories', []),
+                                     applied.get('applied', {}).get('deleted_directories', [])))
+            self.assertEqual(len(retained_date_directories), 3,
+                             ([path.name for path in retained_date_directories], daily_accounting))
+
+        self.assertEqual(retained_counts, [3, 5, 6, 6, 6, 6, 6], daily_accounting)
+        self.assertEqual(daily_accounting[0][0:2], (3, 0))
+        for created_bytes, removed_bytes, net_bytes in physical_deltas[3:]:
+            self.assertGreater(created_bytes, 0)
+            self.assertEqual(created_bytes, removed_bytes, physical_deltas)
+            self.assertEqual(net_bytes, 0, physical_deltas)
+        for index, (added, removed, reclaimed_bytes, applied_deleted, skipped, date_candidates, deleted_directories) in enumerate(daily_accounting[1:], start=1):
+            self.assertEqual(added, 3)
+            self.assertEqual(removed, min(index, 3))
+            self.assertEqual(applied_deleted, removed * 2)
+            self.assertEqual(skipped, [])
+            self.assertGreater(reclaimed_bytes, 0)
 
     def test_shared_source_lock_is_not_reacquired_by_static_scan(self):
         self.entry()

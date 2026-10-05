@@ -138,12 +138,17 @@ retention_count="$configured_retention"
 
 declare -a KEEP_NAMES=()
 declare -a KEEP_REASONS=()
+declare -a RETAINED_RELEASE_IDS=()
+declare -a RETAINED_RELEASE_KEYS=()
 declare -a PROTECTED_DEPENDENCY_PATHS=()
 declare -a PROTECTED_DEPENDENCY_REASONS=()
 declare -a PROTECTED_DEPENDENCY_SEEN=()
 declare -a PROTECTED_DEPENDENCY_QUEUE=()
 declare -a PROTECTED_DEPENDENCY_QUEUE_REASONS=()
+declare -a RELEASE_DELETE_PATHS=()
 DEPENDENCY_GRAPH_UNRESOLVED=0
+RELEASE_APPLY_ALLOWED=0
+DEPENDENCY_QUEUE_PROCESSED=0
 
 append_reason() {
     local release_name="$1"
@@ -174,13 +179,20 @@ reason_for() {
 release_name_for_path() {
     local path="$1"
     local resolved="$(readlink -f -- "$path" 2>/dev/null || true)"
-    local relative release_name
+    local relative first release_name
     case "$resolved" in
         "$RELEASES"/*)
             relative="${resolved#"$RELEASES/"}"
-            release_name="${relative%%/*}"
-            [[ -n "$release_name" && -d "$RELEASES/$release_name" ]] || return 0
-            printf '%s\n' "$release_name"
+            first="${relative%%/*}"
+            if [[ "$first" == "incremental" && "$relative" == */* ]]; then
+                relative="${relative#*/}"
+                release_name="${relative%%/*}"
+                [[ -n "$release_name" && -d "$RELEASES/incremental/$release_name" ]] || return 0
+                printf '%s\n' "incremental/$release_name"
+            else
+                [[ -n "$first" && -d "$RELEASES/$first" ]] || return 0
+                printf '%s\n' "$first"
+            fi
             ;;
     esac
 }
@@ -276,10 +288,13 @@ try:
 except Exception:
     raise SystemExit(2)
 
-def walk(value, provenance=provenance_file, key=""):
+def walk(value, provenance=provenance_file, runtime_declared=False, key=""):
     if isinstance(value, str):
-        # Relative runtime references are declared by the published release contract.
-        relative_runtime = manifest.name == "release.json" and key in {"path", "manifestPath"}
+        # Resolve declared runtime paths relative to the manifest that declares them.
+        relative_runtime = (
+            (manifest.name == "release.json" or runtime_declared)
+            and key in {"path", "manifestPath"}
+        )
         if value.startswith("/") or (relative_runtime and value):
             path = value if value.startswith("/") else str(manifest.parent / value)
             print(("provenance" if provenance else "runtime") + "\t" + path)
@@ -289,17 +304,19 @@ def walk(value, provenance=provenance_file, key=""):
             # Explicit runtime declarations take precedence over historical context.
             if name == "runtimeDependencies":
                 historical = False
-            walk(item, historical, name)
+                walk(item, historical, True, name)
+            else:
+                walk(item, historical, runtime_declared, name)
     elif isinstance(value, list):
         for item in value:
-            walk(item, provenance, key)
+            walk(item, provenance, runtime_declared, key)
 
 walk(payload)
 PY
 }
 
 dependency_build_graph() {
-    local queue_index=0
+    local queue_index="$DEPENDENCY_QUEUE_PROCESSED"
     local entry reason link manifest dependency_paths dependency_path dependency_kind open_path
 
     # Open files are runtime evidence even when a manifest records them as provenance.
@@ -321,11 +338,15 @@ dependency_build_graph() {
     if [[ -e "$DATA/pilot-current" || -L "$DATA/pilot-current" ]]; then
         dependency_enqueue "$DATA/pilot-current" "referenced-by-pilot-current"
     fi
+    if [[ -e "$DATA/previous/stop-data" || -L "$DATA/previous/stop-data" ]]; then
+        dependency_enqueue "$DATA/previous/stop-data" "referenced-by-previous-release"
+    fi
 
     while (( queue_index < ${#PROTECTED_DEPENDENCY_QUEUE[@]} )); do
         entry="${PROTECTED_DEPENDENCY_QUEUE[$queue_index]}"
         reason="${PROTECTED_DEPENDENCY_QUEUE_REASONS[$queue_index]}"
         queue_index=$((queue_index + 1))
+        DEPENDENCY_QUEUE_PROCESSED="$queue_index"
         [[ -d "$entry" ]] || continue
 
         while IFS= read -r -d '' link; do
@@ -368,13 +389,20 @@ dependency_build_graph() {
 
 emit_unresolved_dependency_keeps() {
     local index protected relative release_name release_path reason
+    local -a emitted_paths=()
     for index in "${!PROTECTED_DEPENDENCY_PATHS[@]}"; do
         protected="${PROTECTED_DEPENDENCY_PATHS[$index]}"
         case "$protected" in
             "$RELEASES"/*)
                 relative="${protected#"$RELEASES/"}"
                 release_name="${relative%%/*}"
+                if [[ "$release_name" == "incremental" && "$relative" == */* ]]; then
+                    relative="${relative#*/}"
+                    release_name="incremental/${relative%%/*}"
+                fi
                 release_path="$RELEASES/$release_name"
+                [[ " ${emitted_paths[*]-} " == *" $release_path "* ]] && continue
+                emitted_paths+=("$release_path")
                 reason="${PROTECTED_DEPENDENCY_REASONS[$index]}"
                 echo "KEEP   $release_path reason=$reason"
                 ;;
@@ -382,29 +410,24 @@ emit_unresolved_dependency_keeps() {
     done
 }
 
+while IFS= read -r -d '' symlink_path; do
+    dependency_enqueue "$symlink_path" "active-symlink:$symlink_path"
+done < <(find "$DATA" -path "$RELEASES" -prune -o -type l -print0)
+
+while IFS= read -r -d '' symlink_path; do
+    if [[ "$symlink_path" == "$RELEASES/pilot-current" ]]; then
+        dependency_enqueue "$symlink_path" "protected-by-pilot-current"
+    else
+        dependency_enqueue "$symlink_path" "protected-pointer:$symlink_path"
+    fi
+done < <(find "$RELEASES" -mindepth 1 -maxdepth 1 -type l -print0)
+
 dependency_build_graph
 if (( DEPENDENCY_GRAPH_UNRESOLVED == 1 )); then
     emit_unresolved_dependency_keeps
     echo "CLEANUP_SKIPPED reason=dependency-graph-unresolved"
     exit 0
 fi
-
-protect_reference "$DATA/current-release" "current-release"
-
-while IFS= read -r -d '' symlink_path; do
-    case "$symlink_path" in
-	"$DATA/current-release"|"$DATA/previous/stop-data") continue ;;
-    esac
-    protect_reference "$symlink_path" "active-symlink:$symlink_path"
-done < <(find "$DATA" -path "$RELEASES" -prune -o -type l -print0)
-
-while IFS= read -r -d '' symlink_path; do
-    if [[ "$symlink_path" == "$RELEASES/pilot-current" ]]; then
-        protect_reference "$symlink_path" "protected-by-pilot-current"
-    else
-        protect_reference "$symlink_path" "protected-pointer:$symlink_path"
-    fi
-done < <(find "$RELEASES" -mindepth 1 -maxdepth 1 -type l -print0)
 
 rollback_release_is_referenced() {
     local release_name="$1"
@@ -483,14 +506,18 @@ for rollback_path in "$ROLLBACK_ROOT"/*; do
 
     rollback_name="${rollback_path##*/}"
     metadata_state="$(rollback_marker_metadata_state "$rollback_path")"
-    if [[ -d "$RELEASES/$rollback_name" ]] && rollback_release_is_referenced "$rollback_name"; then
+    if rollback_release_is_referenced "$rollback_name" ||
+       rollback_release_is_referenced "incremental/$rollback_name"; then
         echo "KEEP   $rollback_path reason=active-release-reference"
         continue
     fi
     if [[ "$metadata_state" == "unfinished" || "$metadata_state" == "unknown" ]]; then
-        if [[ -d "$RELEASES/$rollback_name" ]]; then
-            append_reason "$rollback_name" "rollback-release:$rollback_path"
-        fi
+        for rollback_release_path in "$RELEASES/$rollback_name" "$RELEASES/incremental/$rollback_name"; do
+            if [[ -d "$rollback_release_path" ]]; then
+                rollback_release_key="$(release_name_for_path "$rollback_release_path")"
+                append_reason "$rollback_release_key" "rollback-release:$rollback_path"
+            fi
+        done
         echo "KEEP   $rollback_path reason=unfinished-or-unknown-rollback-state"
         continue
     fi
@@ -508,6 +535,37 @@ is_published_release() {
     [[ -f "$release_path/departures.sqlite" ]] || return 1
     [[ -f "$release_path/release-metadata.json" ]] || return 1
     return 0
+}
+
+is_published_incremental_release() {
+    local release_path="$1"
+    [[ "$(dirname "$release_path")" == "$RELEASES/incremental" &&
+       -f "$release_path/release.json" &&
+       -f "$release_path/validation-receipt.json" &&
+       -e "$release_path/stop-data" ]] || return 1
+    python3 - "$release_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+release_path = Path(sys.argv[1])
+try:
+    release = json.loads((release_path / "release.json").read_text(encoding="utf-8"))
+    receipt = json.loads((release_path / "validation-receipt.json").read_text(encoding="utf-8"))
+except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+raise SystemExit(0 if release.get("releaseID") == release_path.name
+                 and receipt.get("releaseID") == release_path.name
+                 and receipt.get("result") == "PASS" else 1)
+PY
+}
+
+is_published_release_candidate() {
+    is_published_release "$1" || is_published_incremental_release "$1"
+}
+
+release_key_for_path() {
+    release_name_for_path "$1"
 }
 
 is_known_abandoned_build_name() {
@@ -625,30 +683,76 @@ trap 'rm -f -- "$ordered_candidates"' EXIT
 
 shopt -s nullglob
 release_entries=("$RELEASES"/*)
+if [[ -d "$RELEASES/incremental" && ! -L "$RELEASES/incremental" ]]; then
+    release_entries+=("$RELEASES/incremental"/*)
+fi
+current_release_target="$(readlink -f -- "$DATA/current-release" 2>/dev/null || true)"
+current_release_key=""
+if [[ -n "$current_release_target" ]]; then
+    current_release_key="$(release_key_for_path "$current_release_target" || true)"
+fi
+declare -a ORDERED_CANDIDATE_IDS=()
+declare -a ORDERED_CANDIDATE_KEYS=()
+declare -a ORDERED_CANDIDATE_TIMESTAMPS=()
 for release_path in "${release_entries[@]-}"; do
     [[ -L "$release_path" || -d "$release_path" ]] || continue
     [[ -L "$release_path" ]] && continue
     release_name="${release_path##*/}"
+    release_key="$(release_key_for_path "$release_path" || true)"
     is_release_name "$release_name" || continue
-    is_published_release "$release_path" || continue
+    is_published_release_candidate "$release_path" || continue
     sortable_name="$release_name"
     case "$sortable_name" in
         scoped-*) sortable_name="${sortable_name#scoped-}" ;;
         vbb-refresh-*) sortable_name="${sortable_name#vbb-refresh-}" ;;
     esac
-    printf '%s\t%s\n' "${sortable_name%%-*}" "$release_name" >> "$ordered_candidates"
+    sortable_timestamp="${sortable_name%%-*}"
+    duplicate_index=-1
+    for index in "${!ORDERED_CANDIDATE_IDS[@]}"; do
+        if [[ "${ORDERED_CANDIDATE_IDS[$index]}" == "$release_name" ]]; then
+            duplicate_index="$index"
+            break
+        fi
+    done
+    if (( duplicate_index >= 0 )); then
+        if [[ "$release_key" == "$current_release_key" ]]; then
+            ORDERED_CANDIDATE_KEYS[$duplicate_index]="$release_key"
+        fi
+        continue
+    fi
+    ORDERED_CANDIDATE_IDS+=("$release_name")
+    ORDERED_CANDIDATE_KEYS+=("$release_key")
+    ORDERED_CANDIDATE_TIMESTAMPS+=("$sortable_timestamp")
+done
+for index in "${!ORDERED_CANDIDATE_IDS[@]}"; do
+    printf '%s\t%s\t%s\n' "${ORDERED_CANDIDATE_TIMESTAMPS[$index]}" \
+        "${ORDERED_CANDIDATE_IDS[$index]}" "${ORDERED_CANDIDATE_KEYS[$index]}" >> "$ordered_candidates"
 done
 
 ordered_release_names=()
-while IFS=$'\t' read -r sortable_timestamp release_name; do
+ordered_release_keys=()
+while IFS=$'\t' read -r sortable_timestamp release_name release_key; do
     [[ -n "$release_name" ]] || continue
     ordered_release_names+=("$release_name")
+    ordered_release_keys+=("$release_key")
 done < <(sort -r -k1,1 -k2,2 "$ordered_candidates")
-retention_slot=0
-for release_name in "${ordered_release_names[@]-}"; do
-    (( retention_slot >= retention_count )) && break
-    retention_slot=$((retention_slot + 1))
-    append_reason "$release_name" "retention-slot=$retention_slot/$retention_count"
+
+if [[ -n "$current_release_key" ]]; then
+    for index in "${!ordered_release_keys[@]}"; do
+        if [[ "${ordered_release_keys[$index]}" == "$current_release_key" ]]; then
+            RETAINED_RELEASE_IDS+=("${ordered_release_names[$index]}")
+            RETAINED_RELEASE_KEYS+=("$current_release_key")
+            break
+        fi
+    done
+fi
+for index in "${!ordered_release_names[@]}"; do
+    (( ${#RETAINED_RELEASE_IDS[@]} >= retention_count )) && break
+    release_name="${ordered_release_names[$index]}"
+    release_key="${ordered_release_keys[$index]}"
+    [[ " ${RETAINED_RELEASE_IDS[*]-} " == *" $release_name "* ]] && continue
+    RETAINED_RELEASE_IDS+=("$release_name")
+    RETAINED_RELEASE_KEYS+=("$release_key")
 done
 
 echo "Release retention: configured=$configured_retention effective=$retention_count"
@@ -656,6 +760,7 @@ echo "Release retention: configured=$configured_retention effective=$retention_c
 for release_path in "${release_entries[@]-}"; do
     [[ -L "$release_path" || -d "$release_path" ]] || continue
     release_name="${release_path##*/}"
+    release_key="$(release_key_for_path "$release_path" || true)"
 
     if [[ -L "$release_path" ]]; then
         echo "KEEP   $release_path reason=protected-pointer/symlink"
@@ -664,11 +769,15 @@ for release_path in "${release_entries[@]-}"; do
     if [[ ! -d "$release_path" ]]; then
         continue
     fi
+    if [[ "$release_path" == "$RELEASES/incremental" ]]; then
+        echo "KEEP   $release_path reason=managed-release-container"
+        continue
+    fi
     if reason="$(dependency_reason_for_path "$release_path" 2>/dev/null)"; then
         echo "KEEP   $release_path reason=$reason"
         continue
     fi
-    reason="$(reason_for "$release_name" 2>/dev/null || true)"
+    reason="$(reason_for "$release_key" 2>/dev/null || true)"
     if [[ -n "$reason" ]]; then
         echo "KEEP   $release_path reason=$reason"
         continue
@@ -677,17 +786,7 @@ for release_path in "${release_entries[@]-}"; do
         classify_nonstandard_release "$release_path"
         continue
     fi
-    if reason="$(reason_for "$release_name")"; then
-        if [[ "$reason" == *"current-release"* ]]; then
-            echo "CURRENT RELEASE $release_path reason=$reason"
-        elif [[ "$reason" == *"previous-release"* ]]; then
-            echo "PREVIOUS RELEASE $release_path reason=$reason"
-        else
-            echo "KEEP   $release_path reason=$reason"
-        fi
-        continue
-    fi
-    if ! is_published_release "$release_path"; then
+    if ! is_published_release_candidate "$release_path"; then
         if ! path_is_strictly_inside "$release_path" "$RELEASES"; then
             echo "KEEP   $release_path reason=outside-root-or-symlink-escape"
             continue
@@ -708,15 +807,35 @@ for release_path in "${release_entries[@]-}"; do
         fi
         continue
     fi
-    if [[ "$(dirname "$release_path")" != "$RELEASES" ]]; then
+    retained=0
+    for retained_key in "${RETAINED_RELEASE_KEYS[@]-}"; do
+        if [[ "$retained_key" == "$release_key" ]]; then
+            retained=1
+            break
+        fi
+    done
+    if (( retained == 1 )); then
+        echo "KEEP   $release_path reason=retention-slot"
+        continue
+    fi
+    if [[ "$(dirname "$release_path")" != "$RELEASES" && "$(dirname "$release_path")" != "$RELEASES/incremental" ]]; then
         echo "KEEP   $release_path reason=safety-path-check"
         continue
     fi
+    if ! command -v "$LSOF_BIN" >/dev/null 2>&1; then
+        echo "KEEP   $release_path reason=open-process-check-unavailable"
+        continue
+    fi
+    open_files="$(open_files_for "$release_path" 2>/dev/null || true)"
+    if [[ -n "$open_files" ]]; then
+        echo "KEEP   $release_path reason=open-by-process"
+        continue
+    fi
+    RELEASE_DELETE_PATHS+=("$release_path")
     if [[ "$DRY_RUN" == "1" ]]; then
         echo "WOULD_DELETE $release_path reason=outside-retention-and-unreferenced"
     else
-        echo "DELETE $release_path reason=outside-retention-and-unreferenced"
-        rm -rf -- "$release_path"
+        echo "DELETE-CANDIDATE $release_path reason=outside-retention-and-unreferenced"
     fi
 done
 
@@ -1090,7 +1209,8 @@ cleanup_gtfs_cache
 
 cleanup_published_artifacts() {
     local helper="$PIPELINE_REPO/scripts/published_artifact_retention.py"
-    local output summary reclaimed index
+    local output="" summary="" reclaimed index physical_reclaimable errors_json
+    local -a preflight_command=()
     if [[ ! -f "$helper" ]]; then
         echo "Published artifact retention skipped reason=helper-missing path=$helper"
         return 0
@@ -1103,18 +1223,49 @@ cleanup_published_artifacts() {
     for index in "${!PROTECTED_DEPENDENCY_PATHS[@]}"; do
         command+=(--runtime-path "${PROTECTED_DEPENDENCY_PATHS[$index]}")
     done
-    if [[ "$DRY_RUN" == "1" ]]; then
-        command+=(--dry-run)
-    else
+    if (( ${#RELEASE_DELETE_PATHS[@]} > 0 )); then
+        for release_path in "${RELEASE_DELETE_PATHS[@]}"; do
+            command+=(--physical-root "$release_path")
+        done
+    fi
+    if [[ "$DRY_RUN" != "1" ]]; then
+        preflight_command=("${command[@]}" --dry-run)
+        if ! output="$("${preflight_command[@]}")"; then
+            echo "Published artifact retention skipped reason=preflight-failed"
+            return 0
+        fi
+        summary="$(printf '%s\n' "$output" | sed -n 's/^\[ArtifactRetention\] summary=//p' | tail -n 1)"
+        errors_json="$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1]).get("errors", [])))' "$summary")"
+        if [[ "$errors_json" != "[]" ]]; then
+            printf '%s\n' "$output"
+            echo "CLEANUP_SKIPPED reason=physical-accounting-or-retention-errors errors=$errors_json"
+            return 0
+        fi
         command+=(--apply)
+    else
+        command+=(--dry-run)
     fi
     if ! output="$("${command[@]}")"; then
         echo "Published artifact retention skipped reason=helper-failed"
         return 0
     fi
-    printf '%s\n' "$output"
     summary="$(printf '%s\n' "$output" | sed -n 's/^\[ArtifactRetention\] summary=//p' | tail -n 1)"
+    if [[ -z "$summary" ]]; then
+        echo "Published artifact retention skipped reason=summary-missing"
+        return 0
+    fi
+    errors_json="$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1]).get("errors", [])))' "$summary")"
+    if [[ "$errors_json" != "[]" ]]; then
+        echo "CLEANUP_SKIPPED reason=physical-accounting-or-retention-errors errors=$errors_json"
+        return 0
+    fi
+    RELEASE_APPLY_ALLOWED=1
+    printf '%s\n' "$output"
     reclaimed="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["reclaimable_bytes"])' "$summary")"
+    physical_reclaimable="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("physical_accounting", {}).get("union_reclaimable_bytes", 0))' "$summary")"
+    if [[ "$physical_reclaimable" =~ ^[0-9]+$ ]]; then
+        echo "Combined physical reclaimable estimate (inode union): $physical_reclaimable bytes"
+    fi
     if [[ "$reclaimed" =~ ^[0-9]+$ ]]; then
         RECLAIMABLE_BYTES=$((RECLAIMABLE_BYTES + reclaimed))
     fi
@@ -1122,7 +1273,63 @@ cleanup_published_artifacts() {
 
 cleanup_published_artifacts
 
-echo "Cleanup reclaimable size: $(format_size "$RECLAIMABLE_BYTES") ($RECLAIMABLE_BYTES bytes)"
+while IFS= read -r -d '' symlink_path; do
+    dependency_enqueue "$symlink_path" "active-symlink:$symlink_path"
+done < <(find "$DATA" -path "$RELEASES" -prune -o -type l -print0)
+while IFS= read -r -d '' symlink_path; do
+    if [[ "$symlink_path" == "$RELEASES/pilot-current" ]]; then
+        dependency_enqueue "$symlink_path" "protected-by-pilot-current"
+    else
+        dependency_enqueue "$symlink_path" "protected-pointer:$symlink_path"
+    fi
+done < <(find "$RELEASES" -mindepth 1 -maxdepth 1 -type l -print0)
+dependency_build_graph
+if (( DEPENDENCY_GRAPH_UNRESOLVED == 1 )); then
+    emit_unresolved_dependency_keeps
+    RELEASE_APPLY_ALLOWED=0
+    echo "CLEANUP_SKIPPED reason=dependency-graph-unresolved-before-release-delete"
+fi
+
+if (( ${#RELEASE_DELETE_PATHS[@]} > 0 )); then
+for release_path in "${RELEASE_DELETE_PATHS[@]}"; do
+    canonical_path="$(readlink -f -- "$release_path" 2>/dev/null || true)"
+    parent_path="$(dirname "$release_path")"
+    canonical_parent="$(readlink -f -- "$parent_path" 2>/dev/null || true)"
+    if (( RELEASE_APPLY_ALLOWED != 1 )); then
+        echo "KEEP   $release_path reason=retention-preflight-not-complete"
+        continue
+    fi
+    if ! path_is_strictly_inside "$release_path" "$RELEASES" ||
+       ! is_published_release_candidate "$release_path"; then
+        echo "KEEP   $release_path reason=release-candidate-recheck-failed"
+        continue
+    fi
+    if [[ -z "$canonical_path" || "$canonical_path" != "$release_path" || ! -d "$canonical_path" ||
+          "$canonical_parent" != "$parent_path" ||
+          ( "$(dirname "$release_path")" != "$RELEASES" && "$(dirname "$release_path")" != "$RELEASES/incremental" ) ||
+          -n "$(dependency_reason_for_path "$release_path" 2>/dev/null || true)" ]]; then
+        echo "KEEP   $release_path reason=release-candidate-recheck-failed"
+        continue
+    fi
+    if ! command -v "$LSOF_BIN" >/dev/null 2>&1; then
+        echo "KEEP   $release_path reason=open-process-check-unavailable"
+        continue
+    fi
+    open_files="$(open_files_for "$release_path" 2>/dev/null || true)"
+    if [[ -n "$open_files" ]]; then
+        echo "KEEP   $release_path reason=open-by-process"
+        continue
+    fi
+    if [[ "$DRY_RUN" == "1" ]]; then
+        echo "WOULD_DELETE $release_path reason=outside-retention-and-unreferenced"
+    else
+        echo "DELETE $release_path reason=outside-retention-and-unreferenced"
+        rm -rf -- "$release_path"
+    fi
+done
+fi
+
+echo "Cleanup reported reclaimable estimate (legacy mixed counters; not inode-union total): $(format_size "$RECLAIMABLE_BYTES") ($RECLAIMABLE_BYTES bytes)"
 
 echo
 echo "Temporary artifacts older than 2 days:"

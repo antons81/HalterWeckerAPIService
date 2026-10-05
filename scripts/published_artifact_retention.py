@@ -24,6 +24,132 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 Inode = tuple[int, int]
 
 
+def physical_accounting(paths: tuple[Path, ...], *, retained_names: frozenset[str] = frozenset()) -> dict:
+    """Measure allocated bytes across candidate trees without double-counting inodes."""
+    normalized: list[Path] = []
+    for path in sorted({path.absolute() for path in paths}, key=lambda item: (len(item.parts), str(item))):
+        if any(path == parent or parent in path.parents for parent in normalized):
+            continue
+        normalized.append(path)
+
+    roots: dict[Path, dict[str, object]] = {}
+    for root in normalized:
+        if root.is_symlink() or not root.is_dir():
+            raise ValueError(f"candidate root is missing or not a directory: {root}")
+        inodes: dict[Inode, tuple[int, int, int]] = {}
+        directory_bytes = 0
+        directory_allocations: dict[Path, int] = {}
+        retained_directories: set[Path] = set()
+
+        def fail_walk(error: OSError) -> None:
+            raise error
+
+        for directory, directories, names in os.walk(root, followlinks=False, onerror=fail_walk):
+            parent = Path(directory)
+            if any(name in retained_names for name in directories + names):
+                retained_directories.add(parent)
+            directories[:] = [name for name in directories
+                              if name not in retained_names and not (parent / name).is_symlink()]
+            names = [name for name in names if name not in retained_names]
+            directory_value = Path(directory).lstat()
+            if not stat.S_ISDIR(directory_value.st_mode):
+                raise ValueError(f"directory changed during scan: {directory}")
+            directory_bytes += directory_value.st_blocks * 512
+            directory_allocations[parent] = directory_value.st_blocks * 512
+            for name in names:
+                path = Path(directory) / name
+                value = path.lstat()
+                if not stat.S_ISREG(value.st_mode):
+                    continue
+                key = (value.st_dev, value.st_ino)
+                previous = inodes.get(key)
+                if previous is None:
+                    inodes[key] = (value.st_blocks * 512, value.st_nlink, 1)
+                else:
+                    if previous[:2] != (value.st_blocks * 512, value.st_nlink):
+                        raise ValueError(f"inode identity changed during scan: {path}")
+                    inodes[key] = (previous[0], previous[1], previous[2] + 1)
+        reclaimable_directory_bytes = sum(
+            allocated for directory, allocated in directory_allocations.items()
+            if not any(directory == retained or directory in retained.parents
+                       for retained in retained_directories)
+        )
+        roots[root] = {"inodes": inodes, "directory_bytes": directory_bytes,
+                       "reclaimable_directory_bytes": reclaimable_directory_bytes}
+
+    global_links: collections.Counter[Inode] = collections.Counter()
+    global_allocated: dict[Inode, tuple[int, int]] = {}
+    for root_data in roots.values():
+        inodes = root_data["inodes"]
+        for key, (allocated, links, count) in inodes.items():
+            global_links[key] += count
+            previous = global_allocated.setdefault(key, (allocated, links))
+            if previous != (allocated, links):
+                raise ValueError(f"inode identity changed across candidate roots: {key}")
+
+    per_root = []
+    union_directory_bytes = 0
+    union_reclaimable_directory_bytes = 0
+    for root, root_data in roots.items():
+        inodes = root_data["inodes"]
+        directory_bytes = root_data["directory_bytes"]
+        reclaimable_directory_bytes = root_data["reclaimable_directory_bytes"]
+        union_directory_bytes += directory_bytes
+        union_reclaimable_directory_bytes += reclaimable_directory_bytes
+        allocated_bytes = sum(value[0] for value in inodes.values())
+        shared_candidate_bytes = sum(
+            allocated for key, (allocated, _, _) in inodes.items() if global_links[key] > inodes[key][2]
+        )
+        reclaimable_bytes = sum(
+            allocated
+            for key, (allocated, links, _) in inodes.items()
+            if global_links[key] == links and global_links[key] == inodes[key][2]
+        )
+        shared_reclaimable_bytes = sum(
+            allocated
+            for key, (allocated, links, _) in inodes.items()
+            if global_links[key] > inodes[key][2] and global_links[key] == links
+        )
+        shared_anywhere_bytes = sum(
+            allocated
+            for key, (allocated, links, _) in inodes.items()
+            if links > inodes[key][2]
+        )
+        per_root.append(dict(
+            path=str(root),
+            allocated_bytes=allocated_bytes,
+            directory_allocated_bytes=directory_bytes,
+            reclaimable_directory_bytes=reclaimable_directory_bytes,
+            shared_with_other_candidate_roots_bytes=shared_candidate_bytes,
+            shared_anywhere_bytes=shared_anywhere_bytes,
+            shared_union_reclaimable_bytes=shared_reclaimable_bytes,
+            exclusive_reclaimable_bytes=reclaimable_bytes,
+            standalone_reclaimable_bytes=sum(
+                allocated for allocated, links, count in inodes.values() if links == count
+            ) + reclaimable_directory_bytes,
+            inode_count=len(inodes),
+        ))
+
+    union_allocated = sum(value[0] for value in global_allocated.values())
+    union_shared = sum(
+        allocated for key, (allocated, links) in global_allocated.items() if global_links[key] < links
+    )
+    union_reclaimable = sum(
+        allocated for key, (allocated, links) in global_allocated.items() if global_links[key] == links
+    )
+    return dict(
+        candidate_roots=per_root,
+        union_allocated_bytes=union_allocated,
+        union_directory_allocated_bytes=union_directory_bytes,
+        shared_within_candidate_roots_bytes=sum(
+            allocated for key, (allocated, _) in global_allocated.items() if global_links[key] > 1
+        ),
+        shared_outside_candidate_roots_bytes=union_shared,
+        union_reclaimable_bytes=union_reclaimable + union_reclaimable_directory_bytes,
+        union_inode_count=len(global_allocated),
+    )
+
+
 def identity(path: Path) -> Inode:
     value = path.stat()
     return value.st_dev, value.st_ino
@@ -80,7 +206,7 @@ class Processes:
                 if len(uid_values) != 4:
                     raise ValueError("invalid Uid in proc status")
                 process_uids = {int(value) for value in uid_values}
-                if cleaner_uid not in process_uids:
+                if cleaner_uid != 0 and cleaner_uid not in process_uids:
                     result.ignored_unrelated_pids += 1
                     continue
                 result.relevant_pids += 1
@@ -199,6 +325,7 @@ class Retention:
         self.data = data_root.resolve()
         self.cache = cache_root.resolve()
         self.static = self.data / "provider-artifacts" / "static"
+        self.transformed = self.cache.parent / "external-build"
         self.now = time.time() if now is None else now
         self.proc_root = proc_root
         self.processes = processes
@@ -344,10 +471,26 @@ class Retention:
             manifest = read_object(path / "manifest.json")
             if manifest.get("providerID") != provider or manifest.get("status") != "complete":
                 raise ValueError("incomplete or provider mismatch")
-            main = path / ("partition.json" if kind == "cache" else "provider.sqlite")
-            expected = manifest.get("size") if kind == "cache" else manifest.get("sqlite", {}).get("size")
-            if not main.is_file() or main.stat().st_size != expected:
-                raise ValueError("artifact size mismatch")
+            if kind == "transformed":
+                outputs = manifest.get("cachedOutputs")
+                if not isinstance(outputs, list) or not outputs:
+                    raise ValueError("transformed outputs are missing")
+                for output in outputs:
+                    if not isinstance(output, dict) or not isinstance(output.get("path"), str):
+                        raise ValueError("invalid transformed output")
+                    relative = Path(output["path"])
+                    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+                        raise ValueError("unsafe transformed output path")
+                    main = path / relative
+                    expected = output.get("size")
+                    if (not isinstance(expected, int) or isinstance(expected, bool) or expected <= 0
+                            or not main.is_file() or main.stat().st_size != expected):
+                        raise ValueError("transformed output size mismatch")
+            else:
+                main = path / ("partition.json" if kind == "cache" else "provider.sqlite")
+                expected = manifest.get("size") if kind == "cache" else manifest.get("sqlite", {}).get("size")
+                if not main.is_file() or main.stat().st_size != expected:
+                    raise ValueError("artifact size mismatch")
             published = max((f.mtime_ns / 1e9 for f in files), default=path.stat().st_mtime)
             if kind == "static":
                 # New temporal children do not make an old structural version newer.
@@ -363,7 +506,8 @@ class Retention:
         return entry
 
     def collect(self) -> None:
-        for kind, root in (("cache", self.cache), ("static", self.static)):
+        for kind, root in (("cache", self.cache), ("static", self.static),
+                           ("transformed", self.transformed)):
             if not root.exists():
                 continue
             if root.is_symlink() or not root.is_dir():
@@ -393,7 +537,7 @@ class Retention:
         processes.filesystem_prefix = self.filesystem_prefix
         self.processes = processes
         for entry in self.entries:
-            if self.errors:
+            if self.errors or (os.getuid() == 0 and processes.errors):
                 entry.reason = "safety-scan-incomplete"
             elif entry.provider in self.locked_providers or entry.path in self.locked_entries or processes.uses(entry.path):
                 entry.reason = "running-build"
@@ -402,13 +546,17 @@ class Retention:
             elif any(entry.path == p or entry.path.is_relative_to(p) or p.is_relative_to(entry.path)
                      for p in self.runtime_roots):
                 entry.reason = "runtime-path-reference"
-            elif entry.kind == "cache" and any(f.key in self.runtime_inodes for f in entry.files):
+            elif entry.kind in {"cache", "transformed"} and any(f.key in self.runtime_inodes for f in entry.files):
                 entry.reason = "runtime-inode-reference"
             elif entry.kind == "static" and (entry.provider, str(entry.manifest.get("artifactKey", ""))) in self.active_keys:
                 entry.reason = "active-artifact-key"
             elif entry.kind == "static" and (entry.provider, entry.path.name) in self.active_keys:
                 entry.reason = "active-artifact-key"
             elif not entry.complete:
+                if entry.kind == "transformed":
+                    # Only validated superseded generations qualify for this policy.
+                    entry.reason = "unvalidated-transformed-generation"
+                    continue
                 if not entry.safely_scannable:
                     continue
                 if entry.kind == "cache":
@@ -440,6 +588,13 @@ class Retention:
                             entry.reason = entry.candidate_reason
                     except (KeyError, ValueError):
                         entry.reason = "invalid-service-date"
+                elif entry.kind == "transformed":
+                    if self.now - entry.published < self.ttl:
+                        entry.reason = "inside-transformed-ttl"
+                    else:
+                        entry.candidate = True
+                        entry.candidate_reason = "superseded-unreferenced-transformed"
+                        entry.reason = entry.candidate_reason
                 else:
                     entry.candidate = True
                     entry.candidate_reason = "superseded-unreferenced-static"
@@ -453,11 +608,20 @@ class Retention:
                 fallback.candidate_reason = ""
                 fallback.delete = False
                 fallback.reason = "latest-fallback"
+        for provider in {entry.provider for entry in self.entries if entry.kind == "transformed"}:
+            complete = [entry for entry in self.entries
+                        if entry.kind == "transformed" and entry.provider == provider and entry.complete]
+            if complete:
+                latest = max(complete, key=lambda entry: (entry.published, str(entry.path)))
+                if latest.candidate:
+                    latest.candidate = False
+                    latest.candidate_reason = ""
+                    latest.reason = "latest-transformed-generation"
         for entry in self.entries:
             if entry.candidate:
                 entry.delete = True
 
-    def plan(self) -> dict:
+    def plan(self, physical_roots: tuple[Path, ...] = ()) -> dict:
         counts = collections.Counter(f.key for e in self.entries if e.candidate for f in e.files)
         seen = set()
         rows = []
@@ -475,7 +639,7 @@ class Retention:
                 files=[dict(path=str(f.path), device=f.device, inode=f.inode, links=f.links,
                             logical_bytes=f.size, allocated_bytes=f.allocated) for f in entry.files]))
         reasons = collections.Counter(e.reason for e in self.entries if not e.delete)
-        return dict(entries=rows, summary=dict(candidates=sum(e.candidate for e in self.entries),
+        summary = dict(candidates=sum(e.candidate for e in self.entries),
             deletable_candidates=sum(e.delete for e in self.entries),
             safety_blocked_candidates=sum(e.candidate and not e.delete for e in self.entries),
             candidate_files=sum(len(e.files) for e in self.entries if e.candidate),
@@ -489,7 +653,53 @@ class Retention:
                 permission_denied_checks=self.processes.permission_denied_checks if self.processes else {},
                 cwd_permission_denied_pids=self.processes.cwd_permission_denied if self.processes else 0,
             ),
-            errors=self.errors + (self.processes.errors if self.processes else [])))
+            errors=self.errors + (self.processes.errors if self.processes else []))
+        try:
+            deleted_entries = [entry.path for entry in self.entries if entry.delete]
+            candidate_paths = set(deleted_entries)
+            reclaimable_date_directories = []
+            date_directory_candidates = []
+            if self.cache.is_dir() and not self.cache.is_symlink():
+                for provider in sorted(self.cache.iterdir()):
+                    if provider.is_symlink() or not provider.is_dir():
+                        continue
+                    for city in sorted(provider.iterdir()):
+                        if city.is_symlink() or not city.is_dir():
+                            continue
+                        for day_directory in sorted(city.iterdir()):
+                            if day_directory.is_symlink() or not day_directory.is_dir():
+                                continue
+                            if provider.name in self.locked_providers or (self.processes and self.processes.uses(day_directory)):
+                                continue
+                            if any(day_directory == root or day_directory.is_relative_to(root)
+                                   or root.is_relative_to(day_directory)
+                                   for root in self.runtime_roots):
+                                continue
+                            try:
+                                service_date = datetime.strptime(day_directory.name, "%Y%m%d").date()
+                            except ValueError:
+                                continue
+                            if service_date >= self.current_date(provider.name):
+                                continue
+                            children = list(day_directory.iterdir())
+                            if not children or all(
+                                child in candidate_paths and child.is_dir() and not child.is_symlink()
+                                for child in children
+                            ):
+                                reclaimable_date_directories.append(day_directory)
+                                value = day_directory.lstat()
+                                date_directory_candidates.append(dict(
+                                    path=str(day_directory), device=value.st_dev, inode=value.st_ino
+                                ))
+            summary["physical_accounting"] = physical_accounting(
+                tuple(deleted_entries + reclaimable_date_directories) + physical_roots,
+                retained_names=frozenset({".lock"}),
+            )
+        except (OSError, ValueError) as error:
+            summary["physical_accounting"] = dict(errors=[str(error)])
+            summary["errors"].append(f"physical-accounting:{error}")
+        return dict(entries=rows, summary=summary,
+                    reclaimable_date_directories=date_directory_candidates)
 
     def apply(self, report: dict) -> None:
         # Process scan results are diagnostic only; filesystem references and locks
@@ -529,11 +739,13 @@ class Retention:
                 continue
             try:
                 current = current_entries.get(entry.path)
-                if refreshed_state.errors:
+                if refreshed_state.errors or (os.getuid() == 0 and fresh.errors):
                     raise ValueError("filesystem-safety-state-incomplete")
                 if current is None or not current.delete:
                     raise ValueError("candidate-no-longer-eligible")
-                provider_directory = self.cache / entry.provider if entry.kind == "cache" else self.static / entry.provider
+                provider_root = {"cache": self.cache, "static": self.static,
+                                 "transformed": self.transformed}[entry.kind]
+                provider_directory = provider_root / entry.provider
                 lock_paths = {
                     self.cache.parent / entry.provider / ".lock",
                     provider_directory / ".lock",
@@ -579,6 +791,7 @@ class Retention:
                             retained_directories.append(dict(path=str(directory), reason="directory-identity-changed"))
                             continue
                         directory.rmdir()
+                        released += latest_directory.st_blocks * 512
                         deleted_directories.append(str(directory))
                     except FileNotFoundError:
                         continue
@@ -588,22 +801,57 @@ class Retention:
                         retained_directories.append(dict(path=str(directory), reason=f"directory-not-empty-or-unavailable:{error}"))
             except (OSError, ValueError) as error:
                 skipped.append(dict(path=str(entry.path), reason=str(error)))
+        if not refreshed_state.errors and not fresh.errors:
+            for candidate in report.get("reclaimable_date_directories", []):
+                day_directory = Path(candidate["path"])
+                try:
+                    provider = day_directory.parents[1]
+                    provider_name = provider.name
+                    service_date = datetime.strptime(day_directory.name, "%Y%m%d").date()
+                    value = day_directory.lstat()
+                    if (day_directory.is_symlink() or not stat.S_ISDIR(value.st_mode)
+                            or (value.st_dev, value.st_ino) != (candidate["device"], candidate["inode"])
+                            or not day_directory.is_relative_to(self.cache)
+                            or service_date >= refreshed_state.current_date(provider_name)
+                            or provider_name in refreshed_state.locked_providers
+                            or any(day_directory == root or day_directory.is_relative_to(root)
+                                   or root.is_relative_to(day_directory)
+                                   for root in refreshed_state.runtime_roots)
+                            or fresh.uses(day_directory)
+                            or any(self.lock_busy_now(path, apply_locks) for path in (
+                                self.cache.parent / provider_name / ".lock", provider / ".lock"
+                            ))):
+                        continue
+                    day_directory.rmdir()
+                    released += value.st_blocks * 512
+                    deleted_directories.append(str(day_directory))
+                except (OSError, ValueError):
+                    # Only remove empty date containers; nested data is never traversed here.
+                    continue
         report["applied"] = dict(deleted=deleted, skipped=skipped,
                                   deleted_directories=deleted_directories,
                                   retained_directories=retained_directories, reclaimed_bytes=released)
         apply_locks.close()
 
-    def run(self, *, dry_run: bool = True) -> dict:
+    def run(self, *, dry_run: bool = True, physical_roots: tuple[Path, ...] = ()) -> dict:
         with self.stack:
-            if not self.cache.exists() and not self.static.exists():
-                return dict(entries=[], summary=dict(candidates=0, candidate_files=0, logical_bytes=0, reclaimable_bytes=0, errors=[]))
+            if not any(root.exists() for root in (self.cache, self.static, self.transformed)):
+                try:
+                    physical = physical_accounting(physical_roots)
+                    errors = []
+                except (OSError, ValueError) as error:
+                    physical = dict(errors=[str(error)])
+                    errors = [f"physical-accounting:{error}"]
+                return dict(entries=[], summary=dict(candidates=0, candidate_files=0,
+                    logical_bytes=0, reclaimable_bytes=0, physical_accounting=physical,
+                    errors=errors))
             for operation in (self.references, self.collect):
                 try:
                     operation()
                 except (OSError, ValueError, TypeError, AttributeError) as error:
                     self.errors.append(str(error))
             self.classify()
-            report = self.plan()
+            report = self.plan(physical_roots)
             if not dry_run:
                 self.apply(report)
             return report
@@ -615,6 +863,8 @@ def main() -> None:
     parser.add_argument("--cache-root", type=Path)
     parser.add_argument("--proc-root", type=Path, default=Path("/proc"))
     parser.add_argument("--runtime-path", action="append", default=[], type=Path)
+    parser.add_argument("--physical-root", action="append", default=[], type=Path,
+                        help="Additional candidate tree included in inode-union accounting")
     parser.add_argument("--filesystem-prefix", default="", help="Read-only host filesystem mount prefix")
     parser.add_argument("--cache-ttl-hours", type=float, default=12)
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -628,7 +878,8 @@ def main() -> None:
     cache = args.cache_root or args.data_root / "cache/gtfs/external-departure-partitions"
     report = Retention(args.data_root, cache, proc_root=args.proc_root,
         runtime_paths=tuple(args.runtime_path), ttl_hours=args.cache_ttl_hours,
-        filesystem_prefix=args.filesystem_prefix).run(dry_run=args.dry_run)
+        filesystem_prefix=args.filesystem_prefix).run(dry_run=args.dry_run,
+            physical_roots=tuple(args.physical_root))
     for entry in report["entries"]:
         print("[ArtifactRetention] " + json.dumps(entry, separators=(",", ":")))
     summary = report["summary"] | {"dry_run": args.dry_run}
