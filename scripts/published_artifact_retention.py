@@ -326,6 +326,7 @@ class Retention:
         self.cache = cache_root.resolve()
         self.static = self.data / "provider-artifacts" / "static"
         self.transformed = self.cache.parent / "external-build"
+        self.normalized = self.data / "provider-artifacts" / "normalized"
         self.now = time.time() if now is None else now
         self.proc_root = proc_root
         self.processes = processes
@@ -471,7 +472,18 @@ class Retention:
             manifest = read_object(path / "manifest.json")
             if manifest.get("providerID") != provider or manifest.get("status") != "complete":
                 raise ValueError("incomplete or provider mismatch")
-            if kind == "transformed":
+            if kind == "normalized":
+                if manifest.get("semanticKey") != path.name:
+                    raise ValueError("normalized semantic key mismatch")
+                database = manifest.get("normalizedSQLite")
+                if not isinstance(database, dict) or database.get("path") != "normalized.sqlite":
+                    raise ValueError("invalid normalized database path")
+                expected = database.get("size")
+                main = path / "normalized.sqlite"
+                if (not isinstance(expected, int) or isinstance(expected, bool) or expected <= 0
+                        or not main.is_file() or main.stat().st_size != expected):
+                    raise ValueError("normalized database size mismatch")
+            elif kind == "transformed":
                 outputs = manifest.get("cachedOutputs")
                 if not isinstance(outputs, list) or not outputs:
                     raise ValueError("transformed outputs are missing")
@@ -507,7 +519,7 @@ class Retention:
 
     def collect(self) -> None:
         for kind, root in (("cache", self.cache), ("static", self.static),
-                           ("transformed", self.transformed)):
+                           ("transformed", self.transformed), ("normalized", self.normalized)):
             if not root.exists():
                 continue
             if root.is_symlink() or not root.is_dir():
@@ -546,16 +558,16 @@ class Retention:
             elif any(entry.path == p or entry.path.is_relative_to(p) or p.is_relative_to(entry.path)
                      for p in self.runtime_roots):
                 entry.reason = "runtime-path-reference"
-            elif entry.kind in {"cache", "transformed"} and any(f.key in self.runtime_inodes for f in entry.files):
+            elif entry.kind in {"cache", "transformed", "normalized"} and any(f.key in self.runtime_inodes for f in entry.files):
                 entry.reason = "runtime-inode-reference"
             elif entry.kind == "static" and (entry.provider, str(entry.manifest.get("artifactKey", ""))) in self.active_keys:
                 entry.reason = "active-artifact-key"
             elif entry.kind == "static" and (entry.provider, entry.path.name) in self.active_keys:
                 entry.reason = "active-artifact-key"
             elif not entry.complete:
-                if entry.kind == "transformed":
-                    # Only validated superseded generations qualify for this policy.
-                    entry.reason = "unvalidated-transformed-generation"
+                if entry.kind in {"transformed", "normalized"}:
+                    # Only validated superseded generations qualify for these policies.
+                    entry.reason = f"unvalidated-{entry.kind}-generation"
                     continue
                 if not entry.safely_scannable:
                     continue
@@ -588,6 +600,13 @@ class Retention:
                             entry.reason = entry.candidate_reason
                     except (KeyError, ValueError):
                         entry.reason = "invalid-service-date"
+                elif entry.kind == "normalized":
+                    if self.now - entry.published < self.ttl:
+                        entry.reason = "inside-normalized-ttl"
+                    else:
+                        entry.candidate = True
+                        entry.candidate_reason = "superseded-unreferenced-normalized"
+                        entry.reason = entry.candidate_reason
                 elif entry.kind == "transformed":
                     if self.now - entry.published < self.ttl:
                         entry.reason = "inside-transformed-ttl"
@@ -617,6 +636,15 @@ class Retention:
                     latest.candidate = False
                     latest.candidate_reason = ""
                     latest.reason = "latest-transformed-generation"
+        for provider in {entry.provider for entry in self.entries if entry.kind == "normalized"}:
+            complete = [entry for entry in self.entries
+                        if entry.kind == "normalized" and entry.provider == provider and entry.complete]
+            if complete:
+                latest = max(complete, key=lambda entry: (entry.published, str(entry.path)))
+                if latest.candidate:
+                    latest.candidate = False
+                    latest.candidate_reason = ""
+                    latest.reason = "latest-normalized-generation"
         for entry in self.entries:
             if entry.candidate:
                 entry.delete = True
@@ -654,7 +682,17 @@ class Retention:
                 cwd_permission_denied_pids=self.processes.cwd_permission_denied if self.processes else 0,
             ),
             errors=self.errors + (self.processes.errors if self.processes else []))
+        summary["normalized_by_provider"] = {}
         try:
+            for provider in sorted({entry.provider for entry in self.entries if entry.kind == "normalized"}):
+                entries = [entry for entry in self.entries
+                           if entry.kind == "normalized" and entry.provider == provider]
+                selected = tuple(entry.path for entry in entries if entry.delete)
+                accounting = physical_accounting(selected, retained_names=frozenset({".lock"}))
+                summary["normalized_by_provider"][provider] = dict(
+                    generations=len(entries), candidates=len(selected),
+                    reclaimable_bytes=accounting["union_reclaimable_bytes"],
+                )
             deleted_entries = [entry.path for entry in self.entries if entry.delete]
             candidate_paths = set(deleted_entries)
             reclaimable_date_directories = []
@@ -744,7 +782,7 @@ class Retention:
                 if current is None or not current.delete:
                     raise ValueError("candidate-no-longer-eligible")
                 provider_root = {"cache": self.cache, "static": self.static,
-                                 "transformed": self.transformed}[entry.kind]
+                                 "transformed": self.transformed, "normalized": self.normalized}[entry.kind]
                 provider_directory = provider_root / entry.provider
                 lock_paths = {
                     self.cache.parent / entry.provider / ".lock",
@@ -835,7 +873,7 @@ class Retention:
 
     def run(self, *, dry_run: bool = True, physical_roots: tuple[Path, ...] = ()) -> dict:
         with self.stack:
-            if not any(root.exists() for root in (self.cache, self.static, self.transformed)):
+            if not any(root.exists() for root in (self.cache, self.static, self.transformed, self.normalized)):
                 try:
                     physical = physical_accounting(physical_roots)
                     errors = []

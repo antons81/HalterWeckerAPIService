@@ -89,6 +89,200 @@ class PublishedArtifactRetentionTests(unittest.TestCase):
         self.assertEqual(self.row(report, invalid)['reason'], 'unvalidated-transformed-generation')
         self.assertEqual(self.row(report, invalid)['decision'], 'KEEP')
 
+    def normalized_entry(self, name, age=24, provider="provider"):
+        path = self.data / 'provider-artifacts/normalized' / provider / name
+        path.mkdir(parents=True)
+        (path / 'normalized.sqlite').write_bytes(b'x' * 4096)
+        (path / 'manifest.json').write_text(json.dumps({
+            'providerID': provider, 'status': 'complete', 'semanticKey': name,
+            'normalizedSQLite': {'path': 'normalized.sqlite', 'size': 4096},
+        }))
+        for file in path.iterdir():
+            os.utime(file, (self.now - age * 3600, self.now - age * 3600))
+        return path
+
+    def test_normalized_latest_is_kept_and_old_superseded_is_deleted(self):
+        old = self.normalized_entry('old', age=48)
+        latest = self.normalized_entry('latest', age=13)
+        report = self.retain()
+        self.assertEqual(self.row(report, old)['decision'], 'DELETE')
+        self.assertEqual(self.row(report, latest)['decision'], 'KEEP')
+        self.assertEqual(self.row(report, latest)['reason'], 'latest-normalized-generation')
+        expected = physical_accounting((old,))['union_reclaimable_bytes']
+        self.assertEqual(report['summary']['normalized_by_provider']['provider'], {
+            'generations': 2, 'candidates': 1, 'reclaimable_bytes': expected,
+        })
+        applied = self.retain(apply=True)
+        self.assertFalse(old.exists())
+        self.assertTrue(latest.exists())
+        self.assertEqual(applied['applied']['skipped'], [])
+        self.assertEqual(applied['applied']['reclaimed_bytes'], expected)
+
+    def test_normalized_current_reference_and_in_use_are_kept(self):
+        referenced = self.normalized_entry('referenced', age=72)
+        opened = self.normalized_entry('opened', age=48)
+        self.normalized_entry('latest', age=13)
+        (self.active / 'release.json').write_text(json.dumps({
+            'runtimeDependencies': [{'path': str(referenced)}],
+        }))
+        snapshot = Processes(inodes={identity(opened / 'normalized.sqlite')})
+        report = self.retain(processes=snapshot)
+        self.assertEqual(self.row(report, referenced)['reason'], 'runtime-path-reference')
+        self.assertEqual(self.row(report, opened)['reason'], 'open-fd-or-mmap')
+        self.assertEqual(self.row(report, referenced)['decision'], 'KEEP')
+        self.assertEqual(self.row(report, opened)['decision'], 'KEEP')
+
+    def test_normalized_fresh_superseded_is_kept(self):
+        fresh = self.normalized_entry('fresh', age=11.9)
+        self.normalized_entry('latest', age=1)
+        report = self.retain()
+        self.assertEqual(self.row(report, fresh)['reason'], 'inside-normalized-ttl')
+        self.assertEqual(self.row(report, fresh)['decision'], 'KEEP')
+
+    def test_normalized_runtime_hardlink_is_kept(self):
+        old = self.normalized_entry('old', age=48)
+        self.normalized_entry('latest', age=13)
+        os.link(old / 'normalized.sqlite', self.active / 'runtime.sqlite')
+        row = self.row(self.retain(), old)
+        self.assertEqual(row['reason'], 'runtime-inode-reference')
+        self.assertEqual(row['decision'], 'KEEP')
+
+    def test_normalized_unvalidated_generation_is_kept(self):
+        invalid = self.normalized_entry('invalid', age=48)
+        self.normalized_entry('latest', age=13)
+        for malformed in (
+            {'providerID': 'provider', 'status': 'complete', 'semanticKey': 'wrong'},
+            {'providerID': 'provider', 'status': 'complete', 'semanticKey': 'invalid',
+             'normalizedSQLite': {'path': '../normalized.sqlite', 'size': 4096}},
+            {'providerID': 'provider', 'status': 'complete', 'semanticKey': 'invalid',
+             'normalizedSQLite': {'path': 'normalized.sqlite', 'size': 1}},
+        ):
+            with self.subTest(manifest=malformed):
+                (invalid / 'manifest.json').write_text(json.dumps(malformed))
+                row = self.row(self.retain(), invalid)
+                self.assertEqual(row['reason'], 'unvalidated-normalized-generation')
+                self.assertEqual(row['decision'], 'KEEP')
+
+    def test_normalized_reference_change_between_plan_and_apply_skips(self):
+        old = self.normalized_entry('old', age=48)
+        self.normalized_entry('latest', age=13)
+        owner = Retention(self.data, self.cache, now=self.now, processes=Processes())
+        report = owner.run()
+        self.assertEqual(self.row(report, old)['decision'], 'DELETE')
+        (self.active / 'release.json').write_text(json.dumps({
+            'runtimeDependencies': [{'path': str(old / 'normalized.sqlite')}],
+        }))
+        with patch('scripts.published_artifact_retention.Processes.scan', return_value=Processes()):
+            owner.apply(report)
+        self.assertTrue(old.exists())
+        self.assertEqual(report['applied']['deleted'], [])
+        self.assertEqual(report['applied']['skipped'], [
+            {'path': str(old), 'reason': 'candidate-no-longer-eligible'},
+        ])
+
+    def test_normalized_process_change_between_plan_and_apply_skips(self):
+        old = self.normalized_entry('old', age=48)
+        self.normalized_entry('latest', age=13)
+        owner = Retention(self.data, self.cache, now=self.now, processes=Processes())
+        report = owner.run()
+        opened = Processes(inodes={identity(old / 'normalized.sqlite')})
+        with patch('scripts.published_artifact_retention.Processes.scan', return_value=opened):
+            owner.apply(report)
+        self.assertTrue(old.exists())
+        self.assertEqual(report['applied']['deleted'], [])
+        self.assertEqual(report['applied']['skipped'][0]['reason'], 'candidate-no-longer-eligible')
+
+    def test_normalized_latest_disappearing_between_plan_and_apply_skips(self):
+        old = self.normalized_entry('old', age=48)
+        latest = self.normalized_entry('latest', age=13)
+        owner = Retention(self.data, self.cache, now=self.now, processes=Processes())
+        report = owner.run()
+        self.assertEqual(self.row(report, old)['decision'], 'DELETE')
+        for file in latest.iterdir():
+            file.unlink()
+        latest.rmdir()
+        with patch('scripts.published_artifact_retention.Processes.scan', return_value=Processes()):
+            owner.apply(report)
+        self.assertTrue(old.exists())
+        self.assertEqual(report['applied']['deleted'], [])
+        self.assertEqual(report['applied']['skipped'][0]['reason'], 'candidate-no-longer-eligible')
+
+    def test_normalized_held_provider_lock_keeps_generations(self):
+        import fcntl
+        old = self.normalized_entry('old', age=48)
+        self.normalized_entry('latest', age=13)
+        lock = old.parent / '.lock'
+        lock.touch()
+        with lock.open('rb') as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            row = self.row(self.retain(), old)
+        self.assertEqual(row['decision'], 'KEEP')
+        self.assertEqual(row['reason'], 'running-build')
+
+    def test_daily_normalized_generations_have_bounded_physical_footprint(self):
+        root = self.data / 'provider-artifacts/normalized'
+        root.mkdir(parents=True)
+        start = self.now
+        footprints = []
+        for day in range(7):
+            self.now = start + day * 24 * 3600
+            latest = self.normalized_entry(f'key-{day}', age=0)
+            applied = self.retain(apply=True)
+            retained = list((root / 'provider').glob('*/normalized.sqlite'))
+            self.assertEqual(retained, [latest / 'normalized.sqlite'])
+            self.assertEqual(applied['applied']['skipped'], [])
+            footprints.append(physical_accounting((root,))['union_allocated_bytes'])
+        self.assertEqual(len(set(footprints)), 1, footprints)
+
+    def test_normalized_provider_summary_deduplicates_hardlinks(self):
+        first = self.normalized_entry('first', age=48)
+        second = self.normalized_entry('second', age=24)
+        self.normalized_entry('latest', age=13)
+        self.normalized_entry('only', age=48, provider='other')
+        (second / 'normalized.sqlite').unlink()
+        os.link(first / 'normalized.sqlite', second / 'normalized.sqlite')
+        shared_bytes = (first / 'normalized.sqlite').stat().st_blocks * 512
+        report = self.retain()
+        rows = [self.row(report, path) for path in (first, second)]
+        expected_files = shared_bytes + sum(
+            (path / 'manifest.json').stat().st_blocks * 512 for path in (first, second)
+        )
+        self.assertEqual(sum(row['reclaimable_bytes'] for row in rows), expected_files)
+        by_provider = report['summary']['normalized_by_provider']
+        expected_union = physical_accounting((first, second))['union_reclaimable_bytes']
+        self.assertEqual(by_provider['provider']['reclaimable_bytes'], expected_union)
+        self.assertEqual(by_provider['provider']['candidates'], 2)
+        self.assertEqual(by_provider['other']['candidates'], 0)
+        self.assertEqual(by_provider['other']['reclaimable_bytes'], 0)
+
+    def test_normalized_external_hardlink_is_not_counted_as_reclaimable(self):
+        old = self.normalized_entry('old', age=48)
+        self.normalized_entry('latest', age=13)
+        outside = self.data / 'unreferenced-hardlink.sqlite'
+        os.link(old / 'normalized.sqlite', outside)
+        report = self.retain()
+        self.assertEqual(self.row(report, old)['decision'], 'DELETE')
+        manifest_bytes = (old / 'manifest.json').stat().st_blocks * 512
+        self.assertEqual(self.row(report, old)['reclaimable_bytes'], manifest_bytes)
+        directory_bytes = old.stat().st_blocks * 512
+        self.assertEqual(report['summary']['normalized_by_provider']['provider']['reclaimable_bytes'],
+                         manifest_bytes + directory_bytes)
+        applied = self.retain(apply=True)
+        self.assertTrue(outside.exists())
+        self.assertFalse(old.exists())
+        self.assertEqual(applied['applied']['reclaimed_bytes'], manifest_bytes + directory_bytes)
+
+    def test_normalized_unresolved_dependency_keeps_candidates(self):
+        old = self.normalized_entry('old', age=48)
+        self.normalized_entry('latest', age=13)
+        (self.active / 'release.json').write_text(json.dumps({
+            'runtimeDependencies': [{'path': 'missing.sqlite'}],
+        }))
+        report = self.retain()
+        self.assertEqual(self.row(report, old)['decision'], 'KEEP')
+        self.assertTrue(report['summary']['errors'])
+        self.assertEqual(report['summary']['normalized_by_provider']['provider']['candidates'], 0)
+
     @staticmethod
     def proc_status(proc, uid=None):
         uid = os.getuid() if uid is None else uid
