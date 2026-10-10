@@ -406,6 +406,23 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                 self.assertEqual(aliased["requestedCityID"], "koeln")
                 self.assertEqual(aliased["lines"][0]["line"], "7")
 
+    def test_bounded_board_queries_only_the_requested_number_of_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "current.sqlite"
+            write_database(path, "bounded-limit")
+            with StaticDeparturesHTTPServer(path) as server:
+                with mock.patch.object(server.database, "board", wraps=server.database.board) as board:
+                    for limit in (1, 24, 100):
+                        for upper_bound in ("", "&to=2026-07-29T00:10:00%2B02:00"):
+                            result = server.get(
+                                "/static-departures/board?cityID=dresden&stopID=stop-parent"
+                                "&from=2026-07-28T23:50:00%2B02:00"
+                                + upper_bound + f"&limit={limit}"
+                            )["departures"]
+                            self.assertEqual(board.call_args.args[2], limit)
+                            self.assertEqual(len(result), 1)
+                            self.assertEqual(result[0]["scheduledTime"], "23:55:00")
+
     def test_apple_store_notification_without_signed_payload_returns_bad_request(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "current.sqlite"

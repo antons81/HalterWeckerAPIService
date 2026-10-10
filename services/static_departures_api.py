@@ -2303,7 +2303,9 @@ class Handler(BaseHTTPRequestHandler):
                 _, timezone_name, _, _ = self.database.city_departure_mode(resolved_city)
                 from_date = parse_iso_boundary(query.get("from", [None])[0], timezone_name)
                 to_date = parse_iso_boundary(query.get("to", [None])[0], timezone_name)
-                departures = self.database.board(resolved_city, stop, 1000 if from_date or to_date else limit, from_date, to_date)
+                # All board backends filter the lower boundary before LIMIT and sort by instant.
+                # The upper boundary can only discard a chronological suffix.
+                departures = self.database.board(resolved_city, stop, limit, from_date, to_date)
                 if from_date or to_date:
                     departures = [
                         item for item in departures
