@@ -143,8 +143,8 @@ class StaticDeparturesMultiProviderTests(unittest.TestCase):
             try:
                 base_lines = legacy.lines("fixture-israel", "S1")
                 self.assertEqual(snapshot.lines("fixture-israel", "S1"), base_lines * 2)
-                base_board = legacy.board("fixture-israel", "S1", 10, now, now)
-                merged_board = snapshot.board("fixture-israel", "S1", 3, now, now)
+                base_board = legacy.board("fixture-israel", "S1", 10, now, now.replace(hour=10))
+                merged_board = snapshot.board("fixture-israel", "S1", 3, now, now.replace(hour=10))
                 self.assertEqual(merged_board, [row for item in base_board for row in (item, item)][:3])
                 base_departures = legacy.external_departures_for(
                     "fixture-israel", "S1", 10, now, "Asia/Jerusalem", now_provider=lambda: now
@@ -177,7 +177,7 @@ class StaticDeparturesMultiProviderTests(unittest.TestCase):
                 self.assertTrue(all(row["routeID"].startswith("israel:") for row in lines))
                 self.assertFalse(any(row["routeID"].startswith("israel:israel:") for row in lines))
 
-                board = snapshot.board("fixture-israel", "S1", 10, now, now)
+                board = snapshot.board("fixture-israel", "S1", 10, now, now.replace(hour=10))
                 self.assertTrue(board)
                 self.assertTrue(all(row["tripID"].startswith("israel:") for row in board))
                 self.assertTrue(all(row["routeID"].startswith("israel:") for row in board))

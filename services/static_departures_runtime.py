@@ -21,6 +21,7 @@ from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
 if __package__:
+    from .gtfs_board_window import BOARD_EPOCH_SQL, board_predicate, departure_instant
     from scripts.provider_artifact_capabilities import (
         HYBRID_RUNTIME,
         SHARD_RUNTIME,
@@ -35,6 +36,7 @@ if __package__:
         VBB_PROVIDER_ID,
     )
 else:
+    from gtfs_board_window import BOARD_EPOCH_SQL, board_predicate, departure_instant
     from provider_artifact_capabilities import (
         HYBRID_RUNTIME,
         SHARD_RUNTIME,
@@ -1065,10 +1067,10 @@ class ProviderSnapshot:
 
     def board(self, city_id: str, stop_id: str, limit: int, from_date: datetime | None = None, to_date: datetime | None = None) -> list[dict[str, object]]:
         mode = self._mode(city_id)
-        service_from = (from_date.date() - timedelta(days=1)).strftime("%Y%m%d") if from_date else "00000000"
-        service_to = to_date.date().strftime("%Y%m%d") if to_date else "99999999"
-        requested_date = (from_date or to_date or datetime.now()).date()
-        self._ensure_temporal_covers(requested_date)
+        boundary = from_date or to_date or datetime.now(ZoneInfo(mode.timezone))
+        if boundary.tzinfo is None:
+            boundary = boundary.replace(tzinfo=ZoneInfo(mode.timezone))
+        self._ensure_temporal_covers(boundary.astimezone(ZoneInfo(mode.timezone)).date())
         stop_prefixes, identifier_prefixes = self._prefixes(city_id)
         query_stop_id = self._query_stop_id(city_id, stop_id)
         if mode.mode == "exact-stop-with-parent-fallback":
@@ -1078,6 +1080,7 @@ class ProviderSnapshot:
             predicate = f"rs.canonical_stop_id IN ({','.join('?' for _ in candidates)})"
             parameters = candidates
         connection = self._connection()
+        time_predicate, time_parameters = board_predicate(connection, mode.timezone, from_date, to_date)
         raw_columns = self._table_columns("raw_stops")
         route_columns = self._table_columns("routes")
         has_agencies = bool(self._table_columns("agencies"))
@@ -1104,11 +1107,11 @@ class ProviderSnapshot:
             LEFT JOIN routes r ON r.route_id=t.route_id
             {agency_join}
             LEFT JOIN raw_stops destination_stops ON destination_stops.stop_id=t.terminal_stop_id
-            WHERE {predicate} AND a.service_date BETWEEN ? AND ?
-            ORDER BY a.service_date,s.departure_seconds,t.trip_id,s.stop_sequence
+            WHERE {predicate} AND {time_predicate}
+            ORDER BY {BOARD_EPOCH_SQL},t.trip_id,s.stop_sequence
             LIMIT ?
             """,
-            (*parameters, service_from, service_to, limit),
+            (*parameters, *time_parameters, limit),
         ).fetchall()
         result = []
         for service_date, departure_time, _seconds, sequence, raw_stop, trip_id, route_id, line, destination, direction, terminal, platform_value, floor_value, parent, location, description, agency_value, operator, route_type_value in rows:
@@ -1507,11 +1510,14 @@ class ReleaseSnapshot:
         decorated: list[tuple[tuple[object, ...], dict[str, object]]] = []
         for provider_id in providers:
             provider_rows = batches[provider_id]
+            timezone_name = self.catalog.provider_mode(resolved_city, provider_id).timezone
             for value in provider_rows:
                 decorated.append((
                     (
-                        str(value.get("serviceDate") or ""),
-                        self._seconds(value.get("scheduledTime")),
+                        departure_instant(
+                            value["serviceDate"], value["scheduledTime"],
+                            timezone_name,
+                        ).timestamp(),
                         str(value.get("tripID") or ""),
                         int(value.get("stopSequence") or 0),
                         provider_id,

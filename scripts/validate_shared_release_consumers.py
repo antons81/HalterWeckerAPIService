@@ -24,17 +24,27 @@ STATIC_CITY_PROBE = '''
 import json, sys
 from urllib.parse import urlencode
 from urllib.request import urlopen
-plan = json.load(open(sys.argv[1]))
+from static_departures_api import departure_datetime, parse_iso_boundary
+with open(sys.argv[1]) as source:
+    plan = json.load(source)
 root = "http://127.0.0.1:8080"
 samples = {}
 def board(city, stop, start, end):
-    query = urlencode(dict(cityID=city, stopID=stop, limit=1, **{"from": start, "to": end}))
+    check = next(row for row in plan["checks"] if row["cityID"] == city)
+    zone = check.get("timezone", "Europe/Berlin")
+    lower, upper = parse_iso_boundary(start, zone).timestamp(), parse_iso_boundary(end, zone).timestamp()
+    query = urlencode(dict(cityID=city, stopID=stop, limit=3, **{"from": start, "to": end}))
     with urlopen(root + "/static-departures/board?" + query, timeout=30) as response:
         if response.status != 200:
             raise RuntimeError("candidate city is unavailable: " + city)
         payload = json.load(response)
     if not isinstance(payload.get("departures"), list):
         raise RuntimeError("invalid candidate board: " + city)
+    epochs = [departure_datetime(row, zone).timestamp() for row in payload["departures"]]
+    if any(not lower <= value <= upper for value in epochs):
+        raise RuntimeError("departure outside candidate board interval: " + city)
+    if epochs != sorted(epochs):
+        raise RuntimeError("candidate board is not chronological: " + city)
     return payload["departures"]
 for check in plan["checks"]:
     city, stop = check["cityID"], check["stopID"]

@@ -651,12 +651,12 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                 subway_lines = legacy.lines("toronto", "ttc-subway:100")
                 germany_lines = legacy.lines("germany", "100")
                 single_lines = legacy.lines("single-provider", "single:100")
-                toronto_board = legacy.board("toronto", "100", 10, board_from, board_from)
-                surface_board = legacy.board("toronto", "ttc-surface:100", 10, board_from, board_from)
-                subway_board = legacy.board("toronto", "ttc-subway:100", 10, board_from, board_from)
-                germany_board = legacy.board("germany", "100", 10, board_from, board_from)
+                toronto_board = legacy.board("toronto", "100", 10, board_from, board_from.replace(hour=9))
+                surface_board = legacy.board("toronto", "ttc-surface:100", 10, board_from, board_from.replace(hour=9))
+                subway_board = legacy.board("toronto", "ttc-subway:100", 10, board_from, board_from.replace(hour=9))
+                germany_board = legacy.board("germany", "100", 10, board_from.astimezone(ZoneInfo("Europe/Berlin")).replace(hour=7), board_from.astimezone(ZoneInfo("Europe/Berlin")).replace(hour=9))
                 foreign_lines = legacy.lines("toronto", "foreign:100")
-                foreign_board = legacy.board("toronto", "foreign:100", 10, board_from, board_from)
+                foreign_board = legacy.board("toronto", "foreign:100", 10, board_from, board_from.replace(hour=9))
             finally:
                 legacy.close()
 

@@ -2,6 +2,7 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY services/gtfs_board_window.py /app/gtfs_board_window.py
 COPY services/static_departures_api.py /app/static_departures_api.py
 COPY services/static_departures_runtime.py /app/static_departures_runtime.py
 COPY services/vbb_overlay_provider.py /app/vbb_overlay_provider.py

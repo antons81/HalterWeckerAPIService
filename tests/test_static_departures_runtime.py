@@ -391,8 +391,8 @@ class StaticDeparturesRuntimeTests(unittest.TestCase):
                     ),
                 )
                 self.assertEqual(
-                    shadow.board("fixture-israel", "S1", 10, now, now),
-                    legacy.board("fixture-israel", "S1", 10, now, now),
+                    shadow.board("fixture-israel", "S1", 10, now, now.replace(hour=10)),
+                    legacy.board("fixture-israel", "S1", 10, now, now.replace(hour=10)),
                 )
                 self.assertEqual(
                     shadow.trip_details("fixture-israel", "T1", str(stop_data), "2026-01-05"),
@@ -429,8 +429,8 @@ class StaticDeparturesRuntimeTests(unittest.TestCase):
             snapshot = ReleaseSnapshot.open(release)
             try:
                 self.assertEqual(
-                    snapshot.board("fixture-israel", "S1", 10, now, now),
-                    snapshot.board("fixture-israel", "israel:S1", 10, now, now),
+                    snapshot.board("fixture-israel", "S1", 10, now, now.replace(hour=10)),
+                    snapshot.board("fixture-israel", "israel:S1", 10, now, now.replace(hour=10)),
                 )
             finally:
                 snapshot.close()
@@ -901,8 +901,8 @@ class StaticDeparturesRuntimeTests(unittest.TestCase):
                     ),
                 )
                 self.assertEqual(
-                    backend.board("fixture-israel", "S1", 10, now, now),
-                    legacy.board("fixture-israel", "S1", 10, now, now),
+                    backend.board("fixture-israel", "S1", 10, now, now.replace(hour=10)),
+                    legacy.board("fixture-israel", "S1", 10, now, now.replace(hour=10)),
                 )
                 self.assertEqual(
                     backend.trip_details("fixture-israel", "T1", str(stop_data), "2026-01-05"),

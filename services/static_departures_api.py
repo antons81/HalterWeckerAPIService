@@ -82,6 +82,7 @@ from stm_gateway import (
     STM_VEHICLE_POSITIONS_PATH,
     STM_NAMESPACE,
 )
+from gtfs_board_window import BOARD_EPOCH_SQL, board_predicate, departure_instant
 from static_departures_runtime import (
     RuntimeUnavailable,
     hybrid_backend_from_environment,
@@ -1789,9 +1790,7 @@ class Database:
         from_date: datetime | None = None,
         to_date: datetime | None = None
     ) -> list[dict[str, object]]:
-        service_from = (from_date.date() - timedelta(days=1)).strftime("%Y%m%d") if from_date else "00000000"
-        service_to = to_date.date().strftime("%Y%m%d") if to_date else "99999999"
-        mode, _, stop_id_prefix, identifier_prefix = self.city_departure_mode(city_id)
+        mode, timezone_name, stop_id_prefix, identifier_prefix = self.city_departure_mode(city_id)
         stop_prefixes, identifier_prefixes = self.city_departure_prefixes(city_id)
         explicit_ids = self._explicit_provider_stop_ids(city_id, stop_id)
         if explicit_ids == ():
@@ -1805,6 +1804,9 @@ class Database:
             stop_predicate = f"rs.canonical_stop_id IN ({','.join('?' for _ in canonical_ids)})"
             stop_parameters = canonical_ids
         with self.lock:
+            time_predicate, time_parameters = board_predicate(
+                self._connection(), timezone_name, from_date, to_date
+            )
             raw_stop_columns = self._table_columns("raw_stops")
             route_columns = self._table_columns("routes")
             has_agencies = bool(self._table_columns("agencies"))
@@ -1837,11 +1839,11 @@ class Database:
                 LEFT JOIN routes r ON r.route_id=t.route_id
                 {agency_join}
                 LEFT JOIN raw_stops AS destination_stops ON destination_stops.stop_id=t.terminal_stop_id
-                WHERE {stop_predicate} AND a.service_date BETWEEN ? AND ?
-                ORDER BY a.service_date,s.departure_seconds,t.trip_id,s.stop_sequence
+                WHERE {stop_predicate} AND {time_predicate}
+                ORDER BY {BOARD_EPOCH_SQL},t.trip_id,s.stop_sequence
                 LIMIT ?
                 """,
-                (*stop_parameters, service_from, service_to, limit)
+                (*stop_parameters, *time_parameters, limit)
             )
             try:
                 rows = cursor.fetchall()
@@ -1889,9 +1891,9 @@ def parse_iso_boundary(value: str | None, timezone_name: str = DEFAULT_TIMEZONE)
 
 
 def departure_datetime(item: dict[str, object], timezone_name: str = DEFAULT_TIMEZONE) -> datetime:
-    service_date = datetime.fromisoformat(str(item["serviceDate"])).replace(tzinfo=ZoneInfo(timezone_name))
-    hour, minute, second = (int(part) for part in str(item["scheduledTime"]).split(":"))
-    return service_date + timedelta(hours=hour, minutes=minute, seconds=second)
+    if item.get("departureDateTime"):
+        return datetime.fromisoformat(str(item["departureDateTime"]))
+    return departure_instant(item["serviceDate"], item["scheduledTime"], timezone_name)
 
 
 def bounded_limit(raw: str | None) -> int:
@@ -2305,8 +2307,8 @@ class Handler(BaseHTTPRequestHandler):
                 if from_date or to_date:
                     departures = [
                         item for item in departures
-                        if (from_date is None or departure_datetime(item, timezone_name) >= from_date)
-                        and (to_date is None or departure_datetime(item, timezone_name) <= to_date)
+                        if (from_date is None or departure_datetime(item, timezone_name).timestamp() >= from_date.timestamp())
+                        and (to_date is None or departure_datetime(item, timezone_name).timestamp() <= to_date.timestamp())
                     ][:limit]
                 payload = {"cityID": resolved_city, "stopID": stop, "departures": departures}
                 if resolved_city != city:

@@ -38,7 +38,7 @@ class ConsumerPreflightTests(unittest.TestCase):
             self.assertEqual(parsed.netloc, "127.0.0.1:8080")
             city = parse_qs(parsed.query)["cityID"][0]
             requests.append(city)
-            result = io.StringIO(json.dumps({"departures": [] if fail and city == "non-pilot-city" else [{"tripID": "trip"}]}))
+            result = io.StringIO(json.dumps({"departures": [] if fail and city == "non-pilot-city" else [{"tripID": "trip", "serviceDate": "2026-10-10", "scheduledTime": "08:00:00"}]}))
             result.status = 200
             return result
         with patch.object(sys, "argv", ["probe", "plan.json"]), \
