@@ -5,7 +5,8 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from contextlib import closing
+from unittest.mock import Mock, patch
 from datetime import date, datetime
 from io import StringIO
 from pathlib import Path
@@ -223,6 +224,9 @@ class StaticDeparturesRuntimeTests(unittest.TestCase):
             [date(2026, 1, 5)],
         )
         legacy_path = helper._legacy_database(root, feed, sources_path, stop_data)
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            connection.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            connection.commit()
 
         release = root / "release-x"
         structural_dir = release / "providers" / ISRAEL_PROVIDER_ID / "structural"
@@ -544,6 +548,63 @@ class StaticDeparturesRuntimeTests(unittest.TestCase):
 
     def test_hybrid_flag_is_default_off(self) -> None:
         self.assertIsNone(hybrid_backend_from_environment(object(), environ={}))
+        self.assertIsNone(hybrid_backend_from_environment(object(), environ={
+            PROVIDER_RUNTIME_MODE_ENV: "legacy", HYBRID_ENV: "1",
+        }))
+
+    def test_hybrid_mode_prevents_auto_provider_only_selection(self) -> None:
+        for values in (
+            {PROVIDER_RUNTIME_MODE_ENV: "hybrid", PROVIDER_RUNTIME_ENV: "1"},
+            {PROVIDER_RUNTIME_MODE_ENV: "auto", HYBRID_ENV: "1", PROVIDER_RUNTIME_ENV: "1"},
+        ):
+            with self.subTest(values=values):
+                self.assertFalse(provider_runtime_enabled(environ=values))
+
+    def test_named_nonpilot_cities_fall_back_for_boards_lines_and_registries(self) -> None:
+        legacy = Mock()
+        legacy.board.return_value = [{"backend": "legacy"}]
+        legacy.lines.return_value = [{"backend": "legacy"}]
+        legacy.resolve_city.side_effect = lambda city: city
+        legacy.city_stop_registry.return_value = {"stop"}
+        legacy.city_child_stop_ids.return_value = {"stop", "child"}
+        legacy.fintraffic_provider_contexts.return_value = ("hsl-context",)
+        legacy.external_gtfs_provider_contexts.return_value = ("provider-context",)
+        snapshot = _HybridFakeSnapshot("release-a", {
+            "wien": ("vor",), "helsinki": ("finland-hsl",),
+            "israel": ("israel-mot",), "toronto": ("ttc-surface",),
+            "oslo": ("norway",), "stockholm": ("sweden",), "chicago": ("cta-chicago",),
+        }, {})
+        backend = HybridStaticDeparturesBackend(legacy, _HybridFakeManager(snapshot),
+                                               ("israel-mot", "ttc-surface", "norway", "sweden", "cta-chicago"))
+        try:
+            for city in ("wien", "helsinki", "bochum", "another-non-pilot-city"):
+                with self.subTest(city=city):
+                    self.assertEqual(backend.board(city, "stop", 1)[0]["backend"], "legacy")
+                    self.assertEqual(backend.lines(city, "stop")[0]["backend"], "legacy")
+                    self.assertEqual(backend.city_stop_registry(city), {"stop"})
+                    self.assertEqual(backend.city_child_stop_ids(city, {"stop"}, "", "non-pilot"), {"stop", "child"})
+            for city in ("israel", "toronto", "oslo", "stockholm", "chicago"):
+                with self.subTest(city=city):
+                    self.assertEqual(backend.board(city, "stop", 1)[0]["backend"], "shard")
+            self.assertEqual(backend.fintraffic_provider_contexts("helsinki"), ("hsl-context",))
+            self.assertEqual(backend.external_gtfs_provider_contexts("helsinki", "finland-hsl"), ("provider-context",))
+        finally:
+            backend.close()
+
+    def test_health_rejects_fallback_from_another_generation(self) -> None:
+        snapshot = _HybridFakeSnapshot("candidate", {}, {})
+        snapshot.catalog.metadata = lambda: {"releaseID": "candidate"}
+        legacy = Mock()
+        legacy.meta.return_value = {"releaseID": "old", "databaseVersion": "old-db"}
+        backend = HybridStaticDeparturesBackend(legacy, _HybridFakeManager(snapshot), (ISRAEL_PROVIDER_ID,))
+        try:
+            with self.assertRaisesRegex(RuntimeUnavailable, "fallback database release mismatch"):
+                backend.meta()
+            legacy.meta.return_value = {"releaseID": "candidate", "databaseVersion": "new-db"}
+            self.assertEqual(backend.meta()["runtimeMode"], "hybrid")
+            self.assertEqual(backend.meta()["fallbackReleaseID"], "candidate")
+        finally:
+            backend.close()
 
     def test_provider_runtime_auto_detects_incremental_release_without_opening_legacy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -590,6 +651,26 @@ class StaticDeparturesRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeUnavailable, HYBRID_RELEASE_POINTER_ENV):
             hybrid_backend_from_environment(object(), environ={HYBRID_ENV: "1"})
 
+    def test_compact_fallback_rejects_wrong_or_malformed_runtime_contract(self) -> None:
+        for providers in ('["germany"]', '{"invalid":true}', 'broken'):
+            legacy = Mock()
+            legacy.meta.return_value = {"fallbackProfile": "hybrid-only", "shardProviderIDs": providers}
+            with self.assertRaisesRegex(RuntimeUnavailable, "contract mismatch"):
+                hybrid_backend_from_environment(legacy, environ={
+                    HYBRID_ENV: "1", HYBRID_RELEASE_POINTER_ENV: "/missing",
+                    "HALTEWECKER_STATIC_DEPARTURES_HYBRID_PROVIDERS": ISRAEL_PROVIDER_ID,
+                })
+
+    def test_compact_fallback_cannot_start_as_legacy(self) -> None:
+        import static_departures_api as api
+        legacy = Mock()
+        legacy.meta.return_value = {"fallbackProfile": "hybrid-only"}
+        with patch.dict("os.environ", {PROVIDER_RUNTIME_MODE_ENV: "legacy"}, clear=True), \
+             patch.object(api, "Database", return_value=legacy):
+            with self.assertRaisesRegex(RuntimeUnavailable, "requires the validated hybrid"):
+                api.validate_fallback_runtime(legacy)
+        legacy.close.assert_called_once()
+
     def test_hybrid_factory_opens_real_release_manager_when_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -608,6 +689,27 @@ class StaticDeparturesRuntimeTests(unittest.TestCase):
             self.assertIsInstance(backend, HybridStaticDeparturesBackend)
             self.assertEqual(backend.manager.active_release_id, "release-x")
             backend.close()
+
+    def test_compact_fallback_accepts_the_matching_shard_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            legacy_path, release, _stop_data = self._build_fixture(Path(temporary))
+            pointer = Path(temporary) / "current-release"
+            pointer.symlink_to(release, target_is_directory=True)
+            with closing(sqlite3.connect(legacy_path)) as connection:
+                connection.executemany("INSERT INTO metadata VALUES (?,?)", [
+                    ("fallbackProfile", "hybrid-only"),
+                    ("shardProviderIDs", json.dumps([ISRAEL_PROVIDER_ID])),
+                ])
+                connection.commit()
+            legacy = Database(str(legacy_path))
+            backend = hybrid_backend_from_environment(legacy, environ={
+                HYBRID_ENV: "1", HYBRID_RELEASE_POINTER_ENV: str(pointer),
+                "HALTEWECKER_STATIC_DEPARTURES_HYBRID_PROVIDERS": ISRAEL_PROVIDER_ID,
+            })
+            try:
+                self.assertEqual(backend.manager.active_release_id, "release-x")
+            finally:
+                backend.close()
 
     def test_hybrid_routes_pilot_nonpilot_and_mixed_scopes(self) -> None:
         legacy = _HybridFakeLegacy()

@@ -1,9 +1,12 @@
 import os
+import json
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+from scripts.artifact_provenance import artifact_provenance
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -11,6 +14,43 @@ PIPELINE = REPOSITORY_ROOT / "scripts" / "run_static_departures_pipeline.sh"
 
 
 class StaticDeparturesPipelineTests(unittest.TestCase):
+    def test_standalone_import_cannot_overwrite_an_incremental_release(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = root / "releases/immutable"
+            release.mkdir(parents=True)
+            (release / "release.json").write_text('{"releaseID":"immutable"}')
+            database = release / "departures.sqlite"
+            database.write_bytes(b"keep")
+            environment = os.environ.copy()
+            environment.update({
+                "REPO": str(REPOSITORY_ROOT), "DATA_ROOT": str(root),
+                "STOP_DATA_ENV_FILE": str(root / "missing.env"),
+                "WMATA_API_KEY": "fixture", "WMATA_SECRET_FILE": str(root / "missing-secret.env"),
+                "GTFS_URL": "https://example.invalid/germany.zip",
+                "RELEASE_ID": "immutable", "SKIP_ACTIVATION": "0", "READINESS_ONLY": "0",
+            })
+            result = subprocess.run(["bash", str(PIPELINE)], env=environment, text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("immutable incremental release requires", result.stderr)
+            self.assertEqual(database.read_bytes(), b"keep")
+            self.assertFalse((release / "departures-next.sqlite").exists())
+
+    def _write_artifact_fixture(self, root: Path, release_dir: Path) -> Path:
+        archive = release_dir / "germany.zip"
+        archive.write_bytes(b"fixture")
+        sources = json.loads((REPOSITORY_ROOT / "config/external-gtfs-sources.json").read_text())
+        payload = {"sources": {"germany": {"path": str(archive)}},
+                   "external": {source["id"]: {"path": str(archive)} for source in sources
+                                if source.get("importIntoStaticDepartures") is True}}
+        ireland = release_dir / "external-artifacts/ireland"
+        ireland.mkdir(parents=True)
+        (ireland / "stops.txt").write_text("stop_id,stop_name\nA,Alpha\n")
+        digest, size = artifact_provenance(ireland)
+        payload["external"]["ireland"] = {"path": str(ireland), "sha256": digest, "size": size}
+        (release_dir / "gtfs-artifacts.json").write_text(json.dumps(payload))
+        return archive
+
     def test_provider_runtime_mounts_data_root_without_legacy_database_file(self) -> None:
         compose_file = REPOSITORY_ROOT / "deploy" / "static-departures.compose.yml"
         compose = compose_file.read_text(encoding="utf-8")
@@ -22,7 +62,8 @@ class StaticDeparturesPipelineTests(unittest.TestCase):
         )
 
     def _run_readiness_with_mock_docker(
-        self, root: Path, *, health_release_id: str, runtime_providers: str | None = None
+        self, root: Path, *, health_release_id: str, runtime_providers: str | None = None,
+        pinned_image: str | None = None, conflicting_environment: bool = False
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         docker_log = root / "docker.log"
         docker_state = root / "docker-state"
@@ -35,6 +76,7 @@ class StaticDeparturesPipelineTests(unittest.TestCase):
             f"state={str(docker_state)!r}\n"
             "printf '%s\\n' \"$*\" >> \"$log\"\n"
             "if [[ \"$1\" == inspect ]]; then\n"
+            "  if [[ \"${2:-}\" == --format ]]; then echo sha256:tested; exit 0; fi\n"
             "  name=\"${2:-}\"\n"
             "  current=\"$(cat \"$state\")\"\n"
             "  if [[ \"$name\" == static-departures-api && \"$current\" == canonical ]]; then exit 0; fi\n"
@@ -62,7 +104,7 @@ class StaticDeparturesPipelineTests(unittest.TestCase):
         environment_file.write_text(
             "GTFS_URL=https://example.invalid/german.zip\n" + (
                 "HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS=israel-mot,germany\n" if runtime_providers else ""
-            ),
+            ) + ("STATIC_DEPARTURES_IMAGE=sha256:wrong\nHALTEWECKER_RUNTIME_PROVIDER_IDS=wrong-provider\n" if conflicting_environment else ""),
             encoding="utf-8",
         )
         wmata_file = root / "wmata.env"
@@ -70,6 +112,8 @@ class StaticDeparturesPipelineTests(unittest.TestCase):
         environment = os.environ.copy()
         if runtime_providers is not None:
             environment["HALTEWECKER_RUNTIME_PROVIDER_IDS"] = runtime_providers
+        if pinned_image is not None:
+            environment["STATIC_DEPARTURES_IMAGE"] = pinned_image
         environment.update(
             {
                 "REPO": str(REPOSITORY_ROOT),
@@ -90,6 +134,32 @@ class StaticDeparturesPipelineTests(unittest.TestCase):
             check=False,
         )
         return result, docker_log
+
+    def test_pinned_activation_runs_exact_preflight_image_without_build_or_pull(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            result, log = self._run_readiness_with_mock_docker(Path(temporary), health_release_id="release-a", pinned_image="sha256:tested")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = log.read_text()
+            self.assertIn("compose -p haltewecker-static-release-a", calls)
+            self.assertIn("--no-build --pull never --no-deps --force-recreate", calls)
+            self.assertNotIn("--build", calls)
+
+    def test_changed_image_restores_preserved_container(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            result, log = self._run_readiness_with_mock_docker(Path(temporary), health_release_id="release-a", pinned_image="sha256:different")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("activated image differs", result.stderr)
+            self.assertIn("start static-departures-api", log.read_text())
+
+    def test_pinned_contract_survives_conflicting_environment_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result, _log = self._run_readiness_with_mock_docker(
+                root, health_release_id="release-a", pinned_image="sha256:tested",
+                runtime_providers="israel-mot,germany", conflicting_environment=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((root / "runtime-providers.log").read_text().strip(), "israel-mot,germany")
 
     def test_runtime_contract_overrides_stale_build_provider_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -194,7 +264,7 @@ class StaticDeparturesPipelineTests(unittest.TestCase):
             release_id = "release-a"
             release_dir = root / "releases" / release_id
             release_dir.mkdir(parents=True)
-            (release_dir / "gtfs-artifacts.json").write_text("{}", encoding="utf-8")
+            self._write_artifact_fixture(root, release_dir)
             (release_dir / "release-metadata.json").write_text(
                 '{"releaseID": "release-a"}', encoding="utf-8"
             )
@@ -271,7 +341,7 @@ class StaticDeparturesPipelineTests(unittest.TestCase):
             (release_dir / "release-metadata.json").write_text(
                 '{"releaseID": "release-a"}', encoding="utf-8"
             )
-            (release_dir / "gtfs-artifacts.json").write_text("{}", encoding="utf-8")
+            self._write_artifact_fixture(root, release_dir)
             (root / "static-departures-release").symlink_to("releases/release-a")
             importer_observation = root / "importer.env"
             mock_python = root / "python3"
@@ -317,6 +387,16 @@ class StaticDeparturesPipelineTests(unittest.TestCase):
                 importer_observation.read_text(encoding="utf-8").strip(),
                 "operator-secret-value",
             )
+            before = importer_observation.stat().st_mtime_ns
+            artifacts_path = release_dir / "gtfs-artifacts.json"
+            payload = json.loads(artifacts_path.read_text())
+            del payload["external"]["finland-hsl"]
+            artifacts_path.write_text(json.dumps(payload))
+            incomplete = subprocess.run(["bash", str(PIPELINE)], cwd=REPOSITORY_ROOT,
+                                        env=environment, text=True, capture_output=True)
+            self.assertNotEqual(incomplete.returncode, 0)
+            self.assertIn("incomplete release-scoped static import plan", incomplete.stderr)
+            self.assertEqual(importer_observation.stat().st_mtime_ns, before)
 
 
 if __name__ == "__main__":

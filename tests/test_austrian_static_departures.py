@@ -112,6 +112,9 @@ at:49:1349:23,ZG KH Nord,Pat:49:1349,A,0
 at:49:1349:24,Wien Hauptbahnhof,Pat:49:1349,B,0
 at:49:1349:25,Wien Hauptbahnhof,Pat:49:1349,C,0
 at:49:975:0:10,Wien Oper/Karlsplatz,,,0
+Pat:49:2000,Station ohne direkte Abfahrten,,,1
+at:49:2000:0:1,Station Plattform,Pat:49:2000,A,0
+at:49:2000:5,Station Alias,Pat:49:2000,,2
 """)
                 archive.writestr("routes.txt", """route_id,route_short_name,route_long_name
 tram-1,D,Tram D
@@ -119,6 +122,7 @@ bus-1,69A,Bus 69A
 """)
                 archive.writestr("trips.txt", """route_id,service_id,trip_id,trip_headsign,direction_id
 tram-1,weekday,trip-platform,Nußdorf,0
+tram-1,weekday,trip-station-platform,Nußdorf,0
 bus-1,weekday,trip-parent,Praterstern,1
 bus-1,removed,trip-removed,Oper,0
 """)
@@ -132,6 +136,7 @@ removed,20260730,2
                 archive.writestr("stop_times.txt", """trip_id,arrival_time,departure_time,stop_id,stop_sequence
 trip-platform,25:10:00,25:10:00,at:49:1349:23,1
 trip-platform,25:20:00,25:20:00,at:49:975:0:10,2
+trip-station-platform,08:15:00,08:15:00,at:49:2000:0:1,1
 trip-parent,10:00:00,10:00:00,Pat:49:1349,1
 trip-removed,11:00:00,11:00:00,at:49:1349:25,1
 """)
@@ -159,6 +164,7 @@ trip-removed,11:00:00,11:00:00,at:49:1349:25,1
                     ("at:49:1349:25",),
                     ("Pat:49:1349",),
                     ("at:49:975:0:10",),
+                    ("at:49:2000:5",),
                 ],
             )
             connection.commit()
@@ -179,5 +185,13 @@ trip-removed,11:00:00,11:00:00,at:49:1349:25,1
                 self.assertEqual(database.board("wien", "at:49:975:0:10", 10)[0]["line"], "D")
                 self.assertEqual(database.board("wien", "at:49:1349:24", 10)[0]["destination"], "Praterstern")
                 self.assertEqual(database.board("wien", "at:49:1349:25", 10), [])
+
+                station_board = database.board("wien", "at:49:2000:5", 10)
+                self.assertEqual([item["line"] for item in station_board], ["D"])
+                self.assertEqual(station_board[0]["platformStopID"], "at:49:2000:0:1")
+                self.assertEqual(
+                    [item["line"] for item in database.lines("wien", "at:49:2000:5")],
+                    ["D"],
+                )
             finally:
                 database.close()

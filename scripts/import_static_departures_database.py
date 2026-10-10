@@ -7,8 +7,10 @@ import argparse
 import json
 import os
 import sqlite3
+import sys
 import time
 import uuid
+from contextlib import nullcontext
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -94,6 +96,9 @@ else:
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+from scripts.static_departures_fallback import FALLBACK_PROFILE, excluded_fallback_providers
 
 
 @dataclass(frozen=True)
@@ -1208,8 +1213,15 @@ def main() -> None:
     parser.add_argument("--timezone", default="",
                         help="Service-window timezone for active services (default: first external source timezone, else Europe/Berlin).")
     parser.add_argument("--external-sources", default=str(REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"))
+    parser.add_argument("--shard-provider-ids", default="",
+                        help="Build hybrid fallback only; omit feeds fully served by these validated shards.")
     args = parser.parse_args()
     url_by_provider = parse_external_gtfs_url_args(args.external_gtfs_url)
+    shard_providers = tuple(dict.fromkeys(value.strip() for value in args.shard_provider_ids.split(",") if value.strip()))
+    if args.add_external and shard_providers:
+        raise ValueError("Hybrid fallback must be built as an isolated fresh database.")
+    excluded = excluded_fallback_providers(REPOSITORY_ROOT, shard_providers, sources_path=Path(args.external_sources)) if shard_providers else ()
+    url_by_provider = {provider: url for provider, url in url_by_provider.items() if provider not in excluded}
     next_path = Path(args.next)
     if not args.add_external:
         next_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1259,15 +1271,17 @@ def main() -> None:
         print(json.dumps({"databaseVersion": version, "externalCityCount": len(imported)}, separators=(",", ":")))
         return
 
-    if not args.gtfs_url.strip():
+    if not args.gtfs_url.strip() and "germany" not in excluded:
         raise ValueError("--gtfs-url is required unless --add-external is used.")
     if not args.next.strip():
         raise ValueError("--next is required unless --add-external is used.")
-    with load_gtfs_archive(args.gtfs_url) as archive:
+    archive_context = nullcontext(None) if "germany" in excluded else load_gtfs_archive(args.gtfs_url)
+    with archive_context as archive:
         connection = connect(next_path)
         try:
             imported_external_city_ids: set[str] = set()
-            timed_stage("germany", "populate_gtfs", lambda: populate_gtfs(connection, archive))
+            if archive is not None:
+                timed_stage("germany", "populate_gtfs", lambda: populate_gtfs(connection, archive))
             austrian_city_ids = configured_austrian_static_city_ids(Path(args.cities))
             if args.austrian_gtfs_dir:
                 austrian_city_ids = import_austrian_gtfs(
@@ -1290,7 +1304,7 @@ def main() -> None:
                         ),
                     )
             timed_stage("all", "canonical-stops", lambda: resolve_canonical_stops(connection))
-            city_ids = timed_stage("all", "city-memberships", lambda: populate_german_city_memberships(
+            city_ids = set() if archive is None else timed_stage("all", "city-memberships", lambda: populate_german_city_memberships(
                 connection, Path(args.stop_data), configured_external_city_ids(Path(args.cities), Path(args.swiss_cities))
             ))
             if austrian_city_ids:
@@ -1337,7 +1351,10 @@ def main() -> None:
                     "exact-stop-with-parent-fallback",
                     "Europe/Vienna",
                 )
-            populate_city_aliases(connection, load_city_aliases(Path(args.city_id_aliases)), city_ids)
+            aliases = load_city_aliases(Path(args.city_id_aliases))
+            if archive is None:
+                aliases = {alias: target for alias, target in aliases.items() if target in city_ids}
+            populate_city_aliases(connection, aliases, city_ids)
             version = str(uuid.uuid4())
             connection.executemany("INSERT INTO metadata VALUES (?, ?)", (
                 ("schemaVersion", "1"), ("databaseVersion", version),
@@ -1348,6 +1365,12 @@ def main() -> None:
                 ("validFrom", dates[0].isoformat()), ("validThrough", dates[-1].isoformat()),
                 ("timezone", DEFAULT_TIMEZONE),
             ))
+            if shard_providers:
+                connection.executemany("INSERT INTO metadata VALUES (?, ?)", (
+                    ("fallbackProfile", FALLBACK_PROFILE),
+                    ("shardProviderIDs", json.dumps(sorted(shard_providers))),
+                    ("excludedProviderIDs", json.dumps(excluded)),
+                ))
             if url_by_provider:
                 external_timezone = _external_window_timezone(
                     Path(args.external_sources), url_by_provider

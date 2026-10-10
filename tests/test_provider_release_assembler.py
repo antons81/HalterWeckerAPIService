@@ -34,6 +34,39 @@ from test_static_departures_multi_provider import (  # noqa: E402
 
 
 class ProviderReleaseAssemblerTests(unittest.TestCase):
+    def test_complete_fallback_database_is_pinned_without_copying(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            legacy, common, stop_data, providers = self._fixture(root / "fixture")
+            stop_release = json.loads((stop_data / "manifest.json").read_text()).get("releaseID")
+            with sqlite3.connect(legacy) as connection:
+                connection.execute("CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT)")
+                connection.execute("INSERT OR REPLACE INTO metadata VALUES ('releaseID','release-a')")
+                connection.execute("INSERT OR REPLACE INTO metadata VALUES ('stopDataReleaseID',?)", (stop_release,))
+            common_copy = self._common_for_release(common, root / "common-a.sqlite", "release-a")
+            assembly = assemble_release(root / "releases", "release-a", common_database=common_copy,
+                                        stop_data_root=stop_data, providers=providers, fallback_database=legacy)
+            fallback = assembly.release_directory / "departures.sqlite"
+            payload = json.loads(assembly.manifest_path.read_text())
+            self.assertEqual(fallback.stat().st_ino, legacy.stat().st_ino)
+            self.assertEqual(payload["fallbackDatabase"], {
+                "path": "departures.sqlite", "size": fallback.stat().st_size,
+                "sha256": hashlib.sha256(fallback.read_bytes()).hexdigest(),
+            })
+
+    def test_fallback_from_another_release_is_rejected_before_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            legacy, common, stop_data, providers = self._fixture(root / "fixture")
+            common_copy = self._common_for_release(common, root / "common-a.sqlite", "release-a")
+            with sqlite3.connect(legacy) as connection:
+                connection.execute("CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT)")
+                connection.execute("INSERT OR REPLACE INTO metadata VALUES ('releaseID','old')")
+            with self.assertRaisesRegex(ReleaseAssemblyError, "fallback database does not match"):
+                assemble_release(root / "releases", "release-a", common_database=common_copy,
+                                 stop_data_root=stop_data, providers=providers, fallback_database=legacy)
+            self.assertFalse((root / "releases/release-a").exists())
+
     def test_release_receipt_is_reused_for_runtime_provider_subset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             _, release = StaticDeparturesMultiProviderTests()._build_fixture(Path(temporary), provider_count=2)

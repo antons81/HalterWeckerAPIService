@@ -2233,12 +2233,24 @@ class HybridStaticDeparturesBackend:
 
     def meta(self) -> dict[str, str]:
         with self.manager.acquire_snapshot() as lease:
-            return lease.snapshot.catalog.metadata()
+            metadata = lease.snapshot.catalog.metadata()
+            metadata["runtimeMode"] = "provider" if self.provider_only else "hybrid"
+            if not self.provider_only:
+                fallback = self.legacy.meta()
+                if fallback.get("releaseID") != lease.release_id:
+                    raise RuntimeUnavailable("hybrid fallback database release mismatch")
+                metadata["fallbackReleaseID"] = fallback["releaseID"]
+                metadata["fallbackDatabaseVersion"] = fallback["databaseVersion"]
+            return metadata
 
     def resolve_city(self, city_id: str) -> str:
         if VBBOverlayProviderAdapter.handles_city(city_id):
             return VBB_CITY_ID
         with self.manager.acquire_snapshot() as lease:
+            if not self.provider_only and not lease.snapshot.catalog.providers_for_city(
+                lease.snapshot.catalog.resolve_city(city_id)
+            ):
+                return self.legacy.resolve_city(city_id)
             return lease.snapshot.catalog.resolve_city(city_id)
 
     def city_stop_registry(self, city_id: str) -> set[str]:
@@ -2246,6 +2258,9 @@ class HybridStaticDeparturesBackend:
             if VBBOverlayProviderAdapter.handles_city(city_id):
                 return self._vbb_adapter(lease.snapshot).city_stop_registry()
             resolved_city = lease.snapshot.catalog.resolve_city(city_id)
+            scope = self._scope(lease.snapshot, city_id, None, self.eligible_provider_ids)
+            if scope.backend == "legacy" and not self.provider_only:
+                return self.legacy.city_stop_registry(self.legacy.resolve_city(city_id))
             return lease.snapshot.catalog.city_stop_registry(resolved_city)
 
     def city_child_stop_ids(
@@ -2260,6 +2275,11 @@ class HybridStaticDeparturesBackend:
             if VBBOverlayProviderAdapter.handles_city(city_id):
                 adapter = self._vbb_adapter(snapshot)
                 return {str(value) for value in stop_ids if adapter.city_has_stop(city_id, str(value))}
+            scope = self._scope(snapshot, city_id, None, self.eligible_provider_ids)
+            if not self.provider_only and (
+                scope.backend == "legacy" or provider_id not in self.eligible_provider_ids
+            ):
+                return self.legacy.city_child_stop_ids(city_id, stop_ids, namespace, provider_id)
             resolved_city = snapshot.catalog.resolve_city(city_id)
             public_ids = snapshot.catalog.city_stop_registry(resolved_city)
             selected = {str(value) for value in stop_ids if str(value) in public_ids}
@@ -2432,6 +2452,9 @@ class HybridStaticDeparturesBackend:
 
         with self.manager.acquire_snapshot() as lease:
             snapshot = lease.snapshot
+            scope = self._scope(snapshot, city_id, None, self.eligible_provider_ids)
+            if scope.backend == "legacy" and not self.provider_only:
+                return self.legacy.fintraffic_provider_contexts(city_id)
             resolved_city = snapshot.catalog.resolve_city(city_id)
             contexts = []
             for mode in snapshot.catalog.provider_modes(resolved_city):
@@ -2459,6 +2482,8 @@ class HybridStaticDeparturesBackend:
         city_id: str,
         provider_id: str,
     ) -> tuple[object, ...]:
+        if not self.provider_only and provider_id not in self.eligible_provider_ids:
+            return self.legacy.external_gtfs_provider_contexts(city_id, provider_id)
         from fintraffic_gateway import GTFSRealtimeProviderContext
 
         with self.manager.acquire_snapshot() as lease:
@@ -2567,7 +2592,10 @@ def _environment_flag(values: Mapping[str, str], name: str) -> bool:
 
 def hybrid_runtime_enabled(*, environ: Mapping[str, str] | None = None) -> bool:
     values = os.environ if environ is None else environ
-    return _environment_flag(values, HYBRID_ENV)
+    mode = str(values.get(PROVIDER_RUNTIME_MODE_ENV, "")).strip().lower()
+    if mode in {"provider", "legacy", "off", "0", "false"}:
+        return False
+    return mode == "hybrid" or _environment_flag(values, HYBRID_ENV)
 
 
 def _is_incremental_release_pointer(pointer: Path) -> bool:
@@ -2591,7 +2619,7 @@ def provider_runtime_enabled(*, environ: Mapping[str, str] | None = None) -> boo
     mode = str(values.get(PROVIDER_RUNTIME_MODE_ENV, "")).strip().lower()
     if mode == "provider":
         return True
-    if mode in {"legacy", "off", "0", "false"}:
+    if mode in {"hybrid", "legacy", "off", "0", "false"} or hybrid_runtime_enabled(environ=values):
         return False
     if _environment_flag(values, PROVIDER_RUNTIME_ENV):
         return True
@@ -2676,7 +2704,7 @@ def hybrid_backend_from_environment(
     environ: Mapping[str, str] | None = None,
 ) -> HybridStaticDeparturesBackend | None:
     values = os.environ if environ is None else environ
-    if not _environment_flag(values, HYBRID_ENV):
+    if not hybrid_runtime_enabled(environ=values):
         return None
     provider_ids = _configured_provider_ids(values)
     if not provider_ids:
@@ -2695,6 +2723,15 @@ def hybrid_backend_from_environment(
     pointer = str(values.get(HYBRID_RELEASE_POINTER_ENV, "")).strip()
     if not pointer:
         raise RuntimeUnavailable(f"{HYBRID_RELEASE_POINTER_ENV} is required when hybrid mode is enabled")
+    fallback_metadata = legacy.meta()
+    if fallback_metadata.get("fallbackProfile") == "hybrid-only":
+        try:
+            fallback_providers = json.loads(fallback_metadata.get("shardProviderIDs", "[]"))
+            matches = isinstance(fallback_providers, list) and set(fallback_providers) == set(provider_ids)
+        except (ValueError, TypeError):
+            matches = False
+        if not matches:
+            raise RuntimeUnavailable("compact fallback shard provider contract mismatch")
     try:
         max_parallel = max(1, int(values.get(HYBRID_MAX_PARALLEL_ENV, "4")))
     except (TypeError, ValueError) as error:

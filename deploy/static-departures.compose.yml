@@ -1,5 +1,6 @@
 services:
   static-departures-api:
+    image: ${STATIC_DEPARTURES_IMAGE:-haltewecker-static-departures-api}
     env_file:
       - /srv/haltewecker/secrets/uk/.env
       - /srv/haltewecker/secrets/canada-metrolink/.env
@@ -16,7 +17,7 @@ services:
     environment:
       DEPARTURES_DATABASE: ${DEPARTURES_DATABASE:-/data/current-release/departures.sqlite}
       STATIC_DATA_ROOT: ${STATIC_DATA_ROOT:-/data/current-release/stop-data}
-      HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE: ${HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE:-auto}
+      HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE: ${HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE:-legacy}
       HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RUNTIME: ${HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RUNTIME:-0}
       HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS: ${HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS:-israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd,511-bay-area,australia-translink-seq,australia-transport-nsw,cta-chicago,mbta-boston,stm-montreal}
       HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RELEASE_POINTER: ${HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RELEASE_POINTER:-/data/current-release}

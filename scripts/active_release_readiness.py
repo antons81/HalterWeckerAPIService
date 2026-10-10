@@ -44,8 +44,11 @@ expected, raw_providers = sys.argv[1:]
 providers = tuple(raw_providers.split(","))
 if os.environ.get("HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS", "").split(",") != list(providers):
     raise RuntimeError("runtime provider contract mismatch")
-if get("/static-departures/health").get("database", {}).get("releaseID") != expected:
+metadata = get("/static-departures/health").get("database", {})
+if metadata.get("releaseID") != expected:
     raise RuntimeError("runtime release mismatch")
+if metadata.get("runtimeMode") != "hybrid" or metadata.get("fallbackReleaseID") != expected:
+    raise RuntimeError("runtime has no validated full fallback database")
 for city in ("duisburg", "dusseldorf"):
     payload = get("/static-stop-data/stops/" + city + ".json")
     if not isinstance(payload, list) or not payload:
@@ -60,6 +63,15 @@ if row is None:
 payload = get("/static-departures/board?" + urlencode(dict(cityID=row[0], stopID=row[1], limit=3)))
 if not isinstance(payload.get("departures"), list):
     raise RuntimeError("invalid departures response")
+for city, stop in (
+    ("wien", "at:49:1876:0:1"),
+    ("wien", "at:49:1320:5"),
+    ("helsinki", "fi-hsl:1040401"),
+):
+    payload = get("/static-departures/board?" + urlencode(dict(cityID=city, stopID=stop, limit=3)))
+    departures = payload.get("departures")
+    if not isinstance(departures, list) or not departures:
+        raise RuntimeError("empty departures response: " + city + "/" + stop)
 '''
 
 

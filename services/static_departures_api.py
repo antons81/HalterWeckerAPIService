@@ -1343,13 +1343,13 @@ class Database:
                 cursor.close()
             return str(row[0]) if row else city_id
 
-    def _query_stop_id(self, city_id: str, stop_id: str) -> str:
+    def _query_stop_ids(self, city_id: str, stop_id: str) -> tuple[str, ...]:
         mode, _, stop_id_prefix, _ = self.city_departure_mode(city_id)
         if mode != "exact-stop-with-parent-fallback":
             explicit_ids = self._explicit_provider_stop_ids(city_id, stop_id)
             if explicit_ids is not None:
-                return explicit_ids[0] if explicit_ids else ""
-            return f"{stop_id_prefix}{stop_id}"
+                return explicit_ids
+            return (f"{stop_id_prefix}{stop_id}",)
         explicit_ids = self._explicit_provider_stop_ids(city_id, stop_id)
         if explicit_ids is not None:
             internal_stop_id = explicit_ids[0] if explicit_ids else ""
@@ -1357,13 +1357,15 @@ class Database:
             internal_stop_id = f"{stop_id_prefix}{stop_id}"
         else:
             internal_stop_id = stop_id
+        if not internal_stop_id:
+            return ()
         with self.lock:
             cursor = self._connection().execute(
                 "SELECT 1 FROM stop_times WHERE raw_stop_id=? LIMIT 1", (internal_stop_id,)
             )
             try:
                 if cursor.fetchone() is not None:
-                    return internal_stop_id
+                    return (internal_stop_id,)
             finally:
                 cursor.close()
             cursor = self._connection().execute(
@@ -1373,7 +1375,35 @@ class Database:
                 row = cursor.fetchone()
             finally:
                 cursor.close()
-        return str(row[0]) if row and row[0] else internal_stop_id
+            station_id = str(row[0]) if row and row[0] else internal_stop_id
+            if station_id != internal_stop_id:
+                cursor = self._connection().execute(
+                    "SELECT 1 FROM stop_times WHERE raw_stop_id=? LIMIT 1", (station_id,)
+                )
+                try:
+                    if cursor.fetchone() is not None:
+                        return (station_id,)
+                finally:
+                    cursor.close()
+            cursor = self._connection().execute(
+                """
+                SELECT child.stop_id
+                FROM raw_stops AS child
+                WHERE child.parent_station=?
+                  AND child.location_type=0
+                  AND EXISTS (
+                      SELECT 1 FROM stop_times
+                      WHERE stop_times.raw_stop_id=child.stop_id
+                  )
+                ORDER BY child.stop_id
+                """,
+                (station_id,),
+            )
+            try:
+                children = tuple(str(child[0]) for child in cursor.fetchall())
+            finally:
+                cursor.close()
+        return children or (station_id,)
 
     def lines(self, city_id: str, stop_id: str) -> list[dict[str, str | None]]:
         mode, _, stop_id_prefix, identifier_prefix = self.city_departure_mode(city_id)
@@ -1381,10 +1411,10 @@ class Database:
         explicit_ids = self._explicit_provider_stop_ids(city_id, stop_id)
         if explicit_ids == ():
             return []
-        query_stop_id = self._query_stop_id(city_id, stop_id)
+        query_stop_ids = self._query_stop_ids(city_id, stop_id)
         if mode == "exact-stop-with-parent-fallback":
-            stop_predicate = "s.raw_stop_id=?"
-            stop_parameters = (query_stop_id,)
+            stop_predicate = f"s.raw_stop_id IN ({','.join('?' for _ in query_stop_ids)})"
+            stop_parameters = query_stop_ids
         else:
             canonical_ids = self._canonical_stop_candidates(city_id, stop_id)
             stop_predicate = f"rs.canonical_stop_id IN ({','.join('?' for _ in canonical_ids)})"
@@ -1766,10 +1796,10 @@ class Database:
         explicit_ids = self._explicit_provider_stop_ids(city_id, stop_id)
         if explicit_ids == ():
             return []
-        query_stop_id = self._query_stop_id(city_id, stop_id)
+        query_stop_ids = self._query_stop_ids(city_id, stop_id)
         if mode == "exact-stop-with-parent-fallback":
-            stop_predicate = "s.raw_stop_id=?"
-            stop_parameters = (query_stop_id,)
+            stop_predicate = f"s.raw_stop_id IN ({','.join('?' for _ in query_stop_ids)})"
+            stop_parameters = query_stop_ids
         else:
             canonical_ids = self._canonical_stop_candidates(city_id, stop_id)
             stop_predicate = f"rs.canonical_stop_id IN ({','.join('?' for _ in canonical_ids)})"
@@ -2634,6 +2664,12 @@ def _configure_poland_gateways(database: Database) -> None:
     )
 
 
+def validate_fallback_runtime(database: Database) -> None:
+    if database.meta().get("fallbackProfile") == "hybrid-only" and not hybrid_runtime_enabled():
+        database.close()
+        raise RuntimeUnavailable("compact fallback requires the validated hybrid shard runtime")
+
+
 if __name__ == "__main__":
     logging.basicConfig(
         level=getattr(
@@ -2654,6 +2690,7 @@ if __name__ == "__main__":
         )
         log_memory_stage("before-db-open", database=database_path)
         database = Database(database_path)
+        validate_fallback_runtime(database)
         if hybrid_runtime_enabled():
             database = hybrid_backend_from_environment(database)
         else:

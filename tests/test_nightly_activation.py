@@ -86,12 +86,22 @@ class RouteReadinessTests(unittest.TestCase):
     def test_probe_checks_required_lines_and_packages(self):
         for value in ('"berlin", "100"', '"wuppertal", "635"', '"germany"', '/patterns/'):
             self.assertIn(value, readiness.ROUTE_PROBE)
-        for value in ('"duisburg", "dusseldorf"', '/static-departures/health', '/static-departures/board', 'transit-radar-cities.json'):
+        for value in (
+            '"duisburg", "dusseldorf"',
+            '/static-departures/health',
+            '/static-departures/board',
+            '"wien", "at:49:1876:0:1"',
+            '"wien", "at:49:1320:5"',
+            '"helsinki", "fi-hsl:1040401"',
+            'empty departures response:',
+            'transit-radar-cities.json',
+        ):
             self.assertIn(value, readiness.STATIC_PROBE)
 
 
 class NightlyActivationTests(unittest.TestCase):
-    def activate(self, *, route_fail=False, static_fail=False, image_change=False, pipeline_fail=False, root_change=False):
+    def activate(self, *, route_fail=False, static_fail=False, image_change=False, pipeline_fail=False, root_change=False,
+                 coverage_fail=False, rollback_fail=False, dry_run=False):
         source = PIPELINE.read_text()
         functions = source[source.index("route_recall_activation() {"):source.index('\ncd "$REPO"', source.index("route_recall_activation() {"))]
         with tempfile.TemporaryDirectory() as directory:
@@ -113,11 +123,12 @@ DATA_ROOT="$ROOT"
 RELEASE_ID=candidate
 INCREMENTAL_RELEASE_DIR="$ROOT/candidate"
 HALTEWECKER_RUNTIME_PROVIDER_IDS=israel-mot
+STATIC_ACTIVATION_IMAGE=image-original
 STATIC_DEPARTURES_PIPELINE="$ROOT/static-runner"
 ROUTERECALL_READINESS_TIMEOUT_SECONDS=0
 replace_link() { "$REAL_PYTHON" -c 'import os,sys; os.symlink(sys.argv[2],sys.argv[1]+".next"); os.replace(sys.argv[1]+".next",sys.argv[1])' "$1" "$2"; }
 validate_incremental_candidate() { return 0; }
-validate_incremental_consumers() { return 0; }
+validate_incremental_consumers() { [[ "$COVERAGE_FAIL" == 0 ]]; }
 docker() {
   echo "$*" >> "$ROOT/docker-calls"
   if [[ "$*" == *"{{.Image}}"* ]]; then cat "$ROOT/image"; return 0; fi
@@ -134,7 +145,7 @@ python3() {
     reload-route) echo 'restart routerecall-api' >> "$ROOT/docker-calls";;
     route) [[ "$target" == previous || "$ROUTE_FAIL" == 0 ]] && [[ $(cat "$ROOT/image") == image-original ]];;
     restore-route) echo image-original > "$ROOT/image"; if [[ "$*" == *"--reload"* ]]; then echo 'restart routerecall-api' >> "$ROOT/docker-calls"; fi;;
-    haltewecker) [[ "$target" == previous || "$STATIC_FAIL" == 0 ]];;
+    haltewecker) if [[ "$target" == previous ]]; then [[ "$ROLLBACK_FAIL" == 0 ]]; else [[ "$STATIC_FAIL" == 0 ]]; fi;;
     *) return 99;;
   esac
 }
@@ -144,14 +155,34 @@ python3() {
                 runner.write_text('#!/bin/bash\necho image-changed > "$ROOT/image"\nexit 0\n')
             env = dict(os.environ, ROOT=str(root), REAL_PYTHON=sys.executable,
                        ROUTE_FAIL=str(int(route_fail)), STATIC_FAIL=str(int(static_fail)),
-                       PIPELINE_FAIL=str(int(pipeline_fail)), ROOT_CHANGED=str(int(root_change)))
+                       PIPELINE_FAIL=str(int(pipeline_fail)), ROOT_CHANGED=str(int(root_change)),
+                       COVERAGE_FAIL=str(int(coverage_fail)), ROLLBACK_FAIL=str(int(rollback_fail)),
+                       HALTEWECKER_ACTIVATION_DRY_RUN=str(int(dry_run)))
             result = subprocess.run(["bash", "-c", harness + functions + "\nactivate_incremental_production"],
                                     env=env, capture_output=True, text=True)
             target = os.readlink(root / "current-release")
-            calls = (root / "docker-calls").read_text()
+            calls = (root / "docker-calls").read_text() if (root / "docker-calls").exists() else ""
             probes = (root / "probes").read_text() if (root / "probes").exists() else ""
             image = (root / "image").read_text().strip()
         return result, target, calls, probes, image
+
+    def test_incomplete_coverage_blocks_switch_even_when_artifact_validation_passes(self):
+        result, target, calls, _, _ = self.activate(coverage_fail=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(target, "previous")
+        self.assertEqual(calls, "")
+
+    def test_unhealthy_rollback_blocks_switch(self):
+        result, target, calls, _, _ = self.activate(rollback_fail=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(target, "previous")
+        self.assertNotIn("restart", calls)
+
+    def test_activation_dry_run_never_switches_or_restarts(self):
+        result, target, calls, _, _ = self.activate(dry_run=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(target, "previous")
+        self.assertEqual(calls, "")
 
     def test_success_never_builds_or_restarts_route(self):
         result, target, calls, _, image = self.activate()

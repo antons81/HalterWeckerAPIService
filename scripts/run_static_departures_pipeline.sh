@@ -2,6 +2,22 @@
 set -euo pipefail
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
+# Preserve the exact runtime contract supplied by the validated activator.
+activation_keys=()
+activation_values=()
+if [[ "${READINESS_ONLY:-0}" == "1" && -n "${STATIC_DEPARTURES_IMAGE:-}" ]]; then
+  for key in STATIC_DEPARTURES_IMAGE HALTEWECKER_RUNTIME_PROVIDER_IDS \
+    HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RUNTIME \
+    HALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME HALTEWECKER_STATIC_DEPARTURES_HYBRID_PROVIDERS \
+    HALTEWECKER_STATIC_DEPARTURES_HYBRID_RELEASE_POINTER HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS \
+    HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RELEASE_POINTER DEPARTURES_DATABASE STATIC_DATA_ROOT; do
+    if [[ -n "${!key:-}" ]]; then
+      activation_keys+=("$key")
+      activation_values+=("${!key}")
+    fi
+  done
+fi
+
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 STOP_DATA_ENV_FILE="${STOP_DATA_ENV_FILE:-/etc/haltewecker-stop-data.env}"
 if [[ -f "$STOP_DATA_ENV_FILE" ]]; then
@@ -40,6 +56,11 @@ if [[ -f "$AUSTRALIA_ENV_FILE" ]]; then
   source "$AUSTRALIA_ENV_FILE"
   set +a
 fi
+
+for ((index=0; index<${#activation_keys[@]}; index++)); do
+  printf -v "${activation_keys[index]}" '%s' "${activation_values[index]}"
+  export "${activation_keys[index]}"
+done
 
 DATA_ROOT="${DATA_ROOT:-/srv/haltewecker/data}"
 if [[ -n "${HALTEWECKER_RUNTIME_PROVIDER_IDS:-}" ]]; then
@@ -118,7 +139,7 @@ fi
 
 # Standalone nightly runs derive provenance only from the active release that
 # supplied STOP_DATA_PATH. Do not search for or reuse artifacts from another release.
-if [[ -n "$RELEASE_ID" && -z "${EXTERNAL_GTFS_ARTIFACTS_JSON:-}" ]]; then
+if [[ -n "$RELEASE_ID" ]]; then
   if [[ -z "$ACTIVE_RELEASE_DIR" ]]; then
     if [[ -d "$DATA_ROOT/releases/incremental/$RELEASE_ID" ]]; then
       ACTIVE_RELEASE_DIR="$DATA_ROOT/releases/incremental/$RELEASE_ID"
@@ -126,12 +147,17 @@ if [[ -n "$RELEASE_ID" && -z "${EXTERNAL_GTFS_ARTIFACTS_JSON:-}" ]]; then
       ACTIVE_RELEASE_DIR="$DATA_ROOT/releases/$RELEASE_ID"
     fi
   fi
-  EXTERNAL_GTFS_ARTIFACTS_JSON="$ACTIVE_RELEASE_DIR/gtfs-artifacts.json"
+  EXTERNAL_GTFS_ARTIFACTS_JSON="${EXTERNAL_GTFS_ARTIFACTS_JSON:-$ACTIVE_RELEASE_DIR/gtfs-artifacts.json}"
 fi
 
 if [[ "${READINESS_ONLY:-0}" == "1" ]]; then
   echo "$LOG_PREFIX release=${RELEASE_ID:-legacy} stage=readiness started"
 else
+
+if [[ "${SKIP_ACTIVATION:-0}" != "1" && -f "$ACTIVE_RELEASE_DIR/release.json" ]]; then
+  echo "$LOG_PREFIX ERROR: immutable incremental release requires candidate assembly and consumer preflight" >&2
+  exit 1
+fi
 
 if [[ -n "$RELEASE_ID" ]]; then
   if [[ -z "${EXTERNAL_GTFS_ARTIFACTS_JSON:-}" ]]; then
@@ -142,6 +168,17 @@ if [[ -n "$RELEASE_ID" ]]; then
     --stop-data "$STOP_DATA_PATH" \
     --artifacts "$EXTERNAL_GTFS_ARTIFACTS_JSON" \
     --release-id "$RELEASE_ID"
+  GTFS_URL="$(python3 - "$EXTERNAL_GTFS_ARTIFACTS_JSON" <<'PY'
+import json
+import sys
+from pathlib import Path
+entry = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")).get("sources", {}).get("germany", {})
+path = entry.get("path")
+if not path or not Path(path).is_file():
+    raise SystemExit("release-scoped Germany GTFS archive is missing")
+print(path)
+PY
+)"
 fi
 
 if [[ -z "$AUSTRIAN_GTFS_PATH" && -d "$AUSTRIAN_GTFS_DIR" && ! -f "$AUSTRIAN_GTFS_DIR/.env" ]]; then
@@ -158,6 +195,9 @@ IMPORT_ARGS=(
   --next "$NEXT_DATABASE_PATH"
   --external-sources "$REPO/config/external-gtfs-sources.json"
 )
+if [[ -n "${STATIC_FALLBACK_SHARD_PROVIDER_IDS:-}" ]]; then
+  IMPORT_ARGS+=(--shard-provider-ids "$STATIC_FALLBACK_SHARD_PROVIDER_IDS")
+fi
 if [[ -n "$RELEASE_ID" ]]; then
   IMPORT_ARGS+=(--release-id "$RELEASE_ID")
 fi
@@ -167,10 +207,7 @@ elif [[ -d "$AUSTRIAN_GTFS_DIR" && -f "$AUSTRIAN_GTFS_DIR/.env" ]]; then
   IMPORT_ARGS+=(--austrian-gtfs-dir "$AUSTRIAN_GTFS_DIR" --austrian-sources "$REPO/config/austrian-sources.json")
 fi
 EXTERNAL_GTFS_IMPORT_ARGS=()
-while IFS= read -r external_mapping; do
-  [[ -n "$external_mapping" ]] || continue
-  EXTERNAL_GTFS_IMPORT_ARGS+=(--external-gtfs-url "$external_mapping")
-done < <(python3 - "${EXTERNAL_GTFS_ARTIFACTS_JSON:-}" "$REPO/config/external-gtfs-sources.json" "$REPO" <<'PY'
+if ! EXTERNAL_GTFS_IMPORT_MAPPINGS="$(python3 - "${EXTERNAL_GTFS_ARTIFACTS_JSON:-}" "$REPO/config/external-gtfs-sources.json" "$REPO" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -219,7 +256,14 @@ else:
             raise SystemExit(f"Static-enabled source has no configured input: {source_id}")
         print(f"{source_id}={value}")
 PY
-)
+)"; then
+  echo "$LOG_PREFIX ERROR: incomplete release-scoped static import plan" >&2
+  exit 1
+fi
+while IFS= read -r external_mapping; do
+  [[ -n "$external_mapping" ]] || continue
+  EXTERNAL_GTFS_IMPORT_ARGS+=(--external-gtfs-url "$external_mapping")
+done <<< "$EXTERNAL_GTFS_IMPORT_MAPPINGS"
 if [[ ${#EXTERNAL_GTFS_IMPORT_ARGS[@]} -gt 0 ]]; then
   IMPORT_ARGS+=("${EXTERNAL_GTFS_IMPORT_ARGS[@]}")
 fi
@@ -228,7 +272,9 @@ fi
 # environment setup cannot replace the credential inherited by the child.
 export WMATA_API_KEY="$WMATA_OPERATOR_API_KEY"
 : "${WMATA_API_KEY:?WMATA_API_KEY is required before static departures importer}"
-python3 -u "$REPO/scripts/import_static_departures_database.py" "${IMPORT_ARGS[@]}"
+python3 "$REPO/scripts/disk_budget.py" --root "$DATA_ROOT" \
+  --minimum-free-gib "${HALTEWECKER_BUILD_MIN_FREE_GIB:-20}" -- \
+  python3 -u "$REPO/scripts/import_static_departures_database.py" "${IMPORT_ARGS[@]}"
 echo "$LOG_PREFIX release=${RELEASE_ID:-legacy} stage=import duration=$((SECONDS - stage_started))s"
 
 if [[ "${SKIP_ACTIVATION:-0}" == "1" ]]; then
@@ -256,7 +302,20 @@ if [[ "$CONTAINER_NAME" == "static-departures-api" ]]; then
 fi
 
 echo "$LOG_PREFIX refreshing static-departures-api container"
-docker compose -f "$REPO/deploy/static-departures.compose.yml" up -d --build
+if [[ -n "${STATIC_DEPARTURES_IMAGE:-}" ]]; then
+  # Activation must run the image that passed candidate and rollback preflight.
+  # A distinct project prevents Compose from deleting the renamed rollback container.
+  pinned_project="$(printf '%s' "haltewecker-static-${RELEASE_ID//[^a-zA-Z0-9_-]/-}" | tr '[:upper:]' '[:lower:]')"
+  docker compose -p "$pinned_project" -f "$REPO/deploy/static-departures.compose.yml" up -d \
+    --no-build --pull never --no-deps --force-recreate static-departures-api
+  actual_image="$(docker inspect --format '{{.Image}}' "$CONTAINER_NAME")"
+  if [[ "$actual_image" != "$STATIC_DEPARTURES_IMAGE" ]]; then
+    echo "$LOG_PREFIX ERROR: activated image differs from preflight image" >&2
+    exit 1
+  fi
+else
+  docker compose -f "$REPO/deploy/static-departures.compose.yml" up -d --build
+fi
 
 HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-45}"
 HEALTH_INTERVAL_SECONDS="${HEALTH_INTERVAL_SECONDS:-2}"

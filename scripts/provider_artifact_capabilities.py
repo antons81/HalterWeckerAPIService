@@ -45,7 +45,10 @@ def _sources_path(repository_root: Path) -> Path:
 
 
 def _incremental_sources_path(repository_root: Path) -> Path:
-    return repository_root / "config" / "incremental-provider-sources.json"
+    repository_path = repository_root / "config" / "incremental-provider-sources.json"
+    if repository_path.is_file():
+        return repository_path
+    return Path("/app/config/incremental-provider-sources.json")
 
 
 def _source_capabilities(repository_root: Path, provider_id: str) -> Mapping[str, object]:

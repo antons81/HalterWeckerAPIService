@@ -33,6 +33,7 @@ class StopDataPipelineTests(unittest.TestCase):
         self.root = Path(self.temporary_directory.name)
         self.data_root = self.root / "data"
         self.data_root.mkdir()
+        (self.root / "tmp").mkdir()
         (self.data_root / "current").mkdir()
         (self.data_root / "current" / "release-marker").write_text("old", encoding="utf-8")
         self.environment_file = self.root / "stop-data.env"
@@ -72,6 +73,11 @@ if [ "${1:-}" = "-m" ] && [ "${2:-}" = "scripts.run_incremental_provider_pipelin
 fi
 
 case \"${1:-}\" in
+  *disk_budget.py)
+    while [[ \"$1\" != -- ]]; do shift; done
+    shift
+    exec \"$@\"
+    ;;
   *release_state.py)
     stage=\"\"
     previous=\"\"
@@ -538,6 +544,7 @@ PY
         environment.update({
             "REPO": str(REPOSITORY_ROOT),
             "DATA_ROOT": str(self.data_root),
+            "TMPDIR": str(self.root / "tmp"),
             "STOP_DATA_LOCK": str(self.root / "stop-data.lock"),
             "STATIC_DEPARTURES_LOCK": str(self.root / "static-departures.lock"),
             "STOP_DATA_ENV_FILE": str(self.environment_file),
@@ -718,24 +725,20 @@ assert callable(validate_validation_receipt)
             f"allowlist={MIXED_INCREMENTAL_PROVIDERS}",
             result.stdout,
         )
-        self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)
-        self.assertIn("reason=incremental-production", result.stdout)
+        self.assertIn("stage=legacy-import status=PASS", result.stdout)
         self.assertIn("stage=incremental-candidate-validation status=PASS", result.stdout)
-        self.assertIn("stage=activation status=PASS mode=FULL_INCREMENTAL", result.stdout)
-        self.assertIn("activation=FULL_INCREMENTAL", result.stdout)
+        self.assertIn("stage=activation status=PASS mode=DRY_RUN pointerSwitch=NOT_RUN", result.stdout)
         self.assertTrue((self.data_root / "current-release").is_symlink())
-        self.assertIn("/releases/incremental/", os.path.realpath(self.data_root / "current-release"))
-        self.assertEqual(os.readlink(self.data_root / "current"), "current-release/stop-data")
+        self.assertEqual(os.readlink(self.data_root / "current"), "releases/old/stop-data")
         self.assertEqual(
-            (self.data_root / "current" / "release-marker").read_text(), "new",
+            (self.data_root / "current" / "release-marker").read_text(), "old",
         )
         rollback_pointer = self.data_root / "rollback"
         self.assertFalse(os.path.lexists(rollback_pointer))
-        self.assertIn("rollback=NONE", result.stdout)
         self.assertTrue((self.root / "static-calls.log").is_file())
         self.assertEqual(
             (self.root / "static-calls.log").read_text(encoding="utf-8").splitlines(),
-            ["1"],
+            ["0"],
         )
 
     def test_invalid_incremental_candidate_does_not_switch_published_pointers(self) -> None:
@@ -757,7 +760,7 @@ assert callable(validate_validation_receipt)
         previous_stops = os.readlink(self.data_root / "current")
         result = self.run_pipeline(
             USE_DEFAULT_PRODUCTION="1", HALTEWECKER_ACTIVATION_DRY_RUN="1",
-            HALTEWECKER_INCREMENTAL_PROVIDER_IDS=MIXED_INCREMENTAL_PROVIDERS.removesuffix(",germany"),
+            HALTEWECKER_INCREMENTAL_PROVIDER_IDS=MIXED_INCREMENTAL_PROVIDERS,
             INCREMENTAL_CANDIDATE_WITHOUT_GERMANY="1",
         )
         self.assertNotEqual(result.returncode, 0)
@@ -769,9 +772,9 @@ assert callable(validate_validation_receipt)
         self.configure_resume_pointer_layout()
         result = self.run_pipeline(USE_DEFAULT_PRODUCTION="1", HALTEWECKER_ACTIVATION_DRY_RUN="1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((self.root / "runtime-provider-calls.log").read_text().strip(),
-                         MIXED_INCREMENTAL_PROVIDERS.removesuffix(",germany"))
         self.assertIn("buildProviders=" + MIXED_INCREMENTAL_PROVIDERS, result.stdout)
+        self.assertIn("runtimeProviders=" + MIXED_INCREMENTAL_PROVIDERS, result.stdout)
+        self.assertIn("--fallback-database", (self.root / "incremental-calls.log").read_text())
 
     def test_runtime_provider_outside_build_does_not_switch_pointer(self) -> None:
         self.configure_resume_pointer_layout()
@@ -784,7 +787,19 @@ assert callable(validate_validation_receipt)
         self.assertIn("runtime providers are absent from the build", result.stderr)
         self.assertEqual(os.readlink(self.data_root / "current-release"), previous)
 
-    def test_successful_incremental_activation_removes_retained_rollback_pointer(self) -> None:
+    def test_stale_runtime_without_germany_stops_before_heavy_build(self) -> None:
+        self.configure_resume_pointer_layout()
+        previous = os.readlink(self.data_root / "current-release")
+        result = self.run_pipeline(
+            USE_DEFAULT_PRODUCTION="1",
+            HALTEWECKER_RUNTIME_PROVIDER_IDS=MIXED_INCREMENTAL_PROVIDERS.removesuffix(",germany"),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Germany must be enabled", result.stderr)
+        self.assertFalse((self.root / "build-calls.log").exists())
+        self.assertEqual(os.readlink(self.data_root / "current-release"), previous)
+
+    def test_dry_run_preserves_retained_rollback_pointer(self) -> None:
         self.configure_resume_pointer_layout()
         rollback = self.data_root / "rollback"
         rollback.symlink_to(os.readlink(self.data_root / "current-release"))
@@ -792,7 +807,7 @@ assert callable(validate_validation_receipt)
             USE_DEFAULT_PRODUCTION="1", HALTEWECKER_ACTIVATION_DRY_RUN="1",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(os.path.lexists(rollback))
+        self.assertEqual(os.readlink(rollback), os.readlink(self.data_root / "current-release"))
 
     def test_failed_incremental_activation_preserves_current_and_existing_rollback(self) -> None:
         self.configure_resume_pointer_layout()
@@ -802,7 +817,7 @@ assert callable(validate_validation_receipt)
         rollback.symlink_to(previous_target)
         result = self.run_pipeline(
             USE_DEFAULT_PRODUCTION="1", HALTEWECKER_ACTIVATION_DRY_RUN="1",
-            READINESS_FAIL="1",
+            STATIC_IMPORT_FAIL="1",
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(os.readlink(current), previous_target)
@@ -815,24 +830,24 @@ assert callable(validate_validation_receipt)
             HALTEWECKER_ACTIVATION_DRY_RUN="1",
             HALTEWECKER_INCREMENTAL_MIGRATION="1",
             HALTEWECKER_PROOF_ESTIMATE_MARGIN_GB="0",
-            DF_FREE_KB=str(22 * 1024 * 1024),
+            DF_FREE_KB=str(50 * 1024 * 1024),
         )
 
         self.assertEqual(migration.returncode, 0, migration.stderr)
         self.assertIn("mode=incremental-migration", migration.stdout)
         self.assertIn("minimum_free_gb=20", migration.stdout)
-        self.assertIn("activation=FULL_INCREMENTAL", migration.stdout)
+        self.assertIn("pointerSwitch=NOT_RUN", migration.stdout)
 
         scheduled = self.run_pipeline(
             USE_DEFAULT_PRODUCTION="1",
             HALTEWECKER_ACTIVATION_DRY_RUN="1",
             HALTEWECKER_PROOF_ESTIMATE_MARGIN_GB="0",
-            DF_FREE_KB=str(44 * 1024 * 1024),
+            DF_FREE_KB=str(39 * 1024 * 1024),
         )
 
         self.assertNotEqual(scheduled.returncode, 0)
         self.assertIn("mode=incremental-production", scheduled.stdout)
-        self.assertIn("minimum_free_gb=45", scheduled.stdout)
+        self.assertIn("minimum_free_gb=20", scheduled.stdout)
         self.assertIn("insufficient disk for incremental-production", scheduled.stderr)
 
     def test_incremental_cache_policy_overrides_stale_env_allowlist(self) -> None:
@@ -861,7 +876,7 @@ assert callable(validate_validation_receipt)
         result = self.run_pipeline(
             USE_DEFAULT_PRODUCTION="1",
             HALTEWECKER_ACTIVATION_DRY_RUN="1",
-            READINESS_FAIL="1",
+            STATIC_IMPORT_FAIL="1",
         )
 
         self.assertNotEqual(result.returncode, 0)
@@ -918,9 +933,8 @@ assert callable(validate_validation_receipt)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("mode=production-shaped-no-activate", result.stdout)
-        self.assertIn("minimum_free_gb=45", result.stdout)
-        self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)
-        self.assertIn("reason=production-shaped-no-activate", result.stdout)
+        self.assertIn("minimum_free_gb=20", result.stdout)
+        self.assertIn("stage=legacy-import status=PASS", result.stdout)
         self.assertIn("stage=incremental-metadata status=PASS", result.stdout)
         self.assertIn("activation=NOT_RUN", result.stdout)
         self.assertEqual(
@@ -929,7 +943,7 @@ assert callable(validate_validation_receipt)
         )
         self.assertFalse((self.data_root / "current-release").exists())
         self.assertFalse((self.data_root / "departures-current.sqlite").exists())
-        self.assertFalse((self.root / "static-calls.log").exists())
+        self.assertEqual((self.root / "static-calls.log").read_text().splitlines(), ["0"])
 
         calls = (self.root / "incremental-calls.log").read_text(encoding="utf-8")
         self.assertIn("--result-json", calls)
@@ -983,7 +997,7 @@ assert callable(validate_validation_receipt)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("warning_free_gb=35", result.stdout)
         self.assertIn("minimum_free_gb=30", result.stdout)
-        self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)
+        self.assertIn("stage=legacy-import status=PASS", result.stdout)
 
     def test_manual_incremental_proof_floor_can_be_lowered_to_20_explicitly(self) -> None:
         result = self.run_pipeline(
@@ -995,31 +1009,28 @@ assert callable(validate_validation_receipt)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("warning_free_gb=25", result.stdout)
         self.assertIn("minimum_free_gb=20", result.stdout)
-        self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)
+        self.assertIn("stage=legacy-import status=PASS", result.stdout)
 
-    def test_manual_incremental_proof_floor_can_be_lowered_to_15_explicitly(self) -> None:
+    def test_manual_incremental_proof_floor_cannot_be_lowered_below_20(self) -> None:
         result = self.run_pipeline(
             "--incremental-no-activate",
             HALTEWECKER_INCREMENTAL_PROOF_OVERRIDE="1",
-            HALTEWECKER_MANUAL_PROOF_MIN_FREE_GB="15",
-            DF_FREE_KB=str(50 * 1024 * 1024),
+            HALTEWECKER_MANUAL_PROOF_MIN_FREE_GB="19",
         )
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("warning_free_gb=20", result.stdout)
-        self.assertIn("minimum_free_gb=15", result.stdout)
-        self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("between 20 and 45", result.stderr)
+        self.assertFalse((self.root / "build-calls.log").exists())
 
     def test_manual_floor_does_not_lower_production_shaped_guard_without_override(self) -> None:
         result = self.run_pipeline(
             "--incremental-no-activate",
-            HALTEWECKER_MANUAL_PROOF_MIN_FREE_GB="15",
-            DF_FREE_KB=str(55 * 1024 * 1024),
+            HALTEWECKER_MANUAL_PROOF_MIN_FREE_GB="20",
+            DF_FREE_KB=str(110 * 1024 * 1024),
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("mode=production-shaped-no-activate", result.stdout)
-        self.assertIn("minimum_free_gb=45", result.stdout)
+        self.assertIn("minimum_free_gb=20", result.stdout)
         self.assertNotIn("minimum_free_gb=15", result.stdout)
 
     def test_frozen_contract_is_forwarded_through_real_wrapper_without_provider_build(self) -> None:
@@ -1057,15 +1068,15 @@ assert callable(validate_validation_receipt)
             "--trusted-common-stop-data",
             str(trusted_common_stop_data),
             HALTEWECKER_INCREMENTAL_PROOF_OVERRIDE="1",
-            HALTEWECKER_MANUAL_PROOF_MIN_FREE_GB="15",
+            HALTEWECKER_MANUAL_PROOF_MIN_FREE_GB="20",
             HALTEWECKER_PROOF_ESTIMATE_MARGIN_GB="0",
-            DF_FREE_KB=str(50 * 1024 * 1024),
+            DF_FREE_KB=str(80 * 1024 * 1024),
             GTFS_CACHE_ROOT=str(cache_root),
             HALTEWECKER_PROVIDER_ARTIFACT_ROOT=str(provider_artifact_root),
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("minimum_free_gb=15", result.stdout)
+        self.assertIn("minimum_free_gb=20", result.stdout)
         self.assertIn("stage=stop-data-build status=SKIPPED", result.stdout)
         self.assertIn("reason=trusted-common-stop-data", result.stdout)
         self.assertIn("stage=trusted-common-stop-data status=PASS", result.stdout)
@@ -1141,11 +1152,11 @@ assert callable(validate_validation_receipt)
         result = self.run_pipeline(
             "--incremental-no-activate",
             HALTEWECKER_MIN_FREE_GB="35",
-            DF_FREE_KB=str(44 * 1024 * 1024),
+            DF_FREE_KB=str(39 * 1024 * 1024),
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("minimum_free_gb=45", result.stdout)
+        self.assertIn("minimum_free_gb=20", result.stdout)
         self.assertIn("insufficient disk for production-shaped-no-activate", result.stderr)
         self.assertFalse((self.root / "build-calls.log").exists())
         self.assertFalse((self.root / "incremental-calls.log").exists())

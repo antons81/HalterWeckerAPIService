@@ -285,8 +285,21 @@ if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; 
   export HALTEWECKER_EXTERNAL_BUILD_CACHE_ROOT="$CACHE_ROOT/external-build"
   export HALTEWECKER_INCREMENTAL_PROVIDER_IDS="${HALTEWECKER_INCREMENTAL_PROVIDER_IDS-israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd,511-bay-area,australia-translink-seq,australia-transport-nsw,cta-chicago,mbta-boston,stm-montreal,germany}"
   BUILD_PROVIDER_IDS="$HALTEWECKER_INCREMENTAL_PROVIDER_IDS"
-  HALTEWECKER_RUNTIME_PROVIDER_IDS="${HALTEWECKER_RUNTIME_PROVIDER_IDS-israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd,511-bay-area,australia-translink-seq,australia-transport-nsw,cta-chicago,mbta-boston,stm-montreal}"
+  HALTEWECKER_RUNTIME_PROVIDER_IDS="${HALTEWECKER_RUNTIME_PROVIDER_IDS-israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd,511-bay-area,australia-translink-seq,australia-transport-nsw,cta-chicago,mbta-boston,stm-montreal,germany}"
   export HALTEWECKER_RUNTIME_PROVIDER_IDS
+  if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$FROZEN_COMMON_STOP_DATA" != "1" ]]; then
+    IFS=',' read -r -a runtime_providers <<< "$HALTEWECKER_RUNTIME_PROVIDER_IDS"
+    for provider in "${runtime_providers[@]}"; do
+      if [[ ",$BUILD_PROVIDER_IDS," != *",$provider,"* ]]; then
+        echo "[Nightly] ERROR: runtime providers are absent from the build release: $provider" >&2
+        exit 1
+      fi
+    done
+    if [[ ",$HALTEWECKER_RUNTIME_PROVIDER_IDS," != *,germany,* ]]; then
+      echo "[Nightly] ERROR: Germany must be enabled in the shared hybrid runtime; refusing duplicate full import" >&2
+      exit 1
+    fi
+  fi
   export HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS="$HALTEWECKER_INCREMENTAL_PROVIDER_IDS"
   export HALTEWECKER_EXTERNAL_DEPARTURES_V3_PROVIDERS="$HALTEWECKER_INCREMENTAL_PROVIDER_IDS"
   export HALTEWECKER_EXTERNAL_DEPARTURE_CACHE=1
@@ -715,6 +728,7 @@ runtime = tuple(value for value in sys.argv[3].split(",") if value)
 supported = tuple(value for value in runtime if provider_capability(Path(sys.argv[4]), value, SHARD_RUNTIME))
 validate_provider_contract(providers, runtime, supported)
 actual = tuple((payload.get("providers") or {}).keys())
+validate_provider_contract(actual, runtime, supported)
 if set(actual) != set(providers):
     raise SystemExit("dry-run candidate does not represent all configured providers")
 if "germany" not in actual:
@@ -770,8 +784,11 @@ validate_incremental_consumers() {
     echo "[Nightly] stage=consumer-preflight status=DRY-RUN buildProviders=$BUILD_PROVIDER_IDS runtimeProviders=$HALTEWECKER_RUNTIME_PROVIDER_IDS"
     return 0
   fi
+  STATIC_ACTIVATION_IMAGE="$(docker inspect --format '{{.Image}}' static-departures-api)" || return 1
   python3 "$REPO/scripts/validate_shared_release_consumers.py" \
     --release "$INCREMENTAL_RELEASE_DIR" \
+    --rollback-release "$CURRENT_RELEASE" \
+    --static-image "$STATIC_ACTIVATION_IMAGE" \
     --build-providers "$BUILD_PROVIDER_IDS" \
     --runtime-providers "$HALTEWECKER_RUNTIME_PROVIDER_IDS"
 }
@@ -850,6 +867,10 @@ activate_incremental_production() {
   fi
   validate_incremental_candidate || return 1
   validate_incremental_consumers || return 1
+  if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" == "1" ]]; then
+    echo "[Nightly] stage=activation status=PASS mode=DRY_RUN pointerSwitch=NOT_RUN"
+    return 0
+  fi
   ROUTERECALL_ACTIVATION_RELOAD=0
   old_release="$(basename "$(readlink -f "$CURRENT_RELEASE")")"
   if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" != "1" ]]; then
@@ -868,10 +889,15 @@ activate_incremental_production() {
     echo "[Nightly] ERROR: current is not a symlink; refusing to overwrite stop-data" >&2
     return 1
   fi
+  haltewecker_activation_readiness "$old_release" || return 1
+  if [[ "$(docker inspect --format '{{.Image}}' static-departures-api)" != "$STATIC_ACTIVATION_IMAGE" ]]; then
+    echo "[Nightly] ERROR: static API image changed after preflight" >&2
+    return 1
+  fi
   # Static HTTP consumers follow the same atomic generation pointer as the API.
   replace_link "$CURRENT" "current-release/stop-data" || return 1
-  # Keep the previous target in memory for failed activation recovery only.
-  # Successful production activation must not retain a rollback release pointer.
+  # Retain the release that passed the full rollback consumer contract.
+  replace_link "$rollback_pointer" "$old_target" || return 1
   replace_link "$CURRENT_RELEASE" "$candidate_target" || return 1
   # The DB adapter hot-reloads; the API's resolved stop-data root is startup-bound.
   if [[ "$ROUTERECALL_ACTIVATION_RELOAD" == "1" ]]; then
@@ -884,8 +910,13 @@ activate_incremental_production() {
     fi
     echo "[Nightly] stage=routerecall-reload status=PASS action=RESTART_SAME_CONTAINER image=$ROUTERECALL_ACTIVATION_IMAGE"
   fi
-  if ! HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE=provider \
-    HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RUNTIME=1 \
+  if ! STATIC_DEPARTURES_IMAGE="$STATIC_ACTIVATION_IMAGE" \
+    HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE=hybrid \
+    HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RUNTIME=0 \
+    HALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME=1 \
+    HALTEWECKER_STATIC_DEPARTURES_HYBRID_PROVIDERS="$HALTEWECKER_RUNTIME_PROVIDER_IDS" \
+    HALTEWECKER_STATIC_DEPARTURES_HYBRID_RELEASE_POINTER="/data/current-release" \
+    DEPARTURES_DATABASE="/data/current-release/departures.sqlite" \
     HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS="$HALTEWECKER_RUNTIME_PROVIDER_IDS" \
     HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RELEASE_POINTER="/data/current-release" \
     READINESS_ONLY=1 \
@@ -905,10 +936,7 @@ activate_incremental_production() {
     rollback_incremental_consumers "$old_target" "$old_release" || echo "[Nightly] ERROR: rollback readiness failed; operator recovery required" >&2
     return 1
   fi
-  if [[ -L "$rollback_pointer" ]]; then
-    unlink "$rollback_pointer"
-  fi
-  echo "[Nightly] stage=activation status=PASS mode=FULL_INCREMENTAL old=$old_target new=$candidate_target rollback=NONE"
+  echo "[Nightly] stage=activation status=PASS mode=FULL_INCREMENTAL old=$old_target new=$candidate_target rollback=VERIFIED"
 }
 
 cd "$REPO"
@@ -923,7 +951,9 @@ if [[ "$RUN_MODE" == "activate-existing" ]]; then
     echo "[Nightly] stage=activation-only status=FAIL release=$RELEASE_ID" >&2
     exit 1
   fi
-  echo "[Nightly] stage=nightly-complete status=PASS release=$RELEASE_ID mode=activation-only activation=FULL_INCREMENTAL"
+  activation_mode="FULL_INCREMENTAL"
+  if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" == "1" ]]; then activation_mode="NOT_RUN"; fi
+  echo "[Nightly] stage=nightly-complete status=PASS release=$RELEASE_ID mode=activation-only activation=$activation_mode"
   exit 0
 fi
 TOTAL_STARTED=$SECONDS
@@ -1005,6 +1035,7 @@ proof_disk_preflight() {
   local minimum_free_kb
   local expected_artifact_miss_kb
   local transient_workspace_kb
+  local fallback_database_kb=0
 
   free_kb="$(disk_free_kb)"
   if [[ "$FROZEN_COMMON_STOP_DATA" != "1" && "$REUSE_STOP_DATA" != "1" && ( -d "$CURRENT" || -L "$CURRENT" ) ]]; then
@@ -1018,21 +1049,26 @@ proof_disk_preflight() {
     return 1
   fi
   transient_workspace_kb="$(temporary_workspace_kb)"
-  estimated_additional_kb=$((current_stop_data_kb + expected_artifact_miss_kb + transient_workspace_kb + margin_kb))
+  if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
+    # The candidate omits feeds served by shards; the previous full database
+    # is not copied. This estimate is supplemented by the live disk guard.
+    fallback_database_kb=$(( ${HALTEWECKER_FALLBACK_DATABASE_ESTIMATE_GB:-20} * 1024 * 1024 ))
+  fi
+  estimated_additional_kb=$((current_stop_data_kb + fallback_database_kb + expected_artifact_miss_kb + transient_workspace_kb + margin_kb))
   estimated_free_kb=$((free_kb - estimated_additional_kb))
   if [[ "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
     if [[ "$INCREMENTAL_PROOF_OVERRIDE" == "1" ]]; then
       manual_min_free_gb="${HALTEWECKER_MANUAL_PROOF_MIN_FREE_GB:-35}"
-      if ! [[ "$manual_min_free_gb" =~ ^[0-9]+$ ]] || (( manual_min_free_gb < 15 || manual_min_free_gb > 45 )); then
-        echo "[Nightly] ERROR: HALTEWECKER_MANUAL_PROOF_MIN_FREE_GB must be an integer between 15 and 45" >&2
+      if ! [[ "$manual_min_free_gb" =~ ^[0-9]+$ ]] || (( manual_min_free_gb < 20 || manual_min_free_gb > 45 )); then
+        echo "[Nightly] ERROR: HALTEWECKER_MANUAL_PROOF_MIN_FREE_GB must be an integer between 20 and 45" >&2
         return 1
       fi
       minimum_free_kb=$((manual_min_free_gb * 1024 * 1024))
       warning_free_kb=$(((manual_min_free_gb + 5) * 1024 * 1024))
       disk_mode="manual-production-shaped-proof"
     else
-      minimum_free_kb=$((45 * 1024 * 1024))
-      warning_free_kb=$((45 * 1024 * 1024))
+      minimum_free_kb=$((20 * 1024 * 1024))
+      warning_free_kb=$((25 * 1024 * 1024))
       disk_mode="production-shaped-no-activate"
     fi
   elif [[ "$INCREMENTAL_PRODUCTION" == "1" ]]; then
@@ -1041,17 +1077,22 @@ proof_disk_preflight() {
       warning_free_kb=$minimum_free_kb
       disk_mode="incremental-migration"
     else
-      minimum_free_kb=$((45 * 1024 * 1024))
+      minimum_free_kb=$((20 * 1024 * 1024))
       warning_free_kb=$minimum_free_kb
       disk_mode="incremental-production"
     fi
   else
-    minimum_free_kb=$(( ${HALTEWECKER_MIN_FREE_GB:-45} * 1024 * 1024 ))
+    minimum_free_kb=$(( ${HALTEWECKER_MIN_FREE_GB:-20} * 1024 * 1024 ))
     warning_free_kb="$minimum_free_kb"
     disk_mode="proof-or-legacy"
   fi
+  if (( minimum_free_kb < 20 * 1024 * 1024 )); then
+    echo "[Nightly] ERROR: disk reserve cannot be lower than 20 GiB" >&2
+    return 1
+  fi
+  export HALTEWECKER_BUILD_MIN_FREE_GIB=$((minimum_free_kb / 1024 / 1024))
   log_disk_state "before"
-  echo "[Nightly] disk model unavoidable_stop_data_kb=$current_stop_data_kb expected_artifact_miss_kb=$expected_artifact_miss_kb transient_workspace_kb=$transient_workspace_kb safety_reserve_kb=$margin_kb"
+  echo "[Nightly] disk model unavoidable_stop_data_kb=$current_stop_data_kb fallback_database_kb=$fallback_database_kb expected_artifact_miss_kb=$expected_artifact_miss_kb transient_workspace_kb=$transient_workspace_kb safety_reserve_kb=$margin_kb"
   echo "[Nightly] disk estimated_additional_gb=$((estimated_additional_kb / 1024 / 1024)) estimated_peak_free_gb=$((estimated_free_kb / 1024 / 1024)) warning_free_gb=$((warning_free_kb / 1024 / 1024)) minimum_free_gb=$((minimum_free_kb / 1024 / 1024)) mode=$disk_mode reuse_stop_data=$REUSE_STOP_DATA"
   if (( free_kb <= warning_free_kb )); then
     echo "[Nightly] WARNING: disk free is at or below warning threshold for $disk_mode" >&2
@@ -1067,6 +1108,11 @@ if [[ "$RUN_MODE" == "normal" && ( "$NO_ACTIVATE" == "1" || "$INCREMENTAL_PRODUC
   proof_disk_preflight
 fi
 
+run_disk_guarded() {
+  python3 "$REPO/scripts/disk_budget.py" --root "$DATA_ROOT" \
+    --minimum-free-gib "${HALTEWECKER_BUILD_MIN_FREE_GIB:-20}" -- "$@"
+}
+
 run_build_stage() {
   diagnostics_set_stage "stop-data-build"
   echo "[StopData] release=$RELEASE_ID stage=build started"
@@ -1078,7 +1124,7 @@ else
 fi
 if [[ -f "$MVO_ENV_FILE" ]]; then
   echo "[StopData] refreshing Austrian MVO GTFS sources"
-  python3 "$REPO/scripts/download_austrian_gtfs.py" \
+  run_disk_guarded python3 "$REPO/scripts/download_austrian_gtfs.py" \
     --registry "$REPO/config/austrian-sources.json" \
     --env-file "$MVO_ENV_FILE" \
     --output "$AUSTRIAN_DATA_ROOT" \
@@ -1105,11 +1151,11 @@ fi
 PREPARE_ARGS+=(--output "$ARTIFACTS_JSON")
 PREPARE_ARGS+=(--release-root "$RELEASE_DIR")
 log_disk_state "raw-download"
-python3 "$REPO/scripts/prepare_gtfs_artifacts.py" "${PREPARE_ARGS[@]}"
+run_disk_guarded python3 "$REPO/scripts/prepare_gtfs_artifacts.py" "${PREPARE_ARGS[@]}"
 VBB_INPUT_URL="${VBB_GTFS_URL:-https://unternehmen.vbb.de/fileadmin/user_upload/VBB/Dokumente/API-Datensaetze/gtfs-mastscharf/GTFS.zip}"
 RNV_INPUT_URL="${RNV_GTFS_URL:-https://gtfs-sandbox-dds.rnv-online.de/latest/gtfs.zip}"
 log_disk_state "raw-extract"
-python3 "$REPO/scripts/prepare_custom_gtfs_artifacts.py" \
+run_disk_guarded python3 "$REPO/scripts/prepare_custom_gtfs_artifacts.py" \
   --cache-root "$CACHE_ROOT" \
   --vbb-url "$VBB_INPUT_URL" \
   --rnv-url "$RNV_INPUT_URL" \
@@ -1197,7 +1243,7 @@ run_build_stop_packages() {
   if [[ -n "${NL_GTFS_URL:-}" ]]; then
     cmd+=(--allow-nl-failure)
   fi
-  "${cmd[@]}"
+  run_disk_guarded "${cmd[@]}"
 }
 
 run_build_stop_packages "${NL_GTFS_URL:-}"
@@ -1205,7 +1251,7 @@ run_build_stop_packages "${NL_GTFS_URL:-}"
 if [[ "${FORCE_PRESERVE_NL:-0}" = "1" || -n "$NL_SOURCE_FAILED" || -f "$BUILD_DIR/.nl-failure" ]]; then
   test -d "$CURRENT"
   echo "[StopData] release=$RELEASE_ID preserving last validated Dutch assets"
-  python3 "$REPO/scripts/preserve_nl_assets.py" \
+  run_disk_guarded python3 "$REPO/scripts/preserve_nl_assets.py" \
     --current "$CURRENT" \
     --output "$BUILD_DIR" \
     --cities "$REPO/config/cities.json"
@@ -1213,7 +1259,7 @@ if [[ "${FORCE_PRESERVE_NL:-0}" = "1" || -n "$NL_SOURCE_FAILED" || -f "$BUILD_DI
 fi
 
 SWISS_INDEX_STARTED=$SECONDS
-python3 "$REPO/scripts/build_swiss_departure_index.py" \
+run_disk_guarded python3 "$REPO/scripts/build_swiss_departure_index.py" \
   --gtfs-url "$SWISS_GTFS_URL" \
   --output "$BUILD_DIR/swiss-static"
 echo "[StopData] source=swiss stage=departure-index duration=$(elapsed_seconds "$SWISS_INDEX_STARTED")"
@@ -1559,6 +1605,11 @@ PY
 run_static_departures_stage() {
   diagnostics_set_stage "legacy-import"
   STATIC_STARTED=$SECONDS
+  local fallback_shards=""
+  if [[ "$INCREMENTAL_PRODUCTION" == "1" || ( "$INCREMENTAL_NO_ACTIVATE" == "1" && "$FROZEN_COMMON_STOP_DATA" != "1" ) ]]; then
+    fallback_shards="$HALTEWECKER_RUNTIME_PROVIDER_IDS"
+  fi
+  STATIC_FALLBACK_SHARD_PROVIDER_IDS="$fallback_shards" \
   EXTERNAL_GTFS_ARTIFACTS_JSON="$ARTIFACTS_JSON" \
 STOP_DATA_PATH="$BUILD_DIR" \
 NEXT_DATABASE_PATH="$RELEASE_DIR/departures.sqlite" \
@@ -1660,14 +1711,8 @@ if [[ "$RUN_MODE" == "normal" ]]; then
     log_disk_peak
     exit 0
   fi
-  if [[ "$NO_ACTIVATE" == "1" || "$INCREMENTAL_PRODUCTION" == "1" ]]; then
-    if [[ "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
-      echo "[Nightly] stage=legacy-import status=SKIPPED release=$RELEASE_ID reason=production-shaped-no-activate"
-    elif [[ "$INCREMENTAL_PRODUCTION" == "1" ]]; then
-      echo "[Nightly] stage=legacy-import status=SKIPPED release=$RELEASE_ID reason=incremental-production"
-    else
-      echo "[Nightly] stage=legacy-import status=SKIPPED release=$RELEASE_ID reason=no-activate-proof"
-    fi
+  if [[ "$NO_ACTIVATE" == "1" && ( "$INCREMENTAL_NO_ACTIVATE" != "1" || "$FROZEN_COMMON_STOP_DATA" == "1" ) ]]; then
+    echo "[Nightly] stage=legacy-import status=SKIPPED release=$RELEASE_ID reason=no-activate-proof"
   else
     echo "[Nightly] stage=legacy-import status=started release=$RELEASE_ID"
     run_static_departures_stage
@@ -1741,9 +1786,16 @@ if [[ "$NO_ACTIVATE" == "1" || "$INCREMENTAL_PRODUCTION" == "1" ]]; then
     INCREMENTAL_ARGS+=(--trusted-common-stop-data "$TRUSTED_COMMON_STOP_DATA")
   fi
   INCREMENTAL_ARGS+=(--result-json "$RELEASE_DIR/incremental-result.json")
+  if [[ "$INCREMENTAL_PRODUCTION" == "1" || ( "$INCREMENTAL_NO_ACTIVATE" == "1" && "$FROZEN_COMMON_STOP_DATA" != "1" ) ]]; then
+    if [[ ! -s "$RELEASE_DIR/departures.sqlite" ]]; then
+      echo "[Nightly] ERROR: fallback database is missing before release assembly" >&2
+      exit 1
+    fi
+    INCREMENTAL_ARGS+=(--fallback-database "$RELEASE_DIR/departures.sqlite")
+  fi
   (
     cd "$REPO"
-    python3 -m scripts.run_incremental_provider_pipeline \
+    run_disk_guarded python3 -m scripts.run_incremental_provider_pipeline \
       "${INCREMENTAL_ARGS[@]}"
   )
   python3 - "$RELEASE_DIR/incremental-result.json" "$RELEASE_ID" "$BUILD_DIR" "$BUILD_FINGERPRINT" "$FROZEN_COMMON_STOP_DATA" <<'PY'
@@ -1790,8 +1842,9 @@ PY
   fi
   echo "[Nightly] stage=incremental-provider status=PASS release=$RELEASE_ID duration=$((SECONDS - INCREMENTAL_STARTED))s"
   log_disk_state "incremental-complete"
-  echo "[Nightly] stage=readiness status=PASS release=$RELEASE_ID mode=incremental-candidate"
+  echo "[Nightly] stage=assembly status=PASS release=$RELEASE_ID mode=incremental-candidate"
   if [[ "$NO_ACTIVATE" == "1" ]]; then
+    echo "[Nightly] stage=consumer-preflight status=NOT_RUN release=$RELEASE_ID activation=NOT_RUN"
     echo "[Nightly] stage=nightly-complete status=PASS release=$RELEASE_ID mode=production-shaped-no-activate activation=NOT_RUN"
     log_disk_state "after"
     log_disk_peak
@@ -1801,7 +1854,9 @@ PY
     if ! activate_incremental_production; then
       exit 1
     fi
-    echo "[Nightly] stage=nightly-complete status=PASS release=$RELEASE_ID mode=incremental-production activation=FULL_INCREMENTAL"
+    activation_mode="FULL_INCREMENTAL"
+    if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" == "1" ]]; then activation_mode="NOT_RUN"; fi
+    echo "[Nightly] stage=nightly-complete status=PASS release=$RELEASE_ID mode=incremental-production activation=$activation_mode"
     log_disk_state "after"
     log_disk_peak
     exit 0

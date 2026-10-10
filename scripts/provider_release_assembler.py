@@ -8,11 +8,12 @@ import os
 import re
 import resource
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
 import uuid
-from contextlib import contextmanager, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -631,6 +632,7 @@ def assemble_release(
     created_at: str | None = None,
     trusted_common_stop_data: Path | str | None = None,
     common_snapshot_fingerprint: str | None = None,
+    fallback_database: Path | str | None = None,
 ) -> ReleaseAssembly:
     """Build, validate, fsync, and rename one immutable release directory."""
     _validate_release_id(release_id)
@@ -690,6 +692,16 @@ def assemble_release(
                 ),
                 snapshot_fingerprint=common_snapshot_fingerprint,
             )
+        fallback_reference = None
+        if fallback_database is not None:
+            fallback_source = Path(fallback_database).resolve(strict=True)
+            with closing(sqlite3.connect(fallback_source.as_uri() + "?mode=ro", uri=True)) as connection:
+                fallback_metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+            if fallback_metadata.get("releaseID") != release_id or fallback_metadata.get("stopDataReleaseID") != stop_data.get("releaseID"):
+                raise ReleaseAssemblyError("fallback database does not match the candidate generation")
+            _link_reference(fallback_source, staging / "departures.sqlite", publish_root=releases)
+            fallback_digest, fallback_size = artifact_provenance(fallback_source)
+            fallback_reference = {"path": "departures.sqlite", "sha256": fallback_digest, "size": fallback_size}
         common_metadata_path = staging / "common-metadata.json"
         with __import__("sqlite3").connect(staging / "common.sqlite") as connection:
             metadata = dict(connection.execute("SELECT key, value FROM metadata"))
@@ -744,6 +756,8 @@ def assemble_release(
                 "providerSetFingerprint": _provider_set_fingerprint(provider_payload),
                 "providers": provider_payload,
             }
+            if fallback_reference is not None:
+                manifest["fallbackDatabase"] = fallback_reference
             _write_json_atomic(staging / "release.json", manifest)
         with profiler.stage("release-json-validation"):
             validate_candidate_release(staging, profiler=profiler)

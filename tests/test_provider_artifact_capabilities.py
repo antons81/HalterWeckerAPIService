@@ -2,12 +2,14 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 
 from provider_artifact_capabilities import (  # noqa: E402
+    _incremental_sources_path,
     PERSISTENT_NORMALIZED,
     HYBRID_RUNTIME,
     SHARD_RUNTIME,
@@ -21,6 +23,14 @@ from provider_artifact_capabilities import (  # noqa: E402
 
 
 class ProviderArtifactCapabilityTests(unittest.TestCase):
+    def test_flat_container_layout_includes_germany_capabilities(self) -> None:
+        self.assertEqual(_incremental_sources_path(Path("/")), Path("/app/config/incremental-provider-sources.json"))
+        dockerfile = (REPOSITORY_ROOT / "services/static-departures.Dockerfile").read_text()
+        self.assertIn("COPY config/incremental-provider-sources.json /app/config/incremental-provider-sources.json", dockerfile)
+        with patch("provider_artifact_capabilities._sources_path", return_value=REPOSITORY_ROOT / "config/external-gtfs-sources.json"), \
+             patch("provider_artifact_capabilities._incremental_sources_path", return_value=REPOSITORY_ROOT / "config/incremental-provider-sources.json"):
+            self.assertTrue(provider_capability(Path("/"), "germany", HYBRID_RUNTIME))
+
     def test_enabled_providers_are_explicit_and_unlisted_providers_fail_closed(self) -> None:
         for provider_id in ("israel-mot", "ttc-surface", "ttc-subway", "germany"):
             self.assertTrue(provider_artifact_eligible(REPOSITORY_ROOT, provider_id))
