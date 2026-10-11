@@ -724,7 +724,7 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
             "https://open-data.cui.wroclaw.pl/hdb/db/14?download=json",
         )
 
-    def test_validate_ireland_local_registry_and_city_coverage(self) -> None:
+    def test_validate_ireland_refreshable_registry_and_city_coverage(self) -> None:
         sources = load_external_gtfs_sources(
             REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
         )
@@ -735,7 +735,11 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
             [city["id"] for city in cities],
             ["dublin", "cork", "galway", "limerick", "waterford"],
         )
-        self.assertEqual(ireland["localPath"], "/srv/haltewecker/data/ireland/static")
+        self.assertEqual(
+            ireland["url"],
+            "https://www.transportforireland.ie/transitData/Data/GTFS_All.zip",
+        )
+        self.assertNotIn("localPath", ireland)
 
     def test_validate_norway_registry_and_city_coverage(self) -> None:
         sources = load_external_gtfs_sources(

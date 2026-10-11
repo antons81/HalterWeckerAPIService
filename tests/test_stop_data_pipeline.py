@@ -73,6 +73,15 @@ if [ "${1:-}" = "-m" ] && [ "${2:-}" = "scripts.run_incremental_provider_pipelin
 fi
 
 case \"${1:-}\" in
+  -c)
+    exec \"$REAL_PYTHON\" \"$@\"
+    ;;
+  *estimate_provider_disk.py)
+    printf '%s\\n' "${FORECAST_KB:-0}"
+    ;;
+  *deduplicate_stop_data.py)
+    exec \"$REAL_PYTHON\" \"$@\"
+    ;;
   *disk_budget.py)
     while [[ \"$1\" != -- ]]; do shift; done
     shift
@@ -561,9 +570,11 @@ PY
             "STAGED_STOP_DATA_LOG": str(self.root / "staged-stop-data.log"),
             "STATIC_DEPARTURES_PIPELINE": str(self.bin_directory / "static-departures-pipeline"),
             "HALTEWECKER_DIAGNOSTICS_DISABLE_TEE": "1",
+            "HALTEWECKER_FALLBACK_DATABASE_ESTIMATE_GB": "20",
             "REAL_PYTHON": sys.executable,
             "GTFS_URL": "https://example.invalid/german.zip",
             "SWISS_GTFS_URL": "https://example.invalid/swiss.zip",
+            "AUSTRIAN_GTFS_URL": "https://example.invalid/austria.zip",
             "NL_GTFS_URL": "https://example.invalid/netherlands.zip",
             "PATH": f"{self.bin_directory}:{environment['PATH']}"
         })
@@ -976,6 +987,18 @@ assert callable(validate_validation_receipt)
         self.assertIn("run_kind=incremental-no-activate", report)
         self.assertIn(f"release_id={release_id}", report)
 
+    def test_incremental_prebuild_reports_missing_austrian_sources_before_build(self) -> None:
+        result = self.run_pipeline(
+            "--incremental-no-activate",
+            AUSTRIAN_GTFS_URL="",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Austria feeds were not refreshed", result.stderr)
+        self.assertIn("MVO credentials are missing", result.stderr)
+        self.assertIn("required sources=vor,steiermark,salzburg,kaernten,ooevv,tirol,vorarlberg,linz-ag", result.stderr)
+        self.assertFalse((self.root / "build-calls.log").exists())
+
     def test_manual_incremental_proof_override_is_explicit_and_scoped(self) -> None:
         result = self.run_pipeline(
             "--incremental-no-activate",
@@ -1148,6 +1171,83 @@ assert callable(validate_validation_receipt)
         report = next((self.data_root / "pipeline-diagnostics").glob("*.report"))
         self.assertIn("status=FAIL", report.read_text(encoding="utf-8"))
 
+    def run_disk_stage(self, stage: str, free_gib: int, *, stop_gib: int = 17,
+                       artifact_miss_gib: int = 0, fallback_gib: int = 37,
+                       estimate_gib: int = 20, has_fallback: bool = True) -> subprocess.CompletedProcess[str]:
+        fallback_database = self.data_root / "fallback-estimate.sqlite"
+        if has_fallback:
+            with fallback_database.open("wb") as stream:
+                stream.truncate(fallback_gib * 1024 * 1024 * 1024)
+        text = PIPELINE.read_text()
+        function = text[text.index("proof_disk_preflight() {"):text.index(
+            '\nif [[ "$RUN_MODE" == "normal"', text.index("proof_disk_preflight() {"))]
+        setup = "\n".join((
+            'diagnostics_set_stage() { :; }',
+            'log_disk_state() { :; }',
+            f'disk_free_kb() {{ echo {free_gib * 1024 * 1024}; }}',
+            'temporary_workspace_kb() { echo 0; }',
+            'HALTEWECKER_ADDITIONAL_WORKSPACE_KB=2097152',
+            f'du() {{ echo {stop_gib * 1024 * 1024}; }}',
+            f'CURRENT="{self.data_root / "current"}"',
+            f'DEPARTURES_CURRENT="{fallback_database}"',
+            'FROZEN_COMMON_STOP_DATA=0', 'REUSE_STOP_DATA=0',
+            'INCREMENTAL_PRODUCTION=1', 'INCREMENTAL_NO_ACTIVATE=0',
+            'INCREMENTAL_MIGRATION=0',
+            f'HALTEWECKER_FALLBACK_DATABASE_ESTIMATE_GB={estimate_gib}',
+            f'HALTEWECKER_EXPECTED_ARTIFACT_MISS_KB={artifact_miss_gib * 1024 * 1024}',
+        ))
+        return subprocess.run(['bash', '-c', setup + '\n' + function +
+                               f'\nproof_disk_preflight {stage}'],
+                              text=True, capture_output=True)
+
+    def test_activation_rechecks_reserve_after_successful_consumer_gates(self) -> None:
+        text = PIPELINE.read_text()
+        function = text[text.index('activation_disk_preflight() {'):text.index(
+            '\nactivate_incremental_production() {')]
+        with tempfile.TemporaryDirectory() as directory:
+            for free_gib, expected in ((24, 1), (25, 0)):
+                script = ('DATA_ROOT="' + directory + '"\n' +
+                          'df() { printf "header\\nmock 0 0 ' + str(free_gib * 1024 * 1024) +
+                          ' 0%% /\\n"; }\n' + function + '\nactivation_disk_preflight')
+                result = subprocess.run(['bash', '-c', script], text=True, capture_output=True)
+                self.assertEqual(result.returncode, expected, result.stderr)
+        body = text[text.index('activate_incremental_production() {'):text.index('\ncd "$REPO"')]
+        self.assertLess(body.index('validate_incremental_consumers || return 1'),
+                        body.index('activation_disk_preflight || return 1'))
+        self.assertLess(body.rindex('activation_disk_preflight || return 1'),
+                        body.index('replace_link "$CURRENT"'))
+
+    def test_initial_budget_includes_fallback_before_expensive_build(self) -> None:
+        rejected = self.run_disk_stage('stop-data', 80)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn('fallback_database_kb=38797312', rejected.stdout)
+        accepted = self.run_disk_stage('stop-data', 82)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        later = self.run_disk_stage('fallback', 48)
+        self.assertNotEqual(later.returncode, 0)
+        self.assertIn('unavoidable_stop_data_kb=0', later.stdout)
+
+    def test_disk_preflight_fails_closed_without_fallback_size_evidence(self) -> None:
+        result = self.run_disk_stage(
+            'stop-data', 100, estimate_gib=0, has_fallback=False
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('cannot estimate candidate fallback SQLite', result.stderr)
+
+    def test_fallback_rechecks_actual_free_space_after_a_cache_miss(self) -> None:
+        fallback = self.run_disk_stage('fallback', 44)
+        self.assertNotEqual(fallback.returncode, 0)
+        self.assertIn('insufficient disk', fallback.stderr)
+
+    def test_stop_data_stage_rejects_insufficient_build_space(self) -> None:
+        result = self.run_disk_stage('stop-data', 41)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_provider_artifact_miss_budget_is_not_ignored(self) -> None:
+        result = self.run_disk_stage('provider-artifacts', 29, artifact_miss_gib=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('expected_artifact_miss_kb=5242880', result.stdout)
+
     def test_production_shaped_mode_uses_production_disk_floor(self) -> None:
         result = self.run_pipeline(
             "--incremental-no-activate",
@@ -1158,6 +1258,8 @@ assert callable(validate_validation_receipt)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("minimum_free_gb=20", result.stdout)
         self.assertIn("insufficient disk for production-shaped-no-activate", result.stderr)
+        self.assertIn("stage=stop-data", result.stdout)
+        self.assertNotIn("stage=fallback", result.stdout)
         self.assertFalse((self.root / "build-calls.log").exists())
         self.assertFalse((self.root / "incremental-calls.log").exists())
 
@@ -1192,6 +1294,13 @@ assert callable(validate_validation_receipt)
         self.assertNotEqual(reports[0].stem, reports[1].stem)
         self.assertTrue(all("run_id=" in report.read_text(encoding="utf-8") for report in reports))
 
+    def test_invalid_forecast_stops_before_expensive_build(self) -> None:
+        result = self.run_pipeline("--incremental-no-activate", FORECAST_KB="invalid")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid provider disk forecast", result.stderr)
+        self.assertFalse((self.root / "build-calls.log").exists())
+        self.assertEqual((self.data_root / "current/release-marker").read_text(), "old")
+
     def test_failure_preserves_already_published_incremental_candidate(self) -> None:
         result = self.run_pipeline(
             "--no-activate",
@@ -1203,6 +1312,8 @@ assert callable(validate_validation_receipt)
         incremental_root = self.data_root / "releases" / "incremental"
         published = list(incremental_root.glob("*/release.json"))
         self.assertEqual(len(published), 1)
+        generation = self.data_root / "releases" / published[0].parent.name
+        self.assertTrue((generation / "stop-data" / "manifest.json").is_file())
         reports = sorted((self.data_root / "pipeline-diagnostics").glob("*.report"))
         self.assertEqual(len(reports), 1)
         self.assertIn(
@@ -1299,6 +1410,8 @@ assert callable(validate_validation_receipt)
         self.assertEqual(self.systemctl_calls(), [])
         self.assertEqual((self.root / "build-calls.log").read_text().splitlines(), ["build"])
         self.assertNotIn("Dutch", result.stdout)
+        self.assertFalse([path for path in (self.data_root / "releases").iterdir()
+                          if path.is_dir() and path.name not in {"old", "incremental"}])
 
     def test_kyiv_without_any_fallback_fails_candidate_after_other_stages(self) -> None:
         output = self.root / "candidate"

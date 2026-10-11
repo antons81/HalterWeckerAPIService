@@ -584,7 +584,14 @@ class GTFSArtifactCacheTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             artifact = root / "current.zip"
-            write_gtfs(artifact)
+            with zipfile.ZipFile(artifact, "w") as archive:
+                for name in ("stops.txt", "routes.txt", "trips.txt", "stop_times.txt"):
+                    archive.writestr(name, "id,name\nfixture,Fixture\n")
+                archive.writestr(
+                    "calendar.txt",
+                    "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
+                    "service,1,1,1,1,1,1,1,20260101,20301231\n",
+                )
 
             class FakeCache:
                 def resolve(self, source_id, url, **kwargs):

@@ -9,6 +9,8 @@ from __future__ import annotations
 import argparse
 import os
 import signal
+import shutil
+import sys
 import subprocess
 import time
 from pathlib import Path
@@ -35,6 +37,20 @@ def terminate_build(process: subprocess.Popen) -> None:
         process.wait()
 
 
+def background_command(command: list[str]) -> list[str]:
+    """Give production API requests priority over owned candidate builders."""
+    nice = shutil.which("nice")
+    if nice is None:
+        raise RuntimeError("nice is required for background candidate builds")
+    arguments = [nice, "-n", "19", "--"]
+    if sys.platform.startswith("linux"):
+        ionice = shutil.which("ionice")
+        if ionice is None:
+            raise RuntimeError("ionice is required for Linux candidate builds")
+        arguments.extend([ionice, "-c", "3", "--"])
+    return [*arguments, *command]
+
+
 def run_guarded(command: list[str], root: Path, minimum_gib: int = 20, *, interval: float = 0.25) -> int:
     if minimum_gib < MINIMUM_FREE_GIB:
         raise ValueError("disk reserve cannot be lower than 20 GiB")
@@ -44,7 +60,7 @@ def run_guarded(command: list[str], root: Path, minimum_gib: int = 20, *, interv
     if minimum_observed < threshold:
         print("[DiskBudget] FAIL: insufficient free space before build", flush=True)
         return 75
-    process = subprocess.Popen(command, start_new_session=True)
+    process = subprocess.Popen(background_command(command), start_new_session=True)
     previous_handlers = {}
 
     def interrupted(signum, _frame):
@@ -64,11 +80,16 @@ def run_guarded(command: list[str], root: Path, minimum_gib: int = 20, *, interv
                 return status if status >= 0 else 128 - status
             time.sleep(interval)
     finally:
-        if process.poll() is None:
-            terminate_build(process)
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
-        print(f"[DiskBudget] minimum_free_bytes={minimum_observed} reserve_gib={minimum_gib}", flush=True)
+        # Repeated termination signals must not interrupt child-group cleanup.
+        for signum in previous_handlers:
+            signal.signal(signum, signal.SIG_IGN)
+        try:
+            if process.poll() is None:
+                terminate_build(process)
+        finally:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
+            print(f"[DiskBudget] minimum_free_bytes={minimum_observed} reserve_gib={minimum_gib}", flush=True)
 
 
 def main() -> None:

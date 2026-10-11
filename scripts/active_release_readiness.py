@@ -30,7 +30,47 @@ for city, line in (("berlin", "100"), ("wuppertal", "635")):
 '''
 
 
-STATIC_PROBE = '''
+LEGACY_SMOKE_EXPECTATION = '''
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from static_departures_api import Database
+from gtfs_board_window import service_day_epoch
+
+def smoke_expectation(database_path, city, stop):
+    database = Database(database_path)
+    try:
+        _, timezone_name, _, _ = database.city_departure_mode(city)
+        zone = ZoneInfo(timezone_name)
+        connection = database._connection()
+        metadata = dict(connection.execute("SELECT key,value FROM metadata"))
+        start = datetime.combine(datetime.now(zone).date(), datetime.min.time(), zone)
+        end = datetime.fromisoformat(metadata["validThrough"]).replace(tzinfo=zone) + timedelta(days=1)
+        if end <= start:
+            raise RuntimeError("fallback schedule window expired")
+        stop_ids = database._external_stop_time_ids(city, stop)
+        if not stop_ids:
+            return start, end, timezone_name, False
+        connection.create_function("readiness_service_epoch", 1,
+                                   lambda day: service_day_epoch(str(day), timezone_name),
+                                   deterministic=True)
+        placeholders = ",".join("?" for _ in stop_ids)
+        # Test source existence independently of board ordering and its row limit.
+        row = connection.execute(
+            "SELECT 1 FROM stop_times st JOIN trips t ON t.trip_id=st.trip_id "
+            "JOIN active_services a ON a.service_id=t.service_id "
+            "WHERE st.raw_stop_id IN (" + placeholders + ") "
+            "AND readiness_service_epoch(a.service_date)+st.departure_seconds>=? "
+            "AND readiness_service_epoch(a.service_date)+st.departure_seconds<? LIMIT 1",
+            (*stop_ids, start.timestamp(), end.timestamp()),
+        ).fetchone()
+        return start, end, timezone_name, row is not None
+    finally:
+        if database.connection is not None:
+            database.connection.close()
+'''
+
+
+STATIC_PROBE = LEGACY_SMOKE_EXPECTATION + '''
 import json, os, sqlite3, sys
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -68,10 +108,17 @@ for city, stop in (
     ("wien", "at:49:1320:5"),
     ("helsinki", "fi-hsl:1040401"),
 ):
-    payload = get("/static-departures/board?" + urlencode(dict(cityID=city, stopID=stop, limit=3)))
+    start, end, zone, scheduled = smoke_expectation(
+        os.environ.get("DEPARTURES_DATABASE", "/data/current-release/departures.sqlite"), city, stop)
+    payload = get("/static-departures/board?" + urlencode(dict(
+        cityID=city, stopID=stop, limit=3, **{"from": start.isoformat(), "to": end.isoformat()})))
     departures = payload.get("departures")
-    if not isinstance(departures, list) or not departures:
+    if not isinstance(departures, list) or (scheduled and not departures):
         raise RuntimeError("empty departures response: " + city + "/" + stop)
+    from static_departures_api import departure_datetime
+    epochs = [departure_datetime(row, zone).timestamp() for row in departures]
+    if epochs != sorted(epochs) or any(not start.timestamp() <= value < end.timestamp() for value in epochs):
+        raise RuntimeError("invalid departure times: " + city + "/" + stop)
 '''
 
 

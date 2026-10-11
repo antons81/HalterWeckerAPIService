@@ -1013,6 +1013,7 @@ def full_chain_preflight(
     provider_reports: list[dict[str, object]] = []
     mandatory_misses: list[dict[str, object]] = []
     rollover_misses: list[dict[str, object]] = []
+    planned_builds: list[dict[str, object]] = []
 
     for provider_id in provider_ids:
         source = dict(sources[provider_id])
@@ -1043,38 +1044,54 @@ def full_chain_preflight(
                 "path": str(raw_path),
             }
             cities = _provider_cities(source, repository_root, stop_data_root)
-            build_key, build_lookup, city_ids = _probe_external_build_cache(
-                repository_root=repository_root,
-                provider_id=provider_id,
-                raw_sha=raw_sha,
-                source=source,
-                cities=cities,
-                sources=sources,
-                normalized_cache_root=normalized_cache_root,
-                environ=environment,
-            )
-            report["transformed"] = {
-                "status": build_lookup.status,
-                "reason": build_lookup.reason,
-                "key": build_key.value,
-                "builderFingerprint": build_key.builder_fingerprint,
-                "directory": (
-                    str(build_lookup.directory)
-                    if build_lookup.directory is not None
-                    else None
-                ),
-                "mergeGroupMembers": list(build_key.city_ids),
-            }
-            if build_lookup.status not in {"HIT", "HIT_COMPATIBLE"}:
-                mandatory_misses.append(
-                    {
-                        "providerID": provider_id,
-                        "stage": "transformed",
-                        "status": build_lookup.status,
-                        "reason": build_lookup.reason,
-                    }
+            build_key = None
+            build_lookup = None
+            city_ids = tuple(str(city["id"]) for city in cities)
+            if source.get("artifactGroup", "external") == "sources":
+                # Native feeds use normalized artifacts, not external city
+                # projection caches. Their source has no external citiesFile.
+                report["transformed"] = {"status": "NOT_APPLICABLE"}
+            else:
+                build_key, build_lookup, city_ids = _probe_external_build_cache(
+                    repository_root=repository_root,
+                    provider_id=provider_id,
+                    raw_sha=raw_sha,
+                    source=source,
+                    cities=cities,
+                    sources=sources,
+                    normalized_cache_root=normalized_cache_root,
+                    environ=environment,
                 )
-
+                report["transformed"] = {
+                    "status": build_lookup.status,
+                    "reason": build_lookup.reason,
+                    "key": build_key.value,
+                    "builderFingerprint": build_key.builder_fingerprint,
+                    "directory": (
+                        str(build_lookup.directory)
+                        if build_lookup.directory is not None
+                        else None
+                    ),
+                    "mergeGroupMembers": list(build_key.city_ids),
+                }
+                if build_lookup.status == "MISS":
+                    planned_builds.append(
+                        {
+                            "providerID": provider_id,
+                            "stage": "transformed",
+                            "status": build_lookup.status,
+                            "reason": build_lookup.reason,
+                        }
+                    )
+                elif build_lookup.status not in {"HIT", "HIT_COMPATIBLE"}:
+                    mandatory_misses.append(
+                        {
+                            "providerID": provider_id,
+                            "stage": "transformed",
+                            "status": build_lookup.status,
+                            "reason": build_lookup.reason,
+                        }
+                    )
             if strategy == NORMALIZED_REQUIRED:
                 try:
                     archive = load_gtfs_archive(str(raw_path))
@@ -1093,6 +1110,24 @@ def full_chain_preflight(
                         "key": normalized_use.semantic_key,
                         "directory": str(normalized_use.artifact_directory),
                     }
+                    if normalized_use.status == "MISS":
+                        planned_builds.append(
+                            {
+                                "providerID": provider_id,
+                                "stage": "normalized",
+                                "status": normalized_use.status,
+                                "reason": normalized_use.reason,
+                            }
+                        )
+                    elif normalized_use.status not in {"HIT", "HIT_COMPATIBLE"}:
+                        mandatory_misses.append(
+                            {
+                                "providerID": provider_id,
+                                "stage": "normalized",
+                                "status": normalized_use.status,
+                                "reason": normalized_use.reason,
+                            }
+                        )
                 except Exception as error:
                     report["normalized"] = {
                         "status": "MISS",
@@ -1107,7 +1142,8 @@ def full_chain_preflight(
                         }
                     )
             elif (
-                build_lookup.status in {"HIT", "HIT_COMPATIBLE"}
+                build_lookup is not None
+                and build_lookup.status in {"HIT", "HIT_COMPATIBLE"}
                 and strategy == STRUCTURAL_SUFFICIENT
             ):
                 archive = load_gtfs_archive(str(raw_path))
@@ -1158,7 +1194,17 @@ def full_chain_preflight(
                     ("structural", probes.structural),
                     ("temporal", probes.temporal),
                 ):
-                    if probe.status != "HIT":
+                    if probe.status == "MISS":
+                        planned_builds.append(
+                            {
+                                "providerID": provider_id,
+                                "stage": stage,
+                                "status": probe.status,
+                                "reason": probe.reason,
+                                "key": probe.artifact_key,
+                            }
+                        )
+                    elif probe.status != "HIT":
                         mandatory_misses.append(
                             {
                                 "providerID": provider_id,
@@ -1169,7 +1215,7 @@ def full_chain_preflight(
                             }
                         )
 
-            if build_lookup.directory is not None:
+            if build_lookup is not None and build_lookup.directory is not None:
                 departure_cache = DeparturePartitionCache(
                     Path(_external_build_cache_root(normalized_cache_root, environment)).parent
                     / "external-departure-partitions",
@@ -1252,6 +1298,8 @@ def full_chain_preflight(
         "selectionPlan": selection_plan,
         "providers": provider_reports,
         "mandatoryMisses": mandatory_misses,
+        "plannedBuilds": planned_builds,
+        "plannedBuildCount": len(planned_builds),
         "rolloverPartitionMisses": rollover_misses,
         "mandatoryMissCount": len(mandatory_misses),
         "rolloverPartitionMissCount": len(rollover_misses),

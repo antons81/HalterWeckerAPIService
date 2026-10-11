@@ -71,7 +71,7 @@
   {
     "id": "ireland",
     "classification": "required",
-    "localPath": "/srv/haltewecker/data/ireland/static",
+    "url": "https://www.transportforireland.ie/transitData/Data/GTFS_All.zip",
     "cities": "config/ireland-cities.json",
     "timezone": "Europe/Dublin",
     "identifierPrefix": "ie:",
@@ -232,7 +232,7 @@
     "id": "mta-ny-subway",
     "classification": "required",
     "namespace": "mta-ny-subway:",
-    "localPath": "/srv/haltewecker/data/mta-ny/static/subway.zip",
+    "url": "https://rrgtfsfeeds.s3.amazonaws.com/gtfs_subway.zip",
     "identifierPrefix": "mta-ny-subway:",
     "staticIdentifierPrefix": "mta-ny-subway:",
     "staticStopIDPrefix": "mta-ny-subway:"
@@ -255,7 +255,13 @@
     "id": "mta-ny-nyct-bus",
     "classification": "required",
     "namespace": "mta-ny-nyct-bus:",
-    "localPath": "/srv/haltewecker/data/mta-ny/static/nyct-bus.zip",
+    "feedBundle": [
+      {"id": "bronx", "url": "https://rrgtfsfeeds.s3.amazonaws.com/gtfs_bx.zip"},
+      {"id": "brooklyn", "url": "https://rrgtfsfeeds.s3.amazonaws.com/gtfs_b.zip"},
+      {"id": "manhattan", "url": "https://rrgtfsfeeds.s3.amazonaws.com/gtfs_m.zip"},
+      {"id": "queens", "url": "https://rrgtfsfeeds.s3.amazonaws.com/gtfs_q.zip"},
+      {"id": "staten-island", "url": "https://rrgtfsfeeds.s3.amazonaws.com/gtfs_si.zip"}
+    ],
     "identifierPrefix": "mta-ny-nyct-bus:",
     "staticIdentifierPrefix": "mta-ny-nyct-bus:",
     "staticStopIDPrefix": "mta-ny-nyct-bus:"
@@ -278,7 +284,7 @@
     "id": "mta-ny-mta-bus",
     "classification": "required",
     "namespace": "mta-ny-mta-bus:",
-    "localPath": "/srv/haltewecker/data/mta-ny/static/busco.zip",
+    "url": "https://rrgtfsfeeds.s3.amazonaws.com/gtfs_busco.zip",
     "identifierPrefix": "mta-ny-mta-bus:",
     "staticIdentifierPrefix": "mta-ny-mta-bus:",
     "staticStopIDPrefix": "mta-ny-mta-bus:"

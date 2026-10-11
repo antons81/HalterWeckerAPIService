@@ -5,6 +5,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -14,7 +15,9 @@ import ireland_artifact_snapshot
 from artifact_provenance import artifact_provenance
 from gtfs_source_cache import ArtifactResult
 from ireland_artifact_snapshot import (
+    IRELAND_ARCHIVE_RELATIVE_PATH,
     IRELAND_SNAPSHOT_RELATIVE_PATH,
+    capture_ireland_archive_snapshot,
     capture_ireland_snapshot,
     validate_ireland_release_snapshot,
 )
@@ -24,15 +27,32 @@ from static_departures_scoped import StaticProvider, resolve_external_artifact
 
 
 class IrelandArtifactSnapshotTests(unittest.TestCase):
-    def _fd_count(self) -> int:
+    def _open_fds_under(self, root: Path) -> set[tuple[str, str, str]]:
+        resolved_root = root.resolve()
+        descriptors_under_root: set[tuple[str, str, str]] = set()
+        found_fd_directory = False
         for candidate in (Path("/dev/fd"), Path("/proc/self/fd")):
             if not candidate.is_dir():
                 continue
+            found_fd_directory = True
             try:
-                return sum(1 for _ in candidate.iterdir())
+                descriptors = list(candidate.iterdir())
             except OSError:
                 continue
-        self.skipTest("no portable local process FD directory available")
+            for descriptor in descriptors:
+                if not descriptor.name.isdecimal():
+                    continue
+                try:
+                    target = Path(os.readlink(descriptor)).resolve()
+                except OSError:
+                    continue
+                if target.is_relative_to(resolved_root):
+                    descriptors_under_root.add(
+                        (str(candidate), descriptor.name, str(target))
+                    )
+        if not found_fd_directory:
+            self.skipTest("no portable local process FD directory available")
+        return descriptors_under_root
 
     def _source(self, root: Path, content: str = "A") -> Path:
         source = root / "shared" / "static"
@@ -85,6 +105,51 @@ class IrelandArtifactSnapshotTests(unittest.TestCase):
                 set(payload),
                 {"path", "status", "sha256", "size"},
             )
+
+    def test_manifest_payload_points_to_release_local_ireland_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "ireland.zip"
+            with zipfile.ZipFile(source, "w") as archive:
+                archive.writestr("agency.txt", "agency_id,agency_name\n1,TFI\n")
+            release = root / "releases" / "release-a"
+            release.mkdir(parents=True)
+
+            payload = artifact_payload(
+                ArtifactResult("ireland", source, "updated"),
+                release_root=release,
+            )
+            expected = release / IRELAND_ARCHIVE_RELATIVE_PATH
+
+            self.assertEqual(Path(payload["path"]), expected)
+            self.assertEqual(expected.read_bytes(), source.read_bytes())
+            self.assertEqual(
+                (payload["sha256"], payload["size"]),
+                artifact_provenance(expected),
+            )
+            self.assertEqual(validate_ireland_release_snapshot(payload, release), expected)
+            self.assertEqual(
+                list((release / "external-artifacts").iterdir()),
+                [expected],
+            )
+
+    def test_ireland_archive_snapshot_rejects_manifest_digest_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "ireland.zip"
+            with zipfile.ZipFile(source, "w") as archive:
+                archive.writestr("agency.txt", "agency_id,agency_name\n1,TFI\n")
+            release = root / "releases" / "release-a"
+            release.mkdir(parents=True)
+            snapshot = capture_ireland_archive_snapshot(source, release)
+            payload = {
+                "path": str(snapshot.path),
+                "sha256": "0" * 64,
+                "size": snapshot.size,
+            }
+
+            with self.assertRaisesRegex(ValueError, "provenance does not match"):
+                validate_ireland_release_snapshot(payload, release)
 
     def test_scoped_resolver_uses_release_snapshot_for_ireland(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -182,7 +247,7 @@ class IrelandArtifactSnapshotTests(unittest.TestCase):
                     raise ValueError("injected destination child open failure")
                 return original_open(path, **kwargs)
 
-            before = self._fd_count()
+            before = self._open_fds_under(root)
             for _ in range(20):
                 with (
                     mock.patch(
@@ -192,9 +257,9 @@ class IrelandArtifactSnapshotTests(unittest.TestCase):
                     self.assertRaisesRegex(ValueError, "destination child"),
                 ):
                     capture_ireland_snapshot(source, release, max_attempts=1)
-            after = self._fd_count()
+            after = self._open_fds_under(root)
 
-            self.assertEqual(after - before, 0)
+            self.assertFalse(after - before, "snapshot capture leaked a temporary-tree FD")
             self.assertFalse(
                 (parent / ireland_artifact_snapshot.IRELAND_SOURCE_ID).exists()
             )
@@ -214,7 +279,7 @@ class IrelandArtifactSnapshotTests(unittest.TestCase):
             sentinel.write_text("unchanged", encoding="utf-8")
             original_type_at = ireland_artifact_snapshot._entry_type_at
 
-            before = self._fd_count()
+            before = self._open_fds_under(root)
             for _ in range(20):
                 injected = False
 
@@ -233,9 +298,9 @@ class IrelandArtifactSnapshotTests(unittest.TestCase):
                     self.assertRaisesRegex(ValueError, "changed type"),
                 ):
                     capture_ireland_snapshot(source, release, max_attempts=1)
-            after = self._fd_count()
+            after = self._open_fds_under(root)
 
-            self.assertEqual(after - before, 0)
+            self.assertFalse(after - before, "snapshot capture leaked a temporary-tree FD")
             self.assertFalse(
                 (parent / ireland_artifact_snapshot.IRELAND_SOURCE_ID).exists()
             )
@@ -260,7 +325,7 @@ class IrelandArtifactSnapshotTests(unittest.TestCase):
                     label="Ireland traversal test",
                 )
                 try:
-                    before = self._fd_count()
+                    before = self._open_fds_under(root)
                     for _ in range(20):
                         calls = 0
 
@@ -289,11 +354,11 @@ class IrelandArtifactSnapshotTests(unittest.TestCase):
                                 traversal(root_fd, label="Ireland traversal")
                             else:
                                 traversal(root_fd)
-                    after = self._fd_count()
+                    after = self._open_fds_under(root)
                 finally:
                     os.close(root_fd)
 
-                self.assertEqual(after - before, 0)
+                self.assertFalse(after - before, "directory traversal leaked a temporary-tree FD")
 
     def test_symlink_and_escaping_manifest_path_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

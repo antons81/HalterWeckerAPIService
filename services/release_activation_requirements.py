@@ -35,6 +35,7 @@ def validate_provider_contract(
 
 def validate_shared_release(
     release_root: Path | str, *, validation_date: date | None = None,
+    require_current_services: bool = True,
 ) -> dict[str, object]:
     """Validate Germany independently of a configurable provider allowlist.
 
@@ -54,7 +55,16 @@ def validate_shared_release(
     today = validation_date or date.today()
     start = references.temporal.valid_from
     end = references.temporal.valid_through
-    if not start or not end or not (date.fromisoformat(start) <= today <= date.fromisoformat(end)):
+    if not start or not end:
+        raise ActivationRequirementError("Germany temporal coverage bounds are missing")
+    try:
+        temporal_start = date.fromisoformat(start)
+        temporal_end = date.fromisoformat(end)
+    except ValueError as error:
+        raise ActivationRequirementError("Germany temporal coverage bounds are invalid") from error
+    if temporal_start > temporal_end:
+        raise ActivationRequirementError("Germany temporal coverage bounds are reversed")
+    if require_current_services and not (temporal_start <= today <= temporal_end):
         raise ActivationRequirementError("Germany temporal coverage does not include the validation date")
 
     def connection(path: Path):
@@ -80,11 +90,12 @@ def validate_shared_release(
             for table in ("routes", "trips", "stop_times"):
                 if structural.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is None:
                     raise ActivationRequirementError(f"Germany structural table is empty: {table}")
-    with connection(references.temporal.database_path) as temporal:
-        if temporal.execute(
-            "SELECT 1 FROM active_services WHERE service_date=? LIMIT 1", (today.strftime("%Y%m%d"),)
-        ).fetchone() is None:
-            raise ActivationRequirementError("Germany has no active services on the validation date")
+    if require_current_services:
+        with connection(references.temporal.database_path) as temporal:
+            if temporal.execute(
+                "SELECT 1 FROM active_services WHERE service_date=? LIMIT 1", (today.strftime("%Y%m%d"),)
+            ).fetchone() is None:
+                raise ActivationRequirementError("Germany has no active services on the validation date")
     return {"status": "PASS", "releaseID": manifest.release_id,
             "requiredProvider": "germany", "germanyCityMappings": len(common_cities),
             "validFrom": start, "validThrough": end}

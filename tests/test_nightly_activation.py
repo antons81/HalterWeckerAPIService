@@ -14,6 +14,43 @@ PIPELINE = Path(__file__).resolve().parents[1] / "scripts/run_stop_data_pipeline
 
 
 class RouteReadinessTests(unittest.TestCase):
+    def test_smoke_source_expectation_distinguishes_empty_calendar_and_limited_board(self):
+        import sqlite3
+        import types
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "departures.sqlite"
+            connection = sqlite3.connect(path)
+            connection.executescript("CREATE TABLE metadata(key TEXT,value TEXT); "
+                "CREATE TABLE stop_times(raw_stop_id TEXT,trip_id TEXT,departure_seconds INTEGER); "
+                "CREATE TABLE trips(trip_id TEXT,service_id TEXT); "
+                "CREATE TABLE active_services(service_id TEXT,service_date TEXT);")
+            today = datetime.now(ZoneInfo("Europe/Berlin")).date()
+            connection.execute("INSERT INTO metadata VALUES ('validThrough',?)", (today.isoformat(),))
+            connection.execute("INSERT INTO trips VALUES ('trip','service')")
+            connection.execute("INSERT INTO active_services VALUES ('service',?)", (today.strftime("%Y%m%d"),))
+            connection.executemany("INSERT INTO stop_times VALUES ('stop','trip',?)", [(-86400,)] * 1000 + [(43200,)])
+            connection.commit()
+            connection.close()
+            class FixtureDatabase:
+                def __init__(self, path):
+                    self.connection = sqlite3.connect(path)
+                def city_departure_mode(self, city):
+                    return "exact", "Europe/Berlin", "", ""
+                def _connection(self):
+                    return self.connection
+                def _external_stop_time_ids(self, city, stop):
+                    return (stop,)
+            module = types.SimpleNamespace(Database=FixtureDatabase)
+            scope = {}
+            with mock.patch.dict(sys.modules, {"static_departures_api": module,
+                                              "gtfs_board_window": __import__("services.gtfs_board_window", fromlist=["*"])}):
+                exec(readiness.LEGACY_SMOKE_EXPECTATION, scope)
+            self.assertTrue(scope["smoke_expectation"](str(path), "wien", "stop")[3])
+            self.assertFalse(scope["smoke_expectation"](str(path), "wien", "not-served")[3])
+
+
     def test_required_reload_restarts_exact_container_without_build(self):
         state = json.dumps([{"Image": "image", "Id": "container"}])
         with mock.patch.object(readiness, "docker", side_effect=[state, "", state]) as docker:

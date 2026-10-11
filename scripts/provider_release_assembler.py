@@ -645,6 +645,13 @@ def assemble_release(
     stop_source = Path(stop_data_root).resolve()
     if not common_source.is_file():
         raise ReleaseAssemblyError(f"common database is missing: {common_source}")
+    # Reject a stale common catalog before hashing any large provider artifacts.
+    with closing(sqlite3.connect(common_source.as_uri() + "?mode=ro", uri=True)) as connection:
+        common_generation = connection.execute(
+            "SELECT value FROM metadata WHERE key='releaseID'"
+        ).fetchone()
+    if common_generation is None or common_generation[0] != release_id:
+        raise ReleaseAssemblyError("common DB releaseID does not match candidate releaseID")
     trusted_stop_source: Path | None = None
     if trusted_common_stop_data is not None:
         trusted_stop_source = _validate_trusted_common_stop_data(

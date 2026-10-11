@@ -14,12 +14,46 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from scripts.static_departures_coverage import CityCoverageError, package_generation, require_preserved_schedules, validate_city_coverage
+from scripts.static_departures_coverage import CityCoverageError, scheduled_stop, package_generation, require_preserved_schedules, validate_city_coverage
 
 
 class CityCoverageTests(unittest.TestCase):
     cities = ("wien", "helsinki", "bochum", "small-non-pilot-city", "israel", "toronto", "chicago", "oslo", "stockholm")
     pilots = {"israel": "israel-mot", "toronto": "ttc-surface", "chicago": "cta-chicago", "oslo": "norway", "stockholm": "sweden"}
+
+    def test_stop_selection_excludes_services_beyond_http_window(self):
+        self.mutate_database("UPDATE active_services SET service_date='20261101'")
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertIsNone(scheduled_stop(connection, "wien", ("",), today=date(2026, 10, 10), through=date(2026, 10, 24)))
+
+    def test_prior_service_day_overflow_is_not_mistaken_for_empty_schedule(self):
+        self.mutate_database("UPDATE active_services SET service_date='20261008'")
+        self.mutate_database("UPDATE stop_times SET departure_seconds=180000")
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(scheduled_stop(connection, "wien", ("",), today=date(2026, 10, 10), through=date(2026, 10, 10)), "wien-stop")
+
+    def test_last_service_day_overflow_outside_window_is_not_expected(self):
+        self.mutate_database("UPDATE active_services SET service_date='20261010'")
+        self.mutate_database("UPDATE stop_times SET departure_seconds=180000")
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertIsNone(scheduled_stop(connection, "wien", ("",), today=date(2026, 10, 10), through=date(2026, 10, 10)))
+
+    def test_spring_dst_service_origin_before_midnight_respects_window(self):
+        self.mutate_database("UPDATE active_services SET service_date='20260329'")
+        self.mutate_database("UPDATE stop_times SET departure_seconds=1800")
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertIsNone(scheduled_stop(connection, "wien", ("",), today=date(2026, 3, 29), through=date(2026, 3, 29), timezone_name="Europe/Vienna"))
+            self.assertEqual(scheduled_stop(connection, "wien", ("",), today=date(2026, 3, 28), through=date(2026, 3, 28), timezone_name="Europe/Vienna"), "wien-stop")
+
+    def test_stop_selection_is_scoped_to_requested_provider(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertIsNone(scheduled_stop(connection, "wien", ("",), catalog="provider_city_stops", today=date(2026, 10, 10), provider_id="unrelated"))
+            self.assertEqual(scheduled_stop(connection, "wien", ("",), catalog="provider_city_stops", today=date(2026, 10, 10), provider_id="non-pilot-wien"), "wien-stop")
+
+    def test_fixed_stop_expectation_does_not_use_other_city_departures(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertIsNone(scheduled_stop(connection, "wien", ("",), today=date(2026, 10, 10), stop_id="not-served"))
+            self.assertEqual(scheduled_stop(connection, "wien", ("",), today=date(2026, 10, 10), stop_id="wien-stop"), "wien-stop")
 
     def test_package_dates_respect_local_day_and_compact_format(self):
         self.assertEqual(package_generation({"generatedAt": "2026-10-09T23:57:51Z", "timezone": "Europe/Dublin"}), "2026-10-10")
@@ -49,7 +83,7 @@ class CityCoverageTests(unittest.TestCase):
                 CREATE TABLE city_departure_modes(city_id TEXT, mode TEXT);
                 CREATE TABLE provider_city_stops(provider_id TEXT, city_id TEXT, stop_id TEXT);
                 CREATE TABLE raw_stops(stop_id TEXT, canonical_stop_id TEXT);
-                CREATE TABLE stop_times(raw_stop_id TEXT, trip_id TEXT);
+                CREATE TABLE stop_times(raw_stop_id TEXT, trip_id TEXT, departure_seconds INTEGER DEFAULT 28800);
                 CREATE TABLE trips(trip_id TEXT, service_id TEXT);
                 CREATE TABLE active_services(service_id TEXT, service_date TEXT);
             """)
@@ -66,7 +100,7 @@ class CityCoverageTests(unittest.TestCase):
                 connection.execute("INSERT INTO provider_city_modes(provider_id,city_id,timezone,stop_id_prefix) VALUES (?,?,?,?)", (provider, city, "UTC", ""))
                 connection.execute("INSERT INTO raw_stops VALUES (?,?)", (stop, stop))
                 connection.execute("INSERT INTO trips VALUES (?,?)", (city + "-trip", "service"))
-                connection.execute("INSERT INTO stop_times VALUES (?,?)", (stop, city + "-trip"))
+                connection.execute("INSERT INTO stop_times(raw_stop_id,trip_id) VALUES (?,?)", (stop, city + "-trip"))
             connection.execute("INSERT INTO active_services VALUES ('service','20261010')")
             connection.commit()
         self.common = self.release / "common.sqlite"
@@ -158,6 +192,16 @@ class CityCoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(CityCoverageError, "today and tomorrow"):
             self.validate()
 
+    def test_expired_rollback_calendar_keeps_structural_city_coverage(self):
+        self.mutate_database("UPDATE metadata SET value='2026-09-10' WHERE key='validFrom'")
+        self.mutate_database("UPDATE metadata SET value='2026-09-30' WHERE key='validThrough'")
+        self.mutate_database("UPDATE active_services SET service_date='20260930'")
+        report = self.validate(require_current_schedules=False)
+        self.assertEqual(report["supportedCities"], len(self.cities))
+        self.assertFalse(any(row["hasSchedule"] for row in report["checks"]))
+        with self.assertRaisesRegex(CityCoverageError, "today and tomorrow"):
+            self.validate()
+
     def test_shard_calendar_that_expires_today_is_rejected(self):
         self.refs.temporal.valid_through = "2026-10-10"
         with self.assertRaisesRegex(CityCoverageError, "provider schedule"):
@@ -221,6 +265,14 @@ class CityCoverageTests(unittest.TestCase):
         check = next(row for row in self.validate()["checks"] if row["cityID"] == "berlin")
         self.assertEqual(check["backend"], "vbb-overlay")
         self.assertTrue(check["hasSchedule"])
+
+    def test_berlin_tomorrow_service_after_six_hours_is_valid(self):
+        self.add_berlin_overlay(tomorrow=True)
+        path = self.stop_root / "transit/vbb/berlin/20261011-00.json"
+        payload = json.loads(path.read_text())
+        payload["trips"][0]["stopTimes"][0]["departureSeconds"] = 14 * 3600
+        path.write_text(json.dumps(payload))
+        self.assertEqual(self.validate()["status"], "PASS")
 
     def test_berlin_missing_tomorrow_cannot_pass_other_database_checks(self):
         self.add_berlin_overlay(tomorrow=False)

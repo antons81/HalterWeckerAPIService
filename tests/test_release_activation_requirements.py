@@ -127,6 +127,20 @@ class SharedReleaseRequirementsTests(unittest.TestCase):
         with self.assertRaises(ActivationRequirementError):
             self.validate()
 
+    def test_expired_rollback_calendar_does_not_block_candidate_preflight(self):
+        self.reference.temporal.valid_from = "2026-09-01"
+        self.reference.temporal.valid_through = "2026-09-30"
+        with sqlite3.connect(self.temporal) as connection:
+            connection.execute("DELETE FROM active_services")
+        result = validate_shared_release(
+            self.root,
+            validation_date=date(2026, 10, 2),
+            require_current_services=False,
+        )
+        self.assertEqual(result["status"], "PASS")
+        with self.assertRaisesRegex(ActivationRequirementError, "does not include"):
+            self.validate()
+
 
 if __name__ == "__main__":
     unittest.main()

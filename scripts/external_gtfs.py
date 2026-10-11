@@ -7,6 +7,7 @@ import base64
 import json
 import math
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -353,6 +354,24 @@ def validate_external_gtfs_source(
             raise ValueError(
                 f"External GTFS source {source_id} has an invalid {url_key}."
             )
+    feed_bundle = source.get("feedBundle")
+    if feed_bundle is not None:
+        if not isinstance(feed_bundle, list) or len(feed_bundle) < 2:
+            raise ValueError(f"External GTFS source {source_id} has an invalid feedBundle.")
+        component_ids: set[str] = set()
+        for component in feed_bundle:
+            if not isinstance(component, dict):
+                raise ValueError(f"External GTFS source {source_id} has an invalid feedBundle entry.")
+            component_id = str(component.get("id", "")).strip()
+            component_url = str(component.get("url", "")).strip()
+            if not component_id or not component_url or component_id in component_ids:
+                raise ValueError(f"External GTFS source {source_id} has an invalid feedBundle entry.")
+            if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", component_id) is None:
+                raise ValueError(f"External GTFS source {source_id} has an invalid feedBundle id.")
+            parsed_component_url = urlsplit(component_url)
+            if parsed_component_url.scheme != "https" or not parsed_component_url.netloc:
+                raise ValueError(f"External GTFS source {source_id} has an invalid feedBundle URL.")
+            component_ids.add(component_id)
     local_path = source.get("localPath")
     if local_path is not None and (
         not isinstance(local_path, str) or not local_path.strip()

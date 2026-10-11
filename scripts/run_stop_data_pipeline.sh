@@ -27,13 +27,20 @@ REUSED_STOP_DATA_METADATA_SHA256=""
 
 cleanup_failed_no_activate() {
   local status="$?"
-  if [[ "$status" -ne 0 && "$NO_ACTIVATE" == "1" && -n "${RELEASE_DIR:-}" ]]; then
-    rm -rf -- "$RELEASE_DIR"
-    DIAGNOSTICS_CLEANUP_ACTIONS="removed release_dir=$RELEASE_DIR"
-    if [[ -n "${INCREMENTAL_RELEASE_DIR:-}" && -d "$INCREMENTAL_RELEASE_DIR" ]]; then
-      if [[ -f "$INCREMENTAL_RELEASE_DIR/release.json" ]]; then
-        DIAGNOSTICS_CLEANUP_ACTIONS+=";preserved published_incremental_release=$INCREMENTAL_RELEASE_DIR"
-      else
+  if [[ "$status" -ne 0 && "$RUN_MODE" == "normal" && "${RELEASE_DIR_PREEXISTED:-1}" == "0" && "${INCREMENTAL_RELEASE_DIR_PREEXISTED:-1}" == "0" && -n "${RELEASE_DIR:-}" ]]; then
+    if [[ ( -n "${INCREMENTAL_RELEASE_DIR:-}" && -f "$INCREMENTAL_RELEASE_DIR/release.json" ) || ( "$NO_ACTIVATE" != "1" && -f "$RELEASE_DIR/release-state.json" ) ]]; then
+      # A published candidate can reference this generation's stop-data and
+      # fallback database. Preserve the dependency closure for later review.
+      DIAGNOSTICS_CLEANUP_ACTIONS="preserved release_dir=$RELEASE_DIR;preserved published_incremental_release=$INCREMENTAL_RELEASE_DIR"
+    elif [[ ( "$RELEASE_DIR" == "$RELEASES/$RELEASE_ID" || ( "$REUSE_STOP_DATA" == "1" && "$RELEASE_DIR" == "$RELEASES/.no-activate-${RELEASE_ID}-$$" ) ) && ! -L "$RELEASE_DIR" &&
+            "$(readlink -f "$CURRENT_RELEASE" 2>/dev/null || true)" != "$RELEASE_DIR" &&
+            "$(readlink -f "$CURRENT" 2>/dev/null || true)" != "$RELEASE_DIR/stop-data" &&
+            "$(readlink -f "$DATA_ROOT/rollback" 2>/dev/null || true)" != "$RELEASE_DIR" ]]; then
+      # Only unpublished directories belonging to this fresh invocation may
+      # be removed. Existing generations and published dependencies survive.
+      rm -rf -- "$RELEASE_DIR"
+      DIAGNOSTICS_CLEANUP_ACTIONS="removed release_dir=$RELEASE_DIR"
+      if [[ "${INCREMENTAL_RELEASE_DIR:-}" == "$INCREMENTAL_RELEASES_ROOT/$RELEASE_ID" && -d "$INCREMENTAL_RELEASE_DIR" && ! -L "$INCREMENTAL_RELEASE_DIR" ]]; then
         rm -rf -- "$INCREMENTAL_RELEASE_DIR"
         DIAGNOSTICS_CLEANUP_ACTIONS+=";removed incremental_release_dir=$INCREMENTAL_RELEASE_DIR"
       fi
@@ -188,8 +195,12 @@ else
   RELEASE_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 fi
 RELEASE_DIR="$RELEASES/$RELEASE_ID"
+RELEASE_DIR_PREEXISTED=0
+if [[ -e "$RELEASE_DIR" || -L "$RELEASE_DIR" ]]; then RELEASE_DIR_PREEXISTED=1; fi
 INCREMENTAL_RELEASES_ROOT="${HALTEWECKER_INCREMENTAL_RELEASES_ROOT:-$DATA_ROOT/releases/incremental}"
 INCREMENTAL_RELEASE_DIR="$INCREMENTAL_RELEASES_ROOT/$RELEASE_ID"
+INCREMENTAL_RELEASE_DIR_PREEXISTED=0
+if [[ -e "$INCREMENTAL_RELEASE_DIR" || -L "$INCREMENTAL_RELEASE_DIR" ]]; then INCREMENTAL_RELEASE_DIR_PREEXISTED=1; fi
 BUILD_DIR="$RELEASE_DIR/stop-data"
 FROZEN_COMMON_STOP_DATA=0
 if [[ -n "$TRUSTED_COMMON_STOP_DATA" ]]; then
@@ -437,7 +448,7 @@ diagnostics_write_report() {
   } > "$DIAGNOSTICS_REPORT"
 }
 
-if [[ "$NO_ACTIVATE" == "1" ]]; then
+if [[ "$NO_ACTIVATE" == "1" || "$RUN_MODE" == "normal" ]]; then
   trap cleanup_failed_no_activate EXIT
   trap 'DIAGNOSTICS_SIGNAL=SIGINT; exit 130' INT
   trap 'DIAGNOSTICS_SIGNAL=SIGTERM; exit 143' TERM
@@ -565,6 +576,14 @@ PY
   RELEASE_DIR="$RELEASES/.no-activate-${RELEASE_ID}-$$"
   INCREMENTAL_RELEASES_ROOT="${HALTEWECKER_INCREMENTAL_RELEASES_ROOT:-$DATA_ROOT/releases/incremental}/reuse-$$"
   INCREMENTAL_RELEASE_DIR="$INCREMENTAL_RELEASES_ROOT/$RELEASE_ID"
+  RELEASE_DIR_PREEXISTED=0
+  INCREMENTAL_RELEASE_DIR_PREEXISTED=0
+  if [[ -e "$RELEASE_DIR" || -L "$RELEASE_DIR" ]]; then RELEASE_DIR_PREEXISTED=1; fi
+  if [[ -e "$INCREMENTAL_RELEASE_DIR" || -L "$INCREMENTAL_RELEASE_DIR" ]]; then INCREMENTAL_RELEASE_DIR_PREEXISTED=1; fi
+  if [[ "$RELEASE_DIR_PREEXISTED" == "1" || "$INCREMENTAL_RELEASE_DIR_PREEXISTED" == "1" ]]; then
+    echo "[Nightly] ERROR: reuse workspace already exists" >&2
+    return 1
+  fi
   BUILD_DIR="$REUSED_STOP_DATA_SOURCE"
   ARTIFACTS_JSON="$RELEASE_DIR/gtfs-artifacts.json"
   CUSTOM_ARTIFACTS_JSON="$RELEASE_DIR/custom-gtfs-artifacts.json"
@@ -851,6 +870,15 @@ rollback_incremental_consumers() {
   route_recall_activation && haltewecker_activation_readiness "$previous_release"
 }
 
+activation_disk_preflight() {
+  local free_kb
+  free_kb="$(df -Pk "$DATA_ROOT" | awk 'NR == 2 { print $4; exit }')"
+  if ! [[ "$free_kb" =~ ^[0-9]+$ ]] || (( free_kb < 25 * 1024 * 1024 )); then
+    echo "[Nightly] ERROR: insufficient disk reserve before activation" >&2
+    return 1
+  fi
+}
+
 activate_incremental_production() {
   local old_target=""
   local old_release=""
@@ -867,6 +895,7 @@ activate_incremental_production() {
   fi
   validate_incremental_candidate || return 1
   validate_incremental_consumers || return 1
+  activation_disk_preflight || return 1
   if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" == "1" ]]; then
     echo "[Nightly] stage=activation status=PASS mode=DRY_RUN pointerSwitch=NOT_RUN"
     return 0
@@ -894,6 +923,7 @@ activate_incremental_production() {
     echo "[Nightly] ERROR: static API image changed after preflight" >&2
     return 1
   fi
+  activation_disk_preflight || return 1
   # Static HTTP consumers follow the same atomic generation pointer as the API.
   replace_link "$CURRENT" "current-release/stop-data" || return 1
   # Retain the release that passed the full rollback consumer contract.
@@ -1026,7 +1056,8 @@ log_disk_peak() {
 }
 
 proof_disk_preflight() {
-  diagnostics_set_stage "disk-preflight"
+  local budget_stage="${1:-stop-data}"
+  diagnostics_set_stage "disk-preflight-$budget_stage"
   local free_kb
   local current_stop_data_kb=0
   local margin_kb
@@ -1036,24 +1067,58 @@ proof_disk_preflight() {
   local expected_artifact_miss_kb
   local transient_workspace_kb
   local fallback_database_kb=0
+  local fallback_database_path
+  local measured_fallback_database_kb=0
+  local configured_fallback_database_kb=0
 
   free_kb="$(disk_free_kb)"
-  if [[ "$FROZEN_COMMON_STOP_DATA" != "1" && "$REUSE_STOP_DATA" != "1" && ( -d "$CURRENT" || -L "$CURRENT" ) ]]; then
+  if [[ "$budget_stage" == "stop-data" && "$FROZEN_COMMON_STOP_DATA" != "1" && "$REUSE_STOP_DATA" != "1" && ( -d "$CURRENT" || -L "$CURRENT" ) ]]; then
     current_stop_data_kb="$(du -skL "$CURRENT" 2>/dev/null | awk '{ print $1; exit }' || true)"
     current_stop_data_kb="${current_stop_data_kb:-0}"
   fi
   margin_kb=$(( ${HALTEWECKER_PROOF_ESTIMATE_MARGIN_GB:-5} * 1024 * 1024 ))
   expected_artifact_miss_kb="${HALTEWECKER_EXPECTED_ARTIFACT_MISS_KB:-0}"
-  if ! [[ "$expected_artifact_miss_kb" =~ ^[0-9]+$ ]]; then
-    echo "[Nightly] ERROR: HALTEWECKER_EXPECTED_ARTIFACT_MISS_KB must be a non-negative integer in KiB" >&2
+  if ! [[ "$expected_artifact_miss_kb" =~ ^[0-9]+$ && "${HALTEWECKER_PROVIDER_FORECAST_KB:-0}" =~ ^[0-9]+$ ]]; then
+    echo "[Nightly] ERROR: artifact allocation estimates must be non-negative integers in KiB" >&2
     return 1
   fi
-  transient_workspace_kb="$(temporary_workspace_kb)"
-  if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
-    # The candidate omits feeds served by shards; the previous full database
-    # is not copied. This estimate is supplemented by the live disk guard.
-    fallback_database_kb=$(( ${HALTEWECKER_FALLBACK_DATABASE_ESTIMATE_GB:-20} * 1024 * 1024 ))
+  if (( ${HALTEWECKER_PROVIDER_FORECAST_KB:-0} > expected_artifact_miss_kb )); then
+    expected_artifact_miss_kb="$HALTEWECKER_PROVIDER_FORECAST_KB"
   fi
+  # Existing temporary files are already reflected in df. Reserve only future
+  # workspace allocations, in addition to candidate and artifact estimates.
+  transient_workspace_kb="${HALTEWECKER_ADDITIONAL_WORKSPACE_KB:-2097152}"
+  if ! [[ "$transient_workspace_kb" =~ ^[0-9]+$ ]]; then
+    echo "[Nightly] ERROR: HALTEWECKER_ADDITIONAL_WORKSPACE_KB must be a non-negative integer in KiB" >&2
+    return 1
+  fi
+  if [[ ( "$budget_stage" == "stop-data" || "$budget_stage" == "fallback" ) && ( "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ) ]]; then
+    # The previous full SQLite is the measured lower bound for a new fallback
+    # database. An explicit estimate may increase that bound, never lower it.
+    fallback_database_path="${HALTEWECKER_FALLBACK_DATABASE_PATH:-$DEPARTURES_CURRENT}"
+    if [[ -n "${HALTEWECKER_FALLBACK_DATABASE_ESTIMATE_GB:-}" ]]; then
+      if ! [[ "$HALTEWECKER_FALLBACK_DATABASE_ESTIMATE_GB" =~ ^[0-9]+$ ]]; then
+        echo "[Nightly] ERROR: HALTEWECKER_FALLBACK_DATABASE_ESTIMATE_GB must be a non-negative integer" >&2
+        return 1
+      fi
+      configured_fallback_database_kb=$(( HALTEWECKER_FALLBACK_DATABASE_ESTIMATE_GB * 1024 * 1024 ))
+    fi
+    if [[ -f "$fallback_database_path" ]]; then
+      measured_fallback_database_kb="$(python3 -c 'import os, sys; print((os.stat(sys.argv[1]).st_size + 1023) // 1024)' "$fallback_database_path")" || return 1
+    fi
+    if (( configured_fallback_database_kb > measured_fallback_database_kb )); then
+      fallback_database_kb="$configured_fallback_database_kb"
+    else
+      fallback_database_kb="$measured_fallback_database_kb"
+    fi
+    if (( fallback_database_kb <= 0 )); then
+      echo "[Nightly] ERROR: cannot estimate candidate fallback SQLite; no existing database or explicit estimate" >&2
+      return 1
+    fi
+  fi
+  # Check the complete candidate peak before any expensive work, then recheck
+  # remaining allocations against actual free space before each later stage.
+  # Existing production and rollback storage is already charged by df.
   estimated_additional_kb=$((current_stop_data_kb + fallback_database_kb + expected_artifact_miss_kb + transient_workspace_kb + margin_kb))
   estimated_free_kb=$((free_kb - estimated_additional_kb))
   if [[ "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
@@ -1092,13 +1157,13 @@ proof_disk_preflight() {
   fi
   export HALTEWECKER_BUILD_MIN_FREE_GIB=$((minimum_free_kb / 1024 / 1024))
   log_disk_state "before"
-  echo "[Nightly] disk model unavoidable_stop_data_kb=$current_stop_data_kb fallback_database_kb=$fallback_database_kb expected_artifact_miss_kb=$expected_artifact_miss_kb transient_workspace_kb=$transient_workspace_kb safety_reserve_kb=$margin_kb"
-  echo "[Nightly] disk estimated_additional_gb=$((estimated_additional_kb / 1024 / 1024)) estimated_peak_free_gb=$((estimated_free_kb / 1024 / 1024)) warning_free_gb=$((warning_free_kb / 1024 / 1024)) minimum_free_gb=$((minimum_free_kb / 1024 / 1024)) mode=$disk_mode reuse_stop_data=$REUSE_STOP_DATA"
+  echo "[Nightly] disk model stage=$budget_stage unavoidable_stop_data_kb=$current_stop_data_kb fallback_database_kb=$fallback_database_kb expected_artifact_miss_kb=$expected_artifact_miss_kb transient_workspace_kb=$transient_workspace_kb safety_reserve_kb=$margin_kb"
+  echo "[Nightly] disk estimated_additional_gb=$((estimated_additional_kb / 1024 / 1024)) estimated_stage_free_gb=$((estimated_free_kb / 1024 / 1024)) warning_free_gb=$((warning_free_kb / 1024 / 1024)) minimum_free_gb=$((minimum_free_kb / 1024 / 1024)) mode=$disk_mode reuse_stop_data=$REUSE_STOP_DATA"
   if (( free_kb <= warning_free_kb )); then
     echo "[Nightly] WARNING: disk free is at or below warning threshold for $disk_mode" >&2
   fi
   if (( free_kb < minimum_free_kb || estimated_free_kb < minimum_free_kb )); then
-    echo "[Nightly] ERROR: insufficient disk for $disk_mode" >&2
+    echo "[Nightly] ERROR: insufficient disk for $disk_mode stage=$budget_stage available_bytes=$((free_kb * 1024)) required_bytes=$(((estimated_additional_kb + minimum_free_kb) * 1024)) deficit_bytes=$(((estimated_additional_kb + minimum_free_kb - free_kb) * 1024))" >&2
     return 1
   fi
 }
@@ -1111,6 +1176,32 @@ fi
 run_disk_guarded() {
   python3 "$REPO/scripts/disk_budget.py" --root "$DATA_ROOT" \
     --minimum-free-gib "${HALTEWECKER_BUILD_MIN_FREE_GIB:-20}" -- "$@"
+}
+
+forecast_provider_disk() {
+  local budget_stage="${1:-stop-data}"
+  local forecast_stop_data="${2:-$CURRENT}"
+  local -a forecast_args
+  forecast_args=(python3 "$REPO/scripts/estimate_provider_disk.py"
+    --repository "$REPO" --stop-data "$forecast_stop_data" --gtfs-artifacts "$ARTIFACTS_JSON"
+    --normalized-cache-root "${HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT:-$DATA_ROOT/provider-artifacts/normalized}"
+    --static-artifact-root "${HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT:-$DATA_ROOT/provider-artifacts/static}")
+  if [[ -f "$CURRENT_RELEASE/release.json" ]]; then
+    forecast_args+=(--active-release "$CURRENT_RELEASE")
+  fi
+  if command -v ionice >/dev/null 2>&1; then
+    forecast_args=(ionice -c 3 -- "${forecast_args[@]}")
+  fi
+  local forecast_kb
+  forecast_kb="$(nice -n 19 -- "${forecast_args[@]}")" || return 1
+  if ! [[ "$forecast_kb" =~ ^[0-9]+$ ]]; then
+    echo "[Nightly] ERROR: invalid provider disk forecast" >&2
+    return 1
+  fi
+  # Recompute remaining allocations so artifacts already built are not charged
+  # again. Explicit estimates can increase this bound but never lower it.
+  export HALTEWECKER_PROVIDER_FORECAST_KB="$forecast_kb"
+  proof_disk_preflight "$budget_stage"
 }
 
 run_build_stage() {
@@ -1129,6 +1220,9 @@ if [[ -f "$MVO_ENV_FILE" ]]; then
     --env-file "$MVO_ENV_FILE" \
     --output "$AUSTRIAN_DATA_ROOT" \
     --output-json "$RELEASE_DIR/austrian-artifacts.json"
+elif [[ ( "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ) && -z "${AUSTRIAN_GTFS_URL:-}" ]]; then
+  echo "[StopData] ERROR: Austria feeds were not refreshed: MVO credentials are missing at $MVO_ENV_FILE and AUSTRIAN_GTFS_URL is unset; required sources=vor,steiermark,salzburg,kaernten,ooevv,tirol,vorarlberg,linz-ag" >&2
+  return 1
 fi
 
 EXTERNAL_URL_OVERRIDES=()
@@ -1240,15 +1334,25 @@ run_build_stop_packages() {
     cmd+=("${EXTERNAL_GTFS_ARGS[@]}")
   fi
   cmd+=(--output "$BUILD_DIR")
-  if [[ -n "${NL_GTFS_URL:-}" ]]; then
+  if [[ -n "${NL_GTFS_URL:-}" && "$INCREMENTAL_PRODUCTION" != "1" && "$INCREMENTAL_NO_ACTIVATE" != "1" ]]; then
     cmd+=(--allow-nl-failure)
   fi
   run_disk_guarded "${cmd[@]}"
 }
 
+if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
+  # Acquisition pins the actual inputs; reject the resulting allocation peak
+  # before stop-data, normalized artifacts, shards or fallback SQL are built.
+  forecast_provider_disk
+fi
+
 run_build_stop_packages "${NL_GTFS_URL:-}"
 
 if [[ "${FORCE_PRESERVE_NL:-0}" = "1" || -n "$NL_SOURCE_FAILED" || -f "$BUILD_DIR/.nl-failure" ]]; then
+  if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
+    echo "[StopData] ERROR: Netherlands GTFS refresh/build failed; stale Dutch assets cannot enter a full-update candidate" >&2
+    return 1
+  fi
   test -d "$CURRENT"
   echo "[StopData] release=$RELEASE_ID preserving last validated Dutch assets"
   run_disk_guarded python3 "$REPO/scripts/preserve_nl_assets.py" \
@@ -1532,6 +1636,11 @@ metadata_path.write_text(
     encoding="utf-8",
 )
 PY
+  if [[ "$REUSE_STOP_DATA" != "1" && "$FROZEN_COMMON_STOP_DATA" != "1" ]]; then
+    run_disk_guarded python3 "$REPO/scripts/deduplicate_stop_data.py" \
+      --source "$CURRENT" --candidate "$BUILD_DIR"
+    log_disk_state "stop-data-deduplicated"
+  fi
   echo "[StopData] release=$RELEASE_ID stage=validation duration=$(elapsed_seconds "$VALIDATION_STARTED")"
 }
 
@@ -1603,6 +1712,11 @@ PY
 }
 
 run_static_departures_stage() {
+  if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
+    forecast_provider_disk fallback "$BUILD_DIR"
+  else
+    proof_disk_preflight fallback
+  fi
   diagnostics_set_stage "legacy-import"
   STATIC_STARTED=$SECONDS
   local fallback_shards=""
@@ -1761,6 +1875,7 @@ else
 fi
 
 if [[ "$NO_ACTIVATE" == "1" || "$INCREMENTAL_PRODUCTION" == "1" ]]; then
+  forecast_provider_disk provider-artifacts "$BUILD_DIR"
   log_disk_state "incremental-start"
   diagnostics_set_stage "incremental-provider"
   NORMALIZED_CACHE_ROOT="${HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT:-${DATA_ROOT}/provider-artifacts/normalized}"

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -53,17 +54,79 @@ for check in plan["checks"]:
         raise RuntimeError("candidate lost scheduled departures: " + city + "/" + stop)
     if city in {"wien", "helsinki", "bochum", "berlin", "israel", "toronto", "chicago", "oslo", "stockholm", "boston", "montreal"}:
         samples[city] = {"stopID": stop, "departures": len(rows), "backend": check["backend"]}
-for city, stop in (("wien", "at:49:1876:0:1"), ("wien", "at:49:1320:5"), ("helsinki", "fi-hsl:1040401")):
+for smoke in plan["smokeChecks"]:
+    city, stop = smoke["cityID"], smoke["stopID"]
     check = next(row for row in plan["checks"] if row["cityID"] == city)
-    if not board(city, stop, check["from"], check["to"]):
-        raise RuntimeError("candidate smoke board is empty: " + city + "/" + stop)
+    rows = board(city, stop, check["from"], check["to"])
+    if smoke["hasSchedule"] and not rows:
+        raise RuntimeError("candidate lost scheduled smoke departures: " + city + "/" + stop)
 for check in plan["packageChecks"]:
     with urlopen(root + "/static-stop-data/departures/" + check["cityID"] + ".json", timeout=30) as response:
         payload = json.load(response)
     if not isinstance(payload.get("stops"), dict) or len(payload["stops"]) != check["stopCount"] or not any(isinstance(rows, list) and rows for rows in payload["stops"].values()):
         raise RuntimeError("candidate package city is unavailable: " + check["cityID"])
-print(json.dumps({"status": "PASS", "releaseID": plan["releaseID"], "checkedCities": plan["supportedCities"], "apiCities": plan["apiCities"], "packageCities": plan["packageCities"], "samples": samples}))
+print("HALTEWECKER_PREFLIGHT_RESULT=" + json.dumps({"status": "PASS", "releaseID": plan["releaseID"], "checkedCities": plan["supportedCities"], "apiCities": plan["apiCities"], "packageCities": plan["packageCities"], "samples": samples}))
 '''
+
+
+CONTROL_FLOW_PROBE = '''
+import json, sys
+from urllib.parse import urlencode
+from urllib.request import urlopen
+with open(sys.argv[1]) as source:
+    plan = json.load(source)
+root = "http://127.0.0.1:8080"
+def get(path):
+    with urlopen(root + path, timeout=30) as response:
+        if response.status != 200:
+            raise RuntimeError("control flow unavailable: " + path)
+        return json.load(response)
+controls = {"wien", "helsinki", "wuppertal", "bochum", "berlin", "bad-homburg-vor-der-hohe",
+            "israel", "toronto", "chicago", "oslo", "stockholm", "boston", "montreal"}
+results = {}
+for check in plan["checks"]:
+    city, stop = check["cityID"], check["stopID"]
+    if city not in controls:
+        continue
+    stops = get("/static-stop-data/stops/" + city + ".json")
+    selected = next((row for row in stops if str(row.get("id")) == stop), None)
+    if selected is None or not all(isinstance(selected.get(key), (int, float)) for key in ("latitude", "longitude")):
+        raise RuntimeError("Nearby stop lookup/coordinates missing: " + city + "/" + stop)
+    query = {"cityID": city, "stopID": stop, "limit": 3}
+    default_board = get("/static-departures/board?" + urlencode(query))
+    if not isinstance(default_board.get("departures"), list):
+        raise RuntimeError("invalid default board: " + city)
+    query.update({"from": check["from"], "to": check["to"]})
+    rows = get("/static-departures/board?" + urlencode(query))["departures"]
+    if check["hasSchedule"] and not rows:
+        raise RuntimeError("Nearby scheduled board missing: " + city)
+    trip_count = 0
+    if rows:
+        row = rows[0]
+        query = {"cityID": city, "tripID": row["tripID"]}
+        if row.get("serviceDate"):
+            query["serviceDate"] = row["serviceDate"]
+        trip = get("/static-departures/trip?" + urlencode(query))
+        stops = trip.get("stops")
+        if not isinstance(stops, list) or not stops:
+            raise RuntimeError("trip details lost stops: " + city)
+        trip_count = len(stops)
+    results[city] = {"stopLookup": "PASS", "nearbyBoard": "PASS", "defaultRows": len(default_board["departures"]),
+                     "rangedRows": len(rows), "tripStops": trip_count}
+print("HALTEWECKER_PREFLIGHT_RESULT=" + json.dumps({"status": "PASS", "controls": results}))
+'''
+
+
+def parse_probe_result(output: str) -> dict:
+    """Read the explicit result record without interpreting diagnostic logs."""
+    prefix = "HALTEWECKER_PREFLIGHT_RESULT="
+    records = [line[len(prefix):] for line in output.splitlines() if line.startswith(prefix)]
+    if len(records) != 1:
+        raise ValueError("consumer probe must emit exactly one result record")
+    result = json.loads(records[0])
+    if not isinstance(result, dict) or result.get("status") != "PASS":
+        raise ValueError("consumer probe did not pass")
+    return result
 
 
 def provider_ids(value: str) -> tuple[str, ...]:
@@ -86,9 +149,31 @@ def image_supported_providers(image: str, providers: tuple[str, ...]) -> tuple[s
                              "--entrypoint", "python3", image, "-c", code, json.dumps(providers)))
 
 
+def image_runtime_contract(image: str, repository: Path) -> dict[str, str]:
+    """Reject stale runtime semantics before accepting candidate validation."""
+    files = ("services/static_departures_api.py", "services/static_departures_runtime.py",
+             "services/gtfs_board_window.py", "services/vbb_overlay_provider.py",
+             "services/validation_receipt.py", "scripts/provider_artifact_capabilities.py",
+             "config/incremental-provider-sources.json", "config/external-gtfs-sources.json")
+    expected = {name: hashlib.sha256((repository / name).read_bytes()).hexdigest() for name in files}
+    code = (
+        "import hashlib,json,sys; from pathlib import Path; "
+        "files=json.loads(sys.argv[1]); "
+        "print(json.dumps({p:hashlib.sha256((Path('/app') / "
+        "(p if p.startswith('config/') else Path(p).name)).read_bytes()).hexdigest() for p in files}))"
+    )
+    actual = docker_json("run", "--rm", "--read-only", "--network", "none",
+                         "--entrypoint", "python3", image, "-c", code, json.dumps(files))
+    changed = [name for name in files if actual.get(name) != expected[name]]
+    if changed:
+        raise ValueError("preflight/API image runtime version mismatch: " + ", ".join(changed))
+    return expected
+
+
 def preflight(release: Path, build: tuple[str, ...], runtime: tuple[str, ...],
               static_container: str, route_container: str, *, reference: Path | None = None,
-              static_image: str | None = None) -> dict[str, object]:
+              static_image: str | None = None,
+              require_current_schedules: bool = True) -> dict[str, object]:
     release = release.resolve(strict=True)
     manifest = json.loads((release / "release.json").read_text())
     if set(manifest["providers"]) != set(build):
@@ -97,8 +182,14 @@ def preflight(release: Path, build: tuple[str, ...], runtime: tuple[str, ...],
     route_image = docker_json("inspect", route_container)[0]["Image"]
     supported = image_supported_providers(static_image, runtime)
     validate_provider_contract(build, runtime, supported)
-    requirements = validate_shared_release(release)
-    coverage = validate_city_coverage(release, runtime, Path(__file__).resolve().parents[1], reference=reference)
+    runtime_contract = image_runtime_contract(static_image, Path(__file__).resolve().parents[1])
+    requirements = validate_shared_release(
+        release, require_current_services=require_current_schedules,
+    )
+    coverage = validate_city_coverage(
+        release, runtime, Path(__file__).resolve().parents[1], reference=reference,
+        require_current_schedules=require_current_schedules,
+    )
     missing_required = {"wien", "helsinki", "bochum", "berlin"} - {row["cityID"] for row in coverage["checks"]}
     if missing_required:
         raise ValueError("required production cities are missing: " + ", ".join(sorted(missing_required)))
@@ -174,8 +265,12 @@ def preflight(release: Path, build: tuple[str, ...], runtime: tuple[str, ...],
             raise ValueError("HalteWecker health resolved a different release")
         if metadata.get("runtimeMode") != "hybrid" or metadata.get("fallbackReleaseID") != manifest["releaseID"]:
             raise ValueError("candidate image has no validated hybrid fallback")
-        candidate_coverage = json.loads(subprocess.check_output(
+        candidate_coverage = parse_probe_result(subprocess.check_output(
             ["docker", "exec", static_name, "python3", "-c", STATIC_CITY_PROBE,
+             "/data/" + coverage_path.relative_to(data_root).as_posix()], text=True,
+        ))
+        control_flows = parse_probe_result(subprocess.check_output(
+            ["docker", "exec", static_name, "python3", "-c", CONTROL_FLOW_PROBE,
              "/data/" + coverage_path.relative_to(data_root).as_posix()], text=True,
         ))
         for city in ("duisburg", "dusseldorf"):
@@ -209,8 +304,8 @@ def preflight(release: Path, build: tuple[str, ...], runtime: tuple[str, ...],
             raise RuntimeError("production pointers changed during preflight")
         return {"status": "PASS", "releaseID": manifest["releaseID"], "requirements": requirements,
                 "buildProviders": build, "runtimeProviders": runtime, "supportedRuntimeProviders": supported,
-                "staticImage": static_image, "routeImage": route_image,
-                "cityCoverage": candidate_coverage, "coveragePlan": coverage, "results": results,
+                "staticImage": static_image, "routeImage": route_image, "runtimeContract": runtime_contract,
+                "cityCoverage": candidate_coverage, "controlFlows": control_flows, "coveragePlan": coverage, "results": results,
                 "currentUnchanged": str(initial_target), "geometryUnchanged": str(initial_geometry)}
     finally:
         for name in reversed(names):
@@ -228,7 +323,8 @@ def validate_release_pair(candidate_root: Path, rollback_root: Path, build: tupl
     rollback = rollback_root.resolve(strict=True)
     rollback_build = tuple(json.loads((rollback / "release.json").read_text())["providers"])
     verified_rollback = preflight(rollback, rollback_build, runtime, static_container,
-                                 route_container, static_image=static_image)
+                                 route_container, static_image=static_image,
+                                 require_current_schedules=False)
     candidate = preflight(candidate_root, build, runtime, static_container, route_container,
                           reference=rollback, static_image=verified_rollback["staticImage"])
     if candidate["staticImage"] != verified_rollback["staticImage"] or candidate["routeImage"] != verified_rollback["routeImage"]:
@@ -254,7 +350,8 @@ def main() -> None:
     if arguments.reference_only:
         report = preflight(arguments.rollback_release, provider_ids(arguments.build_providers),
                            provider_ids(arguments.runtime_providers), arguments.static_container,
-                           arguments.route_container, static_image=arguments.static_image)
+                           arguments.route_container, static_image=arguments.static_image,
+                           require_current_schedules=False)
         del report["coveragePlan"]
         print(json.dumps({"status": "PASS", "verifiedRollback": report}))
         return

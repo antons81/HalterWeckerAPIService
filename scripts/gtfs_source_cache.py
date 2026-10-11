@@ -486,6 +486,7 @@ class GTFSArtifactCache:
         state_url: str | None = None,
         minimum_size: int | None = None,
         metadata_probe: bool = True,
+        force_download: bool = False,
         retry_attempts: int = 1,
         validator: Callable[[Path], None] | None = None,
     ) -> ArtifactResult:
@@ -558,7 +559,7 @@ class GTFSArtifactCache:
                 finally:
                     candidate.unlink(missing_ok=True)
 
-            if valid_cache and source_version is not None:
+            if valid_cache and source_version is not None and not force_download:
                 previous_version = state.get("sourceVersion") if state else None
                 if previous_version == dict(source_version) and state.get("url") == _state_url(url, state_url):
                     return ArtifactResult(source_id, artifact, "unchanged", "source-version", state)
@@ -592,7 +593,7 @@ class GTFSArtifactCache:
                 finally:
                     candidate.unlink(missing_ok=True)
 
-            if metadata_probe:
+            if metadata_probe and not force_download:
                 try:
                     metadata_request = urllib.request.Request(url, headers=request_headers, method="HEAD")
                     with urllib.request.urlopen(metadata_request, timeout=30) as response:
@@ -611,16 +612,17 @@ class GTFSArtifactCache:
             else:
                 metadata = {}
 
-            request_headers.update(
-                {
-                    key: value
-                    for key, value in {
-                        "If-None-Match": str((state or {}).get("etag", "")),
-                        "If-Modified-Since": str((state or {}).get("lastModified", "")),
-                    }.items()
-                    if value
-                }
-            )
+            if not force_download:
+                request_headers.update(
+                    {
+                        key: value
+                        for key, value in {
+                            "If-None-Match": str((state or {}).get("etag", "")),
+                            "If-Modified-Since": str((state or {}).get("lastModified", "")),
+                        }.items()
+                        if value
+                    }
+                )
             fd, temporary_name = tempfile.mkstemp(prefix=".download-", suffix=".zip", dir=artifact.parent)
             os.close(fd)
             candidate = Path(temporary_name)
@@ -649,7 +651,7 @@ class GTFSArtifactCache:
                                         None,
                                     )
                                 response_headers = _headers(response)
-                                if status == 304 and valid_cache:
+                                if status == 304 and valid_cache and not force_download:
                                     state = self._mark_source_checked(
                                         state_path,
                                         state or {},

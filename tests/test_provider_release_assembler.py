@@ -145,6 +145,19 @@ class ProviderReleaseAssemblerTests(unittest.TestCase):
         }
         return legacy, release / "common.sqlite", stop_data, providers
 
+    def test_stale_common_generation_fails_before_artifact_hashing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _legacy, common, stops, providers = self._fixture(root / "fixture")
+            before = common.read_bytes()
+            with mock.patch("provider_release_assembler.artifact_provenance") as hashing:
+                with self.assertRaisesRegex(ReleaseAssemblyError, "common DB releaseID"):
+                    assemble_release(root / "releases", "new-generation",
+                                     common_database=common, stop_data_root=stops, providers=providers)
+            hashing.assert_not_called()
+            self.assertEqual(common.read_bytes(), before)
+            self.assertFalse((root / "releases" / "new-generation").exists())
+
     @staticmethod
     def _common_for_release(source: Path, destination: Path, release_id: str) -> Path:
         shutil.copy2(source, destination)

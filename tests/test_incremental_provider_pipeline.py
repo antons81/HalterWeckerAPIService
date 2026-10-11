@@ -1178,7 +1178,47 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
             self.assertEqual(second.structural.bytes_written, 0)
             self.assertEqual(second.temporal.bytes_written, 0)
 
-    def test_full_chain_preflight_marks_structural_miss_no_go(self):
+    def test_native_germany_probes_normalized_and_shards_without_external_city_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = Mock()
+            normalized = SimpleNamespace(status="MISS", resolution_status="MISS",
+                                         reason="normalized artifact absent", semantic_key="key",
+                                         artifact_directory=root / "normalized")
+            def layer(status):
+                return SimpleNamespace(status=status, reason="validated", artifact_key="key",
+                                       artifact_directory=root / status)
+            for status in ("HIT", "MISS"):
+                with (
+                    self.subTest(structural=status),
+                    unittest.mock.patch.object(incremental, "provider_selection_plan", return_value={}),
+                    unittest.mock.patch.object(incremental, "validate_incremental_artifact_strategies",
+                                               return_value={"germany": incremental.NORMALIZED_REQUIRED}),
+                    unittest.mock.patch.object(incremental, "_source_map",
+                                               return_value={"germany": {"artifactGroup": "sources"}}),
+                    unittest.mock.patch.object(incremental, "_raw_entry", return_value=(root / "gtfs.zip", "a" * 64)),
+                    unittest.mock.patch.object(incremental, "_provider_cities", return_value=[{"id": "wuppertal"}]),
+                    unittest.mock.patch.object(incremental, "_probe_external_build_cache") as external,
+                    unittest.mock.patch.object(incremental, "load_gtfs_archive", return_value=archive),
+                    unittest.mock.patch.object(incremental, "probe_existing_for_raw_sha", return_value=normalized) as native,
+                    unittest.mock.patch.object(incremental, "probe_static_provider_artifacts",
+                        return_value=SimpleNamespace(structural=layer(status), temporal=layer("HIT"))) as shards,
+                ):
+                    report = incremental.full_chain_preflight(
+                        repository_root=REPOSITORY_ROOT, stop_data_root=root,
+                        normalized_cache_root=root, static_artifact_root=root,
+                        dates=[date(2026, 10, 11)], provider_ids=("germany",), raw_snapshot=None,
+                    )
+                    self.assertEqual(report["status"], "PASS")
+                    expected_planned_builds = 1 + (status == "MISS")
+                    self.assertEqual(report["plannedBuildCount"], expected_planned_builds)
+                    self.assertIn("normalized", [item["stage"] for item in report["plannedBuilds"]])
+                    self.assertEqual(report["providers"][0]["transformed"]["status"], "NOT_APPLICABLE")
+                    external.assert_not_called()
+                    native.assert_called_once()
+                    shards.assert_called_once()
+
+    def test_full_chain_preflight_treats_structural_miss_as_planned_build(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             raw_path = root / "sweden.zip"
@@ -1281,17 +1321,62 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
                     raw_snapshot={},
                 )
 
-            self.assertEqual(report["status"], "NO-GO")
-            self.assertEqual(report["mandatoryMissCount"], 2)
+            self.assertEqual(report["status"], "PASS")
+            self.assertEqual(report["mandatoryMissCount"], 0)
+            self.assertEqual(report["plannedBuildCount"], 2)
             self.assertEqual(
                 {
                     (item["providerID"], item["stage"])
-                    for item in report["mandatoryMisses"]
+                    for item in report["plannedBuilds"]
                 },
                 {("sweden", "structural"), ("sweden", "temporal")},
             )
             archive.close.assert_called_once_with()
             context.close.assert_not_called()
+
+    def test_full_chain_preflight_treats_transformed_miss_as_planned_build(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw_path = root / "feed.zip"
+            raw_path.write_bytes(b"raw")
+            build_key = SimpleNamespace(
+                value="build-key", builder_fingerprint="builder", city_ids=("city",),
+                projection_fingerprint="projection",
+            )
+            lookup = SimpleNamespace(status="MISS", reason="cache key not found", directory=None)
+            with (
+                unittest.mock.patch.object(incremental, "provider_selection_plan", return_value={"selectedProviders": ["provider"]}),
+                unittest.mock.patch.object(incremental, "validate_incremental_artifact_strategies", return_value={"provider": incremental.STRUCTURAL_SUFFICIENT}),
+                unittest.mock.patch.object(incremental, "_source_map", return_value={"provider": {"timezone": "UTC", "departurePackageDays": 1}}),
+                unittest.mock.patch.object(incremental, "_raw_entry", return_value=(raw_path, "a" * 64)),
+                unittest.mock.patch.object(incremental, "_provider_cities", return_value=[{"id": "city"}]),
+                unittest.mock.patch.object(incremental, "_probe_external_build_cache", return_value=(build_key, lookup, ("city",))),
+            ):
+                report = incremental.full_chain_preflight(
+                    repository_root=REPOSITORY_ROOT, stop_data_root=root / "stops",
+                    normalized_cache_root=root / "normalized", static_artifact_root=root / "static",
+                    dates=[date(2026, 10, 11)], provider_ids=("provider",), raw_snapshot={},
+                )
+            self.assertEqual(report["status"], "PASS")
+            self.assertEqual(report["plannedBuildCount"], 1)
+            self.assertEqual(report["plannedBuilds"][0]["stage"], "transformed")
+
+    def test_missing_raw_input_remains_a_preflight_blocker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with (
+                unittest.mock.patch.object(incremental, "provider_selection_plan", return_value={"selectedProviders": ["provider"]}),
+                unittest.mock.patch.object(incremental, "validate_incremental_artifact_strategies", return_value={"provider": incremental.STRUCTURAL_SUFFICIENT}),
+                unittest.mock.patch.object(incremental, "_source_map", return_value={"provider": {}}),
+                unittest.mock.patch.object(incremental, "_raw_entry", side_effect=FileNotFoundError("raw source unavailable")),
+            ):
+                report = incremental.full_chain_preflight(
+                    repository_root=REPOSITORY_ROOT, stop_data_root=root / "stops",
+                    normalized_cache_root=root / "normalized", static_artifact_root=root / "static",
+                    dates=[date(2026, 10, 11)], provider_ids=("provider",), raw_snapshot={},
+                )
+            self.assertEqual(report["status"], "NO-GO")
+            self.assertEqual(report["mandatoryMisses"][0]["stage"], "preflight")
 
 if __name__ == "__main__":
     unittest.main()

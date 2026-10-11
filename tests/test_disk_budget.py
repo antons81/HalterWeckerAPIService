@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from scripts.disk_budget import GIB, run_guarded, terminate_build
+from scripts.disk_budget import GIB, background_command, run_guarded, terminate_build
 
 
 class DiskBudgetTests(unittest.TestCase):
@@ -25,7 +25,7 @@ class DiskBudgetTests(unittest.TestCase):
     def test_success_has_its_own_process_group(self):
         result, _process, start, kill = self.run_fixture([30 * GIB, 29 * GIB])
         self.assertEqual(result, 0)
-        start.assert_called_once_with(["build"], start_new_session=True)
+        start.assert_called_once_with(background_command(["build"]), start_new_session=True)
         kill.assert_not_called()
 
     def test_build_failure_is_propagated(self):
@@ -74,6 +74,47 @@ class DiskBudgetTests(unittest.TestCase):
         kill.assert_called_once_with(process.pid, signal.SIGTERM)
         self.assertEqual({signum: signal.getsignal(signum) for signum in handlers}, handlers)
 
+    def test_repeated_termination_during_cleanup_does_not_leak_child(self):
+        process = Mock(pid=12345)
+        process.poll.return_value = None
+        def reap(timeout=None):
+            self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_IGN)
+            signal.raise_signal(signal.SIGTERM)
+            return 0
+        process.wait.side_effect = reap
+        original = signal.getsignal(signal.SIGTERM)
+        with patch("scripts.disk_budget.free_bytes", return_value=30 * GIB), \
+             patch("scripts.disk_budget.subprocess.Popen", return_value=process), \
+             patch("scripts.disk_budget.os.killpg") as kill, \
+             patch("scripts.disk_budget.time.sleep", side_effect=InterruptedError("stop")):
+            with self.assertRaises(InterruptedError):
+                run_guarded(["build"], Path("/tmp"))
+        kill.assert_called_once_with(process.pid, signal.SIGTERM)
+        self.assertEqual(signal.getsignal(signal.SIGTERM), original)
+
     def test_floor_below_twenty_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "lower than 20"):
             run_guarded(["build"], Path("/tmp"), minimum_gib=19)
+
+
+class BackgroundBuildPriorityTests(unittest.TestCase):
+    def test_linux_build_uses_idle_io_and_low_cpu_priority(self):
+        with patch("scripts.disk_budget.sys.platform", "linux"), \
+             patch("scripts.disk_budget.shutil.which", side_effect=lambda name: "/usr/bin/" + name):
+            self.assertEqual(background_command(["python3", "build.py"]),
+                             ["/usr/bin/nice", "-n", "19", "--", "/usr/bin/ionice", "-c", "3", "--", "python3", "build.py"])
+
+    def test_mac_build_does_not_require_linux_io_tool(self):
+        with patch("scripts.disk_budget.sys.platform", "darwin"), \
+             patch("scripts.disk_budget.shutil.which", return_value="/usr/bin/nice") as lookup:
+            self.assertEqual(background_command(["build"]), ["/usr/bin/nice", "-n", "19", "--", "build"])
+        lookup.assert_called_once_with("nice")
+
+    def test_missing_linux_scheduler_fails_before_starting_build(self):
+        with patch("scripts.disk_budget.sys.platform", "linux"), \
+             patch("scripts.disk_budget.shutil.which", side_effect=["/usr/bin/nice", None]), \
+             patch("scripts.disk_budget.free_bytes", return_value=30 * GIB), \
+             patch("scripts.disk_budget.subprocess.Popen") as start:
+            with self.assertRaisesRegex(RuntimeError, "ionice"):
+                run_guarded(["build"], Path("/tmp"))
+        start.assert_not_called()

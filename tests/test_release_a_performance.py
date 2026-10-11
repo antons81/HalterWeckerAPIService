@@ -69,6 +69,10 @@ class ReleaseAPerformanceTests(unittest.TestCase):
                     "provider-a": ["a:42"],
                     "provider-b": ["42", "b:42"],
                 },
+                "authoritative_owners": [
+                    ("provider-a", "city", "42"),
+                    ("provider-a", "city", "a:42"),
+                ],
             },
             "raw-owner-outside-prefix-map": {
                 "cities": {"provider-a": ["city"]},
@@ -118,9 +122,16 @@ class ReleaseAPerformanceTests(unittest.TestCase):
                     entities,
                     authoritative,
                 )
-                self.assertEqual(old_result, new_result)
+                if "authoritative_owners" in case:
+                    self.assertEqual(new_result[0], "OK")
+                    self.assertNotEqual(old_result, new_result)
+                    self.assertEqual(
+                        new_result[2][1], case["authoritative_owners"]
+                    )
+                else:
+                    self.assertEqual(old_result, new_result)
 
-    def test_raw_owner_recovers_global_prefixed_owner_without_filtering(self) -> None:
+    def test_authoritative_city_scope_excludes_foreign_raw_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             stop_data = self._write_stop_data(root / "stop-data", {"city": ["42"]})
@@ -148,18 +159,16 @@ class ReleaseAPerformanceTests(unittest.TestCase):
                 entities,
                 authoritative,
             )
-            self.assertEqual(old_result, new_result)
+            self.assertNotEqual(old_result, new_result)
             self.assertEqual(
                 new_result[2][1],
                 [
                     ("provider-a", "city", "42"),
                     ("provider-a", "city", "a:42"),
-                    ("provider-b", "city", "42"),
-                    ("provider-b", "city", "b:42"),
                 ],
             )
 
-    def test_cross_city_prefix_only_owner_preserves_global_semantics(self) -> None:
+    def test_authoritative_city_scope_prevents_cross_city_owner_leakage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             stop_data = self._write_stop_data(
@@ -190,7 +199,19 @@ class ReleaseAPerformanceTests(unittest.TestCase):
                 entities,
                 authoritative,
             )
-            self.assertEqual(old_result, new_result)
+            self.assertNotEqual(old_result, new_result)
+            self.assertEqual(
+                new_result[2],
+                (
+                    [("city-a", "42"), ("city-b", "42")],
+                    [
+                        ("provider-a", "city-a", "42"),
+                        ("provider-a", "city-a", "a:42"),
+                        ("provider-b", "city-b", "42"),
+                        ("provider-b", "city-b", "b:42"),
+                    ],
+                ),
+            )
 
     def test_manual_partial_missing_and_empty_maps_use_global_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -385,17 +406,22 @@ class ReleaseAPerformanceTests(unittest.TestCase):
                 new_samples.append(time.perf_counter() - started)
                 new_snapshot = self._membership_snapshot(new_connection)
                 new_connection.close()
-                self.assertEqual(old_snapshot, new_snapshot)
+                self.assertNotEqual(old_snapshot, new_snapshot)
+                self._assert_cross_city_authoritative_ownership(new_snapshot)
 
             old_median = statistics.median(old_samples)
             new_median = statistics.median(new_samples)
-            print("[Release A] cross-city-collision-heavy membership benchmark")
+            print(
+                "[Release A] cross-city-collision-heavy membership benchmark "
+                "(global and authoritative ownership have different semantics)"
+            )
             print(f"  old samples: {[round(value, 4) for value in old_samples]}")
             print(f"  new samples: {[round(value, 4) for value in new_samples]}")
             print(
-                "  fixture | old | new | speedup | output_equal\n"
+                "  fixture | global lookup | authoritative lookup | "
+                "authoritative output valid\n"
                 f"  cross-city-collision-heavy | {old_median:.4f}s | "
-                f"{new_median:.4f}s | {old_median / new_median:.2f}x | True"
+                f"{new_median:.4f}s | True"
             )
 
     def test_lookup_index_is_deferred_and_used_by_membership_query(self) -> None:
@@ -831,6 +857,32 @@ class ReleaseAPerformanceTests(unittest.TestCase):
                 """
             ).fetchall(),
         )
+
+    @staticmethod
+    def _assert_cross_city_authoritative_ownership(snapshot) -> None:
+        city_stops, provider_stops = snapshot
+        expected_city_stops = sorted(
+            (f"city-{city_index:03d}", f"shared-stop-{stop_index:03d}")
+            for city_index in range(100)
+            for stop_index in range(50)
+        )
+        expected_provider_stops = sorted(
+            (provider_id, city_id, stop_id)
+            for city_index in range(100)
+            for provider_id in (f"provider-{city_index % 98:02d}",)
+            for city_id in (f"city-{city_index:03d}",)
+            for stop_index in range(50)
+            for stop_id in (
+                f"shared-stop-{stop_index:03d}",
+                f"{provider_id}:shared-stop-{stop_index:03d}",
+            )
+        )
+        if city_stops != expected_city_stops:
+            raise AssertionError("City stop rows changed during membership lookup")
+        if provider_stops != expected_provider_stops:
+            raise AssertionError(
+                "Provider ownership escaped the authoritative city mapping"
+            )
 
 
 if __name__ == "__main__":

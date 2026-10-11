@@ -13,6 +13,7 @@ from pathlib import Path
 
 IRELAND_SOURCE_ID = "ireland"
 IRELAND_SNAPSHOT_RELATIVE_PATH = Path("external-artifacts") / IRELAND_SOURCE_ID
+IRELAND_ARCHIVE_RELATIVE_PATH = Path("external-artifacts") / "ireland.zip"
 DEFAULT_CAPTURE_ATTEMPTS = 3
 TEMP_DIRECTORY_ATTEMPTS = 16
 COPY_CHUNK_SIZE = 1024 * 1024
@@ -495,6 +496,48 @@ def _validate_snapshot_fd(
     return digest, size
 
 
+def _validate_archive_snapshot_fd(
+    parent_fd: int,
+    entry: Mapping[str, object],
+) -> tuple[str, int]:
+    _check_fd_platform_support()
+    try:
+        archive_fd = os.open(
+            "ireland.zip",
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+    except OSError as error:
+        raise ValueError("Ireland release archive cannot be opened safely") from error
+    try:
+        before = os.fstat(archive_fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
+            raise ValueError("Ireland release archive must be a non-empty regular file")
+        digest_builder = hashlib.sha256()
+        _update_digest_from_file(
+            archive_fd,
+            file_size=before.st_size,
+            digest_builder=digest_builder,
+        )
+        after = os.fstat(archive_fd)
+        stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if any(
+            getattr(before, field) != getattr(after, field)
+            for field in stable_fields
+        ):
+            raise ValueError("Ireland release archive changed during validation")
+        digest = digest_builder.hexdigest()
+        expected_digest = entry.get("sha256")
+        expected_size = entry.get("size")
+        if not isinstance(expected_digest, str) or not isinstance(expected_size, int):
+            raise ValueError("Ireland release archive provenance is missing")
+        if (digest, before.st_size) != (expected_digest, expected_size):
+            raise ValueError("Ireland release archive provenance does not match manifest")
+        return digest, before.st_size
+    finally:
+        os.close(archive_fd)
+
+
 def capture_ireland_snapshot(
     source: Path,
     release_root: Path,
@@ -578,6 +621,123 @@ def capture_ireland_snapshot(
     raise AssertionError("unreachable Ireland snapshot capture state")
 
 
+def capture_ireland_archive_snapshot(
+    source: Path,
+    release_root: Path,
+    *,
+    max_attempts: int = DEFAULT_CAPTURE_ATTEMPTS,
+) -> IrelandSnapshot:
+    """Copy a validated Ireland GTFS archive into its immutable release path."""
+    if max_attempts < 1:
+        raise ValueError("Ireland snapshot capture attempts must be positive")
+    source = Path(source)
+    release_root = Path(release_root)
+    destination = release_root / IRELAND_ARCHIVE_RELATIVE_PATH
+
+    with _open_release_parent(release_root, create_parent=True) as parent_fd:
+        if _entry_type_at("ireland.zip", parent_fd) is not None:
+            raise ValueError(f"Ireland release snapshot already exists: {destination}")
+
+        for attempt in range(1, max_attempts + 1):
+            temporary_name = f".ireland-archive-{secrets.token_hex(16)}.tmp"
+            source_fd: int | None = None
+            destination_fd: int | None = None
+            published = False
+            completed = False
+            try:
+                _check_fd_platform_support()
+                try:
+                    source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+                except OSError as error:
+                    raise ValueError(
+                        f"Ireland source archive cannot be opened safely: {source}"
+                    ) from error
+                source_before = os.fstat(source_fd)
+                if not stat.S_ISREG(source_before.st_mode):
+                    raise ValueError("Ireland source archive must be a regular file")
+                if source_before.st_size <= 0:
+                    raise ValueError("Ireland source archive is empty")
+                try:
+                    destination_fd = os.open(
+                        temporary_name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        stat.S_IMODE(source_before.st_mode),
+                        dir_fd=parent_fd,
+                    )
+                except OSError as error:
+                    raise ValueError(
+                        "Ireland staged archive cannot be created safely"
+                    ) from error
+
+                digest_builder = hashlib.sha256()
+                remaining = source_before.st_size
+                total_size = 0
+                while remaining:
+                    chunk = os.read(source_fd, min(COPY_CHUNK_SIZE, remaining))
+                    if not chunk:
+                        raise _CaptureRetry("Ireland source archive changed during copy")
+                    digest_builder.update(chunk)
+                    total_size += len(chunk)
+                    offset = 0
+                    while offset < len(chunk):
+                        written = os.write(destination_fd, chunk[offset:])
+                        if written <= 0:
+                            raise ValueError("Ireland staged archive cannot be written")
+                        offset += written
+                    remaining -= len(chunk)
+                if os.read(source_fd, 1):
+                    raise _CaptureRetry("Ireland source archive changed during copy")
+                os.fsync(destination_fd)
+                source_after = os.fstat(source_fd)
+                stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+                if any(
+                    getattr(source_before, field) != getattr(source_after, field)
+                    for field in stable_fields
+                ):
+                    raise _CaptureRetry("Ireland source archive changed during copy")
+                if total_size != source_before.st_size:
+                    raise _CaptureRetry("Ireland source archive changed during copy")
+                digest = digest_builder.hexdigest()
+                os.close(destination_fd)
+                destination_fd = None
+                os.close(source_fd)
+                source_fd = None
+                if _entry_type_at(temporary_name, parent_fd) != "regular file":
+                    raise ValueError("Ireland staged archive changed during capture")
+                if _entry_type_at("ireland.zip", parent_fd) is not None:
+                    raise ValueError(
+                        f"Ireland release snapshot already exists: {destination}"
+                    )
+                os.rename(
+                    temporary_name,
+                    "ireland.zip",
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                published = True
+                if _entry_type_at("ireland.zip", parent_fd) != "regular file":
+                    raise ValueError("Ireland release archive changed during publication")
+                completed = True
+                return IrelandSnapshot(destination, digest, total_size)
+            except _CaptureRetry:
+                if attempt == max_attempts:
+                    raise ValueError(
+                        "Ireland source changed during archive snapshot capture; "
+                        "refusing mixed generation"
+                    )
+            finally:
+                if destination_fd is not None:
+                    os.close(destination_fd)
+                if source_fd is not None:
+                    os.close(source_fd)
+                if not completed:
+                    _remove_tree_at(parent_fd, "ireland.zip" if published else temporary_name)
+            if attempt < max_attempts:
+                continue
+
+    raise AssertionError("unreachable Ireland archive snapshot state")
+
+
 def validate_ireland_release_snapshot(
     entry: Mapping[str, object],
     release_root: Path,
@@ -588,20 +748,29 @@ def validate_ireland_release_snapshot(
         raise ValueError("Ireland release-local snapshot path is missing")
 
     release_root = Path(release_root)
-    expected = Path(os.path.abspath(_release_snapshot_path(release_root)))
     path = Path(raw_path)
     if not path.is_absolute():
         path = release_root / path
     lexical_path = Path(os.path.abspath(path))
-    if lexical_path != expected:
+    expected_tree = Path(os.path.abspath(_release_snapshot_path(release_root)))
+    expected_archive = Path(os.path.abspath(release_root / IRELAND_ARCHIVE_RELATIVE_PATH))
+    if lexical_path not in {expected_tree, expected_archive}:
         raise ValueError(
             f"Ireland release-local snapshot escapes its expected release path: {path}"
         )
     with _open_release_parent(release_root, create_parent=False) as parent_fd:
-        if _entry_type_at(IRELAND_SOURCE_ID, parent_fd) != "directory":
-            raise ValueError(
-                "Ireland release-local snapshot escapes its expected release path: "
-                f"{path}"
-            )
-        _validate_snapshot_fd(parent_fd, entry)
-    return expected
+        if lexical_path == expected_tree:
+            if _entry_type_at(IRELAND_SOURCE_ID, parent_fd) != "directory":
+                raise ValueError(
+                    "Ireland release-local snapshot escapes its expected release path: "
+                    f"{path}"
+                )
+            _validate_snapshot_fd(parent_fd, entry)
+        else:
+            if _entry_type_at("ireland.zip", parent_fd) != "regular file":
+                raise ValueError(
+                    "Ireland release-local archive escapes its expected release path: "
+                    f"{path}"
+                )
+            _validate_archive_snapshot_fd(parent_fd, entry)
+    return lexical_path

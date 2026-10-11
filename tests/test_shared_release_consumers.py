@@ -9,11 +9,65 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
-from scripts.validate_shared_release_consumers import STATIC_CITY_PROBE, image_supported_providers, main, preflight, provider_ids, validate_release_pair
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+from scripts.validate_shared_release_consumers import CONTROL_FLOW_PROBE, STATIC_CITY_PROBE, parse_probe_result, image_runtime_contract, image_supported_providers, main, preflight, provider_ids, validate_release_pair
 from services.release_activation_requirements import ActivationRequirementError
 
 
 class ConsumerPreflightTests(unittest.TestCase):
+    def test_control_flows_require_public_stop_board_and_trip_stops(self):
+        plan = {"checks": [{"cityID": "wuppertal", "stopID": "10031", "hasSchedule": True,
+                            "from": "2026-10-11T00:00:00", "to": "2026-10-24T23:59:59"}]}
+        broken = False
+        def response(url, **kwargs):
+            path = urlparse(url).path
+            if path.startswith("/static-stop-data/"):
+                payload = [{"id": "10031", "latitude": 51.2, "longitude": 7.1}]
+            elif path.endswith("/trip"):
+                payload = {"stops": [] if broken else [{"stopID": "10031"}]}
+            else:
+                payload = {"departures": [{"tripID": "trip", "serviceDate": "2026-10-11"}]}
+            result = io.StringIO(json.dumps(payload))
+            result.status = 200
+            return result
+        with patch.object(sys, "argv", ["probe", "plan.json"]), \
+             patch("builtins.open", side_effect=lambda *args: io.StringIO(json.dumps(plan))), \
+             patch("urllib.request.urlopen", side_effect=response), patch("builtins.print") as output:
+            exec(CONTROL_FLOW_PROBE, {})
+            self.assertEqual(parse_probe_result(output.call_args.args[0])["controls"]["wuppertal"]["tripStops"], 1)
+            broken = True
+            with self.assertRaisesRegex(RuntimeError, "trip details lost stops"):
+                exec(CONTROL_FLOW_PROBE, {})
+
+
+    def test_info_logs_do_not_corrupt_explicit_probe_result(self):
+        output = 'INFO legacy fallback connected\n{"diagnostic": true}\nHALTEWECKER_PREFLIGHT_RESULT={"status":"PASS"}\n'
+        self.assertEqual(parse_probe_result(output), {"status": "PASS"})
+
+    def test_missing_duplicate_or_failed_result_is_rejected(self):
+        for output in ('INFO connected', 'HALTEWECKER_PREFLIGHT_RESULT={"status":"FAIL"}',
+                       'HALTEWECKER_PREFLIGHT_RESULT={"status":"PASS"}\n' * 2):
+            with self.subTest(output=output), self.assertRaises(ValueError):
+                parse_probe_result(output)
+
+    def test_runtime_image_mismatch_fails_even_if_provider_capabilities_match(self):
+        repository = Path(__file__).resolve().parents[1]
+        with patch("scripts.validate_shared_release_consumers.docker_json", return_value={}):
+            with self.assertRaisesRegex(ValueError, "runtime version mismatch"):
+                image_runtime_contract("sha256:stale", repository)
+
+    def test_matching_runtime_image_contract_passes_without_network(self):
+        import hashlib
+        repository = Path(__file__).resolve().parents[1]
+        def inspect(*args):
+            self.assertIn("none", args)
+            return {name: hashlib.sha256((repository / name).read_bytes()).hexdigest()
+                    for name in json.loads(args[-1])}
+        with patch("scripts.validate_shared_release_consumers.docker_json", side_effect=inspect):
+            self.assertEqual(len(image_runtime_contract("sha256:matching", repository)), 8)
+
     def test_reference_only_emits_no_candidate_acceptance(self):
         arguments = ["validator", "--reference-only", "--release", "candidate", "--rollback-release", "rollback",
                      "--build-providers", "germany,israel-mot", "--runtime-providers", "israel-mot"]
@@ -29,7 +83,7 @@ class ConsumerPreflightTests(unittest.TestCase):
     def test_http_probe_checks_all_planned_cities_and_rejects_nonpilot_failure(self):
         cities = ("wien", "helsinki", "bochum", "berlin", "oslo", "stockholm", "toronto", "chicago", "non-pilot-city")
         plan = {"releaseID": "candidate", "supportedCities": len(cities), "apiCities": len(cities), "packageCities": 0,
-                "packageChecks": [], "checks": [{"cityID": city, "stopID": "stop", "hasSchedule": True,
+                "smokeChecks": [], "packageChecks": [], "checks": [{"cityID": city, "stopID": "stop", "hasSchedule": True,
                     "backend": "fallback", "from": "2026-10-10T00:00:00", "to": "2026-10-11T23:59:59"} for city in cities]}
         requests = []
         fail = False
@@ -48,6 +102,29 @@ class ConsumerPreflightTests(unittest.TestCase):
             self.assertEqual(set(requests), set(cities))
             fail = True
             with self.assertRaisesRegex(RuntimeError, "lost scheduled departures: non-pilot-city"):
+                exec(compile(STATIC_CITY_PROBE, "candidate HTTP probe", "exec"), {})
+
+    def test_fixed_smoke_stop_can_have_no_services_without_hiding_city_loss(self):
+        cities = ("wien", "helsinki", "bochum", "berlin")
+        plan = {"releaseID": "candidate", "supportedCities": 4, "apiCities": 4,
+                "packageCities": 0, "smokeChecks": [], "packageChecks": [], "checks": [
+                    {"cityID": city, "stopID": "scheduled-stop", "hasSchedule": True,
+                     "backend": "fallback", "from": "2026-10-10T00:00:00",
+                     "to": "2026-10-11T23:59:59"} for city in cities]}
+        plan["smokeChecks"] = [{"cityID": "wien", "stopID": "at:49:1320:5", "hasSchedule": False}]
+        def response(url, **kwargs):
+            stop = parse_qs(urlparse(url).query)["stopID"][0]
+            rows = [{"serviceDate": "2026-10-10", "scheduledTime": "08:00:00"}] if stop == "scheduled-stop" else []
+            result = io.StringIO(json.dumps({"departures": rows}))
+            result.status = 200
+            return result
+        with patch.object(sys, "argv", ["probe", "plan.json"]), \
+             patch("builtins.open", side_effect=lambda *args: io.StringIO(json.dumps(plan))), \
+             patch("urllib.request.urlopen", side_effect=response), patch("builtins.print") as output:
+            exec(compile(STATIC_CITY_PROBE, "candidate HTTP probe", "exec"), {})
+            self.assertEqual(parse_probe_result(output.call_args.args[0])["status"], "PASS")
+            plan["smokeChecks"][0]["hasSchedule"] = True
+            with self.assertRaisesRegex(RuntimeError, "lost scheduled smoke departures"):
                 exec(compile(STATIC_CITY_PROBE, "candidate HTTP probe", "exec"), {})
 
     def test_broken_rollback_rejects_candidate_before_candidate_preflight(self):
@@ -71,7 +148,9 @@ class ConsumerPreflightTests(unittest.TestCase):
                 result = validate_release_pair(root / "candidate", rollback, ("germany",), (), "static", "route", static_image="sha256:tested")
             self.assertEqual(result["status"], "PASS")
             self.assertEqual(call.call_args_list[0].args[0], rollback.resolve())
+            self.assertIs(call.call_args_list[0].kwargs["require_current_schedules"], False)
             self.assertEqual(call.call_args_list[1].args[0], root / "candidate")
+            self.assertNotIn("require_current_schedules", call.call_args_list[1].kwargs)
             self.assertEqual(call.call_args_list[1].kwargs["reference"], rollback.resolve())
             self.assertEqual(call.call_args_list[1].kwargs["static_image"], "sha256:tested")
 

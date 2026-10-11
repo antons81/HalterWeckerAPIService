@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import urllib.error
 import zipfile
+from datetime import date, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -27,7 +28,12 @@ from external_gtfs import (  # noqa: E402
 from build_stop_packages import load_gtfs_archive  # noqa: E402
 from gtfs_source_cache import ArtifactResult, GTFSArtifactCache  # noqa: E402
 from prepare_custom_gtfs_artifacts import resolve_source  # noqa: E402
-from prepare_gtfs_artifacts import artifact_payload  # noqa: E402
+from prepare_gtfs_artifacts import (  # noqa: E402
+    artifact_payload,
+    ensure_current_source_calendar,
+    gtfs_calendar_horizon,
+    merge_gtfs_feed_bundle,
+)
 from release_integrity import (  # noqa: E402
     validate_artifact_entry,
     validate_candidate_sources,
@@ -67,6 +73,29 @@ def _write_kyiv_gtfs(path: Path) -> bytes:
             "S1,1,1,1,1,1,1,20200101,20301231\n",
         )
     return path.read_bytes()
+
+
+def _write_bundle_feed(path: Path, suffix: str, *, service_end: date, route_id: str | None = None) -> Path:
+    route_id = route_id or f"route-{suffix}"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("agency.txt", "agency_id,agency_name\nMTA NYCT,New York City Transit\n")
+        archive.writestr(
+            "routes.txt",
+            "route_id,agency_id,route_short_name,route_type\n"
+            f"{route_id},MTA NYCT,{suffix},3\n",
+        )
+        archive.writestr("stops.txt", "stop_id,stop_name,stop_lat,stop_lon\n"
+                         f"stop-{suffix},Stop {suffix},40.0,-73.0\n")
+        archive.writestr("trips.txt", "route_id,service_id,trip_id\n"
+                         f"{route_id},service-{suffix},trip-{suffix}\n")
+        archive.writestr("stop_times.txt", "trip_id,stop_id,stop_sequence,departure_time\n"
+                         f"trip-{suffix},stop-{suffix},1,08:00:00\n")
+        archive.writestr(
+            "calendar.txt",
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
+            f"service-{suffix},1,1,1,1,1,1,1,20260101,{service_end:%Y%m%d}\n",
+        )
+    return path
 
 
 class _ArchiveResponse:
@@ -247,6 +276,7 @@ class ExternalGTFSProvenanceTests(unittest.TestCase):
             has_input = bool(
                 configured_external_url(source)
                 or str(source.get("localPath", "")).strip()
+                or source.get("feedBundle")
             )
             if classification == "required":
                 self.assertTrue(has_input, source["id"])
@@ -458,3 +488,91 @@ class ExternalGTFSProvenanceTests(unittest.TestCase):
         validate_previous_release_sources({"fixture"}, set(), allowlisted={"fixture"})
         with self.assertRaisesRegex(ValueError, "lost cities"):
             validate_previous_release_cities({"fixture-city"}, set())
+
+    def test_expired_source_calendar_forces_unconditional_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            today = date.today()
+            expired = _write_bundle_feed(root / "expired.zip", "old", service_end=today - timedelta(days=1))
+            fresh = _write_bundle_feed(root / "fresh.zip", "new", service_end=today + timedelta(days=21))
+            initial = ArtifactResult("fixture", expired, "unchanged", "remote metadata")
+            refreshed = ArtifactResult("fixture", fresh, "updated", "downloaded")
+            cache = GTFSArtifactCache(root / "cache")
+            with mock.patch("prepare_gtfs_artifacts.resolve_one", return_value=refreshed) as request:
+                result = ensure_current_source_calendar(
+                    cache, initial, source_id="fixture", url="https://gtfs.example/feed.zip",
+                    timezone_name="UTC", allow_stale=True,
+                )
+            self.assertEqual(result.path, fresh)
+            self.assertIs(request.call_args.kwargs["force_download"], True)
+            self.assertIs(request.call_args.kwargs["allow_stale"], False)
+
+    def test_expired_source_with_failed_refresh_reports_exact_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            today = date.today()
+            expired = _write_bundle_feed(root / "expired.zip", "old", service_end=today - timedelta(days=1))
+            initial = ArtifactResult("fixture", expired, "unchanged", "remote metadata")
+            cache = GTFSArtifactCache(root / "cache")
+            with mock.patch(
+                "prepare_gtfs_artifacts.resolve_one",
+                side_effect=urllib.error.HTTPError(
+                    "https://gtfs.example/feed.zip", 503, "unavailable", {}, None,
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "source=fixture calendar expired.*gtfs.example/feed.zip.*HTTPError"):
+                    ensure_current_source_calendar(
+                        cache, initial, source_id="fixture", url="https://gtfs.example/feed.zip",
+                        timezone_name="UTC", allow_stale=True,
+                    )
+
+    def test_mta_bus_bundle_merges_identical_rows_and_rejects_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            today = date.today()
+            first = _write_bundle_feed(root / "first.zip", "A", service_end=today + timedelta(days=30))
+            second = _write_bundle_feed(root / "second.zip", "B", service_end=today + timedelta(days=30))
+            merged = root / "merged.zip"
+            merge_gtfs_feed_bundle([first, second], merged)
+            with zipfile.ZipFile(merged) as archive:
+                self.assertEqual(archive.read("agency.txt").decode().count("MTA NYCT"), 1)
+                self.assertEqual(archive.read("routes.txt").decode().count("route-"), 2)
+            conflict = _write_bundle_feed(
+                root / "conflict.zip", "C", route_id="route-A", service_end=today + timedelta(days=30),
+            )
+            with self.assertRaisesRegex(ValueError, "conflicting duplicate key in routes.txt"):
+                merge_gtfs_feed_bundle([first, conflict], root / "conflict-merged.zip")
+
+    def test_mta_registry_uses_current_official_feeds_instead_of_local_archives(self) -> None:
+        sources = load_external_gtfs_sources(
+            REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
+        )
+        indexed = {source["id"]: source for source in sources}
+        subway = indexed["mta-ny-subway"]
+        mta_bus = indexed["mta-ny-mta-bus"]
+        nyct_bus = indexed["mta-ny-nyct-bus"]
+        self.assertEqual(subway["url"], "https://rrgtfsfeeds.s3.amazonaws.com/gtfs_subway.zip")
+        self.assertEqual(mta_bus["url"], "https://rrgtfsfeeds.s3.amazonaws.com/gtfs_busco.zip")
+        self.assertNotIn("localPath", subway)
+        self.assertNotIn("localPath", mta_bus)
+        self.assertEqual(
+            [row["id"] for row in nyct_bus["feedBundle"]],
+            ["bronx", "brooklyn", "manhattan", "queens", "staten-island"],
+        )
+        self.assertNotIn("localPath", nyct_bus)
+        for source in (subway, mta_bus, nyct_bus):
+            validate_external_gtfs_source(source, REPOSITORY_ROOT)
+
+    def test_ireland_registry_uses_refreshable_official_nta_gtfs(self) -> None:
+        sources = load_external_gtfs_sources(
+            REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
+        )
+        ireland = next(source for source in sources if source["id"] == "ireland")
+
+        self.assertEqual(
+            ireland["url"],
+            "https://www.transportforireland.ie/transitData/Data/GTFS_All.zip",
+        )
+        self.assertNotIn("localPath", ireland)
+        self.assertEqual(source_classification(ireland), "required")
+        validate_external_gtfs_source(ireland, REPOSITORY_ROOT)

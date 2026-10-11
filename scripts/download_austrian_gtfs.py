@@ -18,6 +18,7 @@ from pathlib import Path
 from austrian_sources import DEFAULT_REGISTRY, load_austrian_sources
 from gtfs_source_cache import DEFAULT_CACHE_ROOT, GTFSArtifactCache
 from artifact_provenance import artifact_provenance, immutable_file_path
+from prepare_gtfs_artifacts import gtfs_calendar_horizon, source_calendar_local_date
 
 
 DEFAULT_ENV_FILE = Path("/srv/haltewecker/data/austria/.env")
@@ -99,9 +100,7 @@ def download_source(
     url = f"{env['MVO_API_BASE'].rstrip('/')}/data-sets/{source['datasetId']}/{year}/file"
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"{source['id']}-{year}.zip"
-    result = cache.resolve(
-        str(source["id"]),
-        url,
+    cache_arguments = dict(
         headers={"Authorization": f"Bearer {token_value}", "Accept": "application/zip"},
         source_version={
             "datasetId": int(source["datasetId"]),
@@ -109,10 +108,38 @@ def download_source(
             "originalName": original_name,
             "size": expected_size,
         },
-        allow_stale=True,
         seed_path=target,
         minimum_size=int(expected_size) if expected_size is not None else None,
     )
+    result = cache.resolve(
+        str(source["id"]),
+        url,
+        allow_stale=True,
+        **cache_arguments,
+    )
+    today = source_calendar_local_date("Europe/Vienna")
+    horizon = gtfs_calendar_horizon(result.path)
+    if horizon is None or horizon < today:
+        expired_through = horizon.isoformat() if horizon else "no active service dates"
+        if result.status not in {"updated", "local", "snapshot"}:
+            try:
+                result = cache.resolve(
+                    str(source["id"]), url, allow_stale=False,
+                    force_download=True, **cache_arguments,
+                )
+            except Exception as error:
+                raise RuntimeError(
+                    f"Austrian source {source['id']} active MVO dataset {year} has an expired "
+                    f"calendar through {expired_through}; fresh download failed: "
+                    f"{type(error).__name__}: {error}"
+                ) from error
+            horizon = gtfs_calendar_horizon(result.path)
+        if horizon is None or horizon < today:
+            horizon_text = horizon.isoformat() if horizon else "no active service dates"
+            raise RuntimeError(
+                f"Austrian source {source['id']} active MVO dataset {year} still has an "
+                f"expired calendar through {horizon_text} (today={today})"
+            )
     target_dir.mkdir(parents=True, exist_ok=True)
     temporary_link = target.with_name(f".{target.name}.next")
     temporary_link.unlink(missing_ok=True)
@@ -136,6 +163,7 @@ def download_source(
         "path": str(target),
         "status": result.status,
         "reason": result.reason,
+        "serviceThrough": horizon.isoformat(),
     }
 
 
