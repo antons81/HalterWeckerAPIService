@@ -519,12 +519,15 @@ class ExternalGTFSProvenanceTests(unittest.TestCase):
                 side_effect=urllib.error.HTTPError(
                     "https://gtfs.example/feed.zip", 503, "unavailable", {}, None,
                 ),
-            ):
+            ) as request:
                 with self.assertRaisesRegex(ValueError, "source=fixture calendar expired.*gtfs.example/feed.zip.*HTTPError"):
                     ensure_current_source_calendar(
                         cache, initial, source_id="fixture", url="https://gtfs.example/feed.zip",
-                        timezone_name="UTC", allow_stale=True,
+                        timezone_name="UTC", allow_stale=True, retry_attempts=3,
                     )
+            self.assertEqual(request.call_args.kwargs["retry_attempts"], 3)
+            self.assertIs(request.call_args.kwargs["force_download"], True)
+            self.assertIs(request.call_args.kwargs["allow_stale"], False)
 
     def test_mta_bus_bundle_merges_identical_rows_and_rejects_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

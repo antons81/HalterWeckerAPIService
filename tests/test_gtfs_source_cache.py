@@ -257,6 +257,31 @@ class GTFSArtifactCacheTests(unittest.TestCase):
             self.assertEqual(result.status, "updated")
             self.assertEqual(calls, ["GET", "GET", "GET"])
 
+    def test_poland_gdansk_http_500_retries_then_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "gdansk.zip"
+            write_gtfs(source)
+            calls = []
+
+            def fake_urlopen(request, timeout=0):
+                calls.append(request.get_method())
+                if len(calls) < 3:
+                    return FakeResponse(status=500)
+                return FakeResponse(body=source.read_bytes())
+
+            with patch("gtfs_source_cache.urllib.request.urlopen", side_effect=fake_urlopen):
+                result = GTFSArtifactCache(root / "cache").resolve(
+                    "poland-gdansk",
+                    "https://ckan.multimediagdansk.pl/gtfs.zip",
+                    allow_stale=False,
+                    metadata_probe=False,
+                    retry_attempts=3,
+                )
+
+            self.assertEqual(result.status, "updated")
+            self.assertEqual(calls, ["GET", "GET", "GET"])
+
     def test_kyiv_retry_exhaustion_uses_valid_stale_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

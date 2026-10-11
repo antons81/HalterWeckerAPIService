@@ -1517,6 +1517,22 @@ class ExternalStopAndDepartureTests(unittest.TestCase):
             if item["id"] == "sweden"
         )
         self.assertIsNone(external_gtfs_resilience_policy(sweden))
+        gdansk = next(
+            item
+            for item in load_external_gtfs_sources(
+                REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
+            )
+            if item["id"] == "poland-gdansk"
+        )
+        self.assertEqual(
+            external_gtfs_resilience_policy(gdansk),
+            {
+                "allowStale": True,
+                "retryAttempts": 3,
+                "metadataProbe": True,
+                "requireDataRows": False,
+            },
+        )
         catalog = source["supplementalStopCatalog"]
         self.assertEqual(catalog["resourceID"], "269ffb2e-dac0-4978-9552-10d29a30724b")
         self.assertEqual(catalog["idPrefix"], "kyiv-catalog:")

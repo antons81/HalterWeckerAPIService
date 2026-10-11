@@ -1476,6 +1476,13 @@
     "timezone": "Europe/Warsaw",
     "identifierPrefix": "pl-gdansk:",
     "namespace": "pl-gdansk:",
+    "resilientFetch": {
+      "enabled": true,
+      "allowStale": true,
+      "retryAttempts": 3,
+      "metadataProbe": true,
+      "requireDataRows": false
+    },
     "stopIDMode": "exact",
     "buildStops": true,
     "buildRoutes": true,
