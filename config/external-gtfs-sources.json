@@ -82,6 +82,7 @@
     "buildRoutes": true,
     "buildDepartures": true,
     "buildTripIndex": false,
+    "importIntoStaticDepartures": true,
     "country": "IE"
   },
   {

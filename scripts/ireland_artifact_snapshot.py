@@ -752,14 +752,17 @@ def validate_ireland_release_snapshot(
     if not path.is_absolute():
         path = release_root / path
     lexical_path = Path(os.path.abspath(path))
-    expected_tree = Path(os.path.abspath(_release_snapshot_path(release_root)))
-    expected_archive = Path(os.path.abspath(release_root / IRELAND_ARCHIVE_RELATIVE_PATH))
-    if lexical_path not in {expected_tree, expected_archive}:
+    canonical_path = path.parent.resolve() / path.name
+    expected_snapshot = _release_snapshot_path(release_root)
+    expected_archive_path = release_root / IRELAND_ARCHIVE_RELATIVE_PATH
+    expected_tree = expected_snapshot.parent.resolve() / expected_snapshot.name
+    expected_archive = expected_archive_path.parent.resolve() / expected_archive_path.name
+    if canonical_path not in {expected_tree, expected_archive}:
         raise ValueError(
             f"Ireland release-local snapshot escapes its expected release path: {path}"
         )
     with _open_release_parent(release_root, create_parent=False) as parent_fd:
-        if lexical_path == expected_tree:
+        if canonical_path == expected_tree:
             if _entry_type_at(IRELAND_SOURCE_ID, parent_fd) != "directory":
                 raise ValueError(
                     "Ireland release-local snapshot escapes its expected release path: "

@@ -23,6 +23,19 @@ from provider_artifact_capabilities import (  # noqa: E402
 
 
 class ProviderArtifactCapabilityTests(unittest.TestCase):
+    def test_every_external_gtfs_source_is_materialized_in_full_departures_database(self) -> None:
+        sources = json.loads(
+            (REPOSITORY_ROOT / "config/external-gtfs-sources.json").read_text()
+        )
+
+        self.assertTrue(sources)
+        omitted = [
+            source["id"]
+            for source in sources
+            if source.get("importIntoStaticDepartures") is not True
+        ]
+        self.assertEqual(omitted, [])
+
     def test_incremental_external_providers_are_materialized_in_full_departures_database(self) -> None:
         selected = (
             "israel-mot",

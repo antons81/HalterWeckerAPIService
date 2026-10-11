@@ -210,6 +210,7 @@ fi
 EXTERNAL_GTFS_IMPORT_ARGS=()
 if ! EXTERNAL_GTFS_IMPORT_MAPPINGS="$(python3 - "${EXTERNAL_GTFS_ARTIFACTS_JSON:-}" "$REPO/config/external-gtfs-sources.json" "$REPO" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -237,7 +238,10 @@ if artifact_path:
             from ireland_artifact_snapshot import validate_ireland_release_snapshot
 
             try:
-                validate_ireland_release_snapshot(entry, Path(artifact_path).parent)
+                release_root = os.environ.get("IRELAND_ARTIFACTS_RELEASE_ROOT")
+                if not release_root:
+                    release_root = str(Path(artifact_path).resolve().parent)
+                validate_ireland_release_snapshot(entry, Path(release_root).resolve())
             except ValueError as error:
                 raise SystemExit(str(error)) from error
         print(f"{source_id}={entry['path']}")

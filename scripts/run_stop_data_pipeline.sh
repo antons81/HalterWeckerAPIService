@@ -1490,7 +1490,7 @@ run_candidate_validation() {
 if [[ -f "$MVO_ENV_FILE" ]]; then
   test -f "$RELEASE_DIR/austrian-artifacts.json"
 fi
-python3 - "$BUILD_DIR/manifest.json" "$RELEASE_ID" "$RELEASE_DIR/release-metadata.json" "$BUILD_FINGERPRINT" "$ARTIFACTS_JSON" "$CURRENT_RELEASE" "$REPO" "$REUSE_STOP_DATA" <<'PY'
+python3 - "$BUILD_DIR/manifest.json" "$RELEASE_ID" "$RELEASE_DIR/release-metadata.json" "$BUILD_FINGERPRINT" "$ARTIFACTS_JSON" "$CURRENT_RELEASE" "$REPO" "$REUSE_STOP_DATA" "$REUSED_STOP_DATA_SOURCE" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -1504,6 +1504,11 @@ previous_release_link = Path(sys.argv[6])
 repository_root = Path(sys.argv[7])
 reuse_stop_data = sys.argv[8] == "1"
 candidate_root = manifest_path.parent.parent
+artifact_release_root = (
+    Path(sys.argv[9]).resolve().parent
+    if reuse_stop_data
+    else artifacts_path.resolve().parent
+)
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 if not isinstance(manifest.get("cities"), list) or not manifest["cities"]:
     raise SystemExit("staged stop manifest has no cities")
@@ -1524,7 +1529,7 @@ for group in ("sources", "external"):
             from ireland_artifact_snapshot import validate_ireland_release_snapshot
 
             try:
-                validate_ireland_release_snapshot(entry, candidate_root)
+                validate_ireland_release_snapshot(entry, artifact_release_root)
             except ValueError as error:
                 raise SystemExit(str(error)) from error
         if not artifact_path.exists():
@@ -1821,7 +1826,12 @@ run_static_departures_stage() {
   fi
   diagnostics_set_stage "legacy-import"
   STATIC_STARTED=$SECONDS
+  local ireland_artifacts_release_root="$RELEASE_DIR"
+  if [[ "$REUSE_STOP_DATA" == "1" ]]; then
+    ireland_artifacts_release_root="${REUSED_STOP_DATA_SOURCE%/stop-data}"
+  fi
   STATIC_FALLBACK_SHARD_PROVIDER_IDS="" \
+IRELAND_ARTIFACTS_RELEASE_ROOT="$ireland_artifacts_release_root" \
   EXTERNAL_GTFS_ARTIFACTS_JSON="$ARTIFACTS_JSON" \
 STOP_DATA_PATH="$BUILD_DIR" \
 NEXT_DATABASE_PATH="$RELEASE_DIR/departures-next.sqlite" \
