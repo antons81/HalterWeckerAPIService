@@ -696,7 +696,10 @@ def main() -> None:
                            and bool(resilience_policy["requireDataRows"])
                            else None),
             )
-        result["external"][source_id] = artifact_payload(artifact)
+        result["external"][source_id] = artifact_payload(
+            artifact,
+            release_root=args.release_root,
+        )
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

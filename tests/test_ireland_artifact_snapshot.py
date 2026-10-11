@@ -12,6 +12,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import ireland_artifact_snapshot
+import prepare_gtfs_artifacts
 from artifact_provenance import artifact_provenance
 from gtfs_source_cache import ArtifactResult
 from ireland_artifact_snapshot import (
@@ -132,6 +133,72 @@ class IrelandArtifactSnapshotTests(unittest.TestCase):
                 list((release / "external-artifacts").iterdir()),
                 [expected],
             )
+
+    def test_prepare_artifacts_snapshots_downloaded_ireland_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache_root = root / "cache"
+            release = root / "releases" / "release-a"
+            release.mkdir(parents=True)
+            archive_path = root / "ireland-current.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("agency.txt", "agency_id,agency_name\n1,TFI\n")
+
+            external_sources = root / "external-sources.json"
+            external_sources.write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "ireland",
+                            "classification": "required",
+                            "url": "https://ireland.example/gtfs.zip",
+                            "timezone": "Europe/Dublin",
+                            "buildDepartures": True,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            output = root / "gtfs-artifacts.json"
+
+            def resolve(_cache, source_id: str, url: str, **_kwargs):
+                return ArtifactResult(source_id, archive_path, "updated", url)
+
+            argv = [
+                "prepare_gtfs_artifacts.py",
+                "--cache-root",
+                str(cache_root),
+                "--gtfs-url",
+                "https://germany.example/gtfs.zip",
+                "--swiss-gtfs-url",
+                "https://swiss.example/gtfs.zip",
+                "--external-sources",
+                str(external_sources),
+                "--output",
+                str(output),
+                "--release-root",
+                str(release),
+            ]
+            with (
+                mock.patch("sys.argv", argv),
+                mock.patch.object(prepare_gtfs_artifacts, "resolve_one", side_effect=resolve),
+                mock.patch.object(
+                    prepare_gtfs_artifacts,
+                    "ensure_current_source_calendar",
+                    side_effect=lambda _cache, artifact, **_kwargs: artifact,
+                ),
+                mock.patch.object(
+                    prepare_gtfs_artifacts,
+                    "authenticated_external_request",
+                    side_effect=lambda _source_id, url, **_kwargs: (url, {}),
+                ),
+            ):
+                prepare_gtfs_artifacts.main()
+
+            ireland = json.loads(output.read_text(encoding="utf-8"))["external"]["ireland"]
+            expected = release / IRELAND_ARCHIVE_RELATIVE_PATH
+            self.assertEqual(Path(ireland["path"]), expected)
+            self.assertEqual(validate_ireland_release_snapshot(ireland, release), expected)
 
     def test_ireland_archive_snapshot_rejects_manifest_digest_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
