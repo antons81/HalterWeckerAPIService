@@ -12,11 +12,25 @@ from urllib.parse import parse_qs, urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from scripts.validate_shared_release_consumers import CONTROL_FLOW_PROBE, STATIC_CITY_PROBE, parse_probe_result, image_runtime_contract, image_supported_providers, main, preflight, provider_ids, validate_release_pair
+from scripts.validate_shared_release_consumers import CONTROL_FLOW_PROBE, STATIC_CITY_PROBE, parse_probe_result, image_runtime_contract, image_supported_providers, main, preflight, provider_ids, static_consumer_environment, validate_release_pair
 from services.release_activation_requirements import ActivationRequirementError
 
 
 class ConsumerPreflightTests(unittest.TestCase):
+    def test_candidate_preflight_uses_full_legacy_database_and_rollback_keeps_hybrid(self):
+        candidate = static_consumer_environment(
+            "legacy", ("israel-mot",), "releases/incremental/candidate", "staging/probe/current-release",
+        )
+        self.assertEqual(candidate["HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE"], "legacy")
+        self.assertEqual(candidate["HALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME"], "0")
+        self.assertEqual(candidate["HALTEWECKER_STATIC_DEPARTURES_SHADOW_RUNTIME"], "0")
+        self.assertEqual(candidate["DEPARTURES_DATABASE"],
+                         "/data/releases/incremental/candidate/departures.sqlite")
+        rollback = static_consumer_environment(
+            "hybrid", ("israel-mot",), "releases/incremental/rollback", "staging/probe/current-release",
+        )
+        self.assertEqual(rollback["HALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME"], "1")
+
     def test_control_flows_require_public_stop_board_and_trip_stops(self):
         plan = {"checks": [{"cityID": "wuppertal", "stopID": "10031", "hasSchedule": True,
                             "from": "2026-10-11T00:00:00", "to": "2026-10-24T23:59:59"}]}
@@ -192,6 +206,10 @@ class ConsumerPreflightTests(unittest.TestCase):
         activation = script.split("activate_incremental_production() {", 1)[1]
         self.assertLess(activation.index("validate_incremental_consumers || return 1"),
                         activation.index('replace_link "$CURRENT_RELEASE" "$candidate_target"'))
+        self.assertIn('HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE=legacy', activation)
+        self.assertIn('HALTEWECKER_STATIC_DEPARTURES_SHADOW_RUNTIME=0', activation)
+        self.assertIn('DEPARTURES_DATABASE="/data/departures-current.sqlite"', activation)
+        self.assertIn('replace_link "$DEPARTURES_CURRENT" "releases/incremental/$RELEASE_ID/departures.sqlite"', activation)
 
 
 if __name__ == "__main__":

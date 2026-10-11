@@ -156,6 +156,7 @@ set -eu
 REPO="$ROOT"
 CURRENT_RELEASE="$ROOT/current-release"
 CURRENT="$ROOT/current"
+DEPARTURES_CURRENT="$ROOT/departures-current.sqlite"
 DATA_ROOT="$ROOT"
 RELEASE_ID=candidate
 INCREMENTAL_RELEASE_DIR="$ROOT/candidate"
@@ -163,11 +164,20 @@ HALTEWECKER_RUNTIME_PROVIDER_IDS=israel-mot
 STATIC_ACTIVATION_IMAGE=image-original
 STATIC_DEPARTURES_PIPELINE="$ROOT/static-runner"
 ROUTERECALL_READINESS_TIMEOUT_SECONDS=0
+PREVIOUS_DEPARTURES_POINTER_PRESENT=0
+PREVIOUS_DEPARTURES_POINTER_TARGET=""
+PREVIOUS_ROLLBACK_POINTER_PRESENT=0
+PREVIOUS_ROLLBACK_POINTER_TARGET=""
+PREVIOUS_STATIC_RUNTIME_MODE=legacy
 replace_link() { "$REAL_PYTHON" -c 'import os,sys; os.symlink(sys.argv[2],sys.argv[1]+".next"); os.replace(sys.argv[1]+".next",sys.argv[1])' "$1" "$2"; }
 validate_incremental_candidate() { return 0; }
 validate_incremental_consumers() { [[ "$COVERAGE_FAIL" == 0 ]]; }
 docker() {
   echo "$*" >> "$ROOT/docker-calls"
+  if [[ "$*" == *"{{range .Config.Env}}"* ]]; then
+    printf 'HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE=hybrid\nHALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME=1\n'
+    return 0
+  fi
   if [[ "$*" == *"{{.Image}}"* ]]; then cat "$ROOT/image"; return 0; fi
   if [[ "$*" == *"{{.Id}}"* ]]; then echo original-container; return 0; fi
   return 1

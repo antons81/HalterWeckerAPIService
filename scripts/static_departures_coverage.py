@@ -153,7 +153,12 @@ def validate_city_coverage(
          closing(sqlite3.connect(manifest.common_database_path.resolve().as_uri() + "?mode=ro", uri=True)) as common:
         metadata = dict(legacy.execute("SELECT key,value FROM metadata"))
         excluded = set()
-        if metadata.get("fallbackProfile") == FALLBACK_PROFILE:
+        compact_fallback = metadata.get("fallbackProfile") == FALLBACK_PROFILE
+        if require_current_schedules and compact_fallback:
+            raise CityCoverageError(
+                "candidate departures database omits providers served only by shard runtime"
+            )
+        if compact_fallback:
             try:
                 shard_ids = json.loads(metadata.get("shardProviderIDs", "[]"))
                 excluded_ids = json.loads(metadata.get("excludedProviderIDs", "[]"))
@@ -195,7 +200,10 @@ def validate_city_coverage(
             if not ids or len(ids) != len(stops) or entry.get("stopCount", len(stops)) != len(stops):
                 raise CityCoverageError(f"empty or incomplete candidate stop package: {city}")
             providers = {str(row[0]) for row in common.execute("SELECT provider_id FROM provider_city_modes WHERE city_id=?", (city,))}
-            shard = bool(providers) and providers <= set(runtime)
+            # Full-import candidates must be verified against the one shared
+            # SQLite, even when the release also publishes provider shards for
+            # RouteRecall. Shards are consulted only for legacy hybrid rollback.
+            shard = compact_fallback and bool(providers) and providers <= set(runtime)
             if city in package_cities and not shard:
                 departures = read_object(stop_root / "departures" / f"{city}.json")
                 if not isinstance(departures.get("stops"), dict) or not any(

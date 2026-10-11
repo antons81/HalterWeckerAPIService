@@ -135,30 +135,43 @@ class CityCoverageTests(unittest.TestCase):
              patch("scripts.static_departures_coverage.load_external_cities", side_effect=lambda source, _repository: source["cities"]):
             return validate_city_coverage(self.release, tuple(self.pilots.values()), self.root, validation_date=date(2026, 10, 10), **kwargs)
 
-    def test_every_city_is_checked_and_nonpilot_cities_use_fallback(self):
+    def test_full_database_checks_every_city_including_provider_pilot_cities(self):
         report = self.validate()
         self.assertEqual(report["supportedCities"], len(self.cities))
         checks = {row["cityID"]: row for row in report["checks"]}
         self.assertEqual(set(checks), set(self.cities))
         for city in self.cities:
             self.assertTrue(checks[city]["hasSchedule"], city)
-            self.assertEqual(checks[city]["backend"], "shard" if city in self.pilots else "fallback", city)
+            self.assertEqual(checks[city]["backend"], "fallback", city)
+
+    def test_full_database_cannot_borrow_pilot_coverage_from_provider_shards(self):
+        self.mutate_database("DELETE FROM city_stops WHERE city_id='israel'")
+        with self.assertRaisesRegex(CityCoverageError, "cannot route.*israel"):
+            self.validate()
 
     def mark_compact(self, provider_ids=None):
         values = {"fallbackProfile": "hybrid-only", "shardProviderIDs": json.dumps(provider_ids or list(self.pilots.values())), "excludedProviderIDs": json.dumps(list(self.pilots.values()))}
         for key, value in values.items():
             self.mutate_database("INSERT INTO metadata VALUES (?,?)", (key, value))
 
-    def test_compact_fallback_uses_shards_and_still_checks_every_nonpilot_city(self):
+    def test_compact_fallback_is_rejected_for_candidate_activation(self):
+        self.mark_compact()
+        with self.assertRaisesRegex(CityCoverageError, "candidate departures database omits providers"):
+            self.validate()
+
+    def test_compact_rollback_can_use_shards_for_structural_coverage(self):
         self.mark_compact()
         with patch("scripts.static_departures_coverage.excluded_fallback_providers", return_value=tuple(self.pilots.values())):
-            self.assertEqual(self.validate()["supportedCities"], len(self.cities))
+            report = self.validate(require_current_schedules=False)
+        self.assertEqual(report["supportedCities"], len(self.cities))
+        checks = {row["cityID"]: row for row in report["checks"]}
+        self.assertEqual(checks["israel"]["backend"], "shard")
 
-    def test_compact_fallback_cannot_use_a_smaller_runtime_provider_list(self):
+    def test_compact_rollback_cannot_use_a_smaller_runtime_provider_list(self):
         self.mark_compact(["germany"])
         with patch("scripts.static_departures_coverage.excluded_fallback_providers", return_value=tuple(self.pilots.values())):
             with self.assertRaisesRegex(CityCoverageError, "provider contract"):
-                self.validate()
+                self.validate(require_current_schedules=False)
 
     def test_missing_full_database_cannot_pass_with_valid_provider_shards(self):
         self.database.rename(self.release / "unpublished.sqlite")
@@ -200,11 +213,6 @@ class CityCoverageTests(unittest.TestCase):
         self.assertEqual(report["supportedCities"], len(self.cities))
         self.assertFalse(any(row["hasSchedule"] for row in report["checks"]))
         with self.assertRaisesRegex(CityCoverageError, "today and tomorrow"):
-            self.validate()
-
-    def test_shard_calendar_that_expires_today_is_rejected(self):
-        self.refs.temporal.valid_through = "2026-10-10"
-        with self.assertRaisesRegex(CityCoverageError, "provider schedule"):
             self.validate()
 
     def test_supported_city_cannot_disappear_from_candidate(self):

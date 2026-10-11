@@ -40,6 +40,7 @@
     "buildStops": true,
     "buildRoutes": true,
     "buildDepartures": true,
+    "importIntoStaticDepartures": true,
     "artifactCapabilities": {
       "structuralProviderArtifactEligible": true,
       "staticProviderArtifactEligible": true,
@@ -60,6 +61,7 @@
     "buildRoutes": true,
     "buildDepartures": true,
     "buildTripIndex": false,
+    "importIntoStaticDepartures": true,
     "country": "NO",
     "artifactCapabilities": {
       "structuralProviderArtifactEligible": true,

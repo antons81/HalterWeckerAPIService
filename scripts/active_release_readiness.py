@@ -87,8 +87,18 @@ if os.environ.get("HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS", "").split(",") !
 metadata = get("/static-departures/health").get("database", {})
 if metadata.get("releaseID") != expected:
     raise RuntimeError("runtime release mismatch")
-if metadata.get("runtimeMode") != "hybrid" or metadata.get("fallbackReleaseID") != expected:
-    raise RuntimeError("runtime has no validated full fallback database")
+runtime_mode = os.environ.get("HALTEWECKER_EXPECTED_RUNTIME_MODE", "legacy")
+if runtime_mode == "legacy" and os.environ.get("HALTEWECKER_STATIC_DEPARTURES_SHADOW_RUNTIME", "0").strip().lower() in {"1", "true", "yes", "on"}:
+    raise RuntimeError("legacy runtime unexpectedly enables provider shadow queries")
+if runtime_mode == "legacy" and os.environ.get("DEPARTURES_DATABASE", "") != "/data/departures-current.sqlite":
+    raise RuntimeError("legacy runtime is not reading departures-current.sqlite")
+if runtime_mode == "hybrid":
+    if metadata.get("runtimeMode") != "hybrid" or metadata.get("fallbackReleaseID") != expected:
+        raise RuntimeError("rollback runtime has no validated full fallback database")
+elif metadata.get("runtimeMode") in {"provider", "hybrid"} or metadata.get("fallbackReleaseID"):
+    raise RuntimeError("runtime is not using the shared departures database")
+elif metadata.get("fallbackProfile") == "hybrid-only":
+    raise RuntimeError("runtime departures database omits provider schedules")
 for city in ("duisburg", "dusseldorf"):
     payload = get("/static-stop-data/stops/" + city + ".json")
     if not isinstance(payload, list) or not payload:
@@ -109,7 +119,7 @@ for city, stop in (
     ("helsinki", "fi-hsl:1040401"),
 ):
     start, end, zone, scheduled = smoke_expectation(
-        os.environ.get("DEPARTURES_DATABASE", "/data/current-release/departures.sqlite"), city, stop)
+        os.environ.get("DEPARTURES_DATABASE", "/data/departures-current.sqlite"), city, stop)
     payload = get("/static-departures/board?" + urlencode(dict(
         cityID=city, stopID=stop, limit=3, **{"from": start.isoformat(), "to": end.isoformat()})))
     departures = payload.get("departures")
@@ -191,6 +201,7 @@ def main() -> None:
     parser.add_argument("--container-id", default="")
     parser.add_argument("--release-id", default="")
     parser.add_argument("--providers", default="")
+    parser.add_argument("--runtime-mode", choices=("legacy", "hybrid"), default="legacy")
     parser.add_argument("--release-root", default="")
     parser.add_argument("--reload", action="store_true")
     args = parser.parse_args()
@@ -208,7 +219,8 @@ def main() -> None:
     elif args.consumer == "reload-route":
         reload_route(args.container, args.image, args.container_id)
     else:
-        docker("exec", args.container, "python3", "-c", STATIC_PROBE, args.release_id, args.providers)
+        docker("exec", "-e", f"HALTEWECKER_EXPECTED_RUNTIME_MODE={args.runtime_mode}",
+               args.container, "python3", "-c", STATIC_PROBE, args.release_id, args.providers)
 
 
 if __name__ == "__main__":

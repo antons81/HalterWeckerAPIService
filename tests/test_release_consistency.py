@@ -51,6 +51,15 @@ class ReleaseConsistencyTests(unittest.TestCase):
             self._write_release(root)
             validate_release(root / "release-1")
 
+    def test_candidate_database_can_be_validated_before_atomic_rename(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_release(root)
+            release = root / "release-1"
+            candidate = release / "departures-next.sqlite"
+            (release / "departures.sqlite").rename(candidate)
+            validate_release(release, candidate)
+
     def test_manifest_version_mismatch_fails_before_publication(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

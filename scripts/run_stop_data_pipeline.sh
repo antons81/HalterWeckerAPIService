@@ -214,6 +214,11 @@ ROLLBACK="$DATA_ROOT/temp/current-rollback/$RELEASE_ID"
 CURRENT_RELEASE="$DATA_ROOT/current-release"
 STATIC_DEPARTURES_RELEASE="$DATA_ROOT/static-departures-release"
 DEPARTURES_CURRENT="$DATA_ROOT/departures-current.sqlite"
+PREVIOUS_DEPARTURES_POINTER_PRESENT=0
+PREVIOUS_DEPARTURES_POINTER_TARGET=""
+PREVIOUS_ROLLBACK_POINTER_PRESENT=0
+PREVIOUS_ROLLBACK_POINTER_TARGET=""
+PREVIOUS_STATIC_RUNTIME_MODE="legacy"
 STOP_DATA_LOCK="${STOP_DATA_LOCK:-/run/lock/haltewecker-stop-data.lock}"
 STATIC_DEPARTURES_LOCK="${STATIC_DEPARTURES_LOCK:-/run/lock/haltewecker-static-departures.lock}"
 STOP_DATA_ENV_FILE="${STOP_DATA_ENV_FILE:-/etc/haltewecker-stop-data.env}"
@@ -835,12 +840,13 @@ route_recall_activation() {
 
 haltewecker_activation_readiness() {
   local expected_release="$1"
+  local runtime_mode="${2:-legacy}"
   if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" == "1" ]]; then
     return 0
   fi
   python3 "$REPO/scripts/active_release_readiness.py" haltewecker \
     --container static-departures-api --release-id "$expected_release" \
-    --providers "$HALTEWECKER_RUNTIME_PROVIDER_IDS"
+    --providers "$HALTEWECKER_RUNTIME_PROVIDER_IDS" --runtime-mode "$runtime_mode"
 }
 
 rollback_incremental_consumers() {
@@ -849,6 +855,23 @@ rollback_incremental_consumers() {
   local reload_option=""
   if [[ "$ROUTERECALL_ACTIVATION_RELOAD" == "1" ]]; then reload_option="--reload"; fi
   replace_link "$CURRENT_RELEASE" "$previous_target" || return 1
+  if [[ "$PREVIOUS_DEPARTURES_POINTER_PRESENT" == "1" ]]; then
+    replace_link "$DEPARTURES_CURRENT" "$PREVIOUS_DEPARTURES_POINTER_TARGET" || return 1
+  elif [[ -L "$DEPARTURES_CURRENT" ]]; then
+    rm -f "$DEPARTURES_CURRENT" || return 1
+  elif [[ -e "$DEPARTURES_CURRENT" ]]; then
+    echo "[Nightly] ERROR: cannot restore departures-current; it is not a symlink" >&2
+    return 1
+  fi
+  local rollback_pointer="${HALTEWECKER_ROLLBACK_POINTER:-$DATA_ROOT/rollback}"
+  if [[ "$PREVIOUS_ROLLBACK_POINTER_PRESENT" == "1" ]]; then
+    replace_link "$rollback_pointer" "$PREVIOUS_ROLLBACK_POINTER_TARGET" || return 1
+  elif [[ -L "$rollback_pointer" ]]; then
+    rm -f "$rollback_pointer" || return 1
+  elif [[ -e "$rollback_pointer" ]]; then
+    echo "[Nightly] ERROR: cannot restore rollback pointer; it is not a symlink" >&2
+    return 1
+  fi
   if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" != "1" ]]; then
     local container="static-departures-api"
     local preserved="${container}-rollback-${RELEASE_ID}"
@@ -867,13 +890,18 @@ rollback_incremental_consumers() {
       --container-id "$ROUTERECALL_ACTIVATION_CONTAINER_ID" \
       ${reload_option:+"$reload_option"} || return 1
   fi
-  route_recall_activation && haltewecker_activation_readiness "$previous_release"
+  route_recall_activation && haltewecker_activation_readiness "$previous_release" "$PREVIOUS_STATIC_RUNTIME_MODE"
 }
 
 activation_disk_preflight() {
   local free_kb
+  local minimum_free_gb="${HALTEWECKER_INCREMENTAL_MIN_FREE_GB:-20}"
+  if ! [[ "$minimum_free_gb" =~ ^[0-9]+$ ]] || (( minimum_free_gb < 15 )); then
+    echo "[Nightly] ERROR: HALTEWECKER_INCREMENTAL_MIN_FREE_GB must be an integer of at least 15" >&2
+    return 1
+  fi
   free_kb="$(df -Pk "$DATA_ROOT" | awk 'NR == 2 { print $4; exit }')"
-  if ! [[ "$free_kb" =~ ^[0-9]+$ ]] || (( free_kb < 25 * 1024 * 1024 )); then
+  if ! [[ "$free_kb" =~ ^[0-9]+$ ]] || (( free_kb < (minimum_free_gb + 5) * 1024 * 1024 )); then
     echo "[Nightly] ERROR: insufficient disk reserve before activation" >&2
     return 1
   fi
@@ -918,7 +946,43 @@ activate_incremental_production() {
     echo "[Nightly] ERROR: current is not a symlink; refusing to overwrite stop-data" >&2
     return 1
   fi
-  haltewecker_activation_readiness "$old_release" || return 1
+  local prior_container_env
+  prior_container_env="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' static-departures-api)" || return 1
+  PREVIOUS_STATIC_RUNTIME_MODE="$(printf '%s\n' "$prior_container_env" | awk -F= '$1 == "HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE" { print $2; exit }')"
+  if [[ -z "$PREVIOUS_STATIC_RUNTIME_MODE" ]]; then
+    if printf '%s\n' "$prior_container_env" | grep -qx 'HALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME=1'; then
+      PREVIOUS_STATIC_RUNTIME_MODE="hybrid"
+    else
+      PREVIOUS_STATIC_RUNTIME_MODE="legacy"
+    fi
+  fi
+  if [[ "$PREVIOUS_STATIC_RUNTIME_MODE" != "legacy" && "$PREVIOUS_STATIC_RUNTIME_MODE" != "hybrid" ]]; then
+    echo "[Nightly] ERROR: unsupported previous static API runtime mode: $PREVIOUS_STATIC_RUNTIME_MODE" >&2
+    return 1
+  fi
+  haltewecker_activation_readiness "$old_release" "$PREVIOUS_STATIC_RUNTIME_MODE" || return 1
+  if [[ -e "$DEPARTURES_CURRENT" || -L "$DEPARTURES_CURRENT" ]]; then
+    if [[ ! -L "$DEPARTURES_CURRENT" ]]; then
+      echo "[Nightly] ERROR: departures-current is not a symlink; refusing activation" >&2
+      return 1
+    fi
+    PREVIOUS_DEPARTURES_POINTER_PRESENT=1
+    PREVIOUS_DEPARTURES_POINTER_TARGET="$(readlink "$DEPARTURES_CURRENT")"
+  else
+    PREVIOUS_DEPARTURES_POINTER_PRESENT=0
+    PREVIOUS_DEPARTURES_POINTER_TARGET=""
+  fi
+  if [[ -e "$rollback_pointer" || -L "$rollback_pointer" ]]; then
+    if [[ ! -L "$rollback_pointer" ]]; then
+      echo "[Nightly] ERROR: rollback pointer is not a symlink: $rollback_pointer" >&2
+      return 1
+    fi
+    PREVIOUS_ROLLBACK_POINTER_PRESENT=1
+    PREVIOUS_ROLLBACK_POINTER_TARGET="$(readlink "$rollback_pointer")"
+  else
+    PREVIOUS_ROLLBACK_POINTER_PRESENT=0
+    PREVIOUS_ROLLBACK_POINTER_TARGET=""
+  fi
   if [[ "$(docker inspect --format '{{.Image}}' static-departures-api)" != "$STATIC_ACTIVATION_IMAGE" ]]; then
     echo "[Nightly] ERROR: static API image changed after preflight" >&2
     return 1
@@ -927,8 +991,18 @@ activate_incremental_production() {
   # Static HTTP consumers follow the same atomic generation pointer as the API.
   replace_link "$CURRENT" "current-release/stop-data" || return 1
   # Retain the release that passed the full rollback consumer contract.
-  replace_link "$rollback_pointer" "$old_target" || return 1
-  replace_link "$CURRENT_RELEASE" "$candidate_target" || return 1
+  if ! replace_link "$rollback_pointer" "$old_target"; then
+    rollback_incremental_consumers "$old_target" "$old_release" || echo "[Nightly] ERROR: rollback readiness failed; operator recovery required" >&2
+    return 1
+  fi
+  if ! replace_link "$CURRENT_RELEASE" "$candidate_target"; then
+    rollback_incremental_consumers "$old_target" "$old_release" || echo "[Nightly] ERROR: rollback readiness failed; operator recovery required" >&2
+    return 1
+  fi
+  replace_link "$DEPARTURES_CURRENT" "releases/incremental/$RELEASE_ID/departures.sqlite" || {
+    rollback_incremental_consumers "$old_target" "$old_release" || echo "[Nightly] ERROR: rollback readiness failed; operator recovery required" >&2
+    return 1
+  }
   # The DB adapter hot-reloads; the API's resolved stop-data root is startup-bound.
   if [[ "$ROUTERECALL_ACTIVATION_RELOAD" == "1" ]]; then
     if ! python3 "$REPO/scripts/active_release_readiness.py" reload-route \
@@ -941,12 +1015,13 @@ activate_incremental_production() {
     echo "[Nightly] stage=routerecall-reload status=PASS action=RESTART_SAME_CONTAINER image=$ROUTERECALL_ACTIVATION_IMAGE"
   fi
   if ! STATIC_DEPARTURES_IMAGE="$STATIC_ACTIVATION_IMAGE" \
-    HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE=hybrid \
+    HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE=legacy \
     HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RUNTIME=0 \
-    HALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME=1 \
+    HALTEWECKER_STATIC_DEPARTURES_SHADOW_RUNTIME=0 \
+    HALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME=0 \
     HALTEWECKER_STATIC_DEPARTURES_HYBRID_PROVIDERS="$HALTEWECKER_RUNTIME_PROVIDER_IDS" \
-    HALTEWECKER_STATIC_DEPARTURES_HYBRID_RELEASE_POINTER="/data/current-release" \
-    DEPARTURES_DATABASE="/data/current-release/departures.sqlite" \
+    HALTEWECKER_STATIC_DEPARTURES_HYBRID_RELEASE_POINTER="" \
+    DEPARTURES_DATABASE="/data/departures-current.sqlite" \
     HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS="$HALTEWECKER_RUNTIME_PROVIDER_IDS" \
     HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RELEASE_POINTER="/data/current-release" \
     READINESS_ONLY=1 \
@@ -957,7 +1032,7 @@ activate_incremental_production() {
     rollback_incremental_consumers "$old_target" "$old_release" || echo "[Nightly] ERROR: rollback readiness failed; operator recovery required" >&2
     return 1
   fi
-  if ! route_recall_activation || ! haltewecker_activation_readiness "$RELEASE_ID"; then
+  if ! route_recall_activation || ! haltewecker_activation_readiness "$RELEASE_ID" "legacy"; then
     rollback_incremental_consumers "$old_target" "$old_release" || echo "[Nightly] ERROR: rollback readiness failed; operator recovery required" >&2
     return 1
   fi
@@ -1070,6 +1145,8 @@ proof_disk_preflight() {
   local fallback_database_path
   local measured_fallback_database_kb=0
   local configured_fallback_database_kb=0
+  local production_min_free_gb
+  local minimum_allowed_kb
 
   free_kb="$(disk_free_kb)"
   if [[ "$budget_stage" == "stop-data" && "$FROZEN_COMMON_STOP_DATA" != "1" && "$REUSE_STOP_DATA" != "1" && ( -d "$CURRENT" || -L "$CURRENT" ) ]]; then
@@ -1095,7 +1172,14 @@ proof_disk_preflight() {
   if [[ ( "$budget_stage" == "stop-data" || "$budget_stage" == "fallback" ) && ( "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ) ]]; then
     # The previous full SQLite is the measured lower bound for a new fallback
     # database. An explicit estimate may increase that bound, never lower it.
-    fallback_database_path="${HALTEWECKER_FALLBACK_DATABASE_PATH:-$DEPARTURES_CURRENT}"
+    fallback_database_path="${HALTEWECKER_FALLBACK_DATABASE_PATH:-}"
+    if [[ -z "$fallback_database_path" ]]; then
+      if [[ -f "$DEPARTURES_CURRENT" ]]; then
+        fallback_database_path="$DEPARTURES_CURRENT"
+      else
+        fallback_database_path="$CURRENT_RELEASE/departures.sqlite"
+      fi
+    fi
     if [[ -n "${HALTEWECKER_FALLBACK_DATABASE_ESTIMATE_GB:-}" ]]; then
       if ! [[ "$HALTEWECKER_FALLBACK_DATABASE_ESTIMATE_GB" =~ ^[0-9]+$ ]]; then
         echo "[Nightly] ERROR: HALTEWECKER_FALLBACK_DATABASE_ESTIMATE_GB must be a non-negative integer" >&2
@@ -1137,12 +1221,17 @@ proof_disk_preflight() {
       disk_mode="production-shaped-no-activate"
     fi
   elif [[ "$INCREMENTAL_PRODUCTION" == "1" ]]; then
+    production_min_free_gb="${HALTEWECKER_INCREMENTAL_MIN_FREE_GB:-20}"
+    if ! [[ "$production_min_free_gb" =~ ^[0-9]+$ ]] || (( production_min_free_gb < 15 )); then
+      echo "[Nightly] ERROR: HALTEWECKER_INCREMENTAL_MIN_FREE_GB must be an integer of at least 15" >&2
+      return 1
+    fi
     if [[ "$INCREMENTAL_MIGRATION" == "1" ]]; then
-      minimum_free_kb=$((20 * 1024 * 1024))
+      minimum_free_kb=$((production_min_free_gb * 1024 * 1024))
       warning_free_kb=$minimum_free_kb
       disk_mode="incremental-migration"
     else
-      minimum_free_kb=$((20 * 1024 * 1024))
+      minimum_free_kb=$((production_min_free_gb * 1024 * 1024))
       warning_free_kb=$minimum_free_kb
       disk_mode="incremental-production"
     fi
@@ -1151,11 +1240,19 @@ proof_disk_preflight() {
     warning_free_kb="$minimum_free_kb"
     disk_mode="proof-or-legacy"
   fi
-  if (( minimum_free_kb < 20 * 1024 * 1024 )); then
-    echo "[Nightly] ERROR: disk reserve cannot be lower than 20 GiB" >&2
+  local minimum_allowed_kb=$((20 * 1024 * 1024))
+  if [[ "$INCREMENTAL_PRODUCTION" == "1" ]]; then
+    minimum_allowed_kb=$((15 * 1024 * 1024))
+  fi
+  if (( minimum_free_kb < minimum_allowed_kb )); then
+    echo "[Nightly] ERROR: disk reserve is below the permitted minimum for $disk_mode" >&2
     return 1
   fi
+  unset HALTEWECKER_ALLOW_REDUCED_DISK_RESERVE
   export HALTEWECKER_BUILD_MIN_FREE_GIB=$((minimum_free_kb / 1024 / 1024))
+  if [[ "$INCREMENTAL_PRODUCTION" == "1" && "$HALTEWECKER_BUILD_MIN_FREE_GIB" -lt 20 ]]; then
+    export HALTEWECKER_ALLOW_REDUCED_DISK_RESERVE=1
+  fi
   log_disk_state "before"
   echo "[Nightly] disk model stage=$budget_stage unavoidable_stop_data_kb=$current_stop_data_kb fallback_database_kb=$fallback_database_kb expected_artifact_miss_kb=$expected_artifact_miss_kb transient_workspace_kb=$transient_workspace_kb safety_reserve_kb=$margin_kb"
   echo "[Nightly] disk estimated_additional_gb=$((estimated_additional_kb / 1024 / 1024)) estimated_stage_free_gb=$((estimated_free_kb / 1024 / 1024)) warning_free_gb=$((warning_free_kb / 1024 / 1024)) minimum_free_gb=$((minimum_free_kb / 1024 / 1024)) mode=$disk_mode reuse_stop_data=$REUSE_STOP_DATA"
@@ -1174,8 +1271,13 @@ if [[ "$RUN_MODE" == "normal" && ( "$NO_ACTIVATE" == "1" || "$INCREMENTAL_PRODUC
 fi
 
 run_disk_guarded() {
-  python3 "$REPO/scripts/disk_budget.py" --root "$DATA_ROOT" \
-    --minimum-free-gib "${HALTEWECKER_BUILD_MIN_FREE_GIB:-20}" -- "$@"
+  if [[ "$INCREMENTAL_PRODUCTION" == "1" && "${HALTEWECKER_ALLOW_REDUCED_DISK_RESERVE:-0}" == "1" ]]; then
+    HALTEWECKER_ALLOW_REDUCED_DISK_RESERVE=1 python3 "$REPO/scripts/disk_budget.py" --root "$DATA_ROOT" \
+      --minimum-free-gib "${HALTEWECKER_BUILD_MIN_FREE_GIB:-20}" -- "$@"
+  else
+    python3 "$REPO/scripts/disk_budget.py" --root "$DATA_ROOT" \
+      --minimum-free-gib "${HALTEWECKER_BUILD_MIN_FREE_GIB:-20}" -- "$@"
+  fi
 }
 
 forecast_provider_disk() {
@@ -1719,18 +1821,26 @@ run_static_departures_stage() {
   fi
   diagnostics_set_stage "legacy-import"
   STATIC_STARTED=$SECONDS
-  local fallback_shards=""
-  if [[ "$INCREMENTAL_PRODUCTION" == "1" || ( "$INCREMENTAL_NO_ACTIVATE" == "1" && "$FROZEN_COMMON_STOP_DATA" != "1" ) ]]; then
-    fallback_shards="$HALTEWECKER_RUNTIME_PROVIDER_IDS"
-  fi
-  STATIC_FALLBACK_SHARD_PROVIDER_IDS="$fallback_shards" \
+  STATIC_FALLBACK_SHARD_PROVIDER_IDS="" \
   EXTERNAL_GTFS_ARTIFACTS_JSON="$ARTIFACTS_JSON" \
 STOP_DATA_PATH="$BUILD_DIR" \
-NEXT_DATABASE_PATH="$RELEASE_DIR/departures.sqlite" \
+NEXT_DATABASE_PATH="$RELEASE_DIR/departures-next.sqlite" \
 RELEASE_ID="$RELEASE_ID" \
 SKIP_ACTIVATION=1 \
   "$STATIC_DEPARTURES_PIPELINE"
-  python3 "$REPO/scripts/validate_release_consistency.py" --release-dir "$RELEASE_DIR"
+  python3 "$REPO/scripts/validate_release_consistency.py" \
+    --release-dir "$RELEASE_DIR" --database "$RELEASE_DIR/departures-next.sqlite"
+  python3 - "$RELEASE_DIR/departures-next.sqlite" "$RELEASE_DIR/departures.sqlite" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+source, destination = map(Path, sys.argv[1:])
+if destination.exists() or destination.is_symlink():
+    if not destination.is_file() or destination.is_symlink():
+        raise SystemExit(f"unsafe existing departures database path: {destination}")
+os.replace(source, destination)
+PY
 
   echo "[StaticDepartures] release=$RELEASE_ID stage=import duration=$(elapsed_seconds "$STATIC_STARTED")"
 

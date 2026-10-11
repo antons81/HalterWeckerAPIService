@@ -170,6 +170,25 @@ def image_runtime_contract(image: str, repository: Path) -> dict[str, str]:
     return expected
 
 
+def static_consumer_environment(runtime_mode: str, runtime: tuple[str, ...],
+                                release_path: str, pointer_path: str) -> dict[str, str]:
+    hybrid_enabled = "1" if runtime_mode == "hybrid" else "0"
+    return {
+        "HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE": runtime_mode,
+        "HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RUNTIME": "0",
+        "HALTEWECKER_STATIC_DEPARTURES_SHADOW_RUNTIME": "0",
+        "HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS": ",".join(runtime),
+        "HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RELEASE_POINTER": "/data/" + pointer_path,
+        "HALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME": hybrid_enabled,
+        "HALTEWECKER_STATIC_DEPARTURES_HYBRID_PROVIDERS": ",".join(runtime),
+        "HALTEWECKER_STATIC_DEPARTURES_HYBRID_RELEASE_POINTER": "/data/" + pointer_path,
+        "DEPARTURES_DATABASE": "/data/" + release_path + "/departures.sqlite",
+        "STATIC_DATA_ROOT": "/data/" + release_path + "/stop-data",
+        "APPLE_NOTIFICATION_STORE_PATH": "/tmp/preflight-events.sqlite3",
+        "PORT": "8080",
+    }
+
+
 def preflight(release: Path, build: tuple[str, ...], runtime: tuple[str, ...],
               static_container: str, route_container: str, *, reference: Path | None = None,
               static_image: str | None = None,
@@ -247,24 +266,21 @@ def preflight(release: Path, build: tuple[str, ...], runtime: tuple[str, ...],
     try:
         relative = release.relative_to(data_root).as_posix()
         pointer_relative = candidate_pointer.relative_to(data_root).as_posix()
+        runtime_mode = "legacy" if require_current_schedules else "hybrid"
         static_name, static = start("stopdata", static_image, 8080,
                        [(data_root, "/data")],
-                       {"HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE": "hybrid",
-                        "HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RUNTIME": "0",
-                        "HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS": ",".join(runtime),
-                        "HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RELEASE_POINTER": "/data/" + pointer_relative,
-                        "HALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME": "1",
-                        "HALTEWECKER_STATIC_DEPARTURES_HYBRID_PROVIDERS": ",".join(runtime),
-                        "HALTEWECKER_STATIC_DEPARTURES_HYBRID_RELEASE_POINTER": "/data/" + pointer_relative,
-                        "DEPARTURES_DATABASE": "/data/" + relative + "/departures.sqlite",
-                        "STATIC_DATA_ROOT": "/data/" + relative + "/stop-data",
-                        "APPLE_NOTIFICATION_STORE_PATH": "/tmp/preflight-events.sqlite3", "PORT": "8080"})
+                       static_consumer_environment(runtime_mode, runtime, relative, pointer_relative))
         health = get(static + "/static-departures/health", startup=True)
         metadata = health.get("database", {})
         if metadata.get("releaseID") != manifest["releaseID"]:
             raise ValueError("HalteWecker health resolved a different release")
-        if metadata.get("runtimeMode") != "hybrid" or metadata.get("fallbackReleaseID") != manifest["releaseID"]:
-            raise ValueError("candidate image has no validated hybrid fallback")
+        if runtime_mode == "legacy":
+            if metadata.get("runtimeMode") in {"provider", "hybrid"} or metadata.get("fallbackReleaseID"):
+                raise ValueError("candidate API is still using provider or hybrid runtime")
+            if metadata.get("fallbackProfile") == "hybrid-only":
+                raise ValueError("candidate API database omits provider schedules")
+        elif metadata.get("runtimeMode") != "hybrid" or metadata.get("fallbackReleaseID") != manifest["releaseID"]:
+            raise ValueError("rollback image has no validated hybrid fallback")
         candidate_coverage = parse_probe_result(subprocess.check_output(
             ["docker", "exec", static_name, "python3", "-c", STATIC_CITY_PROBE,
              "/data/" + coverage_path.relative_to(data_root).as_posix()], text=True,

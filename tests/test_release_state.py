@@ -143,8 +143,8 @@ class ReleaseStateTests(unittest.TestCase):
             previous=self.previous,
         )
 
-    def _write_old_primary_pointers(self) -> None:
-        old = self.releases_root / "old"
+    def _write_old_primary_pointers(self, *, incremental: bool = False) -> None:
+        old = self.releases_root / ("incremental/old" if incremental else "old")
         (old / "stop-data").mkdir(parents=True)
         (old / "stop-data" / "release-marker").write_text("old", encoding="utf-8")
         (old / "departures.sqlite").write_bytes(b"old")
@@ -180,6 +180,47 @@ class ReleaseStateTests(unittest.TestCase):
 
         self.assertEqual(info.status, "candidate-not-activated")
         self.assertEqual(info.next_stage, "candidate-validation")
+
+    def test_incremental_release_layout_is_valid_for_existing_primary_pointers(self) -> None:
+        self._write_state("build")
+        self._write_old_primary_pointers(incremental=True)
+
+        info = self._inspect()
+
+        self.assertEqual(info.status, "candidate-not-activated")
+        self.assertEqual(info.next_stage, "candidate-validation")
+
+    def test_incremental_candidate_layout_is_recognized_as_fully_active(self) -> None:
+        candidate = self.releases_root / "incremental" / self.release_id
+        (candidate / "stop-data").mkdir(parents=True)
+        (candidate / "departures.sqlite").write_bytes(b"candidate")
+        (candidate / "release.json").write_text(
+            json.dumps({"releaseID": self.release_id}), encoding="utf-8"
+        )
+        current = self.releases_root.parent / "current"
+        current_release = self.releases_root.parent / "current-release"
+        static_release = self.releases_root.parent / "static-departures-release"
+        departures_current = self.releases_root.parent / "departures-current.sqlite"
+        previous = self.releases_root.parent / "previous" / "stop-data"
+        for pointer, target in (
+            (current_release, candidate),
+            (current, candidate / "stop-data"),
+            (static_release, candidate),
+            (departures_current, candidate / "departures.sqlite"),
+        ):
+            self._link(pointer, target)
+
+        state = detect_activation_state(
+            releases_root=self.releases_root,
+            candidate_release_dir=self.candidate,
+            current=current,
+            current_release=current_release,
+            static_departures_release=static_release,
+            departures_current=departures_current,
+            previous=previous,
+        )
+
+        self.assertEqual(state, "already-active")
 
     def test_dangling_previous_for_deleted_release_allows_resume(self) -> None:
         self._write_state("build")

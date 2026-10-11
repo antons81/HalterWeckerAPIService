@@ -13,13 +13,13 @@ from scripts.disk_budget import GIB, background_command, run_guarded, terminate_
 
 
 class DiskBudgetTests(unittest.TestCase):
-    def run_fixture(self, free, status=0):
+    def run_fixture(self, free, status=0, minimum_gib=20):
         process = Mock(pid=12345)
         process.poll.return_value = status
         with patch("scripts.disk_budget.free_bytes", side_effect=free), \
              patch("scripts.disk_budget.subprocess.Popen", return_value=process) as start, \
              patch("scripts.disk_budget.os.killpg") as kill:
-            result = run_guarded(["build"], Path("/tmp"), interval=0)
+            result = run_guarded(["build"], Path("/tmp"), minimum_gib, interval=0)
         return result, process, start, kill
 
     def test_success_has_its_own_process_group(self):
@@ -95,6 +95,19 @@ class DiskBudgetTests(unittest.TestCase):
     def test_floor_below_twenty_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "lower than 20"):
             run_guarded(["build"], Path("/tmp"), minimum_gib=19)
+
+    def test_fifteen_gib_reserve_requires_incremental_production_opt_in(self):
+        with patch.dict("os.environ", {"HALTEWECKER_ALLOW_REDUCED_DISK_RESERVE": "1"}):
+            result, _process, start, _kill = self.run_fixture(
+                [20 * GIB, 20 * GIB], minimum_gib=15,
+            )
+        self.assertEqual(result, 0)
+        start.assert_called_once()
+
+    def test_incremental_production_opt_in_cannot_lower_reserve_below_fifteen(self):
+        with patch.dict("os.environ", {"HALTEWECKER_ALLOW_REDUCED_DISK_RESERVE": "1"}):
+            with self.assertRaisesRegex(ValueError, "lower than 20"):
+                run_guarded(["build"], Path("/tmp"), minimum_gib=14)
 
 
 class BackgroundBuildPriorityTests(unittest.TestCase):

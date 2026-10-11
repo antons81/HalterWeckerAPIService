@@ -203,6 +203,7 @@ source_ids = [
     str(source[\"id\"])
     for source in registry
     if str(source.get(\"classification\", \"required\")) == \"required\"
+    or source.get(\"importIntoStaticDepartures\") is True
 ]
 sources = {\"germany\": artifact(\"germany\"), \"swiss\": artifact(\"swiss\")}
 external = {source_id: artifact(source_id) for source_id in source_ids}
@@ -396,6 +397,7 @@ set -euo pipefail
 
 printf '%s\\n' "${READINESS_ONLY:-0}" >> "$STATIC_CALLS_LOG"
 printf '%s\\n' "${HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS:-}" >> "$RUNTIME_PROVIDER_CALLS_LOG"
+printf '%s|%s\\n' "${NEXT_DATABASE_PATH:-}" "${STATIC_FALLBACK_SHARD_PROVIDER_IDS:-}" >> "$STATIC_IMPORT_SETTINGS_LOG"
 if [ "${READINESS_ONLY:-0}" = "1" ]; then
   [ "${READINESS_FAIL:-0}" != "1" ] || exit 1
   exit 0
@@ -566,6 +568,7 @@ PY
             "INCREMENTAL_MODULE_CALLS_LOG": str(self.root / "incremental-module-calls.log"),
             "INCREMENTAL_ENV_CALLS_LOG": str(self.root / "incremental-env-calls.log"),
             "STATIC_CALLS_LOG": str(self.root / "static-calls.log"),
+            "STATIC_IMPORT_SETTINGS_LOG": str(self.root / "static-import-settings.log"),
             "RUNTIME_PROVIDER_CALLS_LOG": str(self.root / "runtime-provider-calls.log"),
             "STAGED_STOP_DATA_LOG": str(self.root / "staged-stop-data.log"),
             "STATIC_DEPARTURES_PIPELINE": str(self.bin_directory / "static-departures-pipeline"),
@@ -751,6 +754,12 @@ assert callable(validate_validation_receipt)
             (self.root / "static-calls.log").read_text(encoding="utf-8").splitlines(),
             ["0"],
         )
+        release_id = self.candidate_release_id()
+        release_dir = self.data_root / "releases" / release_id
+        settings = (self.root / "static-import-settings.log").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(settings, [f"{release_dir}/departures-next.sqlite|"])
+        self.assertTrue((release_dir / "departures.sqlite").is_file())
+        self.assertFalse((release_dir / "departures-next.sqlite").exists())
 
     def test_invalid_incremental_candidate_does_not_switch_published_pointers(self) -> None:
         self.configure_resume_pointer_layout()
@@ -834,7 +843,7 @@ assert callable(validate_validation_receipt)
         self.assertEqual(os.readlink(current), previous_target)
         self.assertEqual(os.readlink(rollback), previous_target)
 
-    def test_explicit_migration_floor_is_20_and_does_not_change_scheduled_floor(self) -> None:
+    def test_incremental_floor_is_configurable_and_defaults_to_20(self) -> None:
         self.configure_resume_pointer_layout()
         migration = self.run_pipeline(
             USE_DEFAULT_PRODUCTION="1",
@@ -860,6 +869,26 @@ assert callable(validate_validation_receipt)
         self.assertIn("mode=incremental-production", scheduled.stdout)
         self.assertIn("minimum_free_gb=20", scheduled.stdout)
         self.assertIn("insufficient disk for incremental-production", scheduled.stderr)
+
+        lowered = self.run_pipeline(
+            USE_DEFAULT_PRODUCTION="1",
+            HALTEWECKER_ACTIVATION_DRY_RUN="1",
+            HALTEWECKER_INCREMENTAL_MIN_FREE_GB="15",
+            HALTEWECKER_PROOF_ESTIMATE_MARGIN_GB="0",
+            DF_FREE_KB=str(38 * 1024 * 1024),
+        )
+        self.assertEqual(lowered.returncode, 0, lowered.stderr)
+        self.assertIn("mode=incremental-production", lowered.stdout)
+        self.assertIn("minimum_free_gb=15", lowered.stdout)
+
+    def test_incremental_floor_rejects_values_below_15_before_build(self) -> None:
+        result = self.run_pipeline(
+            USE_DEFAULT_PRODUCTION="1",
+            HALTEWECKER_INCREMENTAL_MIN_FREE_GB="14",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be an integer of at least 15", result.stderr)
+        self.assertFalse((self.root / "build-calls.log").exists())
 
     def test_incremental_cache_policy_overrides_stale_env_allowlist(self) -> None:
         self.environment_file.write_text(
@@ -1173,11 +1202,19 @@ assert callable(validate_validation_receipt)
 
     def run_disk_stage(self, stage: str, free_gib: int, *, stop_gib: int = 17,
                        artifact_miss_gib: int = 0, fallback_gib: int = 37,
-                       estimate_gib: int = 20, has_fallback: bool = True) -> subprocess.CompletedProcess[str]:
+                       estimate_gib: int = 20, has_fallback: bool = True,
+                       active_release_fallback_gib: int | None = None) -> subprocess.CompletedProcess[str]:
         fallback_database = self.data_root / "fallback-estimate.sqlite"
         if has_fallback:
             with fallback_database.open("wb") as stream:
                 stream.truncate(fallback_gib * 1024 * 1024 * 1024)
+        current_release = self.data_root / "current-release"
+        if active_release_fallback_gib is not None:
+            active_release = self.data_root / "releases" / "active"
+            active_release.mkdir(parents=True)
+            with (active_release / "departures.sqlite").open("wb") as stream:
+                stream.truncate(active_release_fallback_gib * 1024 * 1024 * 1024)
+            current_release.symlink_to(active_release, target_is_directory=True)
         text = PIPELINE.read_text()
         function = text[text.index("proof_disk_preflight() {"):text.index(
             '\nif [[ "$RUN_MODE" == "normal"', text.index("proof_disk_preflight() {"))]
@@ -1189,6 +1226,7 @@ assert callable(validate_validation_receipt)
             'HALTEWECKER_ADDITIONAL_WORKSPACE_KB=2097152',
             f'du() {{ echo {stop_gib * 1024 * 1024}; }}',
             f'CURRENT="{self.data_root / "current"}"',
+            f'CURRENT_RELEASE="{current_release}"',
             f'DEPARTURES_CURRENT="{fallback_database}"',
             'FROZEN_COMMON_STOP_DATA=0', 'REUSE_STOP_DATA=0',
             'INCREMENTAL_PRODUCTION=1', 'INCREMENTAL_NO_ACTIVATE=0',
@@ -1205,8 +1243,11 @@ assert callable(validate_validation_receipt)
         function = text[text.index('activation_disk_preflight() {'):text.index(
             '\nactivate_incremental_production() {')]
         with tempfile.TemporaryDirectory() as directory:
-            for free_gib, expected in ((24, 1), (25, 0)):
+            for minimum_gib, free_gib, expected in (
+                (20, 24, 1), (20, 25, 0), (15, 19, 1), (15, 20, 0),
+            ):
                 script = ('DATA_ROOT="' + directory + '"\n' +
+                          'HALTEWECKER_INCREMENTAL_MIN_FREE_GB="' + str(minimum_gib) + '"\n' +
                           'df() { printf "header\\nmock 0 0 ' + str(free_gib * 1024 * 1024) +
                           ' 0%% /\\n"; }\n' + function + '\nactivation_disk_preflight')
                 result = subprocess.run(['bash', '-c', script], text=True, capture_output=True)
@@ -1233,6 +1274,23 @@ assert callable(validate_validation_receipt)
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('cannot estimate candidate fallback SQLite', result.stderr)
+
+    def test_initial_budget_uses_active_release_sqlite_when_legacy_pointer_is_missing(self) -> None:
+        result = self.run_disk_stage(
+            'stop-data', 81, estimate_gib=0, has_fallback=False,
+            active_release_fallback_gib=37,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('fallback_database_kb=38797312', result.stdout)
+
+    def test_initial_budget_still_rejects_active_release_peak_above_available_disk(self) -> None:
+        result = self.run_disk_stage(
+            'stop-data', 79, estimate_gib=0, has_fallback=False,
+            active_release_fallback_gib=37,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('fallback_database_kb=38797312', result.stdout)
+        self.assertIn('insufficient disk for incremental-production', result.stderr)
 
     def test_fallback_rechecks_actual_free_space_after_a_cache_miss(self) -> None:
         fallback = self.run_disk_stage('fallback', 44)

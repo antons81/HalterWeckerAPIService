@@ -15,7 +15,7 @@ def _read_json(path: Path) -> dict[str, object]:
     return payload
 
 
-def validate_release(release_dir: Path) -> None:
+def validate_release(release_dir: Path, database_path: Path | None = None) -> None:
     metadata = _read_json(release_dir / "release-metadata.json")
     manifest = _read_json(release_dir / "stop-data" / "manifest.json")
     problems: list[str] = []
@@ -33,7 +33,7 @@ def validate_release(release_dir: Path) -> None:
     if metadata.get("inputProvenance") != manifest.get("inputProvenance"):
         problems.append("inputProvenance does not match between release metadata and manifest")
 
-    database_path = release_dir / "departures.sqlite"
+    database_path = database_path or release_dir / "departures.sqlite"
     try:
         connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
         try:
@@ -57,8 +57,10 @@ def validate_release(release_dir: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--release-dir", type=Path, required=True)
+    parser.add_argument("--database", type=Path,
+                        help="Candidate SQLite path; defaults to departures.sqlite in the release")
     args = parser.parse_args()
-    validate_release(args.release_dir)
+    validate_release(args.release_dir, args.database)
     print(f"[StopData] release={args.release_dir.name} consistency=ok")
 
 

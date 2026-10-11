@@ -526,6 +526,7 @@ def _pointer_kind(
             return "invalid", None
         return "absent", None
 
+    candidate_keys = _candidate_release_keys(releases_root, candidate_release_dir)
     resolved = Path(os.path.realpath(path))
     if not resolved.exists():
         if allow_dangling_release_pointer:
@@ -533,36 +534,74 @@ def _pointer_kind(
                 relative = resolved.relative_to(releases_root.resolve())
             except ValueError:
                 return "invalid", None
-            parts = relative.parts
-            if suffix:
-                if len(parts) != 2 or parts[1] != suffix:
-                    return "invalid", None
-            elif len(parts) != 1:
+            release_key = _release_key_from_pointer_path(relative, suffix)
+            if release_key is None:
                 return "invalid", None
-            release_id = parts[0]
-            if not RELEASE_ID_PATTERN.fullmatch(release_id):
-                return "invalid", None
-            if not (releases_root / release_id).is_dir():
+            release_dir = releases_root / release_key
+            if not release_dir.is_dir():
                 return "absent", None
         return "invalid", None
     candidate_target = candidate_release_dir / suffix if suffix else candidate_release_dir
     if resolved == candidate_target.resolve():
-        return "candidate", candidate_release_dir.name
+        try:
+            candidate_key = candidate_release_dir.resolve().relative_to(releases_root.resolve())
+        except ValueError:
+            return "invalid", None
+        return "candidate", candidate_key.as_posix()
 
     try:
         relative = resolved.relative_to(releases_root.resolve())
     except ValueError:
         return "invalid", None
+    release_key = _release_key_from_pointer_path(relative, suffix)
+    if release_key is None or not (releases_root / release_key).is_dir():
+        return "invalid", None
+    if release_key in candidate_keys:
+        return "candidate", release_key
+    return "other", release_key
+
+
+def _candidate_release_keys(releases_root: Path, candidate_release_dir: Path) -> set[str]:
+    try:
+        candidate_key = candidate_release_dir.resolve().relative_to(releases_root.resolve()).as_posix()
+    except ValueError:
+        return set()
+    keys = {candidate_key}
+    # Incremental assembly publishes a second, immutable view of the same
+    # candidate. Resume state remains in releases/<id>, while production
+    # pointers target releases/incremental/<id>.
+    assembled = releases_root / "incremental" / candidate_release_dir.name
+    manifest_path = assembled / "release.json"
+    if assembled.is_dir() and not assembled.is_symlink() and manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
+        if isinstance(manifest, dict) and manifest.get("releaseID") == candidate_release_dir.name:
+            keys.add(assembled.relative_to(releases_root).as_posix())
+    return keys
+
+
+def _release_key_from_pointer_path(relative: Path, suffix: str) -> str | None:
+    """Return the canonical release path for either supported release layout."""
     parts = relative.parts
     if suffix:
-        if len(parts) != 2 or parts[1] != suffix:
-            return "invalid", None
-    elif len(parts) != 1:
-        return "invalid", None
-    release_id = parts[0]
-    if not release_id or not (releases_root / release_id).is_dir():
-        return "invalid", None
-    return "other", release_id
+        if len(parts) == 2 and parts[1] == suffix:
+            release_parts = parts[:1]
+        elif len(parts) == 3 and parts[0] == "incremental" and parts[2] == suffix:
+            release_parts = parts[:2]
+        else:
+            return None
+    elif len(parts) == 1:
+        release_parts = parts
+    elif len(parts) == 2 and parts[0] == "incremental":
+        release_parts = parts
+    else:
+        return None
+
+    if not release_parts[-1] or any(part in (".", "..") for part in release_parts):
+        return None
+    return Path(*release_parts).as_posix()
 
 
 def detect_activation_state(
@@ -624,7 +663,8 @@ def detect_activation_state(
         raise ResumeError("static-departures handoff is unsafe before resume")
     if previous_kind == "candidate":
         raise ResumeError("previous pointer targets candidate before activation")
-    if previous_kind == "other" and previous_release == candidate_release_dir.name:
+    candidate_key = candidate_release_dir.resolve().relative_to(releases_root.resolve()).as_posix()
+    if previous_kind == "other" and previous_release == candidate_key:
         raise ResumeError("previous pointer targets candidate before activation")
 
     return "candidate-not-activated"

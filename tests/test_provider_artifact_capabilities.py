@@ -23,6 +23,37 @@ from provider_artifact_capabilities import (  # noqa: E402
 
 
 class ProviderArtifactCapabilityTests(unittest.TestCase):
+    def test_incremental_external_providers_are_materialized_in_full_departures_database(self) -> None:
+        selected = (
+            "israel-mot",
+            "ttc-surface",
+            "ttc-subway",
+            "norway",
+            "sweden",
+            "poland-warsaw",
+            "poland-wkd",
+            "511-bay-area",
+            "australia-translink-seq",
+            "australia-transport-nsw",
+            "cta-chicago",
+            "mbta-boston",
+            "stm-montreal",
+        )
+        sources = {
+            source["id"]: source
+            for source in json.loads(
+                (REPOSITORY_ROOT / "config/external-gtfs-sources.json").read_text()
+            )
+        }
+
+        self.assertEqual(len(selected), 13)
+        for provider_id in selected:
+            with self.subTest(provider=provider_id):
+                self.assertTrue(sources[provider_id]["importIntoStaticDepartures"])
+                self.assertTrue(
+                    provider_capability(REPOSITORY_ROOT, provider_id, STATIC_PROVIDER)
+                )
+
     def test_flat_container_layout_includes_germany_capabilities(self) -> None:
         self.assertEqual(_incremental_sources_path(Path("/")), Path("/app/config/incremental-provider-sources.json"))
         dockerfile = (REPOSITORY_ROOT / "services/static-departures.Dockerfile").read_text()

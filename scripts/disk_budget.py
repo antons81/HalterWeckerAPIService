@@ -52,7 +52,8 @@ def background_command(command: list[str]) -> list[str]:
 
 
 def run_guarded(command: list[str], root: Path, minimum_gib: int = 20, *, interval: float = 0.25) -> int:
-    if minimum_gib < MINIMUM_FREE_GIB:
+    reduced_reserve_allowed = os.environ.get("HALTEWECKER_ALLOW_REDUCED_DISK_RESERVE") == "1"
+    if minimum_gib < MINIMUM_FREE_GIB and not (reduced_reserve_allowed and minimum_gib >= 15):
         raise ValueError("disk reserve cannot be lower than 20 GiB")
     # A buffer leaves room for buffered writes and process termination.
     threshold = (minimum_gib + 5) * GIB
