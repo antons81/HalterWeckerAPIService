@@ -138,9 +138,13 @@ class RouteReadinessTests(unittest.TestCase):
 
 class NightlyActivationTests(unittest.TestCase):
     def activate(self, *, route_fail=False, static_fail=False, image_change=False, pipeline_fail=False, root_change=False,
-                 coverage_fail=False, rollback_fail=False, dry_run=False):
+                 coverage_fail=False, rollback_fail=False, dry_run=False, source_freshness_fail=False):
         source = PIPELINE.read_text()
-        functions = source[source.index("route_recall_activation() {"):source.index('\ncd "$REPO"', source.index("route_recall_activation() {"))]
+        freshness_start = source.index("validate_incremental_source_freshness() {")
+        freshness = source[freshness_start:source.index("\nvalidate_incremental_consumers() {", freshness_start)]
+        activation_start = source.index("route_recall_activation() {")
+        activation = source[activation_start:source.index('\ncd "$REPO"', activation_start)]
+        functions = freshness + "\n" + activation
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "previous").mkdir()
@@ -160,6 +164,7 @@ DEPARTURES_CURRENT="$ROOT/departures-current.sqlite"
 DATA_ROOT="$ROOT"
 RELEASE_ID=candidate
 INCREMENTAL_RELEASE_DIR="$ROOT/candidate"
+ARTIFACTS_JSON="$ROOT/gtfs-artifacts.json"
 HALTEWECKER_RUNTIME_PROVIDER_IDS=israel-mot
 STATIC_ACTIVATION_IMAGE=image-original
 STATIC_DEPARTURES_PIPELINE="$ROOT/static-runner"
@@ -183,6 +188,11 @@ docker() {
   return 1
 }
 python3() {
+  if [[ "$1" == "-" ]]; then
+    echo source-freshness >> "$ROOT/probes"
+    [[ "$SOURCE_FRESHNESS_FAIL" == 0 ]]
+    return
+  fi
   if [[ "$1" == -c ]]; then "$REAL_PYTHON" "$@"; return; fi
   echo "$*" >> "$ROOT/probes"
   local target
@@ -204,6 +214,7 @@ python3() {
                        ROUTE_FAIL=str(int(route_fail)), STATIC_FAIL=str(int(static_fail)),
                        PIPELINE_FAIL=str(int(pipeline_fail)), ROOT_CHANGED=str(int(root_change)),
                        COVERAGE_FAIL=str(int(coverage_fail)), ROLLBACK_FAIL=str(int(rollback_fail)),
+                       SOURCE_FRESHNESS_FAIL=str(int(source_freshness_fail)),
                        HALTEWECKER_ACTIVATION_DRY_RUN=str(int(dry_run)))
             result = subprocess.run(["bash", "-c", harness + functions + "\nactivate_incremental_production"],
                                     env=env, capture_output=True, text=True)
@@ -224,6 +235,13 @@ python3() {
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(target, "previous")
         self.assertNotIn("restart", calls)
+
+    def test_expired_source_blocks_activation_before_any_production_mutation(self):
+        result, target, calls, probes, _ = self.activate(source_freshness_fail=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(target, "previous")
+        self.assertEqual(calls, "")
+        self.assertIn("source-freshness", probes)
 
     def test_activation_dry_run_never_switches_or_restarts(self):
         result, target, calls, _, _ = self.activate(dry_run=True)

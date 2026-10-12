@@ -61,6 +61,38 @@ REQUIRED_BUNDLE_TABLES = frozenset(
 )
 
 
+class ExpiredSourceCalendarRefreshError(ValueError):
+    """An expired cached feed could not be refreshed for this candidate."""
+
+    def __init__(
+        self,
+        *,
+        source_id: str,
+        artifact: ArtifactResult,
+        service_through: date,
+        checked_on: date,
+        reason: str,
+    ) -> None:
+        self.source_id = source_id
+        self.artifact = artifact
+        self.service_through = service_through
+        self.checked_on = checked_on
+        self.reason = reason
+        super().__init__(
+            f"source={source_id} calendar expired on {service_through}; "
+            f"candidate may be assembled from the preserved archive, but activation is blocked: {reason}"
+        )
+
+    def manifest_entry(self) -> dict[str, str]:
+        return {
+            "status": "failed",
+            "calendarStatus": "expired",
+            "serviceThrough": self.service_through.isoformat(),
+            "checkedOn": self.checked_on.isoformat(),
+            "reason": self.reason,
+        }
+
+
 def gtfs_calendar_horizon(path: Path) -> date | None:
     """Return the last service date represented by a GTFS archive."""
     horizons: list[date] = []
@@ -200,14 +232,23 @@ def ensure_current_source_calendar(
     if horizon >= today:
         return result
     if result.status in {"updated", "snapshot", "local"}:
-        raise ValueError(
-            f"source={source_id} supplied an expired GTFS calendar through {horizon}; "
-            f"configured upstream={_public_source_url(url) if url else result.path}"
+        raise ExpiredSourceCalendarRefreshError(
+            source_id=source_id,
+            artifact=result,
+            service_through=horizon,
+            checked_on=today,
+            reason=(
+                "upstream supplied an expired calendar; "
+                f"configured upstream={_public_source_url(url) if url else result.path}"
+            ),
         )
     if not url:
-        raise ValueError(
-            f"source={source_id} calendar expired on {horizon} and has no refresh URL; "
-            f"local artifact={result.path}"
+        raise ExpiredSourceCalendarRefreshError(
+            source_id=source_id,
+            artifact=result,
+            service_through=horizon,
+            checked_on=today,
+            reason=f"no refresh URL is configured; local artifact={result.path}",
         )
     try:
         refreshed = resolve_one(
@@ -217,18 +258,72 @@ def ensure_current_source_calendar(
             force_download=True,
         )
     except Exception as error:
-        raise ValueError(
-            f"source={source_id} calendar expired on {horizon}; fresh download failed "
-            f"from {_public_source_url(url)}: {type(error).__name__}: {error}"
+        raise ExpiredSourceCalendarRefreshError(
+            source_id=source_id,
+            artifact=result,
+            service_through=horizon,
+            checked_on=today,
+            reason=(
+                f"fresh download failed from {_public_source_url(url)}: "
+                f"{type(error).__name__}: {safe_error_reason(error)}"
+            ),
         ) from error
     refreshed_horizon = gtfs_calendar_horizon(refreshed.path)
     if refreshed_horizon is None or refreshed_horizon < today:
         horizon_text = refreshed_horizon.isoformat() if refreshed_horizon else "no active service dates"
-        raise ValueError(
-            f"source={source_id} upstream {_public_source_url(url)} still serves an expired "
-            f"GTFS calendar through {horizon_text} (today={today})"
+        raise ExpiredSourceCalendarRefreshError(
+            source_id=source_id,
+            artifact=refreshed,
+            service_through=refreshed_horizon or horizon,
+            checked_on=today,
+            reason=(
+                f"upstream {_public_source_url(url)} still serves an expired GTFS calendar "
+                f"through {horizon_text} (today={today})"
+            ),
         )
     return refreshed
+
+
+def ensure_source_calendar_for_candidate(
+    cache: GTFSArtifactCache,
+    result: ArtifactResult,
+    *,
+    source_id: str,
+    url: str,
+    timezone_name: str,
+    allow_stale: bool,
+    **kwargs,
+) -> tuple[ArtifactResult, dict[str, str] | None]:
+    """Keep a valid expired archive for assembly while marking the candidate unactivatable."""
+    try:
+        return (
+            ensure_current_source_calendar(
+                cache,
+                result,
+                source_id=source_id,
+                url=url,
+                timezone_name=timezone_name,
+                allow_stale=allow_stale,
+                **kwargs,
+            ),
+            None,
+        )
+    except ExpiredSourceCalendarRefreshError as error:
+        print(
+            f"[GTFSCache] source={source_id} stage=calendar status=expired-preserved "
+            f"serviceThrough={error.service_through.isoformat()} refresh=failed "
+            f"reason={error.reason}"
+        )
+        return error.artifact, error.manifest_entry()
+
+
+def _with_source_refresh_status(
+    payload: dict[str, object],
+    refresh_status: dict[str, str] | None,
+) -> dict[str, object]:
+    if refresh_status is not None:
+        payload["sourceRefresh"] = refresh_status
+    return payload
 
 
 def _kyiv_stale_cache_seed(
@@ -469,20 +564,24 @@ def main() -> None:
         ("swiss", args.swiss_gtfs_url, True),
     ):
         artifact = resolve_one(cache, source_id, url, allow_stale=allow_stale)
-        artifact = ensure_current_source_calendar(
+        artifact, refresh_status = ensure_source_calendar_for_candidate(
             cache, artifact, source_id=source_id, url=url,
             timezone_name={"germany": "Europe/Berlin", "swiss": "Europe/Zurich"}[source_id],
             allow_stale=allow_stale,
         )
-        result["sources"][source_id] = artifact_payload(artifact)
+        result["sources"][source_id] = _with_source_refresh_status(
+            artifact_payload(artifact), refresh_status
+        )
 
     if args.nl_gtfs_url.strip():
         artifact = resolve_one(cache, "netherlands", args.nl_gtfs_url, allow_stale=True)
-        artifact = ensure_current_source_calendar(
+        artifact, refresh_status = ensure_source_calendar_for_candidate(
             cache, artifact, source_id="netherlands", url=args.nl_gtfs_url,
             timezone_name="Europe/Amsterdam", allow_stale=True,
         )
-        result["sources"]["netherlands"] = artifact_payload(artifact)
+        result["sources"]["netherlands"] = _with_source_refresh_status(
+            artifact_payload(artifact), refresh_status
+        )
 
     external_urls = parse_external_gtfs_url_args(args.external_gtfs_url)
     raw_snapshot = (
@@ -502,19 +601,37 @@ def main() -> None:
                 horizon = gtfs_calendar_horizon(pinned_path)
                 timezone_name = str(source.get("timezone") or "Europe/Berlin")
                 today = source_calendar_local_date(timezone_name)
-                if horizon is None or horizon < today:
-                    horizon_text = horizon.isoformat() if horizon else "no active service dates"
+                if horizon is None:
                     raise ValueError(
-                        f"source={source_id} pinned GTFS calendar is expired through {horizon_text}; "
-                        "the immutable snapshot cannot be refreshed"
+                        f"source={source_id} pinned GTFS archive has no active service calendar"
                     )
-            result["external"][source_id] = artifact_payload(
-                ArtifactResult(
-                    source_id,
-                    pinned_path,
-                    "snapshot",
-                    "immutable raw snapshot",
-                )
+                if horizon < today:
+                    refresh_status = {
+                        "status": "failed",
+                        "calendarStatus": "expired",
+                        "serviceThrough": horizon.isoformat(),
+                        "checkedOn": today.isoformat(),
+                        "reason": "immutable raw snapshot cannot be refreshed",
+                    }
+                    print(
+                        f"[GTFSCache] source={source_id} stage=calendar "
+                        f"status=expired-preserved serviceThrough={horizon.isoformat()} "
+                        "refresh=failed reason=immutable-raw-snapshot"
+                    )
+                else:
+                    refresh_status = None
+            else:
+                refresh_status = None
+            result["external"][source_id] = _with_source_refresh_status(
+                artifact_payload(
+                    ArtifactResult(
+                        source_id,
+                        pinned_path,
+                        "snapshot",
+                        "immutable raw snapshot",
+                    )
+                ),
+                refresh_status,
             )
             print(
                 f"[GTFSCache] source={source_id} stage=resolve "
@@ -543,13 +660,16 @@ def main() -> None:
                     raise ValueError(f"GTFS feed bundle {source_id} has a component without ID or URL.")
                 cache_id = f"{source_id}-{component_id}"
                 artifact = resolve_one(cache, cache_id, component_url, allow_stale=True)
-                artifact = ensure_current_source_calendar(
+                artifact, refresh_status = ensure_source_calendar_for_candidate(
                     cache, artifact, source_id=cache_id, url=component_url,
                     timezone_name=timezone_name, allow_stale=True,
                 )
                 component_results.append(artifact)
+                component_payload = _with_source_refresh_status(
+                    artifact_payload(artifact), refresh_status
+                )
                 component_payloads.append(
-                    artifact_payload(artifact)
+                    component_payload
                     | {"componentID": component_id, "sourceURL": _public_source_url(component_url),
                        "serviceThrough": (gtfs_calendar_horizon(artifact.path).isoformat()
                                           if gtfs_calendar_horizon(artifact.path) else None)}
@@ -558,6 +678,17 @@ def main() -> None:
             merge_gtfs_feed_bundle([item.path for item in component_results], bundle_path)
             bundle = artifact_payload(ArtifactResult(source_id, bundle_path, "updated", "merged official GTFS feeds"))
             bundle["componentSources"] = component_payloads
+            failed_components = [
+                {"componentID": item["componentID"], **item["sourceRefresh"]}
+                for item in component_payloads
+                if isinstance(item.get("sourceRefresh"), dict)
+            ]
+            if failed_components:
+                bundle["sourceRefresh"] = {
+                    "status": "failed",
+                    "calendarStatus": "expired",
+                    "reason": json.dumps(failed_components, ensure_ascii=False, sort_keys=True),
+                }
             result["external"][source_id] = bundle
             print(
                 f"[GTFSCache] source={source_id} stage=feed-bundle status=updated "
@@ -567,23 +698,39 @@ def main() -> None:
         if local_path and source_id not in external_urls and not url:
             path = Path(local_path)
             local_kind = validate_local_gtfs_path(source_id, path)
+            refresh_status = None
             if source.get("buildDepartures") is True and local_kind == "file":
                 horizon = gtfs_calendar_horizon(path)
                 today = source_calendar_local_date(str(source.get("timezone") or "Europe/Berlin"))
-                if horizon is None or horizon < today:
-                    horizon_text = horizon.isoformat() if horizon else "no active service dates"
+                if horizon is None:
                     raise ValueError(
-                        f"source={source_id} local GTFS calendar expired through {horizon_text}; "
+                        f"source={source_id} local GTFS archive has no active service calendar; "
                         f"no refresh URL is configured (local artifact={path})"
                     )
-            result["external"][source_id] = artifact_payload(
-                ArtifactResult(
-                    source_id,
-                    path,
-                    "local",
-                    f"local path ({local_kind})",
+                if horizon < today:
+                    refresh_status = {
+                        "status": "failed",
+                        "calendarStatus": "expired",
+                        "serviceThrough": horizon.isoformat(),
+                        "checkedOn": today.isoformat(),
+                        "reason": f"no refresh URL is configured; local artifact={path}",
+                    }
+                    print(
+                        f"[GTFSCache] source={source_id} stage=calendar "
+                        f"status=expired-preserved serviceThrough={horizon.isoformat()} "
+                        "refresh=failed reason=no-refresh-url"
+                    )
+            result["external"][source_id] = _with_source_refresh_status(
+                artifact_payload(
+                    ArtifactResult(
+                        source_id,
+                        path,
+                        "local",
+                        f"local path ({local_kind})",
+                    ),
+                    release_root=args.release_root,
                 ),
-                release_root=args.release_root,
+                refresh_status,
             )
             print(
                 f"[GTFSCache] source={source_id} stage=resolve "
@@ -624,18 +771,21 @@ def main() -> None:
                 metadata_probe=False,
             )
             if source.get("buildDepartures") is True and artifact.path.is_file():
-                artifact = ensure_current_source_calendar(
+                artifact, refresh_status = ensure_source_calendar_for_candidate(
                     cache, artifact, source_id=source_id, url=url,
                     timezone_name=str(source.get("timezone") or "Europe/Berlin"),
                     allow_stale=True,
                 )
+            else:
+                refresh_status = None
             print(
                 f"[GTFSCache] source={source_id} stage=resolve "
                 "status=preserved-stale reason=authentication unavailable"
             )
-            result["external"][source_id] = artifact_payload(artifact) | {
-                "reason": "authentication unavailable",
-            }
+            result["external"][source_id] = _with_source_refresh_status(
+                artifact_payload(artifact) | {"reason": "authentication unavailable"},
+                refresh_status,
+            )
             continue
         preflight = str(source.get("preflight", "head"))
         resilience_policy = external_gtfs_resilience_policy(source)
@@ -679,7 +829,7 @@ def main() -> None:
             seed_state=seed_state,
         )
         if source.get("buildDepartures") is True:
-            artifact = ensure_current_source_calendar(
+            artifact, refresh_status = ensure_source_calendar_for_candidate(
                 cache, artifact, source_id=source_id, url=request_url,
                 timezone_name=str(source.get("timezone") or "Europe/Berlin"),
                 allow_stale=(bool(resilience_policy["allowStale"])
@@ -696,9 +846,14 @@ def main() -> None:
                            and bool(resilience_policy["requireDataRows"])
                            else None),
             )
-        result["external"][source_id] = artifact_payload(
-            artifact,
-            release_root=args.release_root,
+        else:
+            refresh_status = None
+        result["external"][source_id] = _with_source_refresh_status(
+            artifact_payload(
+                artifact,
+                release_root=args.release_root,
+            ),
+            refresh_status,
         )
 
     output = Path(args.output)

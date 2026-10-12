@@ -803,6 +803,29 @@ print(
 PY
 }
 
+validate_incremental_source_freshness() {
+  python3 - "$ARTIFACTS_JSON" "$REPO" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+artifacts_path = Path(sys.argv[1])
+if not artifacts_path.is_file():
+    raise SystemExit(f"candidate GTFS artifact manifest is missing: {artifacts_path}")
+repository = Path(sys.argv[2])
+sys.path.insert(0, str(repository / "scripts"))
+from release_integrity import validate_candidate_source_freshness
+
+artifacts = json.loads(artifacts_path.read_text(encoding="utf-8"))
+try:
+    validate_candidate_source_freshness(artifacts)
+except ValueError as error:
+    print(f"[Nightly] stage=source-freshness status=FAIL reason={error}", file=sys.stderr)
+    raise SystemExit(1) from error
+print("[Nightly] stage=source-freshness status=PASS")
+PY
+}
+
 validate_incremental_consumers() {
   if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" == "1" ]]; then
     echo "[Nightly] stage=consumer-preflight status=DRY-RUN buildProviders=$BUILD_PROVIDER_IDS runtimeProviders=$HALTEWECKER_RUNTIME_PROVIDER_IDS"
@@ -922,6 +945,7 @@ activate_incremental_production() {
     return 1
   fi
   validate_incremental_candidate || return 1
+  validate_incremental_source_freshness || return 1
   validate_incremental_consumers || return 1
   activation_disk_preflight || return 1
   if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" == "1" ]]; then
@@ -2079,6 +2103,7 @@ PY
   log_disk_state "incremental-complete"
   echo "[Nightly] stage=assembly status=PASS release=$RELEASE_ID mode=incremental-candidate"
   if [[ "$NO_ACTIVATE" == "1" ]]; then
+    validate_incremental_source_freshness || exit 1
     echo "[Nightly] stage=consumer-preflight status=NOT_RUN release=$RELEASE_ID activation=NOT_RUN"
     echo "[Nightly] stage=nightly-complete status=PASS release=$RELEASE_ID mode=production-shaped-no-activate activation=NOT_RUN"
     log_disk_state "after"

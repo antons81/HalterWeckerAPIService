@@ -103,6 +103,39 @@ def validate_candidate_sources(
             )
 
 
+def validate_candidate_source_freshness(
+    artifact_manifest: Mapping[str, object],
+) -> None:
+    """Reject activation when preparation had to carry an expired source forward."""
+    failures: list[str] = []
+    for group in ("sources", "external"):
+        entries = artifact_manifest.get(group)
+        if not isinstance(entries, Mapping):
+            continue
+        for source_id, raw_entry in entries.items():
+            if not isinstance(raw_entry, Mapping) or "sourceRefresh" not in raw_entry:
+                continue
+            refresh = raw_entry.get("sourceRefresh")
+            if (
+                isinstance(refresh, Mapping)
+                and refresh.get("status") == "succeeded"
+                and refresh.get("calendarStatus") == "current"
+            ):
+                continue
+            if isinstance(refresh, Mapping):
+                service_through = str(refresh.get("serviceThrough", "unknown"))
+                reason = str(refresh.get("reason", "freshness status is incomplete"))
+                failures.append(
+                    f"{source_id} (service through {service_through}; {reason})"
+                )
+            else:
+                failures.append(f"{source_id} (invalid sourceRefresh metadata)")
+    if failures:
+        raise ValueError(
+            "Candidate source freshness blocks activation: " + "; ".join(failures)
+        )
+
+
 def validate_previous_release_sources(
     old_source_ids: Iterable[str],
     candidate_source_ids: set[str],

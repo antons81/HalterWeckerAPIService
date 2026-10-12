@@ -31,12 +31,14 @@ from prepare_custom_gtfs_artifacts import resolve_source  # noqa: E402
 from prepare_gtfs_artifacts import (  # noqa: E402
     artifact_payload,
     ensure_current_source_calendar,
+    ensure_source_calendar_for_candidate,
     gtfs_calendar_horizon,
     merge_gtfs_feed_bundle,
 )
 from release_integrity import (  # noqa: E402
     validate_artifact_entry,
     validate_candidate_sources,
+    validate_candidate_source_freshness,
     validate_previous_release_cities,
     validate_previous_release_sources,
 )
@@ -528,6 +530,148 @@ class ExternalGTFSProvenanceTests(unittest.TestCase):
             self.assertEqual(request.call_args.kwargs["retry_attempts"], 3)
             self.assertIs(request.call_args.kwargs["force_download"], True)
             self.assertIs(request.call_args.kwargs["allow_stale"], False)
+
+    def test_expired_cached_source_is_preserved_for_assembly_but_marked_unactivatable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            today = date(2026, 10, 11)
+            expired = _write_bundle_feed(
+                root / "gdansk-expired.zip", "gdansk", service_end=date(2026, 10, 8)
+            )
+            initial = ArtifactResult("poland-gdansk", expired, "unchanged", "remote metadata")
+            cache = GTFSArtifactCache(root / "cache")
+            with (
+                mock.patch("prepare_gtfs_artifacts.source_calendar_local_date", return_value=today),
+                mock.patch(
+                    "prepare_gtfs_artifacts.resolve_one",
+                    side_effect=urllib.error.HTTPError(
+                        "https://gtfs.example/feed.zip", 500, "upstream unavailable", {}, None,
+                    ),
+                ) as request,
+            ):
+                preserved, refresh_status = ensure_source_calendar_for_candidate(
+                    cache,
+                    initial,
+                    source_id="poland-gdansk",
+                    url="https://gtfs.example/feed.zip",
+                    timezone_name="Europe/Warsaw",
+                    allow_stale=True,
+                    retry_attempts=3,
+                )
+
+            self.assertEqual(preserved.path, expired)
+            self.assertEqual(refresh_status["status"], "failed")
+            self.assertEqual(refresh_status["calendarStatus"], "expired")
+            self.assertEqual(refresh_status["serviceThrough"], "2026-10-08")
+            self.assertEqual(request.call_args.kwargs["retry_attempts"], 3)
+            self.assertIs(request.call_args.kwargs["force_download"], True)
+
+            payload = {
+                "sources": {},
+                "external": {
+                    "poland-gdansk": artifact_payload(preserved)
+                    | {"sourceRefresh": refresh_status}
+                },
+            }
+            with self.assertRaisesRegex(
+                ValueError,
+                "Candidate source freshness blocks activation: poland-gdansk .*service through 2026-10-08",
+            ):
+                validate_candidate_source_freshness(payload)
+
+    def test_prepare_artifacts_continues_after_expired_source_refresh_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            expired = _write_bundle_feed(
+                root / "gdansk-expired.zip", "gdansk", service_end=date(2026, 10, 8)
+            )
+            fresh = _write_bundle_feed(
+                root / "fresh.zip", "fresh", service_end=date(2026, 11, 30)
+            )
+            sources_path = root / "external-sources.json"
+            sources_path.write_text(
+                json.dumps([
+                    {
+                        "id": "poland-gdansk",
+                        "classification": "required",
+                        "url": "https://gdansk.example/feed.zip",
+                        "timezone": "Europe/Warsaw",
+                        "buildDepartures": True,
+                    },
+                    {
+                        "id": "fixture-after",
+                        "classification": "required",
+                        "url": "https://next.example/feed.zip",
+                        "timezone": "UTC",
+                        "buildDepartures": True,
+                    },
+                ]),
+                encoding="utf-8",
+            )
+            output_path = root / "release" / "gtfs-artifacts.json"
+            release_root = output_path.parent
+            release_root.mkdir()
+
+            def resolve(_cache, source_id, _url, **kwargs):
+                if source_id == "poland-gdansk":
+                    if kwargs.get("force_download"):
+                        raise urllib.error.HTTPError(
+                            "https://gdansk.example/feed.zip", 500, "upstream unavailable", {}, None,
+                        )
+                    return ArtifactResult(source_id, expired, "unchanged", "remote metadata")
+                return ArtifactResult(source_id, fresh, "updated", "downloaded")
+
+            argv = [
+                "prepare_gtfs_artifacts.py",
+                "--cache-root", str(root / "cache"),
+                "--gtfs-url", "https://germany.example/feed.zip",
+                "--swiss-gtfs-url", "https://swiss.example/feed.zip",
+                "--external-sources", str(sources_path),
+                "--output", str(output_path),
+                "--release-root", str(release_root),
+            ]
+            with (
+                mock.patch("sys.argv", argv),
+                mock.patch("prepare_gtfs_artifacts.source_calendar_local_date", return_value=date(2026, 10, 11)),
+                mock.patch("prepare_gtfs_artifacts.resolve_one", side_effect=resolve),
+                mock.patch(
+                    "prepare_gtfs_artifacts.authenticated_external_request",
+                    side_effect=lambda _source_id, url, **_kwargs: (url, {}),
+                ),
+            ):
+                from prepare_gtfs_artifacts import main
+                main()
+
+            artifacts = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                artifacts["external"]["poland-gdansk"]["sourceRefresh"]["status"],
+                "failed",
+            )
+            self.assertEqual(artifacts["external"]["fixture-after"]["status"], "updated")
+            self.assertTrue(Path(artifacts["external"]["poland-gdansk"]["path"]).is_file())
+            validate_candidate_sources(
+                json.loads(sources_path.read_text(encoding="utf-8")),
+                artifacts["external"],
+                set(),
+                root,
+                environ={},
+            )
+            with self.assertRaisesRegex(ValueError, "Candidate source freshness blocks activation"):
+                validate_candidate_source_freshness(artifacts)
+
+    def test_candidate_source_freshness_allows_unmarked_and_confirmed_current_sources(self) -> None:
+        validate_candidate_source_freshness({
+            "sources": {},
+            "external": {
+                "unchanged-current": {"path": "feed.zip"},
+                "refreshed": {
+                    "sourceRefresh": {
+                        "status": "succeeded",
+                        "calendarStatus": "current",
+                    }
+                },
+            },
+        })
 
     def test_mta_bus_bundle_merges_identical_rows_and_rejects_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
