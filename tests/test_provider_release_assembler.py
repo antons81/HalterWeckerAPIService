@@ -229,6 +229,31 @@ class ProviderReleaseAssemblerTests(unittest.TestCase):
                 1,
             )
 
+    def test_candidate_may_publish_only_shards_kept_in_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _legacy, common, stop_data, providers = self._fixture(root / "fixture")
+            common_copy = self._common_for_release(common, root / "common-runtime.sqlite", "release-runtime")
+            with sqlite3.connect(common_copy) as connection:
+                connection.execute(
+                    "UPDATE provider_registry SET status='fallback' WHERE provider_id='synthetic-2'"
+                )
+                connection.commit()
+
+            assembly = assemble_release(
+                root / "releases",
+                "release-runtime",
+                common_database=common_copy,
+                stop_data_root=stop_data,
+                providers={"israel-mot": providers["israel-mot"]},
+            )
+
+            payload = validate_candidate_release(assembly.release_directory)
+            self.assertEqual(set(payload["providers"]), {"israel-mot"})
+            self.assertFalse(
+                (assembly.release_directory / "providers" / "synthetic-2").exists()
+            )
+
     def test_trusted_external_common_stop_data_is_accepted_with_matching_fingerprint(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -299,9 +299,12 @@ if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; 
   export HALTEWECKER_EXTERNAL_BUILD_CACHE=1
   export HALTEWECKER_EXTERNAL_TRANSFORMED_BUILD_CACHE=1
   export HALTEWECKER_EXTERNAL_BUILD_CACHE_ROOT="$CACHE_ROOT/external-build"
-  export HALTEWECKER_INCREMENTAL_PROVIDER_IDS="${HALTEWECKER_INCREMENTAL_PROVIDER_IDS-israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd,511-bay-area,australia-translink-seq,australia-transport-nsw,cta-chicago,mbta-boston,stm-montreal,germany}"
+  export HALTEWECKER_INCREMENTAL_PROVIDER_IDS="${HALTEWECKER_INCREMENTAL_PROVIDER_IDS-israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd,511-bay-area,australia-translink-seq,australia-transport-nsw,cta-chicago,mbta-boston,stm-montreal}"
   BUILD_PROVIDER_IDS="$HALTEWECKER_INCREMENTAL_PROVIDER_IDS"
-  HALTEWECKER_RUNTIME_PROVIDER_IDS="${HALTEWECKER_RUNTIME_PROVIDER_IDS-israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd,511-bay-area,australia-translink-seq,australia-transport-nsw,cta-chicago,mbta-boston,stm-montreal,germany}"
+  if [[ ",$BUILD_PROVIDER_IDS," != *,germany,* ]]; then
+    BUILD_PROVIDER_IDS+=",germany"
+  fi
+  HALTEWECKER_RUNTIME_PROVIDER_IDS="${HALTEWECKER_RUNTIME_PROVIDER_IDS-germany}"
   export HALTEWECKER_RUNTIME_PROVIDER_IDS
   if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$FROZEN_COMMON_STOP_DATA" != "1" ]]; then
     IFS=',' read -r -a runtime_providers <<< "$HALTEWECKER_RUNTIME_PROVIDER_IDS"
@@ -753,8 +756,8 @@ supported = tuple(value for value in runtime if provider_capability(Path(sys.arg
 validate_provider_contract(providers, runtime, supported)
 actual = tuple((payload.get("providers") or {}).keys())
 validate_provider_contract(actual, runtime, supported)
-if set(actual) != set(providers):
-    raise SystemExit("dry-run candidate does not represent all configured providers")
+if set(actual) != set(runtime):
+    raise SystemExit("dry-run candidate does not contain exactly the configured runtime providers")
 if "germany" not in actual:
     raise SystemExit("mandatory production provider germany is missing")
 print(
@@ -764,7 +767,7 @@ print(
 PY
     return
   fi
-  python3 - "$INCREMENTAL_RELEASE_DIR" "$HALTEWECKER_INCREMENTAL_PROVIDER_IDS" "$REPO" <<'PY'
+  python3 - "$INCREMENTAL_RELEASE_DIR" "$HALTEWECKER_RUNTIME_PROVIDER_IDS" "$REPO" <<'PY'
 import sys
 from pathlib import Path
 
@@ -1310,6 +1313,7 @@ forecast_provider_disk() {
   local -a forecast_args
   forecast_args=(python3 "$REPO/scripts/estimate_provider_disk.py"
     --repository "$REPO" --stop-data "$forecast_stop_data" --gtfs-artifacts "$ARTIFACTS_JSON"
+    --runtime-provider-ids "${HALTEWECKER_RUNTIME_PROVIDER_IDS:-germany}"
     --normalized-cache-root "${HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT:-$DATA_ROOT/provider-artifacts/normalized}"
     --static-artifact-root "${HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT:-$DATA_ROOT/provider-artifacts/static}")
   if [[ -f "$CURRENT_RELEASE/release.json" ]]; then
@@ -1463,7 +1467,12 @@ run_build_stop_packages() {
   if [[ -n "${NL_GTFS_URL:-}" && "$INCREMENTAL_PRODUCTION" != "1" && "$INCREMENTAL_NO_ACTIVATE" != "1" ]]; then
     cmd+=(--allow-nl-failure)
   fi
-  run_disk_guarded "${cmd[@]}"
+  local sqlite_departures_only=0
+  if [[ "$NO_ACTIVATE" != "1" || ( "$INCREMENTAL_NO_ACTIVATE" == "1" && "$FROZEN_COMMON_STOP_DATA" != "1" ) ]]; then
+    sqlite_departures_only=1
+  fi
+  HALTEWECKER_EXTERNAL_DEPARTURES_SQLITE_ONLY="$sqlite_departures_only" \
+    run_disk_guarded "${cmd[@]}"
 }
 
 if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
@@ -1882,8 +1891,38 @@ if [ -n "${SWEDEN_GTFS_URL:-}" ]; then
   for sweden_city in stockholm malmo goteborg uppsala vaxjo helsingborg linkoping jonkoping orebro vasteras; do
     test -f "$BUILD_DIR/stops/$sweden_city.json"
     test -f "$BUILD_DIR/routes/$sweden_city.json"
-    test -f "$BUILD_DIR/departures/$sweden_city.json"
   done
+  python3 - "$REPO" "$RELEASE_DIR/departures.sqlite" <<'PY'
+import sqlite3
+import sys
+from contextlib import closing
+from datetime import datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, sys.argv[1])
+from scripts.static_departures_coverage import scheduled_stop
+
+database = Path(sys.argv[2]).resolve(strict=True)
+cities = (
+    "stockholm", "malmo", "goteborg", "uppsala", "vaxjo",
+    "helsingborg", "linkoping", "jonkoping", "orebro", "vasteras",
+)
+today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
+with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
+    for city in cities:
+        stop_id = scheduled_stop(
+            connection,
+            city,
+            ("",),
+            today=today,
+            through=today + timedelta(days=1),
+            timezone_name="Europe/Stockholm",
+        )
+        if stop_id is None:
+            raise SystemExit(f"candidate SQLite has no current or next-day schedule for Sweden city {city}")
+print("[StaticDepartures] Sweden candidate SQLite schedules validated")
+PY
   python3 - "$BUILD_DIR/manifest.json" "$BUILD_DIR/transit-radar-cities.json" <<'PY'
 import json
 import sys
@@ -2034,6 +2073,7 @@ if [[ "$NO_ACTIVATE" == "1" || "$INCREMENTAL_PRODUCTION" == "1" ]]; then
     --gtfs-artifacts "$ARTIFACTS_JSON"
     --normalized-cache-root "$NORMALIZED_CACHE_ROOT"
     --static-artifact-root "$STATIC_ARTIFACT_ROOT"
+    --runtime-provider-ids "${HALTEWECKER_RUNTIME_PROVIDER_IDS:-germany}"
   )
   if [[ -n "$RAW_SNAPSHOT_MANIFEST" ]]; then
     INCREMENTAL_ARGS+=(--raw-snapshot-manifest "$RAW_SNAPSHOT_MANIFEST")

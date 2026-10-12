@@ -28,6 +28,7 @@ from external_gtfs import (  # noqa: E402
     build_external_stop_packages,
     build_external_trip_index,
     apply_current_departure_headsign_enrichment,
+    _sqlite_is_departure_source,
     _deduplicate_merged_stops,
     _merge_namespaced_city_records_bounded,
     external_city_ids,
@@ -91,6 +92,7 @@ def _toronto_merge_member(
     missing_assets: set[str] | None = None,
     malformed_departures: str | None = None,
     incomplete_departures: bool = False,
+    sqlite_only_departures: bool = False,
 ) -> dict[str, object]:
     output = root / provider_id
     missing = missing_assets or set()
@@ -153,6 +155,7 @@ def _toronto_merge_member(
         "source": {"country": "CA"},
         "city": {"id": "toronto", "name": "Toronto", "aliases": []},
         "output": output,
+        "sqliteOnlyDepartures": sqlite_only_departures,
     }
 
 
@@ -163,6 +166,7 @@ def _merge_toronto_fixture(
     missing_assets_by_provider: dict[str, set[str]] | None = None,
     malformed_provider: str | None = None,
     incomplete_provider: str | None = None,
+    sqlite_only_departures: bool = False,
 ) -> Path:
     departure_items_by_provider = departure_items_by_provider or {}
     missing_assets_by_provider = missing_assets_by_provider or {}
@@ -178,6 +182,7 @@ def _merge_toronto_fixture(
                 if provider_id == malformed_provider
                 else None,
                 incomplete_departures=provider_id == incomplete_provider,
+                sqlite_only_departures=sqlite_only_departures,
             )
         )
     output = root / "merged"
@@ -192,6 +197,114 @@ def _merge_toronto_fixture(
 
 
 class ExternalGTFSRegistryTests(unittest.TestCase):
+    def test_sqlite_routed_source_skips_release_departure_json_and_keeps_trip_headsigns(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config"
+            config.mkdir()
+            (config / "cities.json").write_text(
+                json.dumps([{
+                    "id": "fixture-city",
+                    "name": "Fixture City",
+                    "aliases": [],
+                    "latitude": 52.5200,
+                    "longitude": 13.4050,
+                    "radiusMeters": 25_000,
+                    "packageMode": "external",
+                    "externalGTFSProvider": "fixture-provider",
+                    "transitRadar": {
+                        "adapter": "oebb",
+                        "boardURL": "https://api.example.test/static-departures",
+                    },
+                }]),
+                encoding="utf-8",
+            )
+            archive = _gtfs_zip(
+                root / "fixture.zip",
+                stops="stop_id,stop_name,stop_lat,stop_lon\nS1,Central,52.5200,13.4050\n",
+                stop_times="trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+                "T1,08:00:00,08:00:00,S1,1\n",
+            )
+            source_path = root / "sources.json"
+            source_path.write_text(
+                json.dumps([{
+                    "id": "fixture-provider",
+                    "url": str(archive),
+                    "cities": str(config / "cities.json"),
+                    "timezone": "Europe/Berlin",
+                    "identifierPrefix": "fixture:",
+                    "stopIDMode": "exact",
+                    "country": "DE",
+                    "buildStops": True,
+                    "buildRoutes": True,
+                    "buildDepartures": True,
+                    "buildTripIndex": True,
+                    "importIntoStaticDepartures": True,
+                }]),
+                encoding="utf-8",
+            )
+            output = root / "output"
+            cache_root = root / "gtfs-cache"
+            manifest, cities, _packages, _lines = process_external_gtfs_sources(
+                repository_root=REPOSITORY_ROOT,
+                sources_path=source_path,
+                url_by_provider={},
+                output=output,
+                load_gtfs_archive=load_gtfs_archive,
+                gtfs_cache=GTFSArtifactCache(cache_root),
+                environ={
+                    "HALTEWECKER_EXTERNAL_DEPARTURES_SQLITE_ONLY": "1",
+                    "HALTEWECKER_EXTERNAL_DEPARTURES_V3_PROVIDERS": "fixture-provider",
+                    "HALTEWECKER_EXTERNAL_DEPARTURE_CACHE": "1",
+                    "HALTEWECKER_EXTERNAL_DEPARTURE_CACHE_PROVIDERS": "fixture-provider",
+                },
+            )
+
+            self.assertEqual([entry["id"] for entry in manifest], ["fixture-city"])
+            self.assertEqual([city["id"] for city in cities], ["fixture-city"])
+            self.assertTrue((output / "stops" / "fixture-city.json").is_file())
+            self.assertTrue((output / "routes" / "fixture-city.json").is_file())
+            self.assertTrue((output / "trips" / "fixture-city.json").is_file())
+            self.assertFalse((output / "departures" / "fixture-city.json").exists())
+            self.assertFalse((output / "departures-v2" / "fixture-city").exists())
+            trips = json.loads((output / "trips" / "fixture-city.json").read_text())
+            self.assertEqual(trips["T1"], {"r": "R1", "h": "Towards Depot"})
+            cached_partitions = list(
+                (cache_root / "external-departure-partitions" / "fixture-provider")
+                .rglob("manifest.json")
+            )
+            self.assertEqual(len(cached_partitions), 3)
+            self.assertEqual(
+                {json.loads(path.read_text())["status"] for path in cached_partitions},
+                {"complete"},
+            )
+
+    def test_sqlite_only_departures_require_import_and_api_board_route(self) -> None:
+        source = {"importIntoStaticDepartures": True}
+        city = {"transitRadar": {"boardURL": "https://api.example.test/static-departures"}}
+        environment = {"HALTEWECKER_EXTERNAL_DEPARTURES_SQLITE_ONLY": "1"}
+
+        self.assertTrue(_sqlite_is_departure_source(source, [city], environment))
+        self.assertFalse(_sqlite_is_departure_source(source, [{}], environment))
+        self.assertFalse(
+            _sqlite_is_departure_source(
+                {"importIntoStaticDepartures": False}, [city], environment
+            )
+        )
+        self.assertFalse(
+            _sqlite_is_departure_source(
+                source, [city], {"HALTEWECKER_EXTERNAL_DEPARTURES_SQLITE_ONLY": "0"}
+            )
+        )
+        self.assertFalse(
+            _sqlite_is_departure_source(
+                source,
+                [city],
+                environment,
+                merge_group_sources=(source, {"importIntoStaticDepartures": False}),
+            )
+        )
+
     def test_kyiv_gtfs_outage_without_cache_fails_closed_after_limited_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1095,6 +1208,24 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
                 set(trips), {"ttc-surface:trip-600", "ttc-subway:trip-600"}
             )
             self.assertEqual(set(lines), {"ttc-surface:100", "ttc-subway:100"})
+
+    def test_toronto_merge_skips_json_when_all_members_use_shared_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = _merge_toronto_fixture(
+                root,
+                missing_assets_by_provider={
+                    "ttc-surface": {"departures"},
+                    "ttc-subway": {"departures"},
+                },
+                sqlite_only_departures=True,
+            )
+
+            self.assertTrue((output / "stops" / "toronto.json").is_file())
+            self.assertTrue((output / "routes" / "toronto.json").is_file())
+            self.assertTrue((output / "trips" / "toronto.json").is_file())
+            self.assertFalse((output / "departures" / "toronto.json").exists())
+            self.assertFalse((output / "departures-v2" / "toronto").exists())
 
     def test_nt_namespaced_route_stage_materializes_member_routes(self) -> None:
         providers = (

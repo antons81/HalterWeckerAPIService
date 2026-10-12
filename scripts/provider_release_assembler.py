@@ -843,7 +843,7 @@ def readiness_probe(
     *,
     provider_ids: tuple[str, ...],
     israel_case: Mapping[str, object],
-    toronto_case: Mapping[str, object],
+    toronto_case: Mapping[str, object] | None,
     trip_case: Mapping[str, object],
 ) -> dict[str, object]:
     profiler = _AssemblyProfiler()
@@ -862,7 +862,7 @@ def _readiness_probe(
     *,
     provider_ids: tuple[str, ...],
     israel_case: Mapping[str, object],
-    toronto_case: Mapping[str, object],
+    toronto_case: Mapping[str, object] | None,
     trip_case: Mapping[str, object],
 ) -> dict[str, object]:
     """Run the local candidate probe through the same runtime abstraction."""
@@ -894,19 +894,26 @@ def _readiness_probe(
             case_datetime(israel_case, "toDate"),
         )
 
-        toronto_city = str(toronto_case.get("cityID") or "")
-        toronto_stop = str(toronto_case.get("stopID") or "")
-        routed_providers = snapshot.catalog.providers_for_city(toronto_city)
-        if len(routed_providers) < 2:
-            raise ReleaseAssemblyError("Toronto readiness case does not fan out to multiple providers")
-        toronto_lines = snapshot.lines(toronto_city, toronto_stop)
-        toronto_board = snapshot.board(
-            toronto_city,
-            toronto_stop,
-            int(toronto_case.get("limit", 1)),
-            case_datetime(toronto_case, "fromDate"),
-            case_datetime(toronto_case, "toDate"),
-        )
+        toronto_result = None
+        if toronto_case is not None:
+            toronto_city = str(toronto_case.get("cityID") or "")
+            toronto_stop = str(toronto_case.get("stopID") or "")
+            routed_providers = snapshot.catalog.providers_for_city(toronto_city)
+            if len(routed_providers) < 2:
+                raise ReleaseAssemblyError("Toronto readiness case does not fan out to multiple providers")
+            toronto_lines = snapshot.lines(toronto_city, toronto_stop)
+            toronto_board = snapshot.board(
+                toronto_city,
+                toronto_stop,
+                int(toronto_case.get("limit", 1)),
+                case_datetime(toronto_case, "fromDate"),
+                case_datetime(toronto_case, "toDate"),
+            )
+            toronto_result = {
+                "providerIDs": routed_providers,
+                "lines": len(toronto_lines),
+                "board": len(toronto_board),
+            }
 
         trip_provider = str(trip_case.get("providerID") or israel_provider)
         trip_city = str(trip_case.get("cityID") or israel_city)
@@ -921,22 +928,22 @@ def _readiness_probe(
         )
         if trip_details is None:
             raise ReleaseAssemblyError("trip readiness query returned no details")
-        return {
+        result = {
             "status": "READY",
             "releaseID": snapshot.release_id,
             "commonMetadata": metadata,
-            "israel": {
-                "providerCount": 1,
-                "lines": len(israel_lines),
-                "board": len(israel_board),
-            },
-            "toronto": {
-                "providerIDs": routed_providers,
-                "lines": len(toronto_lines),
-                "board": len(toronto_board),
-            },
             "tripDetails": {"providerID": trip_provider, "tripID": trip_id},
         }
+        primary_key = "israel" if israel_provider == "israel-mot" else "primary"
+        result[primary_key] = {
+            "providerID": israel_provider,
+            "providerCount": 1,
+            "lines": len(israel_lines),
+            "board": len(israel_board),
+        }
+        if toronto_result is not None:
+            result["toronto"] = toronto_result
+        return result
 
 
 __all__ = [

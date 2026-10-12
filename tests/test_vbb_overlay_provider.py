@@ -73,6 +73,16 @@ class _Legacy:
     def trip_details(self, *_args, **_kwargs):
         return self._called()
 
+
+class _LegacyFallback(_Legacy):
+    def board(self, *_args, **_kwargs):
+        self.calls += 1
+        return [{"source": "shared-sqlite"}]
+
+    def trip_details(self, *_args, **_kwargs):
+        self.calls += 1
+        return {"providerID": "legacy", "stops": [{"id": "sqlite-stop"}]}
+
     def close(self):
         return None
 
@@ -240,6 +250,51 @@ class VBBOverlayProviderTests(unittest.TestCase):
             adapter = VBBOverlayProviderAdapter(root, now_provider=lambda: stale)
             with self.assertRaises(VBBOverlayUnavailable):
                 adapter.board("berlin", "public-stop", 10)
+
+    def test_hybrid_backend_falls_back_to_shared_sqlite_for_unmapped_vbb_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            anchor, _service_date, _filename = self._fixture(root)
+            legacy = _LegacyFallback()
+            backend = HybridStaticDeparturesBackend(
+                legacy,
+                _Manager(_Snapshot(root)),
+                ("germany",),
+            )
+
+            rows = backend.board(
+                "berlin",
+                "338936",
+                3,
+                anchor,
+                anchor + timedelta(hours=2),
+            )
+            trip = backend.trip_details(
+                "berlin",
+                "unmapped-vbb-trip",
+                str(root),
+                anchor.strftime("%Y-%m-%d"),
+            )
+
+            self.assertEqual(rows, [{"source": "shared-sqlite"}])
+            self.assertEqual(trip["providerID"], "legacy")
+            self.assertEqual(legacy.calls, 2)
+            backend.close()
+
+    def test_provider_only_backend_keeps_vbb_overlay_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            anchor, _service_date, _filename = self._fixture(root)
+            backend = HybridStaticDeparturesBackend(
+                None,
+                _Manager(_Snapshot(root)),
+                ("germany",),
+                provider_only=True,
+            )
+
+            with self.assertRaisesRegex(RuntimeUnavailable, "unknown Berlin stop"):
+                backend.board("berlin", "338936", 3, anchor, anchor + timedelta(hours=2))
+            backend.close()
 
     def test_unknown_city_and_stop_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:

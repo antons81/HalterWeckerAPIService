@@ -93,20 +93,28 @@ def main() -> None:
     parser.add_argument("--normalized-cache-root", type=Path, required=True)
     parser.add_argument("--static-artifact-root", type=Path, required=True)
     parser.add_argument("--active-release", type=Path)
+    parser.add_argument("--runtime-provider-ids")
     args = parser.parse_args()
     sys.path.insert(0, str(args.repository))
     from scripts.run_incremental_provider_pipeline import (
-        full_chain_preflight, provider_selection_plan, service_dates,
+        full_chain_preflight, provider_selection_plan,
+        resolve_runtime_provider_ids, service_dates,
     )
     # Probe records stay diagnostic; stdout has exactly one numeric result.
     with contextlib.redirect_stdout(io.StringIO()):
         selection = provider_selection_plan(args.repository)
+        runtime_provider_ids = resolve_runtime_provider_ids(
+            args.repository,
+            selection["selectedProviders"],
+            runtime_provider_ids=args.runtime_provider_ids,
+        )
         plan = full_chain_preflight(
             repository_root=args.repository, stop_data_root=args.stop_data,
             normalized_cache_root=args.normalized_cache_root,
             static_artifact_root=args.static_artifact_root,
             dates=service_dates(valid_from=None, valid_through=None, window_days=21),
             provider_ids=tuple(selection["selectedProviders"]), raw_snapshot=None,
+            runtime_provider_ids=runtime_provider_ids,
             gtfs_artifacts=json.loads(args.gtfs_artifacts.read_text()),
         )
     forecast = forecast_provider_allocations(

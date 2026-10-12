@@ -200,6 +200,93 @@ class IrelandArtifactSnapshotTests(unittest.TestCase):
             self.assertEqual(Path(ireland["path"]), expected)
             self.assertEqual(validate_ireland_release_snapshot(ireland, release), expected)
 
+    def test_prepare_artifacts_snapshots_cached_ireland_archive_when_auth_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache_root = root / "cache"
+            ireland_cache = cache_root / "ireland" / "current.zip"
+            ireland_cache.parent.mkdir(parents=True)
+            with zipfile.ZipFile(ireland_cache, "w") as archive:
+                archive.writestr("agency.txt", "agency_id,agency_name\n1,TFI\n")
+                archive.writestr("routes.txt", "route_id,route_type\nR1,3\n")
+                archive.writestr("stops.txt", "stop_id,stop_name\nS1,Stop 1\n")
+                archive.writestr("trips.txt", "route_id,service_id,trip_id\nR1,WK,T1\n")
+                archive.writestr(
+                    "stop_times.txt",
+                    "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+                    "T1,08:00:00,08:00:00,S1,1\n",
+                )
+            release = root / "releases" / "release-a"
+            release.mkdir(parents=True)
+            external_sources = root / "external-sources.json"
+            external_sources.write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "ireland",
+                            "classification": "conditional",
+                            "url": "https://ireland.example/gtfs.zip",
+                            "timezone": "Europe/Dublin",
+                            "buildDepartures": True,
+                            "allowStale": True,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            output = root / "gtfs-artifacts.json"
+
+            def resolve(cache, source_id: str, url: str, **_kwargs):
+                if source_id == "ireland":
+                    return ArtifactResult(source_id, ireland_cache, "cache-hit", url)
+                archive_path = root / f"{source_id}.zip"
+                with zipfile.ZipFile(archive_path, "w") as archive:
+                    archive.writestr("agency.txt", f"agency_id,agency_name\n1,{source_id}\n")
+                return ArtifactResult(source_id, archive_path, "cache-hit", url)
+
+            argv = [
+                "prepare_gtfs_artifacts.py",
+                "--cache-root",
+                str(cache_root),
+                "--gtfs-url",
+                "https://germany.example/gtfs.zip",
+                "--swiss-gtfs-url",
+                "https://swiss.example/gtfs.zip",
+                "--external-sources",
+                str(external_sources),
+                "--output",
+                str(output),
+                "--release-root",
+                str(release),
+            ]
+
+            def authenticate(source_id: str, url: str, **_kwargs):
+                if source_id == "ireland":
+                    raise ValueError("missing test credential")
+                return url, {}
+
+            with (
+                mock.patch("sys.argv", argv),
+                mock.patch.object(prepare_gtfs_artifacts, "resolve_one", side_effect=resolve),
+                mock.patch.object(
+                    prepare_gtfs_artifacts,
+                    "ensure_source_calendar_for_candidate",
+                    side_effect=lambda _cache, artifact, **_kwargs: (artifact, None),
+                ),
+                mock.patch.object(
+                    prepare_gtfs_artifacts,
+                    "authenticated_external_request",
+                    side_effect=authenticate,
+                ),
+            ):
+                prepare_gtfs_artifacts.main()
+
+            ireland = json.loads(output.read_text(encoding="utf-8"))["external"]["ireland"]
+            expected = release / IRELAND_ARCHIVE_RELATIVE_PATH
+            self.assertEqual(Path(ireland["path"]), expected)
+            self.assertEqual(validate_ireland_release_snapshot(ireland, release), expected)
+            self.assertEqual(ireland.get("reason"), "authentication unavailable")
+
     def test_ireland_archive_snapshot_rejects_manifest_digest_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

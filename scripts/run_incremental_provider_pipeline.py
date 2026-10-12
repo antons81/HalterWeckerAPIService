@@ -342,6 +342,37 @@ def _environment_provider_ids(
     )
 
 
+def resolve_runtime_provider_ids(
+    repository_root: Path,
+    provider_ids: Iterable[str],
+    *,
+    runtime_provider_ids: str | Iterable[str] | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
+    """Resolve the smaller set of provider shards published at runtime."""
+    configured_provider_ids = tuple(provider_ids)
+    values = os.environ if environ is None else environ
+    configured = runtime_provider_ids
+    if configured is None:
+        configured = values.get("HALTEWECKER_RUNTIME_PROVIDER_IDS")
+    selected = (
+        _normalize_provider_ids(
+            configured,
+            source_name="HALTEWECKER_RUNTIME_PROVIDER_IDS",
+        )
+        if configured
+        else _normalize_provider_ids(
+            configured_provider_ids,
+            source_name=INCREMENTAL_PROVIDER_IDS_ENV,
+        )
+    )
+    source_ids = set(_source_map(repository_root))
+    unknown = sorted(set(selected) - source_ids)
+    if unknown:
+        raise ValueError(f"unknown runtime providers: {unknown}")
+    return selected
+
+
 def provider_selection_plan(
     repository_root: Path,
     *,
@@ -915,6 +946,7 @@ def _build_common_catalog(
     output: Path,
     release_id: str,
     provider_builds: list[ProviderBuild],
+    runtime_provider_ids: tuple[str, ...] | None = None,
 ) -> None:
     providers: dict[str, dict[str, object]] = {}
     aliases: list[tuple[str, str]] = []
@@ -930,7 +962,11 @@ def _build_common_catalog(
         temporal_reference = _manifest_reference(item.temporal)
         providers[item.provider_id] = {
             "cities": [str(city["id"]) for city in item.cities],
-            "status": "active",
+            "status": (
+                "active"
+                if runtime_provider_ids is None or item.provider_id in runtime_provider_ids
+                else "fallback"
+            ),
             "required": True,
             "providerOrder": provider_order,
             "mergeGroup": str(item.source.get("mergeGroup", "")),
@@ -993,6 +1029,7 @@ def full_chain_preflight(
     dates: list[date],
     provider_ids: tuple[str, ...],
     raw_snapshot: Mapping[str, Mapping[str, object]],
+    runtime_provider_ids: tuple[str, ...] | None = None,
     gtfs_artifacts: Mapping[str, object] | None = None,
     common_snapshot_fingerprint: str | None = None,
 ) -> dict[str, object]:
@@ -1001,7 +1038,15 @@ def full_chain_preflight(
         repository_root,
         provider_ids=provider_ids,
     )
-    strategies = validate_incremental_artifact_strategies(repository_root, provider_ids)
+    runtime_provider_ids = resolve_runtime_provider_ids(
+        repository_root,
+        provider_ids,
+        runtime_provider_ids=runtime_provider_ids,
+    )
+    strategies = validate_incremental_artifact_strategies(
+        repository_root,
+        runtime_provider_ids,
+    )
     sources = _source_map(repository_root)
     environment = dict(os.environ)
     environment["HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT"] = str(
@@ -1015,7 +1060,7 @@ def full_chain_preflight(
     rollover_misses: list[dict[str, object]] = []
     planned_builds: list[dict[str, object]] = []
 
-    for provider_id in provider_ids:
+    for provider_id in runtime_provider_ids:
         source = dict(sources[provider_id])
         strategy = strategies[provider_id]
         report: dict[str, object] = {
@@ -1296,6 +1341,7 @@ def full_chain_preflight(
     return {
         "status": "PASS" if not mandatory_misses else "NO-GO",
         "selectionPlan": selection_plan,
+        "runtimeProviderIDs": list(runtime_provider_ids),
         "providers": provider_reports,
         "mandatoryMisses": mandatory_misses,
         "plannedBuilds": planned_builds,
@@ -1321,6 +1367,7 @@ def build_incremental_candidate(
     static_artifact_root: Path,
     dates: list[date],
     provider_ids: tuple[str, ...] | None = None,
+    runtime_provider_ids: tuple[str, ...] | None = None,
     raw_snapshot: Mapping[str, Mapping[str, object]] | None = None,
     common_snapshot_fingerprint: str | None = None,
     trusted_common_stop_data: Path | None = None,
@@ -1331,7 +1378,12 @@ def build_incremental_candidate(
         provider_ids=provider_ids,
     )
     provider_ids = tuple(selection_plan["selectedProviders"])
-    validate_incremental_artifact_strategies(repository_root, provider_ids)
+    runtime_provider_ids = resolve_runtime_provider_ids(
+        repository_root,
+        provider_ids,
+        runtime_provider_ids=runtime_provider_ids,
+    )
+    validate_incremental_artifact_strategies(repository_root, runtime_provider_ids)
     stop_manifest = _read_json(stop_data_root / "manifest.json")
     if trusted_common_stop_data is None and str(stop_manifest.get("releaseID")) != release_id:
         raise ValueError("stop-data releaseID does not match nightly release ID")
@@ -1360,7 +1412,7 @@ def build_incremental_candidate(
         static_artifact_root=static_artifact_root,
     )
     provider_builds: list[ProviderBuild] = []
-    for provider_id in provider_ids:
+    for provider_id in runtime_provider_ids:
         source = sources[provider_id]
         strategy = str(selection_plan["artifactStrategies"][provider_id])
         raw_path, raw_sha = _stage(
@@ -1505,6 +1557,7 @@ def build_incremental_candidate(
                 output=common_path,
                 release_id=release_id,
                 provider_builds=provider_builds,
+                runtime_provider_ids=runtime_provider_ids,
             ),
         )
         _disk_telemetry(
@@ -1534,7 +1587,10 @@ def build_incremental_candidate(
                 release_id,
                 common_database=common_path,
                 stop_data_root=stop_data_root,
-                providers=provider_inputs,
+                providers={
+                    provider_id: provider_inputs[provider_id]
+                    for provider_id in runtime_provider_ids
+                },
                 trusted_common_stop_data=trusted_common_stop_data,
                 common_snapshot_fingerprint=common_snapshot_fingerprint,
                 fallback_database=fallback_database,
@@ -1566,7 +1622,7 @@ def build_incremental_candidate(
             "validation-receipt",
             lambda: write_validation_receipt(
                 published_release_directory,
-                provider_ids=provider_ids,
+                provider_ids=runtime_provider_ids,
             ),
         )
         print(
@@ -1581,96 +1637,111 @@ def build_incremental_candidate(
             normalized_cache_root=normalized_cache_root,
             static_artifact_root=static_artifact_root,
         )
-        israel = next(item for item in provider_builds if item.provider_id == "israel-mot")
-        israel_city = str(israel.cities[0]["id"])
-        israel_probe_date = _select_probe_date(
-            provider_id=israel.provider_id,
-            temporal_database=israel.temporal.database_path,
-            dates=dates,
-        )
-        israel_stop = _first_stop(
-            _provider_rows(
-                israel.provider_id,
-                israel.structural.database_path,
-            )[0],
-            israel_city,
-        )
-        timezone_name = str(israel.source.get("timezone", "UTC"))
-        toronto = next(item for item in provider_builds if item.provider_id == "ttc-surface")
-        toronto_timezone_name = str(toronto.source.get("timezone", "UTC"))
-        subway = next(item for item in provider_builds if item.provider_id == "ttc-subway")
-        toronto_surface_probe_date = _select_probe_date(
-            provider_id=toronto.provider_id,
-            temporal_database=toronto.temporal.database_path,
-            dates=dates,
-        )
-        toronto_subway_probe_date = _select_probe_date(
-            provider_id=subway.provider_id,
-            temporal_database=subway.temporal.database_path,
-            dates=dates,
-        )
-        toronto_probe_date = _select_common_probe_date(
-            provider_temporal_databases={
-                "ttc-surface": toronto.temporal.database_path,
-                "ttc-subway": subway.temporal.database_path,
-            },
-            dates=dates,
-        )
-        probe_dates = {
-            "israel-mot": israel_probe_date.isoformat(),
-            "ttc-surface": toronto_surface_probe_date.isoformat(),
-            "ttc-subway": toronto_subway_probe_date.isoformat(),
-            "toronto-common": toronto_probe_date.isoformat(),
-        }
+        if {"israel-mot", "ttc-surface", "ttc-subway"} <= set(runtime_provider_ids):
+            primary = next(item for item in provider_builds if item.provider_id == "israel-mot")
+            primary_city = str(primary.cities[0]["id"])
+            primary_probe_date = _select_probe_date(
+                provider_id=primary.provider_id,
+                temporal_database=primary.temporal.database_path,
+                dates=dates,
+            )
+            primary_stop = _first_stop(
+                _provider_rows(primary.provider_id, primary.structural.database_path)[0],
+                primary_city,
+            )
+            primary_timezone = str(primary.source.get("timezone", "UTC"))
+            toronto = next(item for item in provider_builds if item.provider_id == "ttc-surface")
+            subway = next(item for item in provider_builds if item.provider_id == "ttc-subway")
+            toronto_probe_date = _select_common_probe_date(
+                provider_temporal_databases={
+                    "ttc-surface": toronto.temporal.database_path,
+                    "ttc-subway": subway.temporal.database_path,
+                },
+                dates=dates,
+            )
+            toronto_timezone = str(toronto.source.get("timezone", "UTC"))
+            toronto_city = "toronto"
+            toronto_stop = "100"
+            toronto_case_date = toronto_probe_date
+        else:
+            primary = next(
+                item for item in provider_builds
+                if item.provider_id in runtime_provider_ids
+            )
+            primary_city = next(
+                (str(city["id"]) for city in primary.cities
+                 if str(city["id"]) in {"wuppertal", "berlin"}),
+                str(primary.cities[0]["id"]),
+            )
+            primary_probe_date = _select_probe_date(
+                provider_id=primary.provider_id,
+                temporal_database=primary.temporal.database_path,
+                dates=dates,
+            )
+            primary_stop = _first_stop(
+                _provider_rows(primary.provider_id, primary.structural.database_path)[0],
+                primary_city,
+            )
+            primary_timezone = str(primary.source.get("timezone", "Europe/Berlin"))
+            toronto = None
+            toronto_probe_date = None
+            toronto_timezone = None
+            toronto_city = None
+            toronto_stop = None
+            toronto_case_date = None
+        probe_dates = {primary.provider_id: primary_probe_date.isoformat()}
+        if toronto is not None and toronto_probe_date is not None:
+            probe_dates["toronto-common"] = toronto_probe_date.isoformat()
         print(
             "[NightlyIncremental] stage=readiness-probe-dates status=PASS "
             + " ".join(f"{key}={value}" for key, value in probe_dates.items()),
             flush=True,
         )
-        try:
-            from zoneinfo import ZoneInfo
+        from zoneinfo import ZoneInfo
 
-            timezone = ZoneInfo(timezone_name)
-            toronto_timezone = ZoneInfo(toronto_timezone_name)
-        except Exception:
-            timezone = None
-            toronto_timezone = None
-        from_datetime = datetime.combine(israel_probe_date, datetime.min.time()).replace(tzinfo=timezone)
-        to_datetime = datetime.combine(israel_probe_date, datetime.max.time()).replace(tzinfo=timezone)
-        toronto_from_datetime = datetime.combine(
-            toronto_probe_date, datetime.min.time()
-        ).replace(tzinfo=toronto_timezone)
-        toronto_to_datetime = datetime.combine(
-            toronto_probe_date, datetime.max.time()
-        ).replace(tzinfo=toronto_timezone)
+        primary_zone = ZoneInfo(primary_timezone)
+        from_datetime = datetime.combine(
+            primary_probe_date, datetime.min.time(), primary_zone
+        )
+        to_datetime = datetime.combine(
+            primary_probe_date, datetime.max.time(), primary_zone
+        )
         trip_case = _first_trip_case(
-            provider_id=israel.provider_id,
-            structural_database=israel.structural.database_path,
-            temporal_database=israel.temporal.database_path,
-            city_id=israel_city,
-            service_date=israel_probe_date,
+            provider_id=primary.provider_id,
+            structural_database=primary.structural.database_path,
+            temporal_database=primary.temporal.database_path,
+            city_id=primary_city,
+            service_date=primary_probe_date,
             static_root=published_release_directory / "stop-data",
         )
+        toronto_case = None
+        if toronto is not None and toronto_case_date is not None:
+            toronto_zone = ZoneInfo(str(toronto_timezone))
+            toronto_case = {
+                "cityID": str(toronto_city),
+                "stopID": str(toronto_stop),
+                "fromDate": datetime.combine(
+                    toronto_case_date, datetime.min.time(), toronto_zone
+                ).isoformat(),
+                "toDate": datetime.combine(
+                    toronto_case_date, datetime.max.time(), toronto_zone
+                ).isoformat(),
+                "limit": 30,
+            }
         readiness = _stage(
             "readiness",
             lambda: readiness_probe(
                 published_release_directory,
-                provider_ids=provider_ids,
+                provider_ids=runtime_provider_ids,
                 israel_case={
-                    "providerID": "israel-mot",
-                    "cityID": israel_city,
-                    "stopID": israel_stop,
+                    "providerID": primary.provider_id,
+                    "cityID": primary_city,
+                    "stopID": primary_stop,
                     "fromDate": from_datetime.isoformat(),
                     "toDate": to_datetime.isoformat(),
                     "limit": 30,
                 },
-                toronto_case={
-                    "cityID": "toronto",
-                    "stopID": "100",
-                    "fromDate": toronto_from_datetime.isoformat(),
-                    "toDate": toronto_to_datetime.isoformat(),
-                    "limit": 30,
-                },
+                toronto_case=toronto_case,
                 trip_case=trip_case,
             ),
         )
@@ -1695,7 +1766,9 @@ def build_incremental_candidate(
                 "manifestSha256": stop_manifest_sha256,
             },
             "selectionPlan": selection_plan,
-            "providerIDs": list(provider_ids),
+            "providerIDs": list(runtime_provider_ids),
+            "cachePreparationProviderIDs": list(provider_ids),
+            "runtimeProviderIDs": list(runtime_provider_ids),
             "dates": {"validFrom": dates[0].isoformat(), "validThrough": dates[-1].isoformat()},
             "readinessProbeDates": probe_dates,
             "providers": {
@@ -1727,6 +1800,7 @@ def build_incremental_candidate(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repository-root", type=Path)
+    parser.add_argument("--runtime-provider-ids")
     parser.add_argument("--release-id")
     parser.add_argument("--releases-root", type=Path)
     parser.add_argument("--stop-data", type=Path)
@@ -1754,6 +1828,11 @@ def main(argv: list[str] | None = None) -> int:
     repository_root = args.repository_root.resolve()
     try:
         selection_plan = provider_selection_plan(repository_root)
+        runtime_provider_ids = resolve_runtime_provider_ids(
+            repository_root,
+            selection_plan["selectedProviders"],
+            runtime_provider_ids=args.runtime_provider_ids,
+        )
     except Exception:
         traceback.print_exc(file=sys.stderr)
         return 1
@@ -1810,6 +1889,7 @@ def main(argv: list[str] | None = None) -> int:
             static_artifact_root=args.static_artifact_root.resolve(),
             dates=dates,
             provider_ids=tuple(selection_plan["selectedProviders"]),
+            runtime_provider_ids=runtime_provider_ids,
             raw_snapshot=raw_snapshot,
             gtfs_artifacts=gtfs_artifacts,
             common_snapshot_fingerprint=args.common_snapshot_fingerprint,
@@ -1831,7 +1911,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("missing required arguments: " + ", ".join(missing_arguments))
     print(
         f"[NightlyIncremental] stage=nightly-start status=started release_id={args.release_id} "
-        f"providers={','.join(selection_plan['selectedProviders'])}",
+        f"cache_providers={','.join(selection_plan['selectedProviders'])} "
+        f"runtime_providers={','.join(runtime_provider_ids)}",
         flush=True,
     )
     print(
@@ -1855,6 +1936,7 @@ def main(argv: list[str] | None = None) -> int:
             static_artifact_root=args.static_artifact_root.resolve(),
             dates=dates,
             provider_ids=tuple(selection_plan["selectedProviders"]),
+            runtime_provider_ids=runtime_provider_ids,
             raw_snapshot=raw_snapshot,
             common_snapshot_fingerprint=args.common_snapshot_fingerprint,
             trusted_common_stop_data=(

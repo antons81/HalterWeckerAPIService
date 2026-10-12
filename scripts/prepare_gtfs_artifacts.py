@@ -783,7 +783,10 @@ def main() -> None:
                 "status=preserved-stale reason=authentication unavailable"
             )
             result["external"][source_id] = _with_source_refresh_status(
-                artifact_payload(artifact) | {"reason": "authentication unavailable"},
+                artifact_payload(
+                    artifact,
+                    release_root=args.release_root,
+                ) | {"reason": "authentication unavailable"},
                 refresh_status,
             )
             continue

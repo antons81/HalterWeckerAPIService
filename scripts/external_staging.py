@@ -985,13 +985,22 @@ class ExternalMergeStage:
         ).fetchone()
         return json.loads(row[0]) if row is not None else default
 
-    def write_outputs(self, output: Path, city_id: str) -> tuple[int, dict[str, object]]:
+    def write_outputs(
+        self,
+        output: Path,
+        city_id: str,
+        *,
+        include_departures: bool = True,
+    ) -> tuple[int, dict[str, object]]:
         """Write merged assets directly from SQLite cursors."""
         stops_directory = output / "stops"
         routes_directory = output / "routes"
         departures_directory = output / "departures"
         trips_directory = output / "trips"
-        for directory in (stops_directory, routes_directory, departures_directory, trips_directory):
+        directories = [stops_directory, routes_directory, trips_directory]
+        if include_departures:
+            directories.append(departures_directory)
+        for directory in directories:
             directory.mkdir(parents=True, exist_ok=True)
 
         stop_path = stops_directory / f"{city_id}.json"
@@ -1024,56 +1033,57 @@ class ExternalMergeStage:
                 first = False
             stream.write("}")
 
-        departures_path = departures_directory / f"{city_id}.json"
-        with departures_path.open("w", encoding="utf-8") as stream:
-            stream.write("{\"generatedAt\":")
-            stream.write(json.dumps(self.metadata("generatedAt"), ensure_ascii=False))
-            stream.write(",\"timezone\":")
-            stream.write(json.dumps(self.metadata("timezone", "America/Toronto"), ensure_ascii=False))
-            stream.write(",\"stops\":{")
-            stop_cursor = self.connection.execute(
-                "SELECT DISTINCT stop_id FROM departures ORDER BY stop_id"
-            )
-            first_stop = True
-            for (stop_id,) in stop_cursor:
-                if not first_stop:
-                    stream.write(",")
-                stream.write(json.dumps(stop_id, ensure_ascii=False))
-                stream.write(": [".replace(" ", ""))
-                first_item = True
-                for (payload,) in self.connection.execute(
-                    """
-                    SELECT payload FROM departures
-                    WHERE stop_id=?
-                    ORDER BY json_extract(payload, '$.p'),
-                             json_extract(payload, '$.t'),
-                             json_extract(payload, '$.r')
-                    """,
-                    (stop_id,),
-                ):
-                    if not first_item:
-                        stream.write(",")
-                    stream.write(payload)
-                    first_item = False
-                stream.write("]")
-                first_stop = False
-            stream.write("},\"platforms\":{")
-            first_platform = True
-            for (parent_id,) in self.connection.execute(
-                "SELECT DISTINCT parent_id FROM platforms ORDER BY parent_id"
-            ):
-                if not first_platform:
-                    stream.write(",")
-                stream.write(json.dumps(parent_id, ensure_ascii=False))
-                stream.write(": [".replace(" ", ""))
-                children = self.connection.execute(
-                    "SELECT child_id FROM platforms WHERE parent_id=? ORDER BY child_id",
-                    (parent_id,),
+        if include_departures:
+            departures_path = departures_directory / f"{city_id}.json"
+            with departures_path.open("w", encoding="utf-8") as stream:
+                stream.write("{\"generatedAt\":")
+                stream.write(json.dumps(self.metadata("generatedAt"), ensure_ascii=False))
+                stream.write(",\"timezone\":")
+                stream.write(json.dumps(self.metadata("timezone", "America/Toronto"), ensure_ascii=False))
+                stream.write(",\"stops\":{")
+                stop_cursor = self.connection.execute(
+                    "SELECT DISTINCT stop_id FROM departures ORDER BY stop_id"
                 )
-                stream.write(",".join(json.dumps(row[0], ensure_ascii=False) for row in children))
-                stream.write("]")
-                first_platform = False
-            stream.write("}}")
+                first_stop = True
+                for (stop_id,) in stop_cursor:
+                    if not first_stop:
+                        stream.write(",")
+                    stream.write(json.dumps(stop_id, ensure_ascii=False))
+                    stream.write(": [".replace(" ", ""))
+                    first_item = True
+                    for (payload,) in self.connection.execute(
+                        """
+                        SELECT payload FROM departures
+                        WHERE stop_id=?
+                        ORDER BY json_extract(payload, '$.p'),
+                                 json_extract(payload, '$.t'),
+                                 json_extract(payload, '$.r')
+                        """,
+                        (stop_id,),
+                    ):
+                        if not first_item:
+                            stream.write(",")
+                        stream.write(payload)
+                        first_item = False
+                    stream.write("]")
+                    first_stop = False
+                stream.write("},\"platforms\":{")
+                first_platform = True
+                for (parent_id,) in self.connection.execute(
+                    "SELECT DISTINCT parent_id FROM platforms ORDER BY parent_id"
+                ):
+                    if not first_platform:
+                        stream.write(",")
+                    stream.write(json.dumps(parent_id, ensure_ascii=False))
+                    stream.write(": [".replace(" ", ""))
+                    children = self.connection.execute(
+                        "SELECT child_id FROM platforms WHERE parent_id=? ORDER BY child_id",
+                        (parent_id,),
+                    )
+                    stream.write(",".join(json.dumps(row[0], ensure_ascii=False) for row in children))
+                    stream.write("]")
+                    first_platform = False
+                stream.write("}}")
 
         trip_path = trips_directory / f"{city_id}.json"
         with trip_path.open("w", encoding="utf-8") as stream:

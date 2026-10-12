@@ -2056,6 +2056,57 @@ class HybridStaticDeparturesBackend:
             release_id,
         )
 
+    def _vbb_legacy_fallback(
+        self,
+        query: str,
+        city_id: str,
+        release_id: str,
+        overlay_error: VBBOverlayUnavailable,
+        legacy_call: Callable[[], object],
+    ) -> object:
+        if self.provider_only or self.legacy is None:
+            raise RuntimeUnavailable(str(overlay_error)) from overlay_error
+
+        scope = _HybridScope(
+            "legacy",
+            "vbb-overlay-fallback",
+            VBB_CITY_ID,
+            (VBB_PROVIDER_ID,),
+        )
+        self._log_routing(
+            query,
+            scope,
+            provider=VBB_PROVIDER_ID,
+            release_id=release_id,
+        )
+        started = time.perf_counter()
+        try:
+            value = legacy_call()
+        except Exception as fallback_error:
+            LOGGER.error(
+                "event=hybrid-vbb-fallback status=ERROR query=%s city=%s "
+                "release_id=%s overlay_error=%s fallback_error=%s",
+                query,
+                city_id,
+                release_id,
+                type(overlay_error).__name__,
+                type(fallback_error).__name__,
+                exc_info=True,
+            )
+            raise RuntimeUnavailable(
+                f"VBB overlay failed and shared SQLite fallback failed: {fallback_error}"
+            ) from fallback_error
+        LOGGER.info(
+            "event=hybrid-vbb-fallback status=OK query=%s city=%s release_id=%s "
+            "duration=%.6f rows=%s reason=overlay-unavailable",
+            query,
+            city_id,
+            release_id,
+            time.perf_counter() - started,
+            _result_count(value),
+        )
+        return value
+
     def _run_shard(
         self,
         snapshot: ReleaseSnapshot,
@@ -2180,7 +2231,13 @@ class HybridStaticDeparturesBackend:
                 try:
                     return vbb_call(adapter)
                 except VBBOverlayUnavailable as error:
-                    raise RuntimeUnavailable(str(error)) from error
+                    return self._vbb_legacy_fallback(
+                        query,
+                        city_id,
+                        lease.release_id,
+                        error,
+                        legacy_call,
+                    )
             scope = self._scope(
                 lease.snapshot,
                 city_id,
@@ -2429,9 +2486,28 @@ class HybridStaticDeparturesBackend:
                 scope = _HybridScope("vbb", "vbb-overlay", VBB_CITY_ID, (VBB_PROVIDER_ID,))
                 self._log_routing("trip-details", scope, provider=VBB_PROVIDER_ID, release_id=lease.release_id)
                 try:
-                    return adapter.trip_details(city_id, trip_id, static_root, service_date)
+                    result = adapter.trip_details(city_id, trip_id, static_root, service_date)
                 except VBBOverlayUnavailable as error:
-                    raise RuntimeUnavailable(str(error)) from error
+                    return self._vbb_legacy_fallback(
+                        "trip-details",
+                        city_id,
+                        lease.release_id,
+                        error,
+                        lambda: self.legacy.trip_details(
+                            city_id, trip_id, static_root, service_date
+                        ),
+                    )
+                if result is None and not self.provider_only and self.legacy is not None:
+                    return self._vbb_legacy_fallback(
+                        "trip-details",
+                        city_id,
+                        lease.release_id,
+                        VBBOverlayUnavailable("trip is absent from the current VBB overlay"),
+                        lambda: self.legacy.trip_details(
+                            city_id, trip_id, static_root, service_date
+                        ),
+                    )
+                return result
             provider_id = self._trip_provider(lease.snapshot, city_id, trip_id)
             if provider_id not in self.eligible_provider_ids:
                 scope = _HybridScope("legacy", "non-pilot-provider", city_id, (provider_id,) if provider_id else ())

@@ -2308,6 +2308,9 @@ def apply_current_departure_headsign_enrichment(
     namespace: str = "",
     *,
     provider_global_headsigns: bool = False,
+    source_archive: zipfile.ZipFile | None = None,
+    source_context: NormalizedProviderContext | None = None,
+    include_source_trip_headsigns: bool = False,
 ) -> None:
     """Add current-window headsigns to an immutable trip-index base."""
     def departure_paths_for_city(city_id: str) -> list[Path]:
@@ -2369,9 +2372,12 @@ def apply_current_departure_headsign_enrichment(
             ),
         )
 
+    use_shared_connection = provider_global_headsigns or include_source_trip_headsigns
+    if include_source_trip_headsigns and source_archive is None:
+        raise ValueError("source GTFS archive is required for trip headsign enrichment")
     shared_temporary = (
         tempfile.TemporaryDirectory(prefix="haltewecker-trip-headsigns-")
-        if provider_global_headsigns
+        if use_shared_connection
         else None
     )
     shared_connection: sqlite3.Connection | None = None
@@ -2380,6 +2386,18 @@ def apply_current_departure_headsign_enrichment(
         shared_connection.execute(
             "CREATE TABLE headsigns(trip_id TEXT PRIMARY KEY, headsign TEXT NOT NULL)"
         )
+        if include_source_trip_headsigns and source_archive is not None:
+            shared_connection.executemany(
+                "INSERT OR IGNORE INTO headsigns VALUES (?, ?)",
+                (
+                    (trip_id, headsign)
+                    for row in _source_iter_table(source_archive, "trips.txt", source_context)
+                    for trip_id in [str(row.get("trip_id", "")).strip()]
+                    for headsign in [str(row.get("trip_headsign", "")).strip()]
+                    if trip_id and headsign
+                ),
+            )
+            shared_connection.commit()
 
     try:
         for city in cities:
@@ -2531,7 +2549,10 @@ def _merge_namespaced_city_records_bounded(
             required_assets = {
                 "stops": source.get("buildStops", True) is True,
                 "routes": source.get("buildRoutes", True) is True,
-                "departures": source.get("buildDepartures", True) is True,
+                "departures": (
+                    source.get("buildDepartures", True) is True
+                    and record.get("sqliteOnlyDepartures") is not True
+                ),
                 "trips": source.get("buildTripIndex", True) is True,
             }
             for asset_name, asset_path in member_paths.items():
@@ -2591,8 +2612,16 @@ def _merge_namespaced_city_records_bounded(
             started=staging_started,
         )
         output_started = time.monotonic()
-        stop_count, _metadata = stage.write_outputs(output, city_id)
-        _write_merged_v2_departures(city_id, records, output)
+        include_departures = any(
+            record.get("sqliteOnlyDepartures") is not True for record in records
+        )
+        stop_count, _metadata = stage.write_outputs(
+            output,
+            city_id,
+            include_departures=include_departures,
+        )
+        if include_departures:
+            _write_merged_v2_departures(city_id, records, output)
         log_memory_stage(
             "merge-output-assembly-write",
             source=city_id,
@@ -2638,6 +2667,36 @@ def _departure_output_schema_version(environ: dict[str, str] | None, provider_id
     if version not in {1, 2, 3}:
         raise ValueError(f"unsupported external departures schema version: {version}")
     return version
+
+
+def _city_has_sqlite_departure_route(city: dict[str, object]) -> bool:
+    transit_radar = city.get("transitRadar")
+    if not isinstance(transit_radar, dict):
+        return False
+    return bool(str(transit_radar.get("boardURL", "")).strip())
+
+
+def _sqlite_is_departure_source(
+    source: dict[str, object],
+    cities: list[dict[str, object]],
+    environ: dict[str, str] | None,
+    *,
+    merge_group_sources: tuple[dict[str, object], ...] = (),
+    merge_group_complete: bool = True,
+) -> bool:
+    values = environ if environ is not None else os.environ
+    if values.get("HALTEWECKER_EXTERNAL_DEPARTURES_SQLITE_ONLY", "0").strip() != "1":
+        return False
+    if source.get("importIntoStaticDepartures") is not True or not cities:
+        return False
+    if not all(_city_has_sqlite_departure_route(city) for city in cities):
+        return False
+    if not merge_group_complete:
+        return False
+    return all(
+        member.get("importIntoStaticDepartures") is True
+        for member in merge_group_sources
+    )
 
 
 def _write_departures_v2_manifest(
@@ -2873,6 +2932,7 @@ def _build_external_departure_partitions(
     structural_input_key: str,
     gtfs_cache: GTFSArtifactCache | None,
     environ: dict[str, str] | None,
+    sqlite_only: bool = False,
     now: datetime | None = None,
 ) -> None:
     if output_schema_version not in {2, 3}:
@@ -2907,6 +2967,14 @@ def _build_external_departure_partitions(
             Path(gtfs_cache.root) / "external-departure-partitions",
             provider_id,
         )
+
+    if sqlite_only and cache is None:
+        print(
+            f"[StopData] source={provider_id} stage=departures-json "
+            "status=skipped reason=shared-sqlite-route",
+            flush=True,
+        )
+        return
 
     stop_set_digests: dict[str, str] = {}
     if cache is not None:
@@ -2948,6 +3016,74 @@ def _build_external_departure_partitions(
                 f"key={key.value[:12] if cache else 'n/a'}",
                 flush=True,
             )
+
+    if sqlite_only:
+        temporary = tempfile.TemporaryDirectory(
+            prefix="haltewecker-departure-cache-build-"
+        )
+        cache_output = Path(temporary.name)
+        try:
+            temporary_stops = cache_output / "stops"
+            temporary_stops.mkdir(parents=True, exist_ok=True)
+            for city in cities:
+                city_id = str(city["id"])
+                shutil.copyfile(
+                    output / "stops" / f"{city_id}.json",
+                    temporary_stops / f"{city_id}.json",
+                )
+            rebuild_groups: dict[tuple[str, ...], list[dict[str, object]]] = {}
+            for city in cities:
+                missing_dates = missing_dates_by_city.get(str(city["id"]), set())
+                if missing_dates:
+                    dates = tuple(date for date in service_dates if date in missing_dates)
+                    rebuild_groups.setdefault(dates, []).append(city)
+            for dates, rebuild_cities in rebuild_groups.items():
+                build_external_departure_index(
+                    archive,
+                    rebuild_cities,
+                    cache_output,
+                    timezone_name=timezone_name,
+                    namespace=namespace,
+                    departure_window_days=departure_window_days,
+                    context=context,
+                    output_schema_version=2,
+                    now=build_now,
+                    write_service_dates=dates,
+                )
+            for city in cities:
+                city_id = str(city["id"])
+                for service_date in service_dates:
+                    lookup = lookups.get((city_id, service_date))
+                    if lookup is not None and lookup.status == "HIT":
+                        continue
+                    key = keys.get((city_id, service_date))
+                    source_partition = (
+                        cache_output
+                        / "departures-v2"
+                        / city_id
+                        / f"{service_date}.json"
+                    )
+                    if key is None or not source_partition.is_file():
+                        raise FileNotFoundError(
+                            f"cache-only departure partition was not produced: "
+                            f"{city_id}/{service_date}"
+                        )
+                    cache.persist(key, source_partition)
+                    saved = cache.probe(key)
+                    if saved.status != "HIT":
+                        raise ValueError(
+                            f"provider={provider_id} city={city_id} date={service_date} "
+                            f"departure cache save failed: {saved.reason} "
+                            f"path={cache._directory(key).absolute()}"
+                        )
+        finally:
+            temporary.cleanup()
+        print(
+            f"[StopData] source={provider_id} stage=departures-json "
+            "status=skipped reason=shared-sqlite-route cache=validated",
+            flush=True,
+        )
+        return
 
     # Group cities with identical missing dates without rewriting valid partitions.
     rebuild_groups: dict[tuple[str, ...], list[dict[str, object]]] = {}
@@ -3058,6 +3194,9 @@ def process_external_gtfs_sources(
         if selected_source_ids is None
         or str(candidate["id"]) in selected_source_ids
     ]
+    selected_source_ids_for_build = {
+        str(candidate["id"]) for candidate in selected_sources
+    }
     merge_group_members_by_group: dict[str, tuple[str, ...]] = {}
     for candidate in selected_sources:
         merge_group = str(candidate.get("mergeGroup", "")).strip()
@@ -3141,6 +3280,25 @@ def process_external_gtfs_sources(
         )
 
         cities = load_external_cities(source, repository_root)
+        merge_group = str(source.get("mergeGroup", "")).strip()
+        merge_group_sources: tuple[dict[str, object], ...] = ()
+        merge_group_complete = True
+        if merge_group:
+            merge_group_sources = tuple(
+                candidate
+                for candidate in sources
+                if str(candidate.get("mergeGroup", "")).strip() == merge_group
+            )
+            merge_group_complete = {
+                str(candidate["id"]) for candidate in merge_group_sources
+            }.issubset(selected_source_ids_for_build)
+        sqlite_only_departures = _sqlite_is_departure_source(
+            source,
+            cities,
+            environ,
+            merge_group_sources=merge_group_sources,
+            merge_group_complete=merge_group_complete,
+        )
         for city in cities:
             city_id = str(city["id"])
             if city_id in occupied:
@@ -3530,6 +3688,7 @@ def process_external_gtfs_sources(
                             "source": source,
                             "city": city,
                             "output": source_output,
+                            "sqliteOnlyDepartures": sqlite_only_departures,
                         })
                 else:
                     for entry in entries:
@@ -3562,7 +3721,10 @@ def process_external_gtfs_sources(
                         "status=cache-hit duration=0.00s"
                     )
 
-            if source.get("buildDepartures", True):
+            if source.get("buildDepartures", True) and (
+                not sqlite_only_departures
+                or _departure_output_schema_version(environ, source_id) in {2, 3}
+            ):
                 departure_schema_version = _departure_output_schema_version(environ, source_id)
                 if departure_schema_version in {2, 3}:
                     _timed_external_stage(
@@ -3589,6 +3751,7 @@ def process_external_gtfs_sources(
                             ),
                             gtfs_cache=gtfs_cache,
                             environ=environ,
+                            sqlite_only=sqlite_only_departures,
                         ),
                     )
                 else:
@@ -3638,6 +3801,9 @@ def process_external_gtfs_sources(
                         provider_global_headsigns=(
                             source_id in LEGACY_PROVIDER_GLOBAL_HEADSIGN_MAP
                         ),
+                        source_archive=archive,
+                        source_context=normalized_context,
+                        include_source_trip_headsigns=sqlite_only_departures,
                     ),
                 )
             elif source_id == CTA_PROVIDER_ID:

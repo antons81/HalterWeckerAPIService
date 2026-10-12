@@ -20,11 +20,12 @@ PIPELINE = REPOSITORY_ROOT / "scripts" / "run_stop_data_pipeline.sh"
 NIGHTLY_WRAPPER = REPOSITORY_ROOT / "scripts" / "update_stop_data_wrapper.sh"
 NIGHTLY_SERVICE = REPOSITORY_ROOT / "deploy" / "systemd" / "haltewecker-stop-data.service"
 NIGHTLY_TIMER = REPOSITORY_ROOT / "deploy" / "systemd" / "haltewecker-stop-data.timer"
-MIXED_INCREMENTAL_PROVIDERS = (
+INCREMENTAL_PROVIDERS = (
     "israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd,"
     "511-bay-area,australia-translink-seq,australia-transport-nsw,cta-chicago,"
-    "mbta-boston,stm-montreal,germany"
+    "mbta-boston,stm-montreal"
 )
+BUILD_PROVIDERS = INCREMENTAL_PROVIDERS + ",germany"
 
 
 class StopDataPipelineTests(unittest.TestCase):
@@ -144,7 +145,7 @@ case \"${1:-}\" in
       printf '{"releaseID":"%s","releaseDirectory":"%s","stopData":{"releaseID":"%s","path":"%s","buildFingerprint":"test-build-fingerprint"},"providers":{}}\n' \
         "$release_id" "$release_root/$release_id" "$release_id" "$stop_data" > "$result_json"
       if [ "${INCREMENTAL_FAIL:-0}" != "1" ] && [ "${INCREMENTAL_READINESS_FAIL:-0}" != "1" ]; then
-        provider_json='{"israel-mot":{},"ttc-surface":{},"ttc-subway":{},"norway":{},"sweden":{},"poland-warsaw":{},"poland-wkd":{},"511-bay-area":{},"australia-translink-seq":{},"australia-transport-nsw":{},"cta-chicago":{},"mbta-boston":{},"stm-montreal":{},"germany":{}}'
+        provider_json='{"germany":{}}'
         if [ "${INCREMENTAL_CANDIDATE_INVALID:-0}" = "1" ]; then provider_json='{}'; fi
         if [ "${INCREMENTAL_CANDIDATE_WITHOUT_GERMANY:-0}" = "1" ]; then
           provider_json=$("$REAL_PYTHON" -c 'import json,sys; value=json.loads(sys.argv[1]); value.pop("germany",None); print(json.dumps(value))' "$provider_json")
@@ -363,6 +364,7 @@ PY
     ;;
 esac
 """)
+
         self.write_mock("systemctl", """#!/usr/bin/env bash
 set -euo pipefail
 
@@ -429,6 +431,15 @@ PY
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
+
+    def test_service_keeps_cache_scope_broad_and_runtime_shard_scope_to_germany(self) -> None:
+        service = NIGHTLY_SERVICE.read_text(encoding="utf-8")
+
+        self.assertIn(
+            f"Environment=HALTEWECKER_INCREMENTAL_PROVIDER_IDS={INCREMENTAL_PROVIDERS}",
+            service,
+        )
+        self.assertIn("Environment=HALTEWECKER_RUNTIME_PROVIDER_IDS=germany", service)
 
     def test_stop_data_fingerprint_is_deterministic_and_exposes_components(self) -> None:
         first = build_fingerprint.compute(REPOSITORY_ROOT)
@@ -615,7 +626,7 @@ PY
         )
         self.assertNotIn("flock -n", service)
         self.assertIn(
-            f"Environment=HALTEWECKER_INCREMENTAL_PROVIDER_IDS={MIXED_INCREMENTAL_PROVIDERS}",
+            f"Environment=HALTEWECKER_INCREMENTAL_PROVIDER_IDS={INCREMENTAL_PROVIDERS}",
             service,
         )
         self.assertNotIn("EnvironmentFile=", service)
@@ -734,9 +745,9 @@ assert callable(validate_validation_receipt)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
             "stage=cache-policy schema=3 "
-            f"incrementalProviders={MIXED_INCREMENTAL_PROVIDERS} "
-            f"providers={MIXED_INCREMENTAL_PROVIDERS} "
-            f"allowlist={MIXED_INCREMENTAL_PROVIDERS}",
+            f"incrementalProviders={INCREMENTAL_PROVIDERS} "
+            f"providers={INCREMENTAL_PROVIDERS} "
+            f"allowlist={INCREMENTAL_PROVIDERS}",
             result.stdout,
         )
         self.assertIn("stage=legacy-import status=PASS", result.stdout)
@@ -780,7 +791,7 @@ assert callable(validate_validation_receipt)
         previous_stops = os.readlink(self.data_root / "current")
         result = self.run_pipeline(
             USE_DEFAULT_PRODUCTION="1", HALTEWECKER_ACTIVATION_DRY_RUN="1",
-            HALTEWECKER_INCREMENTAL_PROVIDER_IDS=MIXED_INCREMENTAL_PROVIDERS,
+            HALTEWECKER_INCREMENTAL_PROVIDER_IDS=INCREMENTAL_PROVIDERS,
             INCREMENTAL_CANDIDATE_WITHOUT_GERMANY="1",
         )
         self.assertNotEqual(result.returncode, 0)
@@ -792,8 +803,8 @@ assert callable(validate_validation_receipt)
         self.configure_resume_pointer_layout()
         result = self.run_pipeline(USE_DEFAULT_PRODUCTION="1", HALTEWECKER_ACTIVATION_DRY_RUN="1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("buildProviders=" + MIXED_INCREMENTAL_PROVIDERS, result.stdout)
-        self.assertIn("runtimeProviders=" + MIXED_INCREMENTAL_PROVIDERS, result.stdout)
+        self.assertIn("buildProviders=" + BUILD_PROVIDERS, result.stdout)
+        self.assertIn("runtimeProviders=germany", result.stdout)
         self.assertIn("--fallback-database", (self.root / "incremental-calls.log").read_text())
 
     def test_runtime_provider_outside_build_does_not_switch_pointer(self) -> None:
@@ -812,7 +823,7 @@ assert callable(validate_validation_receipt)
         previous = os.readlink(self.data_root / "current-release")
         result = self.run_pipeline(
             USE_DEFAULT_PRODUCTION="1",
-            HALTEWECKER_RUNTIME_PROVIDER_IDS=MIXED_INCREMENTAL_PROVIDERS.removesuffix(",germany"),
+            HALTEWECKER_RUNTIME_PROVIDER_IDS=INCREMENTAL_PROVIDERS,
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Germany must be enabled", result.stderr)
@@ -904,9 +915,9 @@ assert callable(validate_validation_receipt)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
             "stage=cache-policy schema=3 "
-            f"incrementalProviders={MIXED_INCREMENTAL_PROVIDERS} "
-            f"providers={MIXED_INCREMENTAL_PROVIDERS} "
-            f"allowlist={MIXED_INCREMENTAL_PROVIDERS}",
+            f"incrementalProviders={INCREMENTAL_PROVIDERS} "
+            f"providers={INCREMENTAL_PROVIDERS} "
+            f"allowlist={INCREMENTAL_PROVIDERS}",
             result.stdout,
         )
 

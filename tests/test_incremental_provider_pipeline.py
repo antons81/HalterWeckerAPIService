@@ -129,7 +129,7 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    MIXED_PROVIDER_IDS = (
+    INCREMENTAL_PROVIDER_IDS = (
         "israel-mot",
         "ttc-surface",
         "ttc-subway",
@@ -143,13 +143,11 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
         "cta-chicago",
         "mbta-boston",
         "stm-montreal",
-        "germany",
     )
-
     @classmethod
     def _selection_environment(cls, *, selected=None, capabilities=None):
-        selected = cls.MIXED_PROVIDER_IDS if selected is None else tuple(selected)
-        capabilities = cls.MIXED_PROVIDER_IDS if capabilities is None else tuple(capabilities)
+        selected = cls.INCREMENTAL_PROVIDER_IDS if selected is None else tuple(selected)
+        capabilities = cls.INCREMENTAL_PROVIDER_IDS if capabilities is None else tuple(capabilities)
         configured = ",".join(capabilities)
         return {
             incremental.INCREMENTAL_PROVIDER_IDS_ENV: ",".join(selected),
@@ -158,12 +156,13 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
             incremental.DEPARTURE_CACHE_PROVIDER_IDS_ENV: configured,
         }
 
-    def test_production_selection_contains_exact_mixed_fourteen(self):
+    def test_production_selection_contains_exact_thirteen_cache_providers(self):
         plan = incremental.provider_selection_plan(
             REPOSITORY_ROOT,
             environ=self._selection_environment(),
         )
-        self.assertEqual(plan["selectedProviders"], list(self.MIXED_PROVIDER_IDS))
+        self.assertEqual(plan["selectedProviders"], list(self.INCREMENTAL_PROVIDER_IDS))
+        self.assertNotIn("germany", plan["selectedProviders"])
         self.assertEqual(
             plan["representativeReadinessProviders"],
             list(incremental.REPRESENTATIVE_READINESS_PROVIDER_IDS),
@@ -179,7 +178,7 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
             environ=self._selection_environment(),
         )
         self.assertNotEqual(plan["selectedProviders"], ["israel-mot", "ttc-surface", "ttc-subway"])
-        self.assertEqual(len(plan["selectedProviders"]), 14)
+        self.assertEqual(len(plan["selectedProviders"]), 13)
 
     def test_germany_provider_uses_prepared_source_artifact_and_de_city_scope(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -258,7 +257,7 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
     def test_provider_without_required_capability_fails_closed(self):
         environment = self._selection_environment(
             selected=("ireland",),
-            capabilities=self.MIXED_PROVIDER_IDS,
+            capabilities=self.INCREMENTAL_PROVIDER_IDS,
         )
         with self.assertRaisesRegex(ValueError, "required incremental capabilities"):
             incremental.provider_selection_plan(REPOSITORY_ROOT, environ=environment)
@@ -309,7 +308,7 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
             REPOSITORY_ROOT,
             environ=self._selection_environment(),
         )
-        self.assertEqual(set(plan["capabilityStatus"]), set(self.MIXED_PROVIDER_IDS))
+        self.assertEqual(set(plan["capabilityStatus"]), set(self.INCREMENTAL_PROVIDER_IDS))
         for status in plan["capabilityStatus"].values():
             self.assertEqual(
                 status,
@@ -1085,6 +1084,218 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
                 static_artifact_root=Path(tempfile.mkdtemp()),
                 dates=[date(2026, 9, 10), date(2026, 9, 11)],
                 provider_ids=("israel-mot",),
+            )
+
+    def test_runtime_provider_scope_can_be_narrower_than_cache_scope(self) -> None:
+        selected = incremental.resolve_runtime_provider_ids(
+            REPOSITORY_ROOT,
+            ("germany", "norway", "sweden"),
+            runtime_provider_ids="germany",
+        )
+
+        self.assertEqual(selected, ("germany",))
+
+    def test_germany_runtime_shard_is_independent_of_thirteen_cache_providers(self) -> None:
+        selected = incremental.resolve_runtime_provider_ids(
+            REPOSITORY_ROOT,
+            self.INCREMENTAL_PROVIDER_IDS,
+            runtime_provider_ids="germany",
+        )
+
+        self.assertEqual(selected, ("germany",))
+
+    def test_runtime_provider_scope_rejects_unknown_providers(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unknown runtime providers"):
+            incremental.resolve_runtime_provider_ids(
+                REPOSITORY_ROOT,
+                ("germany", "unknown-runtime-provider"),
+                runtime_provider_ids="unknown-runtime-provider",
+            )
+
+    def test_full_chain_preflight_only_probes_runtime_shard_providers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw_path = root / "provider.zip"
+            raw_path.write_bytes(b"fixture")
+            visited = []
+            sources = {
+                provider_id: {"artifactGroup": "sources"}
+                for provider_id in ("germany", "norway")
+            }
+            with (
+                unittest.mock.patch.object(
+                    incremental,
+                    "provider_selection_plan",
+                    return_value={"selectedProviders": ["germany", "norway"]},
+                ),
+                unittest.mock.patch.object(
+                    incremental,
+                    "validate_incremental_artifact_strategies",
+                    return_value={"germany": incremental.STRUCTURAL_SUFFICIENT},
+                ) as validate_strategies,
+                unittest.mock.patch.object(incremental, "_source_map", return_value=sources),
+                unittest.mock.patch.object(
+                    incremental,
+                    "_raw_entry",
+                    side_effect=lambda _artifacts, provider_id, **_kwargs: (
+                        visited.append(provider_id) or (raw_path, "a" * 64)
+                    ),
+                ),
+                unittest.mock.patch.object(
+                    incremental,
+                    "_provider_cities",
+                    return_value=[{"id": "wuppertal"}],
+                ),
+            ):
+                report = incremental.full_chain_preflight(
+                    repository_root=REPOSITORY_ROOT,
+                    stop_data_root=root / "stop-data",
+                    normalized_cache_root=root / "normalized",
+                    static_artifact_root=root / "static",
+                    dates=[date(2026, 10, 11)],
+                    provider_ids=("germany", "norway"),
+                    runtime_provider_ids=("germany",),
+                    raw_snapshot={},
+                )
+
+            self.assertEqual(report["status"], "PASS")
+            self.assertEqual(report["runtimeProviderIDs"], ["germany"])
+            self.assertEqual([item["providerID"] for item in report["providers"]], ["germany"])
+            self.assertEqual(visited, ["germany"])
+            validate_strategies.assert_called_once_with(
+                REPOSITORY_ROOT,
+                ("germany",),
+            )
+
+    def test_candidate_only_materializes_runtime_provider_shards(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stop_data = root / "stop-data"
+            stop_data.mkdir()
+            (stop_data / "manifest.json").write_text(
+                json.dumps({"releaseID": "release-a", "cities": []}),
+                encoding="utf-8",
+            )
+            artifacts_path = root / "gtfs-artifacts.json"
+            artifacts_path.write_text("{}", encoding="utf-8")
+            raw_path = root / "germany.zip"
+            raw_path.write_bytes(b"fixture")
+            raw_providers = []
+            catalog_provider_ids = []
+            cache_use = SimpleNamespace(
+                status="HIT",
+                resolution_status="HIT",
+                semantic_key="normalized-key",
+                manifest={"normalizedSQLite": {"size": 0}},
+            )
+            structural = SimpleNamespace(
+                status="HIT",
+                duration_seconds=0.0,
+                bytes_written=0,
+                artifact_key="structural-key",
+                database_path=root / "structural.sqlite",
+                manifest={},
+            )
+            temporal = SimpleNamespace(
+                status="HIT",
+                duration_seconds=0.0,
+                bytes_written=0,
+                artifact_key="temporal-key",
+                database_path=root / "temporal.sqlite",
+                manifest={
+                    "dependencies": {
+                        "validFrom": "2026-10-11",
+                        "validThrough": "2026-10-11",
+                    }
+                },
+            )
+            static_use = SimpleNamespace(structural=structural, temporal=temporal)
+
+            def raw_entry(_artifacts, provider_id, **_kwargs):
+                raw_providers.append(provider_id)
+                return raw_path, "a" * 64
+
+            def build_catalog(**kwargs):
+                catalog_provider_ids.extend(item.provider_id for item in kwargs["provider_builds"])
+                raise RuntimeError("intentional stop after provider materialization")
+
+            with (
+                unittest.mock.patch.object(
+                    incremental,
+                    "provider_selection_plan",
+                    return_value={
+                        "selectedProviders": ["germany", "norway"],
+                        "artifactStrategies": {
+                            "germany": incremental.NORMALIZED_REQUIRED,
+                            "norway": incremental.NORMALIZED_REQUIRED,
+                        },
+                    },
+                ),
+                unittest.mock.patch.object(
+                    incremental,
+                    "validate_incremental_artifact_strategies",
+                    return_value={"germany": incremental.NORMALIZED_REQUIRED},
+                ),
+                unittest.mock.patch.object(
+                    incremental,
+                    "_source_map",
+                    return_value={
+                        "germany": {"artifactGroup": "sources"},
+                        "norway": {"artifactGroup": "sources"},
+                    },
+                ),
+                unittest.mock.patch.object(incremental, "_raw_entry", side_effect=raw_entry),
+                unittest.mock.patch.object(
+                    incremental,
+                    "_provider_cities",
+                    return_value=[{"id": "wuppertal"}],
+                ),
+                unittest.mock.patch.object(
+                    incremental,
+                    "load_gtfs_archive",
+                    return_value=Mock(),
+                ),
+                unittest.mock.patch.object(
+                    incremental,
+                    "load_or_build_normalized",
+                    return_value=(Mock(), cache_use),
+                ),
+                unittest.mock.patch.object(
+                    incremental,
+                    "load_or_build_static_provider_artifacts",
+                    return_value=static_use,
+                ),
+                unittest.mock.patch.object(incremental, "_close_provider_resources"),
+                unittest.mock.patch.object(incremental, "_disk_telemetry"),
+                unittest.mock.patch.object(incremental, "_validate_temporal_window"),
+                unittest.mock.patch.object(
+                    incremental,
+                    "_build_common_catalog",
+                    side_effect=build_catalog,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "intentional stop after provider materialization",
+                ):
+                    incremental.build_incremental_candidate(
+                        repository_root=REPOSITORY_ROOT,
+                        release_id="release-a",
+                        releases_root=root / "releases" / "incremental",
+                        stop_data_root=stop_data,
+                        gtfs_artifacts_path=artifacts_path,
+                        normalized_cache_root=root / "normalized",
+                        static_artifact_root=root / "static",
+                        dates=[date(2026, 10, 11)],
+                        provider_ids=("germany", "norway"),
+                        runtime_provider_ids=("germany",),
+                    )
+
+            self.assertEqual(raw_providers, ["germany"])
+            self.assertEqual(catalog_provider_ids, ["germany"])
+            self.assertEqual(
+                list((root / "releases" / "incremental").glob(".release-a.incremental-*")),
+                [],
             )
 
     def test_candidate_release_directory_is_distinct_from_source_generation(self) -> None:

@@ -195,8 +195,13 @@ def preflight(release: Path, build: tuple[str, ...], runtime: tuple[str, ...],
               require_current_schedules: bool = True) -> dict[str, object]:
     release = release.resolve(strict=True)
     manifest = json.loads((release / "release.json").read_text())
-    if set(manifest["providers"]) != set(build):
-        raise ValueError("candidate build membership does not match configuration")
+    published_providers = set(manifest["providers"])
+    if not set(runtime) <= published_providers:
+        raise ValueError("candidate omits a configured runtime provider shard")
+    if not published_providers <= set(build):
+        raise ValueError("candidate publishes a provider outside the build configuration")
+    if "germany" not in published_providers:
+        raise ValueError("candidate omits the Germany shard required by RouteRecall")
     static_image = static_image or docker_json("inspect", static_container)[0]["Image"]
     route_image = docker_json("inspect", route_container)[0]["Image"]
     supported = image_supported_providers(static_image, runtime)
