@@ -8,7 +8,14 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
-from scripts.estimate_provider_disk import forecast_provider_allocations, MIB
+from types import SimpleNamespace
+from unittest import mock
+
+from scripts.estimate_provider_disk import (
+    forecast_full_sqlite_build_cache_misses,
+    forecast_provider_allocations,
+    MIB,
+)
 
 
 class ProviderDiskForecastTests(unittest.TestCase):
@@ -59,3 +66,152 @@ class ProviderDiskForecastTests(unittest.TestCase):
                 plan["providers"][0][layer]["status"] = "INVALID"
                 with self.assertRaises(ValueError):
                     forecast_provider_allocations(plan, None)
+
+    def test_full_sqlite_forecast_charges_only_transformed_cache_misses(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repo"
+            stop_data = root / "stop-data"
+            normalized = root / "provider-artifacts" / "normalized"
+            cache_root = root / "cache" / "external-build"
+            raw = root / "feed.zip"
+            with zipfile.ZipFile(raw, "w") as archive:
+                archive.writestr("stops.txt", b"stop")
+
+            cached_generation = cache_root / "provider" / "old-generation"
+            output = cached_generation / "stops" / "city.json"
+            output.parent.mkdir(parents=True)
+            output.write_bytes(b"s" * (2 * MIB))
+            manifest = {
+                "providerID": "provider",
+                "complete": True,
+                "status": "complete",
+                "cachedOutputs": [
+                    {"path": "stops/city.json", "size": output.stat().st_size}
+                ],
+            }
+            (cached_generation / "manifest.json").write_text(json.dumps(manifest))
+
+            source = {
+                "id": "provider",
+                "artifactGroup": "external",
+                "buildTripIndex": False,
+            }
+            environment = {
+                "HALTEWECKER_INCREMENTAL_PROVIDER_IDS": "provider",
+                "HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS": "provider",
+                "HALTEWECKER_EXTERNAL_BUILD_CACHE": "1",
+                "HALTEWECKER_EXTERNAL_TRANSFORMED_BUILD_CACHE": "1",
+                "HALTEWECKER_EXTERNAL_BUILD_CACHE_ROOT": str(cache_root),
+            }
+            lookup = SimpleNamespace(status="MISS", reason="new raw SHA")
+            key = SimpleNamespace(value="new-cache-key")
+            artifacts = {
+                "external": {
+                    "provider": {
+                        "path": str(raw),
+                        "sha256": "f" * 64,
+                    }
+                }
+            }
+
+            with (
+                mock.patch(
+                    "scripts.run_incremental_provider_pipeline.provider_selection_plan",
+                    return_value={"selectedProviders": ["provider"]},
+                ),
+                mock.patch(
+                    "scripts.run_incremental_provider_pipeline._source_map",
+                    return_value={"provider": source},
+                ),
+                mock.patch(
+                    "scripts.run_incremental_provider_pipeline._raw_entry",
+                    return_value=(raw, "f" * 64),
+                ),
+                mock.patch(
+                    "scripts.run_incremental_provider_pipeline._provider_cities",
+                    return_value=[{"id": "city"}],
+                ),
+                mock.patch(
+                    "scripts.run_incremental_provider_pipeline._probe_external_build_cache",
+                    return_value=(key, lookup, ("city",)),
+                ),
+            ):
+                result = forecast_full_sqlite_build_cache_misses(
+                    repository_root=repository,
+                    stop_data_root=stop_data,
+                    gtfs_artifacts=artifacts,
+                    normalized_cache_root=normalized,
+                    runtime_provider_ids="",
+                    environ=environment,
+                )
+
+            baseline = (
+                (output.stat().st_size + 4095) // 4096 * 4096
+                + ((cached_generation / "manifest.json").stat().st_size + 4095)
+                // 4096
+                * 4096
+            )
+            expected = ((baseline * 5 + 3) // 4 + 4095) // 4096 * 4096
+            self.assertEqual(result["mode"], "full-sqlite-build-cache-only")
+            self.assertEqual(result["runtimeProviders"], [])
+            self.assertEqual(result["additionalBytes"], expected)
+            self.assertEqual(result["providers"][0]["status"], "MISS")
+
+    def test_full_sqlite_forecast_does_not_charge_a_valid_cache_hit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "feed.zip"
+            with zipfile.ZipFile(raw, "w") as archive:
+                archive.writestr("stops.txt", b"stop")
+            source = {
+                "id": "provider",
+                "artifactGroup": "external",
+                "buildTripIndex": False,
+            }
+            environment = {
+                "HALTEWECKER_INCREMENTAL_PROVIDER_IDS": "provider",
+                "HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS": "provider",
+                "HALTEWECKER_EXTERNAL_BUILD_CACHE": "1",
+                "HALTEWECKER_EXTERNAL_TRANSFORMED_BUILD_CACHE": "1",
+                "HALTEWECKER_EXTERNAL_BUILD_CACHE_ROOT": str(root / "cache"),
+            }
+            artifacts = {"external": {"provider": {"path": str(raw)}}}
+
+            with (
+                mock.patch(
+                    "scripts.run_incremental_provider_pipeline.provider_selection_plan",
+                    return_value={"selectedProviders": ["provider"]},
+                ),
+                mock.patch(
+                    "scripts.run_incremental_provider_pipeline._source_map",
+                    return_value={"provider": source},
+                ),
+                mock.patch(
+                    "scripts.run_incremental_provider_pipeline._raw_entry",
+                    return_value=(raw, "f" * 64),
+                ),
+                mock.patch(
+                    "scripts.run_incremental_provider_pipeline._provider_cities",
+                    return_value=[{"id": "city"}],
+                ),
+                mock.patch(
+                    "scripts.run_incremental_provider_pipeline._probe_external_build_cache",
+                    return_value=(
+                        SimpleNamespace(value="hit-key"),
+                        SimpleNamespace(status="HIT", reason="validated cache"),
+                        ("city",),
+                    ),
+                ),
+            ):
+                result = forecast_full_sqlite_build_cache_misses(
+                    repository_root=root / "repo",
+                    stop_data_root=root / "stop-data",
+                    gtfs_artifacts=artifacts,
+                    normalized_cache_root=root / "provider-artifacts" / "normalized",
+                    runtime_provider_ids="",
+                    environ=environment,
+                )
+
+            self.assertEqual(result["additionalBytes"], 0)
+            self.assertEqual(result["providers"][0]["status"], "HIT")

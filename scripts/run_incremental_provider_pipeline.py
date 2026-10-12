@@ -355,17 +355,28 @@ def resolve_runtime_provider_ids(
     configured = runtime_provider_ids
     if configured is None:
         configured = values.get("HALTEWECKER_RUNTIME_PROVIDER_IDS")
-    selected = (
-        _normalize_provider_ids(
-            configured,
-            source_name="HALTEWECKER_RUNTIME_PROVIDER_IDS",
-        )
-        if configured
-        else _normalize_provider_ids(
+    if configured is None:
+        selected = _normalize_provider_ids(
             configured_provider_ids,
             source_name=INCREMENTAL_PROVIDER_IDS_ENV,
         )
-    )
+    elif isinstance(configured, str) and not configured.strip():
+        selected = ()
+    elif not isinstance(configured, str):
+        configured_values = tuple(configured)
+        selected = (
+            _normalize_provider_ids(
+                configured_values,
+                source_name="HALTEWECKER_RUNTIME_PROVIDER_IDS",
+            )
+            if configured_values
+            else ()
+        )
+    else:
+        selected = _normalize_provider_ids(
+            configured,
+            source_name="HALTEWECKER_RUNTIME_PROVIDER_IDS",
+        )
     source_ids = set(_source_map(repository_root))
     unknown = sorted(set(selected) - source_ids)
     if unknown:
@@ -378,6 +389,7 @@ def provider_selection_plan(
     *,
     environ: Mapping[str, str] | None = None,
     provider_ids: Iterable[str] | None = None,
+    require_departure_cache_capabilities: bool = True,
 ) -> dict[str, object]:
     """Validate and describe the configured production incremental scope."""
     values = dict(os.environ if environ is None else environ)
@@ -395,11 +407,15 @@ def provider_selection_plan(
     build_cache_ids = set(
         _environment_provider_ids(values, BUILD_CACHE_PROVIDER_IDS_ENV)
     )
-    departures_v3_ids = set(
-        _environment_provider_ids(values, DEPARTURES_V3_PROVIDER_IDS_ENV)
+    departures_v3_ids = (
+        set(_environment_provider_ids(values, DEPARTURES_V3_PROVIDER_IDS_ENV))
+        if require_departure_cache_capabilities
+        else set()
     )
-    departure_cache_ids = set(
-        _environment_provider_ids(values, DEPARTURE_CACHE_PROVIDER_IDS_ENV)
+    departure_cache_ids = (
+        set(_environment_provider_ids(values, DEPARTURE_CACHE_PROVIDER_IDS_ENV))
+        if require_departure_cache_capabilities
+        else set()
     )
     capability_status: dict[str, dict[str, bool]] = {}
     unsupported: list[str] = []
@@ -412,7 +428,12 @@ def provider_selection_plan(
             "stopSetDigest": provider_id in departure_cache_ids,
         }
         capability_status[provider_id] = status
-        if not all(status.values()) or source.get("buildDepartures") is not True:
+        required_status = (
+            status.values()
+            if require_departure_cache_capabilities
+            else (status["normalized"], status["structural"])
+        )
+        if not all(required_status) or source.get("buildDepartures") is not True:
             unsupported.append(provider_id)
     if unsupported:
         raise ValueError(

@@ -1630,6 +1630,9 @@ forecast_provider_disk() {
     --runtime-provider-ids "${HALTEWECKER_RUNTIME_PROVIDER_IDS-}"
     --normalized-cache-root "${HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT:-$DATA_ROOT/provider-artifacts/normalized}"
     --static-artifact-root "${HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT:-$DATA_ROOT/provider-artifacts/static}")
+  if [[ "$UNIFIED_SQLITE_PIPELINE" == "1" ]]; then
+    forecast_args+=(--full-sqlite)
+  fi
   if [[ -f "$CURRENT_RELEASE/release.json" ]]; then
     forecast_args+=(--active-release "$CURRENT_RELEASE")
   fi

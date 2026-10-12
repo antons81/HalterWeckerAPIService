@@ -320,6 +320,21 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
                 },
             )
 
+    def test_full_sqlite_selection_does_not_require_departure_shard_capabilities(self):
+        environment = self._selection_environment()
+        environment.pop(incremental.DEPARTURES_V3_PROVIDER_IDS_ENV)
+        environment.pop(incremental.DEPARTURE_CACHE_PROVIDER_IDS_ENV)
+
+        plan = incremental.provider_selection_plan(
+            REPOSITORY_ROOT,
+            environ=environment,
+            require_departure_cache_capabilities=False,
+        )
+
+        self.assertEqual(plan["selectedProviders"], list(self.INCREMENTAL_PROVIDER_IDS))
+        self.assertFalse(plan["capabilityStatus"]["norway"]["departuresV3"])
+        self.assertFalse(plan["capabilityStatus"]["norway"]["stopSetDigest"])
+
     def test_artifact_strategy_reports_only_validated_normalized_providers(self):
         plan = incremental.provider_selection_plan(
             REPOSITORY_ROOT,
@@ -1094,6 +1109,15 @@ class IncrementalProviderPipelineTests(unittest.TestCase):
         )
 
         self.assertEqual(selected, ("germany",))
+
+    def test_explicitly_empty_runtime_scope_does_not_fall_back_to_cache_scope(self) -> None:
+        selected = incremental.resolve_runtime_provider_ids(
+            REPOSITORY_ROOT,
+            self.INCREMENTAL_PROVIDER_IDS,
+            runtime_provider_ids="",
+        )
+
+        self.assertEqual(selected, ())
 
     def test_germany_runtime_shard_is_independent_of_thirteen_cache_providers(self) -> None:
         selected = incremental.resolve_runtime_provider_ids(
