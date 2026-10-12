@@ -190,6 +190,28 @@ class ReleaseStateTests(unittest.TestCase):
         self.assertEqual(info.status, "candidate-not-activated")
         self.assertEqual(info.next_stage, "candidate-validation")
 
+    def test_incremental_release_can_resume_with_legacy_stop_data_pointer_and_no_departures_pointer(self) -> None:
+        self._write_state("build")
+        old = self.releases_root / "old"
+        (old / "stop-data").mkdir(parents=True)
+        (old / "stop-data" / "release-marker").write_text("old", encoding="utf-8")
+        (old / "departures.sqlite").write_bytes(b"old")
+        incremental = self.releases_root / "incremental" / "old"
+        incremental.mkdir(parents=True)
+        (incremental / "release.json").write_text(
+            json.dumps({"releaseID": "old"}), encoding="utf-8"
+        )
+        (incremental / "stop-data").symlink_to(Path("../../old/stop-data"))
+        (incremental / "departures.sqlite").symlink_to(Path("../../old/departures.sqlite"))
+        self._link(self.current_release, incremental)
+        self._link(self.current, self.current_release / "stop-data")
+
+        info = self._inspect()
+
+        self.assertEqual(info.status, "candidate-not-activated")
+        self.assertEqual(info.completed_stage, "build")
+        self.assertEqual(info.next_stage, "candidate-validation")
+
     def test_incremental_candidate_layout_is_recognized_as_fully_active(self) -> None:
         candidate = self.releases_root / "incremental" / self.release_id
         (candidate / "stop-data").mkdir(parents=True)

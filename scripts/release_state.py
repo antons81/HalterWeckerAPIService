@@ -604,6 +604,11 @@ def _release_key_from_pointer_path(relative: Path, suffix: str) -> str | None:
     return Path(*release_parts).as_posix()
 
 
+def _release_identity(release_key: str) -> str:
+    """Normalize legacy and incremental paths for the same release ID."""
+    return Path(release_key).name
+
+
 def detect_activation_state(
     *,
     releases_root: Path,
@@ -637,6 +642,8 @@ def detect_activation_state(
 
     primary_names = ("current-release", "current", "departures-current.sqlite")
     primary = [states[name] for name in primary_names]
+    required_primary = [states[name] for name in ("current-release", "current")]
+    departures_pointer = states["departures-current.sqlite"]
     static_kind, static_release = states["static-departures-release"]
     previous_kind, previous_release = states["previous"]
 
@@ -648,23 +655,41 @@ def detect_activation_state(
     if any(kind == "candidate" for kind, _ in primary) or static_kind == "candidate":
         raise ResumeError("partial activation detected in canonical pointers")
 
-    primary_releases = {release for kind, release in primary if kind == "other"}
+    primary_releases = {
+        _release_identity(release)
+        for kind, release in required_primary
+        if kind == "other" and release is not None
+    }
     primary_absent = all(kind == "absent" for kind, _ in primary)
-    primary_coherent = len(primary_releases) == 1 and all(
-        kind == "other" and release in primary_releases for kind, release in primary
+    required_primary_coherent = len(primary_releases) == 1 and all(
+        kind == "other" for kind, _ in required_primary
     )
+    departures_pointer_coherent = departures_pointer[0] == "absent" or (
+        departures_pointer[0] == "other"
+        and departures_pointer[1] is not None
+        and _release_identity(departures_pointer[1]) in primary_releases
+    )
+    primary_coherent = required_primary_coherent and departures_pointer_coherent
     if not (primary_absent or primary_coherent):
         raise ResumeError("canonical pointers are inconsistent before resume")
 
     if static_kind == "other":
-        if not primary_coherent or static_release not in primary_releases:
+        if (
+            not primary_coherent
+            or static_release is None
+            or _release_identity(static_release) not in primary_releases
+        ):
             raise ResumeError("static-departures handoff is inconsistent before resume")
     elif static_kind != "absent":
         raise ResumeError("static-departures handoff is unsafe before resume")
     if previous_kind == "candidate":
         raise ResumeError("previous pointer targets candidate before activation")
     candidate_key = candidate_release_dir.resolve().relative_to(releases_root.resolve()).as_posix()
-    if previous_kind == "other" and previous_release == candidate_key:
+    if (
+        previous_kind == "other"
+        and previous_release is not None
+        and _release_identity(previous_release) == _release_identity(candidate_key)
+    ):
         raise ResumeError("previous pointer targets candidate before activation")
 
     return "candidate-not-activated"

@@ -1220,14 +1220,15 @@ assert callable(validate_validation_receipt)
     def run_disk_stage(self, stage: str, free_gib: int, *, stop_gib: int = 17,
                        artifact_miss_gib: int = 0, fallback_gib: int = 37,
                        estimate_gib: int = 20, has_fallback: bool = True,
-                       active_release_fallback_gib: int | None = None) -> subprocess.CompletedProcess[str]:
+                       active_release_fallback_gib: int | None = None,
+                       unified_sqlite: bool = False) -> subprocess.CompletedProcess[str]:
         fallback_database = self.data_root / "fallback-estimate.sqlite"
         if has_fallback:
             with fallback_database.open("wb") as stream:
                 stream.truncate(fallback_gib * 1024 * 1024 * 1024)
         current_release = self.data_root / "current-release"
         if active_release_fallback_gib is not None:
-            active_release = self.data_root / "releases" / "active"
+            active_release = self.data_root / "releases" / f"active-{free_gib}"
             active_release.mkdir(parents=True)
             with (active_release / "departures.sqlite").open("wb") as stream:
                 stream.truncate(active_release_fallback_gib * 1024 * 1024 * 1024)
@@ -1246,7 +1247,9 @@ assert callable(validate_validation_receipt)
             f'CURRENT_RELEASE="{current_release}"',
             f'DEPARTURES_CURRENT="{fallback_database}"',
             'FROZEN_COMMON_STOP_DATA=0', 'REUSE_STOP_DATA=0',
-            'INCREMENTAL_PRODUCTION=1', 'INCREMENTAL_NO_ACTIVATE=0',
+            f'INCREMENTAL_PRODUCTION={0 if unified_sqlite else 1}',
+            f'UNIFIED_SQLITE_PIPELINE={1 if unified_sqlite else 0}',
+            'INCREMENTAL_NO_ACTIVATE=0',
             'INCREMENTAL_MIGRATION=0',
             f'HALTEWECKER_FALLBACK_DATABASE_ESTIMATE_GB={estimate_gib}',
             f'HALTEWECKER_EXPECTED_ARTIFACT_MISS_KB={artifact_miss_gib * 1024 * 1024}',
@@ -1313,6 +1316,23 @@ assert callable(validate_validation_receipt)
         fallback = self.run_disk_stage('fallback', 44)
         self.assertNotEqual(fallback.returncode, 0)
         self.assertIn('insufficient disk', fallback.stderr)
+
+    def test_unified_sqlite_resume_uses_database_growth_headroom_and_keeps_20_gib_floor(self) -> None:
+        accepted = self.run_disk_stage(
+            'fallback', 72, active_release_fallback_gib=37, unified_sqlite=True,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn('full_sqlite_candidate_kb=', accepted.stdout)
+        self.assertIn('estimate_margin_kb=0', accepted.stdout)
+        self.assertIn('minimum_free_gb=20', accepted.stdout)
+
+    def test_unified_sqlite_resume_still_rejects_space_below_20_gib_floor(self) -> None:
+        rejected = self.run_disk_stage(
+            'fallback', 67, active_release_fallback_gib=37, unified_sqlite=True,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn('minimum_free_gb=20', rejected.stdout)
+        self.assertIn('insufficient disk for full-sqlite-production', rejected.stderr)
 
     def test_stop_data_stage_rejects_insufficient_build_space(self) -> None:
         result = self.run_disk_stage('stop-data', 41)

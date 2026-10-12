@@ -1478,7 +1478,14 @@ proof_disk_preflight() {
       current_stop_data_kb="${current_stop_data_kb:-0}"
     fi
   fi
-  margin_kb=$(( ${HALTEWECKER_PROOF_ESTIMATE_MARGIN_GB:-5} * 1024 * 1024 ))
+  local estimate_margin_default_gb=5
+  if [[ "$UNIFIED_SQLITE_PIPELINE" == "1" && "$budget_stage" == "fallback" ]]; then
+    # The full-SQLite forecast already includes 25% database growth. Once
+    # stop-data is built, avoid charging a second fixed estimate margin while
+    # still enforcing the independent 20 GiB free-space floor.
+    estimate_margin_default_gb=0
+  fi
+  margin_kb=$(( ${HALTEWECKER_PROOF_ESTIMATE_MARGIN_GB:-$estimate_margin_default_gb} * 1024 * 1024 ))
   expected_artifact_miss_kb="${HALTEWECKER_EXPECTED_ARTIFACT_MISS_KB:-0}"
   if ! [[ "$expected_artifact_miss_kb" =~ ^[0-9]+$ && "${HALTEWECKER_PROVIDER_FORECAST_KB:-0}" =~ ^[0-9]+$ ]]; then
     echo "[Nightly] ERROR: artifact allocation estimates must be non-negative integers in KiB" >&2
@@ -1600,7 +1607,7 @@ proof_disk_preflight() {
   fi
   export HALTEWECKER_BUILD_MIN_FREE_GIB=$((minimum_free_kb / 1024 / 1024))
   log_disk_state "before"
-  echo "[Nightly] disk model stage=$budget_stage unavoidable_stop_data_kb=$current_stop_data_kb fallback_database_kb=$fallback_database_kb full_sqlite_candidate_kb=$full_database_kb expected_artifact_miss_kb=$expected_artifact_miss_kb transient_workspace_kb=$transient_workspace_kb safety_reserve_kb=$margin_kb"
+  echo "[Nightly] disk model stage=$budget_stage unavoidable_stop_data_kb=$current_stop_data_kb fallback_database_kb=$fallback_database_kb full_sqlite_candidate_kb=$full_database_kb expected_artifact_miss_kb=$expected_artifact_miss_kb transient_workspace_kb=$transient_workspace_kb estimate_margin_kb=$margin_kb"
   echo "[Nightly] disk estimated_additional_gb=$((estimated_additional_kb / 1024 / 1024)) estimated_stage_free_gb=$((estimated_free_kb / 1024 / 1024)) warning_free_gb=$((warning_free_kb / 1024 / 1024)) minimum_free_gb=$((minimum_free_kb / 1024 / 1024)) mode=$disk_mode reuse_stop_data=$REUSE_STOP_DATA"
   if (( free_kb <= warning_free_kb )); then
     echo "[Nightly] WARNING: disk free is at or below warning threshold for $disk_mode" >&2
