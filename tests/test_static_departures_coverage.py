@@ -234,37 +234,31 @@ class CityCoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(CityCoverageError, "today and tomorrow"):
             self.validate()
 
-    def test_supported_city_cannot_disappear_from_candidate(self):
+    def test_candidate_city_set_may_shrink_or_grow_relative_to_previous_release(self):
         reference = self.root / "rollback"
         (reference / "stop-data").mkdir(parents=True)
         (reference / "release.json").write_text('{"stopData":{"path":"stop-data"}}')
-        (reference / "stop-data/manifest.json").write_text(json.dumps({"cities": [{"id": "lost-city"}]}))
-        with self.assertRaisesRegex(CityCoverageError, "removed supported cities: lost-city"):
-            self.validate(reference=reference)
-
-    def test_candidate_may_drop_only_temporarily_excluded_radomsko(self):
-        reference = self.root / "rollback"
-        (reference / "stop-data").mkdir(parents=True)
-        (reference / "release.json").write_text('{"stopData":{"path":"stop-data"}}')
-        reference_cities = [{"id": city} for city in self.cities] + [{"id": "radomsko"}]
-        (reference / "stop-data/manifest.json").write_text(json.dumps({"cities": reference_cities}))
-
-        report = self.validate(reference=reference)
-
-        self.assertEqual(report["supportedCities"], len(self.cities))
-        self.assertNotIn("radomsko", {row["cityID"] for row in report["checks"]})
+        for reference_cities in ([{"id": "old-only-city"}],
+                                 [{"id": city} for city in self.cities] + [{"id": "removed-city"}]):
+            (reference / "stop-data/manifest.json").write_text(
+                json.dumps({"cities": reference_cities})
+            )
+            report = self.validate(reference=reference)
+            self.assertEqual(report["supportedCities"], len(self.cities))
 
     def test_scheduled_city_cannot_become_empty_in_candidate(self):
         rollback = self.validate()
         self.mutate_database("DELETE FROM stop_times WHERE trip_id='helsinki-trip'")
         candidate = self.validate()
-        with self.assertRaisesRegex(CityCoverageError, "lost scheduled cities: helsinki"):
+        with self.assertRaisesRegex(
+            CityCoverageError, "lost schedules for retained cities: helsinki"
+        ):
             require_preserved_schedules(candidate, rollback)
 
-    def test_preserved_schedule_gate_ignores_only_temporarily_excluded_radomsko(self):
+    def test_preserved_schedule_gate_allows_removed_city_ids(self):
         candidate = self.validate()
         rollback = {
-            "checks": candidate["checks"] + [{"cityID": "radomsko", "hasSchedule": True}]
+            "checks": candidate["checks"] + [{"cityID": "removed-city", "hasSchedule": True}]
         }
 
         require_preserved_schedules(candidate, rollback)

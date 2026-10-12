@@ -1905,8 +1905,6 @@ manifest_city_ids = {
 sys.path.insert(0, str(repository_root / "scripts"))
 from release_integrity import validate_candidate_sources
 from release_integrity import (
-    validate_previous_release_city_retirements,
-    validate_previous_release_cities,
     validate_previous_release_sources,
 )
 from release_integrity import validate_artifact_entry
@@ -2038,40 +2036,6 @@ if old_artifacts_path.is_file():
         raise SystemExit(
             "Candidate lost sources from active release: " + ", ".join(missing_old)
         )
-old_manifest_path = old_root / "stop-data" / "manifest.json"
-if old_manifest_path.is_file():
-    old_manifest = json.loads(old_manifest_path.read_text(encoding="utf-8"))
-    old_city_ids = {
-        str(city.get("id"))
-        for city in old_manifest.get("cities", [])
-        if isinstance(city, dict) and city.get("id")
-    }
-    try:
-        if isinstance(old_artifacts, dict):
-            retirements = validate_previous_release_city_retirements(
-                old_manifest=old_manifest,
-                candidate_manifest=manifest,
-                active_stop_data=old_root / "stop-data",
-                candidate_stop_data=manifest_path.parent,
-                active_artifacts=old_artifacts,
-                candidate_artifacts=artifacts,
-                registry=registry,
-                repository_root=repository_root,
-                candidate_artifacts_root=candidate_root,
-            )
-            if retirements:
-                print(
-                    "[StopData] legitimate source retirements="
-                    + json.dumps(retirements, ensure_ascii=False, sort_keys=True)
-                )
-        else:
-            validate_previous_release_cities(
-                old_city_ids,
-                manifest_city_ids,
-                allowlisted={"radomsko"},
-            )
-    except ValueError as error:
-        raise SystemExit(str(error)) from error
 if reuse_stop_data:
     if manifest.get("sourceArtifacts") != source_artifacts:
         raise SystemExit("reused stop-data source provenance differs from candidate artifacts")

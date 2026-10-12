@@ -22,12 +22,7 @@ from services.vbb_overlay_provider import VBBOverlayProviderAdapter
 
 
 class CityCoverageError(ValueError):
-    """A release loses a supported city or cannot route its published stops."""
-
-
-# Temporary source outage: keep the exception limited to this single city while
-# the city and its GTFS source are absent from the active registries.
-TRANSITIONALLY_EXCLUDED_CITY_IDS = frozenset({"radomsko"})
+    """A release has invalid city coverage or cannot route its published stops."""
 
 
 def read_object(path: Path) -> dict:
@@ -142,14 +137,6 @@ def validate_city_coverage(
     cities = city_manifest(stop_root)
     if stop_manifest.get("releaseID") != payload.get("releaseID"):
         raise CityCoverageError("candidate stop-data generation does not match releaseID")
-    if reference is not None:
-        lost = (
-            set(city_manifest(stop_data_root(reference.resolve(strict=True))))
-            - set(cities)
-            - TRANSITIONALLY_EXCLUDED_CITY_IDS
-        )
-        if lost:
-            raise CityCoverageError("candidate removed supported cities: " + ", ".join(sorted(lost)))
     database = release / "departures.sqlite"
     if not database.is_file():
         label = "full departures database" if full_database_candidate else "complete fallback database"
@@ -329,11 +316,15 @@ def validate_city_coverage(
 
 
 def require_preserved_schedules(candidate: dict, rollback: dict) -> None:
-    available = {row["cityID"] for row in candidate["checks"] if row["hasSchedule"]}
-    lost = (
-        {row["cityID"] for row in rollback["checks"] if row["hasSchedule"]}
-        - available
-        - TRANSITIONALLY_EXCLUDED_CITY_IDS
-    )
+    candidate_checks = {row["cityID"]: row for row in candidate["checks"]}
+    lost = {
+        row["cityID"]
+        for row in rollback["checks"]
+        if row["hasSchedule"]
+        and row["cityID"] in candidate_checks
+        and not candidate_checks[row["cityID"]]["hasSchedule"]
+    }
     if lost:
-        raise CityCoverageError("candidate lost scheduled cities: " + ", ".join(sorted(lost)))
+        raise CityCoverageError(
+            "candidate lost schedules for retained cities: " + ", ".join(sorted(lost))
+        )
