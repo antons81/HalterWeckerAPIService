@@ -155,11 +155,14 @@ def validate_previous_release_sources(
 def validate_previous_release_cities(
     old_city_ids: Iterable[str],
     candidate_city_ids: set[str],
+    *,
+    allowlisted: Iterable[str] = (),
 ) -> None:
+    allowed = set(allowlisted)
     missing = sorted(
         city_id
         for city_id in set(old_city_ids)
-        if city_id not in candidate_city_ids
+        if city_id not in candidate_city_ids and city_id not in allowed
     )
     if missing:
         raise ValueError("Candidate lost cities from active release: " + ", ".join(missing))

@@ -2065,7 +2065,11 @@ if old_manifest_path.is_file():
                     + json.dumps(retirements, ensure_ascii=False, sort_keys=True)
                 )
         else:
-            validate_previous_release_cities(old_city_ids, manifest_city_ids)
+            validate_previous_release_cities(
+                old_city_ids,
+                manifest_city_ids,
+                allowlisted={"radomsko"},
+            )
     except ValueError as error:
         raise SystemExit(str(error)) from error
 if reuse_stop_data:
