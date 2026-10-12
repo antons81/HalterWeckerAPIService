@@ -39,6 +39,13 @@ class StopDataPipelineTests(unittest.TestCase):
         (self.data_root / "current" / "release-marker").write_text("old", encoding="utf-8")
         self.environment_file = self.root / "stop-data.env"
         self.environment_file.write_text("", encoding="utf-8")
+        self.route_compose_file = self.root / "routerecall-api.compose.yml"
+        self.route_compose_file.write_text(
+            "services:\n  routerecall-api:\n    image: ${ROUTERECALL_IMAGE_REF:-routerecall-api:local}\n"
+            "    environment:\n      ROUTERECALL_DATABASE: ${ROUTERECALL_DATABASE:-/data/haltewecker/current-release/departures.sqlite}\n"
+            "      ROUTERECALL_PROVIDER_RUNTIME: ${ROUTERECALL_PROVIDER_RUNTIME:-1}\n",
+            encoding="utf-8",
+        )
         self.bin_directory = self.root / "bin"
         self.bin_directory.mkdir()
         self.systemctl_log = self.root / "systemctl.log"
@@ -51,6 +58,19 @@ exec \"$@\"
         self.write_mock("flock", """#!/usr/bin/env bash
 [ "${FLOCK_FAIL:-0}" != "1" ] || exit 1
 exit 0
+""")
+        self.write_mock("docker", """#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "inspect" ]; then
+  if [[ "$*" == *routerecall-api* ]]; then
+    printf '%s\\n' 'sha256:test-route-image'
+  else
+    printf '%s\\n' 'sha256:test-static-image'
+  fi
+  exit 0
+fi
+echo "unexpected docker invocation: $*" >&2
+exit 64
 """)
         self.write_mock("df", """#!/usr/bin/env bash
 if [ -n "${DF_FREE_KB:-}" ]; then
@@ -79,6 +99,15 @@ case \"${1:-}\" in
     ;;
   *estimate_provider_disk.py)
     printf '%s\\n' "${FORECAST_KB:-0}"
+    ;;
+  *estimate_full_sqlite_disk.py)
+    printf '{"candidateStopDataKiB":0}\\n'
+    ;;
+  *validate_shared_release_consumers.py)
+    printf '%s\\n' "$*" >> "$CONSUMER_PREFLIGHT_CALLS_LOG"
+    [ "${CONSUMER_PREFLIGHT_FAIL:-0}" != "1" ] || exit 1
+    printf '{"status":"PASS","candidate":{"staticImage":"sha256:test-static-image","routeImage":"sha256:test-route-image"}}\\n'
+    exit 0
     ;;
   *deduplicate_stop_data.py)
     exec \"$REAL_PYTHON\" \"$@\"
@@ -432,14 +461,15 @@ PY
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
-    def test_service_keeps_cache_scope_broad_and_runtime_shard_scope_to_germany(self) -> None:
+    def test_service_keeps_only_cache_providers_and_shared_sqlite_runtime(self) -> None:
         service = NIGHTLY_SERVICE.read_text(encoding="utf-8")
 
         self.assertIn(
             f"Environment=HALTEWECKER_INCREMENTAL_PROVIDER_IDS={INCREMENTAL_PROVIDERS}",
             service,
         )
-        self.assertIn("Environment=HALTEWECKER_RUNTIME_PROVIDER_IDS=germany", service)
+        self.assertIn("Environment=HALTEWECKER_RUNTIME_PROVIDER_IDS=", service)
+        self.assertIn("Environment=HALTEWECKER_INCREMENTAL_MIN_FREE_GB=20", service)
 
     def test_stop_data_fingerprint_is_deterministic_and_exposes_components(self) -> None:
         first = build_fingerprint.compute(REPOSITORY_ROOT)
@@ -570,6 +600,7 @@ PY
             "STOP_DATA_LOCK": str(self.root / "stop-data.lock"),
             "STATIC_DEPARTURES_LOCK": str(self.root / "static-departures.lock"),
             "STOP_DATA_ENV_FILE": str(self.environment_file),
+            "ROUTERECALL_COMPOSE_FILE": str(self.route_compose_file),
             "SYSTEMCTL_LOG": str(self.systemctl_log),
             "BUILD_ARGS_LOG": str(self.root / "build-args.log"),
             "BUILD_CALLS_LOG": str(self.root / "build-calls.log"),
@@ -580,6 +611,7 @@ PY
             "INCREMENTAL_ENV_CALLS_LOG": str(self.root / "incremental-env-calls.log"),
             "STATIC_CALLS_LOG": str(self.root / "static-calls.log"),
             "STATIC_IMPORT_SETTINGS_LOG": str(self.root / "static-import-settings.log"),
+            "CONSUMER_PREFLIGHT_CALLS_LOG": str(self.root / "consumer-preflight-calls.log"),
             "RUNTIME_PROVIDER_CALLS_LOG": str(self.root / "runtime-provider-calls.log"),
             "STAGED_STOP_DATA_LOG": str(self.root / "staged-stop-data.log"),
             "STATIC_DEPARTURES_PIPELINE": str(self.bin_directory / "static-departures-pipeline"),
@@ -673,6 +705,10 @@ assert callable(validate_validation_receipt)
         old_stop_data.mkdir(parents=True)
         (old_stop_data / "release-marker").write_text("old", encoding="utf-8")
         (old_release / "departures.sqlite").write_bytes(b"old")
+        (old_release / "release.json").write_text(
+            json.dumps({"releaseID": "old", "stopData": {"path": "stop-data"}}),
+            encoding="utf-8",
+        )
         current = self.data_root / "current"
         (current / "release-marker").unlink()
         current.rmdir()
@@ -690,7 +726,11 @@ assert callable(validate_validation_receipt)
             for path in (self.data_root / "releases").iterdir()
             if path.is_dir() and path.name not in {"old", "incremental"}
         ]
-        self.assertEqual(len(releases), 1)
+        self.assertEqual(
+            len(releases),
+            1,
+            f"expected one candidate release; found {[path.name for path in releases]}",
+        )
         return releases[0].name
 
     def prepare_reusable_current_release(self) -> tuple[Path, str]:
@@ -744,10 +784,9 @@ assert callable(validate_validation_receipt)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
-            "stage=cache-policy schema=3 "
+            "stage=cache-policy mode=full-sqlite "
             f"incrementalProviders={INCREMENTAL_PROVIDERS} "
-            f"providers={INCREMENTAL_PROVIDERS} "
-            f"allowlist={INCREMENTAL_PROVIDERS}",
+            "runtimeProviders=none duplicateDepartureCache=disabled",
             result.stdout,
         )
         self.assertIn("stage=legacy-import status=PASS", result.stdout)
@@ -765,6 +804,8 @@ assert callable(validate_validation_receipt)
             (self.root / "static-calls.log").read_text(encoding="utf-8").splitlines(),
             ["0"],
         )
+        consumer_preflight = (self.root / "consumer-preflight-calls.log").read_text(encoding="utf-8")
+        self.assertIn("--build-providers  --runtime-providers", consumer_preflight)
         release_id = self.candidate_release_id()
         release_dir = self.data_root / "releases" / release_id
         settings = (self.root / "static-import-settings.log").read_text(encoding="utf-8").splitlines()
@@ -772,62 +813,63 @@ assert callable(validate_validation_receipt)
         self.assertTrue((release_dir / "departures.sqlite").is_file())
         self.assertFalse((release_dir / "departures-next.sqlite").exists())
 
-    def test_invalid_incremental_candidate_does_not_switch_published_pointers(self) -> None:
+    def test_consumer_preflight_failure_does_not_switch_published_pointers(self) -> None:
         self.configure_resume_pointer_layout()
         old_release = os.readlink(self.data_root / "current-release")
         old_stops = os.readlink(self.data_root / "current")
         result = self.run_pipeline(
             USE_DEFAULT_PRODUCTION="1",
             HALTEWECKER_ACTIVATION_DRY_RUN="1",
-            INCREMENTAL_CANDIDATE_INVALID="1",
+            CONSUMER_PREFLIGHT_FAIL="1",
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(os.readlink(self.data_root / "current-release"), old_release)
         self.assertEqual(os.readlink(self.data_root / "current"), old_stops)
 
-    def test_configured_provider_override_cannot_activate_without_germany(self) -> None:
+    def test_incremental_cache_allowlist_rejects_unapproved_provider(self) -> None:
         self.configure_resume_pointer_layout()
         previous_release = os.readlink(self.data_root / "current-release")
         previous_stops = os.readlink(self.data_root / "current")
         result = self.run_pipeline(
             USE_DEFAULT_PRODUCTION="1", HALTEWECKER_ACTIVATION_DRY_RUN="1",
-            HALTEWECKER_INCREMENTAL_PROVIDER_IDS=INCREMENTAL_PROVIDERS,
-            INCREMENTAL_CANDIDATE_WITHOUT_GERMANY="1",
+            HALTEWECKER_INCREMENTAL_PROVIDER_IDS=INCREMENTAL_PROVIDERS + ",germany",
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("mandatory build provider germany is missing", result.stderr)
+        self.assertIn("allowlist must match the 13 approved providers", result.stderr)
         self.assertEqual(os.readlink(self.data_root / "current-release"), previous_release)
         self.assertEqual(os.readlink(self.data_root / "current"), previous_stops)
 
-    def test_build_providers_are_not_forwarded_to_runtime(self) -> None:
+    def test_incremental_cache_providers_are_not_runtime_shards(self) -> None:
         self.configure_resume_pointer_layout()
         result = self.run_pipeline(USE_DEFAULT_PRODUCTION="1", HALTEWECKER_ACTIVATION_DRY_RUN="1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("buildProviders=" + BUILD_PROVIDERS, result.stdout)
-        self.assertIn("runtimeProviders=germany", result.stdout)
-        self.assertIn("--fallback-database", (self.root / "incremental-calls.log").read_text())
+        self.assertIn("runtimeProviders=none duplicateDepartureCache=disabled", result.stdout)
+        self.assertFalse((self.root / "incremental-calls.log").exists())
+        preflight = (self.root / "consumer-preflight-calls.log").read_text(encoding="utf-8")
+        self.assertIn("--build-providers  --runtime-providers", preflight)
 
-    def test_runtime_provider_outside_build_does_not_switch_pointer(self) -> None:
+    def test_stale_runtime_provider_setting_is_ignored_for_full_sqlite(self) -> None:
         self.configure_resume_pointer_layout()
         previous = os.readlink(self.data_root / "current-release")
         result = self.run_pipeline(
             USE_DEFAULT_PRODUCTION="1", HALTEWECKER_ACTIVATION_DRY_RUN="1",
             HALTEWECKER_RUNTIME_PROVIDER_IDS="unconfigured-provider",
         )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("runtime providers are absent from the build", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("runtimeProviders=none", result.stdout)
         self.assertEqual(os.readlink(self.data_root / "current-release"), previous)
 
-    def test_stale_runtime_without_germany_stops_before_heavy_build(self) -> None:
+    def test_germany_remains_a_standard_full_sqlite_import(self) -> None:
         self.configure_resume_pointer_layout()
         previous = os.readlink(self.data_root / "current-release")
         result = self.run_pipeline(
             USE_DEFAULT_PRODUCTION="1",
+            HALTEWECKER_ACTIVATION_DRY_RUN="1",
             HALTEWECKER_RUNTIME_PROVIDER_IDS=INCREMENTAL_PROVIDERS,
         )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Germany must be enabled", result.stderr)
-        self.assertFalse((self.root / "build-calls.log").exists())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("mode=full-sqlite", result.stdout)
+        self.assertTrue((self.root / "build-calls.log").is_file())
         self.assertEqual(os.readlink(self.data_root / "current-release"), previous)
 
     def test_dry_run_preserves_retained_rollback_pointer(self) -> None:
@@ -857,19 +899,20 @@ assert callable(validate_validation_receipt)
     def test_incremental_floor_is_configurable_and_defaults_to_20(self) -> None:
         self.configure_resume_pointer_layout()
         migration = self.run_pipeline(
+            "--incremental",
             USE_DEFAULT_PRODUCTION="1",
             HALTEWECKER_ACTIVATION_DRY_RUN="1",
-            HALTEWECKER_INCREMENTAL_MIGRATION="1",
             HALTEWECKER_PROOF_ESTIMATE_MARGIN_GB="0",
             DF_FREE_KB=str(50 * 1024 * 1024),
         )
 
         self.assertEqual(migration.returncode, 0, migration.stderr)
-        self.assertIn("mode=incremental-migration", migration.stdout)
+        self.assertIn("mode=full-sqlite-production", migration.stdout)
         self.assertIn("minimum_free_gb=20", migration.stdout)
         self.assertIn("pointerSwitch=NOT_RUN", migration.stdout)
 
         scheduled = self.run_pipeline(
+            "--incremental",
             USE_DEFAULT_PRODUCTION="1",
             HALTEWECKER_ACTIVATION_DRY_RUN="1",
             HALTEWECKER_PROOF_ESTIMATE_MARGIN_GB="0",
@@ -877,9 +920,9 @@ assert callable(validate_validation_receipt)
         )
 
         self.assertNotEqual(scheduled.returncode, 0)
-        self.assertIn("mode=incremental-production", scheduled.stdout)
+        self.assertIn("mode=full-sqlite-production", scheduled.stdout)
         self.assertIn("minimum_free_gb=20", scheduled.stdout)
-        self.assertIn("insufficient disk for incremental-production", scheduled.stderr)
+        self.assertIn("insufficient disk for full-sqlite-production", scheduled.stderr)
 
         lowered = self.run_pipeline(
             USE_DEFAULT_PRODUCTION="1",
@@ -888,36 +931,35 @@ assert callable(validate_validation_receipt)
             HALTEWECKER_PROOF_ESTIMATE_MARGIN_GB="0",
             DF_FREE_KB=str(38 * 1024 * 1024),
         )
-        self.assertEqual(lowered.returncode, 0, lowered.stderr)
-        self.assertIn("mode=incremental-production", lowered.stdout)
-        self.assertIn("minimum_free_gb=15", lowered.stdout)
+        self.assertNotEqual(lowered.returncode, 0)
+        self.assertIn("must be an integer of at least 20", lowered.stderr)
 
-    def test_incremental_floor_rejects_values_below_15_before_build(self) -> None:
+    def test_incremental_floor_rejects_values_below_20_before_build(self) -> None:
         result = self.run_pipeline(
             USE_DEFAULT_PRODUCTION="1",
-            HALTEWECKER_INCREMENTAL_MIN_FREE_GB="14",
+            HALTEWECKER_INCREMENTAL_MIN_FREE_GB="19",
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("must be an integer of at least 15", result.stderr)
+        self.assertIn("must be an integer of at least 20", result.stderr)
         self.assertFalse((self.root / "build-calls.log").exists())
 
-    def test_incremental_cache_policy_overrides_stale_env_allowlist(self) -> None:
+    def test_unified_sqlite_cache_policy_overrides_stale_env_allowlist(self) -> None:
         self.environment_file.write_text(
             "HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS=cta-chicago\n",
             encoding="utf-8",
         )
 
         result = self.run_pipeline(
-            "--incremental-no-activate",
+            "--incremental",
+            HALTEWECKER_ACTIVATION_DRY_RUN="1",
             HALTEWECKER_MIN_FREE_GB="35",
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
-            "stage=cache-policy schema=3 "
+            "stage=cache-policy mode=full-sqlite "
             f"incrementalProviders={INCREMENTAL_PROVIDERS} "
-            f"providers={INCREMENTAL_PROVIDERS} "
-            f"allowlist={INCREMENTAL_PROVIDERS}",
+            "runtimeProviders=none duplicateDepartureCache=disabled",
             result.stdout,
         )
 
@@ -986,8 +1028,9 @@ assert callable(validate_validation_receipt)
         self.assertIn("mode=production-shaped-no-activate", result.stdout)
         self.assertIn("minimum_free_gb=20", result.stdout)
         self.assertIn("stage=legacy-import status=PASS", result.stdout)
-        self.assertIn("stage=incremental-metadata status=PASS", result.stdout)
         self.assertIn("activation=NOT_RUN", result.stdout)
+        self.assertIn("stage=incremental-candidate-validation status=PASS", result.stdout)
+        self.assertIn("mode=full-sqlite-no-activate", result.stdout)
         self.assertEqual(
             (self.data_root / "current" / "release-marker").read_text(encoding="utf-8"),
             "old",
@@ -996,30 +1039,11 @@ assert callable(validate_validation_receipt)
         self.assertFalse((self.data_root / "departures-current.sqlite").exists())
         self.assertEqual((self.root / "static-calls.log").read_text().splitlines(), ["0"])
 
-        calls = (self.root / "incremental-calls.log").read_text(encoding="utf-8")
-        self.assertIn("--result-json", calls)
-        module_call = (self.root / "incremental-module-calls.log").read_text(encoding="utf-8")
-        self.assertEqual(
-            module_call.strip(),
-            f"module=scripts.run_incremental_provider_pipeline cwd={REPOSITORY_ROOT} pythonpath=",
-        )
-        release_id = next(
-            path.name
-            for path in (self.data_root / "releases").iterdir()
-            if (path / "stop-data" / "manifest.json").is_file()
-        )
+        self.assertFalse((self.root / "incremental-calls.log").exists())
+        release_id = self.candidate_release_id()
         release_dir = self.data_root / "releases" / release_id
-        result_metadata = json.loads(
-            (release_dir / "incremental-result.json").read_text(encoding="utf-8")
-        )
-        self.assertEqual(result_metadata["releaseID"], release_id)
-        self.assertEqual(result_metadata["stopData"]["releaseID"], release_id)
-        self.assertEqual(
-            result_metadata["stopData"]["buildFingerprint"],
-            "test-build-fingerprint",
-        )
-        candidate = Path(result_metadata["releaseDirectory"])
-        self.assertTrue((candidate / "release.json").is_file())
+        self.assertTrue((release_dir / "departures.sqlite").is_file())
+        self.assertFalse((release_dir / "departures-next.sqlite").exists())
 
         reports = sorted((self.data_root / "pipeline-diagnostics").glob("*.report"))
         self.assertEqual(len(reports), 1)
@@ -1146,37 +1170,19 @@ assert callable(validate_validation_receipt)
         self.assertIn("stage=nightly-complete status=PASS", result.stdout)
         self.assertIn("activation=NOT_RUN", result.stdout)
         self.assertFalse((self.root / "build-calls.log").exists())
-        calls = (self.root / "incremental-calls.log").read_text(encoding="utf-8")
-        self.assertIn("--raw-snapshot-manifest", calls)
-        self.assertIn(str(raw_manifest), calls)
-        self.assertIn("--common-snapshot-fingerprint", calls)
-        self.assertIn(fingerprint, calls)
-        self.assertIn("--trusted-common-stop-data", calls)
-        self.assertIn(str(trusted_common_stop_data), calls)
-        environment = (self.root / "incremental-env-calls.log").read_text(encoding="utf-8")
-        self.assertIn("HALTEWECKER_EXTERNAL_BUILD_CACHE=1", environment)
+        self.assertFalse((self.root / "incremental-calls.log").exists())
         self.assertIn(
-            f"HALTEWECKER_EXTERNAL_BUILD_CACHE_ROOT={cache_root / 'external-build'}",
-            environment,
+            "stage=cache-policy mode=full-sqlite",
+            result.stdout,
         )
-        self.assertIn(
-            f"HALTEWECKER_PROVIDER_ARTIFACT_ROOT={provider_artifact_root}",
-            environment,
-        )
-        self.assertIn(
-            f"HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT={provider_artifact_root / 'normalized'}",
-            environment,
-        )
-        self.assertIn(
-            f"HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT={provider_artifact_root / 'static'}",
-            environment,
-        )
+        self.assertTrue((self.data_root / "releases" / self.candidate_release_id() / "departures.sqlite").is_file())
+        self.assertEqual((self.root / "static-calls.log").read_text(encoding="utf-8").splitlines(), ["0"])
         self.assertFalse((self.root / "systemctl.log").exists())
 
     def test_production_shaped_incremental_failure_cleans_candidate_and_keeps_pointers(self) -> None:
         result = self.run_pipeline(
             "--incremental-no-activate",
-            INCREMENTAL_FAIL="1",
+            STATIC_IMPORT_FAIL="1",
         )
 
         self.assertNotEqual(result.returncode, 0)
@@ -1198,7 +1204,7 @@ assert callable(validate_validation_receipt)
     def test_production_shaped_readiness_failure_keeps_pointers_unchanged(self) -> None:
         result = self.run_pipeline(
             "--incremental-no-activate",
-            INCREMENTAL_READINESS_FAIL="1",
+            CONSUMER_PREFLIGHT_FAIL="1",
         )
 
         self.assertNotEqual(result.returncode, 0)
@@ -1255,7 +1261,7 @@ assert callable(validate_validation_receipt)
             '\nactivate_incremental_production() {')]
         with tempfile.TemporaryDirectory() as directory:
             for minimum_gib, free_gib, expected in (
-                (20, 24, 1), (20, 25, 0), (15, 19, 1), (15, 20, 0),
+                (20, 24, 1), (20, 25, 0), (19, 100, 1),
             ):
                 script = ('DATA_ROOT="' + directory + '"\n' +
                           'HALTEWECKER_INCREMENTAL_MIN_FREE_GB="' + str(minimum_gib) + '"\n' +
@@ -1350,7 +1356,8 @@ assert callable(validate_validation_receipt)
         self.assertEqual(reused.returncode, 0, reused.stderr)
         self.assertIn(f"stage=stop-data-reuse status=PASS release={release_id}", reused.stdout)
         self.assertIn("stage=stop-data-build status=SKIPPED", reused.stdout)
-        self.assertIn("stage=incremental-provider status=PASS", reused.stdout)
+        self.assertIn("stage=legacy-import status=PASS", reused.stdout)
+        self.assertFalse((self.root / "incremental-calls.log").exists())
         self.assertEqual(
             (self.root / "build-calls.log").read_text(encoding="utf-8").splitlines(),
             ["build"],
@@ -1370,25 +1377,20 @@ assert callable(validate_validation_receipt)
         self.assertFalse((self.root / "build-calls.log").exists())
         self.assertEqual((self.data_root / "current/release-marker").read_text(), "old")
 
-    def test_failure_preserves_already_published_incremental_candidate(self) -> None:
+    def test_failed_full_sqlite_candidate_is_cleaned_without_touching_current_release(self) -> None:
         result = self.run_pipeline(
             "--no-activate",
-            INCREMENTAL_FAIL="1",
-            INCREMENTAL_PUBLISHED="1",
+            STATIC_IMPORT_FAIL="1",
         )
 
         self.assertNotEqual(result.returncode, 0)
-        incremental_root = self.data_root / "releases" / "incremental"
-        published = list(incremental_root.glob("*/release.json"))
-        self.assertEqual(len(published), 1)
-        generation = self.data_root / "releases" / published[0].parent.name
-        self.assertTrue((generation / "stop-data" / "manifest.json").is_file())
+        self.assertEqual((self.data_root / "current" / "release-marker").read_text(), "old")
+        self.assertFalse((self.data_root / "current-release").exists())
+        self.assertFalse((self.data_root / "departures-current.sqlite").exists())
+        self.assertEqual(list((self.data_root / "releases").iterdir()), [])
         reports = sorted((self.data_root / "pipeline-diagnostics").glob("*.report"))
         self.assertEqual(len(reports), 1)
-        self.assertIn(
-            "preserved published_incremental_release=",
-            reports[0].read_text(encoding="utf-8"),
-        )
+        self.assertIn("cleanup_actions=removed release_dir=", reports[0].read_text(encoding="utf-8"))
 
     def test_stop_data_only_failure_cleans_new_generation_only(self) -> None:
         result = self.run_pipeline("--stop-data-only", BUILD_FAIL="1")
@@ -1411,36 +1413,33 @@ assert callable(validate_validation_receipt)
         stderr_log = next((self.data_root / "pipeline-diagnostics").glob("*.stderr.log"))
         self.assertIn("stage=cleanup status=PASS", stderr_log.read_text(encoding="utf-8"))
 
-    def test_no_activate_proof_skips_legacy_database_and_runs_incremental_first(self) -> None:
-        result = self.run_pipeline("--no-activate", STATIC_IMPORT_FAIL="1")
+    def test_no_activate_builds_and_validates_full_sqlite_candidate_without_activation(self) -> None:
+        result = self.run_pipeline("--no-activate")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)
-        self.assertIn("stage=incremental-provider status=PASS", result.stdout)
+        self.assertIn("stage=legacy-import status=PASS", result.stdout)
+        self.assertIn("mode=full-sqlite-no-activate", result.stdout)
         self.assertIn("disk phase=before", result.stdout)
         self.assertIn("disk phase=after", result.stdout)
         self.assertIn("disk phase=peak", result.stdout)
-        self.assertFalse((self.root / "static-calls.log").exists())
-        self.assertTrue((self.root / "incremental-calls.log").is_file())
+        self.assertTrue((self.root / "static-calls.log").is_file())
+        self.assertFalse((self.root / "incremental-calls.log").exists())
         release_id = self.candidate_release_id()
         release_dir = self.data_root / "releases" / release_id
-        self.assertFalse((release_dir / "departures.sqlite").exists())
+        self.assertTrue((release_dir / "departures.sqlite").is_file())
         self.assertEqual(
             (self.data_root / "current" / "release-marker").read_text(),
             "old",
         )
         self.assertFalse((self.data_root / "current-release").exists())
 
-    def test_no_activate_failure_cleans_source_and_incremental_generations(self) -> None:
-        result = self.run_pipeline("--no-activate", INCREMENTAL_FAIL="1")
+    def test_no_activate_import_failure_cleans_full_candidate_generation(self) -> None:
+        result = self.run_pipeline("--no-activate", STATIC_IMPORT_FAIL="1")
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)
+        self.assertIn("stage=legacy-import status=started", result.stdout)
         releases_root = self.data_root / "releases"
-        incremental_root = self.data_root / "releases" / "incremental"
-        self.assertFalse([path for path in releases_root.iterdir() if path != incremental_root])
-        self.assertTrue(incremental_root.is_dir())
-        self.assertFalse(list(incremental_root.glob("*")))
+        self.assertFalse(list(releases_root.iterdir()))
         self.assertEqual(
             (self.data_root / "current" / "release-marker").read_text(),
             "old",
@@ -1547,7 +1546,7 @@ assert callable(validate_validation_receipt)
         self.assertIn("kyiv", json.loads((output / "manifest.json").read_text())["cities"][0]["id"])
         self.assertTrue((output / "transit" / "city-lines" / "kyiv.json").is_file())
 
-    def test_reuse_stop_data_skips_build_and_legacy_import_without_mutating_source(self) -> None:
+    def test_reuse_stop_data_skips_rebuild_and_imports_full_database_without_mutating_source(self) -> None:
         source, release_id = self.prepare_reusable_current_release()
         source_manifest = (source / "manifest.json").read_bytes()
         source_metadata = (source.parent / "release-metadata.json").read_bytes()
@@ -1556,33 +1555,34 @@ assert callable(validate_validation_receipt)
         result = self.run_pipeline(
             "--no-activate",
             "--reuse-stop-data",
-            STATIC_IMPORT_FAIL="1",
             REUSE_STOP_DATA="1",
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("stage=stop-data-build status=SKIPPED", result.stdout)
         self.assertIn("stage=validation status=PASS", result.stdout)
-        self.assertIn("stage=legacy-import status=SKIPPED", result.stdout)
+        self.assertIn("stage=legacy-import status=PASS", result.stdout)
         self.assertIn("stage=stop-data-reuse status=UNCHANGED", result.stdout)
         self.assertIn("reuse_stop_data=1", result.stdout)
+        self.assertFalse((self.root / "incremental-calls.log").exists())
         self.assertEqual(
             (self.root / "build-calls.log").read_text(encoding="utf-8").splitlines(),
             ["build"],
         )
         self.assertEqual(
             (self.root / "static-calls.log").read_text(encoding="utf-8").splitlines(),
-            static_calls_before,
+            static_calls_before + ["0"],
         )
         self.assertEqual((source / "manifest.json").read_bytes(), source_manifest)
         self.assertEqual((source.parent / "release-metadata.json").read_bytes(), source_metadata)
         self.assertEqual(os.path.realpath(self.data_root / "current"), str(source))
 
-        reuse_candidates = list((self.data_root / "releases" / "incremental").glob("reuse-*"))
+        reuse_candidates = [
+            path for path in (self.data_root / "releases").iterdir()
+            if path.name.startswith(".no-activate-")
+        ]
         self.assertEqual(len(reuse_candidates), 1)
-        stop_data_reference = reuse_candidates[0] / release_id / "stop-data"
-        self.assertTrue(stop_data_reference.is_symlink())
-        self.assertEqual(os.path.realpath(stop_data_reference), str(source))
+        self.assertTrue((reuse_candidates[0] / "departures.sqlite").is_file())
 
     def test_reuse_stop_data_requires_explicit_published_current_symlink(self) -> None:
         current = self.data_root / "current"
@@ -1618,7 +1618,7 @@ assert callable(validate_validation_receipt)
         result = self.run_pipeline(
             "--no-activate",
             "--reuse-stop-data",
-            INCREMENTAL_FAIL="1",
+            STATIC_IMPORT_FAIL="1",
             REUSE_STOP_DATA="1",
         )
 
@@ -1627,9 +1627,7 @@ assert callable(validate_validation_receipt)
         self.assertTrue(source.is_dir())
         self.assertEqual((source / "manifest.json").read_bytes(), source_manifest)
         self.assertEqual(os.path.realpath(self.data_root / "current"), str(source))
-        reuse_candidates = list((self.data_root / "releases" / "incremental").glob("reuse-*"))
-        self.assertEqual(len(reuse_candidates), 1)
-        self.assertFalse(list(reuse_candidates[0].iterdir()))
+        self.assertFalse(list((self.data_root / "releases").glob(".no-activate-*")))
 
     def test_validation_failure_does_not_trigger_static_departures(self) -> None:
         result = self.run_pipeline(BUILD_INVALID="1")
@@ -1731,7 +1729,6 @@ assert callable(validate_validation_receipt)
             "candidate-validation",
             "static-departures",
             "handoff-readiness",
-            "commit",
         ):
             with self.subTest(stage=stage):
                 if stage != "build":
@@ -1739,31 +1736,43 @@ assert callable(validate_validation_receipt)
                     self.setUp()
                 self.configure_resume_pointer_layout()
                 interrupted = self.run_pipeline(
+                    USE_DEFAULT_PRODUCTION="1",
+                    HALTEWECKER_ACTIVATION_DRY_RUN="1",
                     CRASH_AFTER_STATE="1",
                     CRASH_AFTER_STAGE=stage,
                 )
 
                 self.assertEqual(interrupted.returncode, 99, interrupted.stderr)
+                self.assertTrue(
+                    any(
+                        path.is_dir() and path.name not in {"old", "incremental"}
+                        for path in (self.data_root / "releases").iterdir()
+                    ),
+                    interrupted.stdout + interrupted.stderr,
+                )
                 release_id = self.candidate_release_id()
                 state = json.loads(
                     (self.data_root / "releases" / release_id / "release-state.json").read_text()
                 )
                 self.assertEqual(state["completedStage"], stage)
 
-                resumed = self.run_pipeline("--resume", release_id)
+                resumed = self.run_pipeline(
+                    "--resume",
+                    release_id,
+                    USE_DEFAULT_PRODUCTION="1",
+                    HALTEWECKER_ACTIVATION_DRY_RUN="1",
+                )
 
                 self.assertEqual(resumed.returncode, 0, resumed.stderr)
                 self.assertEqual(
                     (self.root / "build-calls.log").read_text(encoding="utf-8").splitlines(),
                     ["build"],
                 )
-                if stage == "commit":
-                    self.assertIn("already-active", resumed.stdout)
-                else:
-                    final_state = json.loads(
-                        (self.data_root / "releases" / release_id / "release-state.json").read_text()
-                    )
-                    self.assertEqual(final_state["completedStage"], "commit")
+                final_state = json.loads(
+                    (self.data_root / "releases" / release_id / "release-state.json").read_text()
+                )
+                self.assertEqual(final_state["completedStage"], "handoff-readiness")
+                self.assertEqual(os.readlink(self.data_root / "current-release"), "releases/old")
 
     def test_crash_after_activation_reconciles_state_without_activation(self) -> None:
         self.configure_resume_pointer_layout()

@@ -96,15 +96,12 @@ class DiskBudgetTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "lower than 20"):
             run_guarded(["build"], Path("/tmp"), minimum_gib=19)
 
-    def test_fifteen_gib_reserve_requires_incremental_production_opt_in(self):
+    def test_fifteen_gib_reserve_cannot_be_enabled_by_environment(self):
         with patch.dict("os.environ", {"HALTEWECKER_ALLOW_REDUCED_DISK_RESERVE": "1"}):
-            result, _process, start, _kill = self.run_fixture(
-                [20 * GIB, 20 * GIB], minimum_gib=15,
-            )
-        self.assertEqual(result, 0)
-        start.assert_called_once()
+            with self.assertRaisesRegex(ValueError, "lower than 20"):
+                self.run_fixture([40 * GIB], minimum_gib=15)
 
-    def test_incremental_production_opt_in_cannot_lower_reserve_below_fifteen(self):
+    def test_reserve_bypass_environment_is_ignored(self):
         with patch.dict("os.environ", {"HALTEWECKER_ALLOW_REDUCED_DISK_RESERVE": "1"}):
             with self.assertRaisesRegex(ValueError, "lower than 20"):
                 run_guarded(["build"], Path("/tmp"), minimum_gib=14)

@@ -1052,34 +1052,6 @@
     "provenance": "zbiorkom.live community publication"
   },
   {
-    "id": "poland-radomsko",
-    "classification": "required",
-    "url": "https://api.zbiorkom.live/api6-open/radomsko/gtfs/default",
-    "cities": "config/poland-cities.json",
-    "timezone": "Europe/Warsaw",
-    "identifierPrefix": "pl-radomsko:",
-    "namespace": "pl-radomsko:",
-    "stopIDMode": "exact",
-    "buildStops": true,
-    "buildRoutes": true,
-    "buildDepartures": true,
-    "buildRadarTopology": false,
-    "importIntoStaticDepartures": true,
-    "filterCitiesByProvider": true,
-    "country": "PL",
-    "sourceName": "zbiorkom.live community publication",
-    "sourceURL": "https://api.zbiorkom.live/api6-open/radomsko/gtfs/default",
-    "sourceType": "community",
-    "license": "unknown",
-    "realtime": {
-      "tripUpdatesURL": "https://api.zbiorkom.live/api6-open/radomsko/gtfsRealtime/default/tripUpdates",
-      "vehiclePositionsURL": "https://api.zbiorkom.live/api6-open/radomsko/gtfsRealtime/default/vehiclePositions"
-    },
-    "sourcePublisher": "zbiorkom.live",
-    "upstreamOperator": "MPK Radomsko",
-    "provenance": "zbiorkom.live community publication"
-  },
-  {
     "id": "poland-bydgoszcz",
     "classification": "required",
     "url": "https://mkuran.pl/gtfs/bydgoszcz.zip",

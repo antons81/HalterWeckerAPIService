@@ -71,7 +71,7 @@ def smoke_expectation(database_path, city, stop):
 
 
 STATIC_PROBE = LEGACY_SMOKE_EXPECTATION + '''
-import json, os, sqlite3, sys
+import json, os, sys
 from urllib.parse import urlencode
 from urllib.request import urlopen
 root = "http://127.0.0.1:8080"
@@ -82,7 +82,11 @@ def get(path):
         return json.load(response)
 expected, raw_providers = sys.argv[1:]
 providers = tuple(raw_providers.split(","))
-if os.environ.get("HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS", "").split(",") != list(providers):
+providers = tuple(value for value in providers if value)
+configured_providers = tuple(
+    value for value in os.environ.get("HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS", "").split(",") if value
+)
+if configured_providers != providers:
     raise RuntimeError("runtime provider contract mismatch")
 metadata = get("/static-departures/health").get("database", {})
 if metadata.get("releaseID") != expected:
@@ -90,8 +94,8 @@ if metadata.get("releaseID") != expected:
 runtime_mode = os.environ.get("HALTEWECKER_EXPECTED_RUNTIME_MODE", "legacy")
 if runtime_mode == "legacy" and os.environ.get("HALTEWECKER_STATIC_DEPARTURES_SHADOW_RUNTIME", "0").strip().lower() in {"1", "true", "yes", "on"}:
     raise RuntimeError("legacy runtime unexpectedly enables provider shadow queries")
-if runtime_mode == "legacy" and os.environ.get("DEPARTURES_DATABASE", "") != "/data/departures-current.sqlite":
-    raise RuntimeError("legacy runtime is not reading departures-current.sqlite")
+if runtime_mode == "legacy" and os.environ.get("DEPARTURES_DATABASE", "") != "/data/current-release/departures.sqlite":
+    raise RuntimeError("legacy runtime is not reading the active shared departures SQLite")
 if runtime_mode == "hybrid":
     if metadata.get("runtimeMode") != "hybrid" or metadata.get("fallbackReleaseID") != expected:
         raise RuntimeError("rollback runtime has no validated full fallback database")
@@ -104,15 +108,6 @@ for city in ("duisburg", "dusseldorf"):
     if not isinstance(payload, list) or not payload:
         raise RuntimeError("empty stop package: " + city)
 get("/static-stop-data/transit-radar-cities.json")
-with sqlite3.connect("file:/data/current-release/common.sqlite?mode=ro", uri=True) as connection:
-    placeholders = ",".join("?" for _ in providers)
-    row = connection.execute("SELECT city_id, stop_id FROM provider_city_stops "
-                             "WHERE provider_id IN (" + placeholders + ") LIMIT 1", providers).fetchone()
-if row is None:
-    raise RuntimeError("no runtime stop for departures readiness")
-payload = get("/static-departures/board?" + urlencode(dict(cityID=row[0], stopID=row[1], limit=3)))
-if not isinstance(payload.get("departures"), list):
-    raise RuntimeError("invalid departures response")
 for city, stop in (
     ("wien", "at:49:1876:0:1"),
     ("wien", "at:49:1320:5"),
@@ -148,6 +143,25 @@ def require_identity(container: str, expected_image: str, expected_id: str) -> N
 
 def check_route(container: str, image: str, identifier: str) -> None:
     require_identity(container, image, identifier)
+    docker("exec", container, "python3", "-c", ROUTE_PROBE)
+    require_identity(container, image, identifier)
+
+
+def check_shared_route(container: str, image: str, identifier: str) -> None:
+    state = container_state(container)
+    if state["Image"] != image or state["Id"] != identifier:
+        raise RuntimeError("RouteRecall container/image changed during shared SQLite activation")
+    environment = dict(
+        value.split("=", 1)
+        for value in state.get("Config", {}).get("Env", [])
+        if "=" in value
+    )
+    if environment.get("ROUTERECALL_PROVIDER_RUNTIME") != "0":
+        raise RuntimeError("RouteRecall still has provider-shard runtime enabled")
+    if environment.get("ROUTERECALL_DATABASE") != "/data/haltewecker/current-release/departures.sqlite":
+        raise RuntimeError("RouteRecall is not configured for the shared departures SQLite")
+    if environment.get("ROUTERECALL_RELEASE_POINTER") != "/data/haltewecker/current-release":
+        raise RuntimeError("RouteRecall release pointer is not the shared release pointer")
     docker("exec", container, "python3", "-c", ROUTE_PROBE)
     require_identity(container, image, identifier)
 
@@ -195,7 +209,7 @@ def restore_route(container: str, image: str, identifier: str, *, reload: bool =
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("consumer", choices=("route", "haltewecker", "restore-route", "reload-route", "stop-data-root"))
+    parser.add_argument("consumer", choices=("route", "shared-route", "haltewecker", "restore-route", "reload-route", "stop-data-root"))
     parser.add_argument("--container", default="")
     parser.add_argument("--image", default="")
     parser.add_argument("--container-id", default="")
@@ -214,6 +228,8 @@ def main() -> None:
         parser.error("--container is required")
     if args.consumer == "route":
         check_route(args.container, args.image, args.container_id)
+    elif args.consumer == "shared-route":
+        check_shared_route(args.container, args.image, args.container_id)
     elif args.consumer == "restore-route":
         restore_route(args.container, args.image, args.container_id, reload=args.reload)
     elif args.consumer == "reload-route":

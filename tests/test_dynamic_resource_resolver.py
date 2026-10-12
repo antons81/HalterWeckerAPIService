@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from dynamic_resource_resolver import (  # noqa: E402
     resolve_ckan_gtfs_zip,
+    resolve_mobility_database_gtfs_zip,
     resolve_realtime_manifest,
     resolve_wroclaw_gtfs_zip,
 )
@@ -54,6 +55,42 @@ class DynamicResourceResolverTests(unittest.TestCase):
 
         self.assertEqual(resolved.url, "https://example.test/hdb/download/13/")
         self.assertEqual(resolved.version, "2026-08-28 10:00:00")
+
+    def test_mobility_database_selects_newest_matching_feed_archive(self) -> None:
+        html = """
+        <a href="https://files.mobilitydatabase.org/mdb-2093/mdb-2093-202610070056/mdb-2093-202610070056.zip">old</a>
+        <a href="https://files.mobilitydatabase.org/mdb-2093/mdb-2093-202610100001/mdb-2093-202610100001.zip">new</a>
+        <a href="https://files.mobilitydatabase.org/mdb-9999/mdb-9999-202610110001/mdb-9999-202610110001.zip">other feed</a>
+        """
+        with mock.patch(
+            "dynamic_resource_resolver._read_metadata",
+            return_value=html.encode(),
+        ):
+            resolved = resolve_mobility_database_gtfs_zip(
+                "https://mobilitydatabase.org/feeds/gtfs/mdb-2093",
+                feed_id="mdb-2093",
+            )
+
+        self.assertEqual(
+            resolved.url,
+            "https://files.mobilitydatabase.org/mdb-2093/mdb-2093-202610100001/mdb-2093-202610100001.zip",
+        )
+        self.assertEqual(resolved.version, "202610100001")
+
+    def test_mobility_database_rejects_a_page_without_matching_feed_archive(self) -> None:
+        html = (
+            "https://files.mobilitydatabase.org/mdb-9999/"
+            "mdb-9999-202610110001/mdb-9999-202610110001.zip"
+        )
+        with mock.patch(
+            "dynamic_resource_resolver._read_metadata",
+            return_value=html.encode(),
+        ):
+            with self.assertRaisesRegex(ValueError, "no archive for feed mdb-2093"):
+                resolve_mobility_database_gtfs_zip(
+                    "https://mobilitydatabase.org/feeds/gtfs/mdb-2093",
+                    feed_id="mdb-2093",
+                )
 
     def test_manifest_normalizes_combined_and_component_keys(self) -> None:
         payload = {

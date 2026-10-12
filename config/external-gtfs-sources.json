@@ -1472,6 +1472,11 @@
     "id": "poland-gdansk",
     "classification": "required",
     "url": "https://ckan.multimediagdansk.pl/dataset/c24aa637-3619-4dc2-a171-a23eec8f2172/resource/30e783e4-2bec-4a7d-bb22-ee3e3b26ca96/download/gtfsgoogle.zip",
+    "dynamicResource": {
+      "kind": "mobilityDatabaseGTFS",
+      "metadataURL": "https://mobilitydatabase.org/feeds/gtfs/mdb-2093",
+      "feedID": "mdb-2093"
+    },
     "cities": "config/poland-cities.json",
     "timezone": "Europe/Warsaw",
     "identifierPrefix": "pl-gdansk:",
@@ -2305,34 +2310,6 @@
     },
     "sourcePublisher": "zbiorkom.live",
     "upstreamOperator": "MZK Oświęcim",
-    "provenance": "zbiorkom.live community publication"
-  },
-  {
-    "id": "poland-radomsko",
-    "classification": "required",
-    "url": "https://api.zbiorkom.live/api6-open/radomsko/gtfs/default",
-    "cities": "config/poland-cities.json",
-    "timezone": "Europe/Warsaw",
-    "identifierPrefix": "pl-radomsko:",
-    "namespace": "pl-radomsko:",
-    "stopIDMode": "exact",
-    "buildStops": true,
-    "buildRoutes": true,
-    "buildDepartures": true,
-    "buildRadarTopology": false,
-    "importIntoStaticDepartures": true,
-    "filterCitiesByProvider": true,
-    "country": "PL",
-    "sourceName": "zbiorkom.live community publication",
-    "sourceURL": "https://api.zbiorkom.live/api6-open/radomsko/gtfs/default",
-    "sourceType": "community",
-    "license": "unknown",
-    "realtime": {
-      "tripUpdatesURL": "https://api.zbiorkom.live/api6-open/radomsko/gtfsRealtime/default/tripUpdates",
-      "vehiclePositionsURL": "https://api.zbiorkom.live/api6-open/radomsko/gtfsRealtime/default/vehiclePositions"
-    },
-    "sourcePublisher": "zbiorkom.live",
-    "upstreamOperator": "MPK Radomsko",
     "provenance": "zbiorkom.live community publication"
   },
   {

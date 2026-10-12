@@ -129,11 +129,12 @@ class CityCoverageTests(unittest.TestCase):
         self.pin_database()
 
     def validate(self, **kwargs):
+        runtime = kwargs.pop("runtime", tuple(self.pilots.values()))
         with patch("scripts.static_departures_coverage._package_cities", return_value=self.package_cities), \
              patch("scripts.static_departures_coverage.load_release_manifest", return_value=self.manifest), \
              patch("scripts.static_departures_coverage.load_external_gtfs_sources", return_value=self.sources), \
              patch("scripts.static_departures_coverage.load_external_cities", side_effect=lambda source, _repository: source["cities"]):
-            return validate_city_coverage(self.release, tuple(self.pilots.values()), self.root, validation_date=date(2026, 10, 10), **kwargs)
+            return validate_city_coverage(self.release, runtime, self.root, validation_date=date(2026, 10, 10), **kwargs)
 
     def test_full_database_checks_every_city_including_provider_pilot_cities(self):
         report = self.validate()
@@ -143,6 +144,24 @@ class CityCoverageTests(unittest.TestCase):
         for city in self.cities:
             self.assertTrue(checks[city]["hasSchedule"], city)
             self.assertEqual(checks[city]["backend"], "fallback", city)
+
+    def test_release_metadata_candidate_uses_only_the_full_sqlite(self):
+        (self.release / "release.json").unlink()
+        (self.release / "release-metadata.json").write_text(json.dumps({"releaseID": "candidate"}))
+
+        report = self.validate(runtime=())
+
+        self.assertEqual(report["databaseMode"], "full-sqlite")
+        self.assertEqual(report["supportedCities"], len(self.cities))
+        self.assertEqual({row["backend"] for row in report["checks"]}, {"sqlite"})
+        self.assertTrue(all(row["hasSchedule"] for row in report["checks"]))
+
+    def test_full_sqlite_candidate_rejects_provider_runtime_dependency(self):
+        (self.release / "release.json").unlink()
+        (self.release / "release-metadata.json").write_text(json.dumps({"releaseID": "candidate"}))
+
+        with self.assertRaisesRegex(CityCoverageError, "must not depend on provider runtime"):
+            self.validate(runtime=("germany",))
 
     def test_full_database_cannot_borrow_pilot_coverage_from_provider_shards(self):
         self.mutate_database("DELETE FROM city_stops WHERE city_id='israel'")
@@ -223,12 +242,32 @@ class CityCoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(CityCoverageError, "removed supported cities: lost-city"):
             self.validate(reference=reference)
 
+    def test_candidate_may_drop_only_temporarily_excluded_radomsko(self):
+        reference = self.root / "rollback"
+        (reference / "stop-data").mkdir(parents=True)
+        (reference / "release.json").write_text('{"stopData":{"path":"stop-data"}}')
+        reference_cities = [{"id": city} for city in self.cities] + [{"id": "radomsko"}]
+        (reference / "stop-data/manifest.json").write_text(json.dumps({"cities": reference_cities}))
+
+        report = self.validate(reference=reference)
+
+        self.assertEqual(report["supportedCities"], len(self.cities))
+        self.assertNotIn("radomsko", {row["cityID"] for row in report["checks"]})
+
     def test_scheduled_city_cannot_become_empty_in_candidate(self):
         rollback = self.validate()
         self.mutate_database("DELETE FROM stop_times WHERE trip_id='helsinki-trip'")
         candidate = self.validate()
         with self.assertRaisesRegex(CityCoverageError, "lost scheduled cities: helsinki"):
             require_preserved_schedules(candidate, rollback)
+
+    def test_preserved_schedule_gate_ignores_only_temporarily_excluded_radomsko(self):
+        candidate = self.validate()
+        rollback = {
+            "checks": candidate["checks"] + [{"cityID": "radomsko", "hasSchedule": True}]
+        }
+
+        require_preserved_schedules(candidate, rollback)
 
     def test_raw_id_collision_does_not_claim_canonical_board_is_available(self):
         self.mutate_database("UPDATE raw_stops SET canonical_stop_id='another-stop' WHERE stop_id='bochum-stop'")

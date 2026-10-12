@@ -25,6 +25,11 @@ class CityCoverageError(ValueError):
     """A release loses a supported city or cannot route its published stops."""
 
 
+# Temporary source outage: keep the exception limited to this single city while
+# the city and its GTFS source are absent from the active registries.
+TRANSITIONALLY_EXCLUDED_CITY_IDS = frozenset({"radomsko"})
+
+
 def read_object(path: Path) -> dict:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -32,8 +37,15 @@ def read_object(path: Path) -> dict:
     return payload
 
 
+def release_payload(release: Path) -> dict:
+    path = release / "release.json"
+    if not path.is_file():
+        path = release / "release-metadata.json"
+    return read_object(path)
+
+
 def stop_data_root(release: Path) -> Path:
-    payload = read_object(release / "release.json")
+    payload = release_payload(release)
     entry = payload.get("stopData", {})
     relative = entry.get("path", "stop-data") if isinstance(entry, dict) else entry
     return (release / str(relative)).resolve(strict=True)
@@ -121,21 +133,30 @@ def validate_city_coverage(
     release = release.resolve(strict=True)
     today = validation_date or datetime.now(ZoneInfo("Europe/Berlin")).date()
     stop_root = stop_data_root(release)
-    payload = read_object(release / "release.json")
+    release_manifest_path = release / "release.json"
+    full_database_candidate = not release_manifest_path.is_file()
+    payload = release_payload(release)
     stop_manifest = read_object(stop_root / "manifest.json")
+    if full_database_candidate and runtime:
+        raise CityCoverageError("full SQLite candidate must not depend on provider runtime shards")
     cities = city_manifest(stop_root)
     if stop_manifest.get("releaseID") != payload.get("releaseID"):
         raise CityCoverageError("candidate stop-data generation does not match releaseID")
     if reference is not None:
-        lost = set(city_manifest(stop_data_root(reference.resolve(strict=True)))) - set(cities)
+        lost = (
+            set(city_manifest(stop_data_root(reference.resolve(strict=True))))
+            - set(cities)
+            - TRANSITIONALLY_EXCLUDED_CITY_IDS
+        )
         if lost:
             raise CityCoverageError("candidate removed supported cities: " + ", ".join(sorted(lost)))
     database = release / "departures.sqlite"
     if not database.is_file():
-        raise CityCoverageError("complete fallback database is missing")
+        label = "full departures database" if full_database_candidate else "complete fallback database"
+        raise CityCoverageError(f"{label} is missing")
     digest, size = artifact_provenance(database)
     fallback_reference = payload.get("fallbackDatabase")
-    if reference is not None and not isinstance(fallback_reference, dict):
+    if reference is not None and not full_database_candidate and not isinstance(fallback_reference, dict):
         raise CityCoverageError("candidate has no pinned fallback database reference")
     if fallback_reference is not None and (
         fallback_reference.get("path") != "departures.sqlite"
@@ -144,13 +165,14 @@ def validate_city_coverage(
     ):
         raise CityCoverageError("fallback database hash/size does not match candidate")
     package_cities = _package_cities(repository)
-    manifest = load_release_manifest(release, provider_ids=runtime)
+    manifest = None if full_database_candidate else load_release_manifest(release, provider_ids=runtime)
+    common_database = database if full_database_candidate else manifest.common_database_path
     checks = []
     package_checks = []
     smoke_checks = []
     package_count = 0
     with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)) as legacy, \
-         closing(sqlite3.connect(manifest.common_database_path.resolve().as_uri() + "?mode=ro", uri=True)) as common:
+         closing(sqlite3.connect(common_database.resolve().as_uri() + "?mode=ro", uri=True)) as common:
         metadata = dict(legacy.execute("SELECT key,value FROM metadata"))
         excluded = set()
         compact_fallback = metadata.get("fallbackProfile") == FALLBACK_PROFILE
@@ -158,6 +180,8 @@ def validate_city_coverage(
             raise CityCoverageError(
                 "candidate departures database omits providers served only by shard runtime"
             )
+        if full_database_candidate and metadata.get("fallbackProfile") == FALLBACK_PROFILE:
+            raise CityCoverageError("full SQLite candidate is marked as a shard-only fallback")
         if compact_fallback:
             try:
                 shard_ids = json.loads(metadata.get("shardProviderIDs", "[]"))
@@ -204,7 +228,8 @@ def validate_city_coverage(
             # SQLite, even when the release also publishes provider shards for
             # RouteRecall. Shards are consulted only for legacy hybrid rollback.
             shard = compact_fallback and bool(providers) and providers <= set(runtime)
-            if city in package_cities and not shard:
+            sqlite_routed = full_database_candidate and bool(providers)
+            if city in package_cities and not shard and not sqlite_routed:
                 departures = read_object(stop_root / "departures" / f"{city}.json")
                 if not isinstance(departures.get("stops"), dict) or not any(
                     isinstance(rows, list) and rows for rows in departures["stops"].values()
@@ -299,12 +324,16 @@ def validate_city_coverage(
                     probe = sorted(ids)[0] if ids else None
             smoke_checks.extend({"cityID": city, "stopID": stop, "hasSchedule": expected}
                                 for stop, expected in smoke_expected.items())
-            checks.append({"cityID": city, "stopID": probe or sorted(ids)[0], "hasSchedule": bool(probe) and require_current_schedules, "timezone": timezone, "backend": "shard" if shard else "fallback", "from": today.isoformat() + "T00:00:00", "to": end + "T23:59:59"})
-    return {"status": "PASS", "releaseID": payload["releaseID"], "supportedCities": len(cities), "apiCities": len(checks), "packageCities": package_count, "scheduleFreshnessRequired": require_current_schedules, "checks": checks, "packageChecks": package_checks, "smokeChecks": smoke_checks, "fallbackDatabaseVersion": metadata["databaseVersion"], "fallbackSHA256": digest}
+            checks.append({"cityID": city, "stopID": probe or sorted(ids)[0], "hasSchedule": bool(probe) and require_current_schedules, "timezone": timezone, "backend": "shard" if shard else ("sqlite" if full_database_candidate else "fallback"), "from": today.isoformat() + "T00:00:00", "to": end + "T23:59:59"})
+    return {"status": "PASS", "releaseID": payload["releaseID"], "supportedCities": len(cities), "apiCities": len(checks), "packageCities": package_count, "scheduleFreshnessRequired": require_current_schedules, "databaseMode": "full-sqlite" if full_database_candidate else "hybrid-fallback", "checks": checks, "packageChecks": package_checks, "smokeChecks": smoke_checks, "fallbackDatabaseVersion": metadata["databaseVersion"], "fallbackSHA256": digest}
 
 
 def require_preserved_schedules(candidate: dict, rollback: dict) -> None:
     available = {row["cityID"] for row in candidate["checks"] if row["hasSchedule"]}
-    lost = {row["cityID"] for row in rollback["checks"] if row["hasSchedule"]} - available
+    lost = (
+        {row["cityID"] for row in rollback["checks"] if row["hasSchedule"]}
+        - available
+        - TRANSITIONALLY_EXCLUDED_CITY_IDS
+    )
     if lost:
         raise CityCoverageError("candidate lost scheduled cities: " + ", ".join(sorted(lost)))

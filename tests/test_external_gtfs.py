@@ -593,7 +593,6 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
                 "poland-swinoujscie",
                 "poland-mielec",
                 "poland-oswiecim",
-                "poland-radomsko",
                 "poland-bydgoszcz",
                 "poland-kolobrzeg",
                 "poland-sanok",
@@ -619,7 +618,7 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
             "rzeszow", "torun", "elblag", "gorzow", "rybnik", "radom", "suwalki",
             "przemysl", "kutno", "legnica", "elk", "kalisz", "konin", "koszalin",
             "krosno", "pila", "siedlce", "starachowice", "tarnow", "walbrzych",
-            "swinoujscie", "mielec", "oswiecim", "radomsko",
+            "swinoujscie", "mielec", "oswiecim",
         }
         cities = load_cities(REPOSITORY_ROOT / "config" / "poland-cities.json")
         actual = {str(city["id"]) for city in cities}
@@ -649,7 +648,6 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
             "poland-walbrzych",
             "poland-mielec",
             "poland-oswiecim",
-            "poland-radomsko",
             "poland-swinoujscie",
         }
         for source in sources:
@@ -682,6 +680,39 @@ class ExternalGTFSRegistryTests(unittest.TestCase):
         self.assertNotIn("liveVehicles", oswiecim["transitRadar"]["features"])
         self.assertNotIn("vehiclePositions", oswiecim["transitRadar"]["features"])
         self.assertFalse(oswiecim["transitRadar"]["supportsVehiclePositions"])
+
+    def test_radomsko_is_excluded_and_gdansk_remains_configured(self) -> None:
+        cities = {
+            str(city["id"]): city
+            for city in load_cities(REPOSITORY_ROOT / "config" / "poland-cities.json")
+        }
+        sources = {
+            str(source["id"]): source
+            for source in load_external_gtfs_sources(
+                REPOSITORY_ROOT / "config" / "external-gtfs-sources.json"
+            )
+        }
+        legacy_sources = {
+            str(source["id"]): source
+            for source in json.loads(
+                (REPOSITORY_ROOT / "config" / "poland-sources.json").read_text(encoding="utf-8")
+            )
+        }
+
+        self.assertNotIn("radomsko", cities)
+        self.assertNotIn("poland-radomsko", sources)
+        self.assertNotIn("poland-radomsko", legacy_sources)
+        self.assertIn("gdansk", cities)
+        self.assertIn("poland-gdansk", sources)
+        self.assertIn("poland-gdansk", legacy_sources)
+        gdansk_source = sources["poland-gdansk"]
+        self.assertEqual(gdansk_source["classification"], "required")
+        self.assertIs(gdansk_source["importIntoStaticDepartures"], True)
+        self.assertTrue(gdansk_source["url"])
+        self.assertEqual(
+            [city["id"] for city in load_external_cities(gdansk_source, REPOSITORY_ROOT)],
+            ["gdansk"],
+        )
 
     def test_poland_tier2_release_sources_and_realtime_gates(self) -> None:
         sources = {

@@ -72,6 +72,31 @@ class RouteReadinessTests(unittest.TestCase):
             readiness.check_route("route", "image", "container")
         self.assertEqual([call.args[0] for call in docker.call_args_list], ["inspect", "exec", "inspect"])
 
+    def test_shared_route_requires_read_only_common_database_configuration(self):
+        state = json.dumps([{
+            "Image": "image",
+            "Id": "container",
+            "Config": {"Env": [
+                "ROUTERECALL_PROVIDER_RUNTIME=0",
+                "ROUTERECALL_DATABASE=/data/haltewecker/current-release/departures.sqlite",
+                "ROUTERECALL_RELEASE_POINTER=/data/haltewecker/current-release",
+            ]},
+        }])
+        with mock.patch.object(readiness, "docker", side_effect=[state, "", state]) as docker:
+            readiness.check_shared_route("route", "image", "container")
+        self.assertEqual([call.args[0] for call in docker.call_args_list], ["inspect", "exec", "inspect"])
+
+    def test_shared_route_rejects_provider_runtime_before_http(self):
+        state = json.dumps([{
+            "Image": "image",
+            "Id": "container",
+            "Config": {"Env": ["ROUTERECALL_PROVIDER_RUNTIME=1"]},
+        }])
+        with mock.patch.object(readiness, "docker", return_value=state) as docker:
+            with self.assertRaisesRegex(RuntimeError, "provider-shard runtime"):
+                readiness.check_shared_route("route", "image", "container")
+        docker.assert_called_once()
+
     def test_image_change_is_rejected_before_http(self):
         with mock.patch.object(readiness, "docker", return_value=json.dumps([{"Image": "changed", "Id": "container"}])) as docker:
             with self.assertRaisesRegex(RuntimeError, "image changed"):
@@ -137,6 +162,74 @@ class RouteReadinessTests(unittest.TestCase):
 
 
 class NightlyActivationTests(unittest.TestCase):
+    def test_route_reconfiguration_uses_preflight_image_and_read_only_sqlite(self):
+        source = PIPELINE.read_text()
+        start = source.index("route_recall_activation() {")
+        end = source.index("\nhaltewecker_activation_readiness() {", start)
+        functions = source[start:end]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            compose = root / "routerecall-api.compose.yml"
+            compose.write_text("services:\n  routerecall-api:\n    image: route\n")
+            harness = r'''
+set -eu
+REPO="$ROOT"
+RELEASE_ID=candidate
+ROUTERECALL_COMPOSE_FILE="$ROOT/routerecall-api.compose.yml"
+ROUTERECALL_ACTIVATION_IMAGE=sha256:verified
+ROUTERECALL_ACTIVATION_CONTAINER_ID=old-container
+ROUTERECALL_ACTIVE_IMAGE=sha256:verified
+ROUTERECALL_ACTIVE_CONTAINER_ID=old-container
+ROUTERECALL_ORIGINAL_SHARED_DATABASE=0
+ROUTERECALL_ACTIVE_SHARED_DATABASE=0
+ROUTERECALL_PREVIOUS_CONTAINER_PRESERVED=0
+ROUTERECALL_READINESS_TIMEOUT_SECONDS=0
+HALTEWECKER_ACTIVATION_DRY_RUN=0
+docker() {
+  printf '%s env_image=%s provider=%s db=%s\n' "$*" "${ROUTERECALL_IMAGE_REF:-}" \
+    "${ROUTERECALL_PROVIDER_RUNTIME:-}" "${ROUTERECALL_DATABASE:-}" >> "$ROOT/docker.log"
+  case "$1" in
+    inspect)
+      if [ "$#" -eq 2 ] && [[ "$2" == *rollback* ]]; then return 1; fi
+      case "$*" in
+        *"{{.Config.Image}}"*) echo routerecall-api:prod;;
+        *"{{.Image}}"*) echo sha256:verified;;
+        *"{{.Id}}"*) if [ "${ROUTE_NEW:-0}" = 1 ]; then echo new-container; else echo old-container; fi;;
+      esac
+      ;;
+    image)
+      echo sha256:verified
+      ;;
+    rename|stop)
+      ;;
+    compose)
+      [ "${COMPOSE_FAIL:-0}" = 0 ] || return 1
+      ROUTE_NEW=1
+      ;;
+    *) return 64;;
+  esac
+}
+python3() {
+  case "$*" in
+    *shared-route*|*route*) echo "$*" >> "$ROOT/readiness.log"; return "${READINESS_FAIL:-0}";;
+    *) return 64;;
+  esac
+}
+'''
+            result = subprocess.run(
+                ["bash", "-c", harness + functions + "\nactivate_route_recall_shared_sqlite"],
+                env=dict(os.environ, ROOT=str(root)),
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = (root / "docker.log").read_text()
+            self.assertIn("rename routerecall-api routerecall-api-rollback-candidate", calls)
+            self.assertIn("stop --time 10 routerecall-api-rollback-candidate", calls)
+            self.assertIn("--no-build --pull never --no-deps --force-recreate routerecall-api", calls)
+            self.assertIn("env_image=routerecall-api:prod provider=0 db=/data/haltewecker/current-release/departures.sqlite", calls)
+            self.assertIn("shared-route", (root / "readiness.log").read_text())
+
     def activate(self, *, route_fail=False, static_fail=False, image_change=False, pipeline_fail=False, root_change=False,
                  coverage_fail=False, rollback_fail=False, dry_run=False, source_freshness_fail=False):
         source = PIPELINE.read_text()

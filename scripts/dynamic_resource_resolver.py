@@ -19,6 +19,12 @@ _DOWNLOAD_LINK = re.compile(
 )
 _GTFS_ROW = re.compile(r"<tr\b.*?</tr>", re.IGNORECASE | re.DOTALL)
 _DATE = re.compile(r"\b(20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})\b")
+_MOBILITY_DATABASE_ARCHIVE = re.compile(
+    r"https://files\.mobilitydatabase\.org/"
+    r"(?P<feed>mdb-[0-9]+)/(?P<archive>mdb-[0-9]+)-(?P<version>[0-9]{12})/"
+    r"(?P=archive)-(?P=version)\.zip",
+    re.IGNORECASE,
+)
 
 
 class DynamicResourceError(ValueError):
@@ -137,6 +143,41 @@ def resolve_wroclaw_gtfs_zip(metadata_url: str) -> ResolvedResource:
     )
 
 
+def resolve_mobility_database_gtfs_zip(
+    metadata_url: str,
+    *,
+    feed_id: str,
+) -> ResolvedResource:
+    """Choose the newest immutable archive URL listed for a MobilityDatabase feed."""
+    if not re.fullmatch(r"mdb-[0-9]+", feed_id):
+        raise DynamicResourceError("MobilityDatabase feedID is invalid")
+    try:
+        html = unescape(_read_metadata(metadata_url).decode("utf-8"))
+    except UnicodeDecodeError as error:
+        raise DynamicResourceError("MobilityDatabase feed page is not UTF-8") from error
+
+    candidates = [
+        match
+        for match in _MOBILITY_DATABASE_ARCHIVE.finditer(html)
+        if match.group("feed").lower() == feed_id.lower()
+    ]
+    if not candidates:
+        raise DynamicResourceError(
+            f"MobilityDatabase page has no archive for feed {feed_id}"
+        )
+    selected = max(candidates, key=lambda match: match.group("version"))
+    version = selected.group("version")
+    return ResolvedResource(
+        url=selected.group(0),
+        version=version,
+        metadata={
+            "resolver": "mobilityDatabaseGTFS",
+            "feedID": feed_id,
+            "versionID": version,
+        },
+    )
+
+
 def resolve_gtfs_resource(source: dict[str, object]) -> ResolvedResource | None:
     """Resolve a source's optional dynamicResource declaration."""
     configuration = source.get("dynamicResource")
@@ -156,6 +197,11 @@ def resolve_gtfs_resource(source: dict[str, object]) -> ResolvedResource | None:
         return resolve_ckan_gtfs_zip(metadata_url, package_id=package_id)
     if kind == "wroclawGTFS":
         return resolve_wroclaw_gtfs_zip(metadata_url)
+    if kind == "mobilityDatabaseGTFS":
+        feed_id = configuration.get("feedID")
+        if not isinstance(feed_id, str) or not feed_id.strip():
+            raise DynamicResourceError("mobilityDatabaseGTFS requires feedID")
+        return resolve_mobility_database_gtfs_zip(metadata_url, feed_id=feed_id)
     raise DynamicResourceError(f"unsupported dynamicResource kind: {kind}")
 
 

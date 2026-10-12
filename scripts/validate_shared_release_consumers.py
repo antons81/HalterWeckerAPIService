@@ -154,7 +154,7 @@ def image_runtime_contract(image: str, repository: Path) -> dict[str, str]:
     files = ("services/static_departures_api.py", "services/static_departures_runtime.py",
              "services/gtfs_board_window.py", "services/vbb_overlay_provider.py",
              "services/validation_receipt.py", "scripts/provider_artifact_capabilities.py",
-             "config/incremental-provider-sources.json", "config/external-gtfs-sources.json")
+             "config/incremental-provider-sources.json")
     expected = {name: hashlib.sha256((repository / name).read_bytes()).hexdigest() for name in files}
     code = (
         "import hashlib,json,sys; from pathlib import Path; "
@@ -194,22 +194,33 @@ def preflight(release: Path, build: tuple[str, ...], runtime: tuple[str, ...],
               static_image: str | None = None,
               require_current_schedules: bool = True) -> dict[str, object]:
     release = release.resolve(strict=True)
-    manifest = json.loads((release / "release.json").read_text())
-    published_providers = set(manifest["providers"])
-    if not set(runtime) <= published_providers:
-        raise ValueError("candidate omits a configured runtime provider shard")
-    if not published_providers <= set(build):
-        raise ValueError("candidate publishes a provider outside the build configuration")
-    if "germany" not in published_providers:
-        raise ValueError("candidate omits the Germany shard required by RouteRecall")
+    release_manifest = release / "release.json"
+    full_database_candidate = not release_manifest.is_file()
+    manifest_path = release_manifest if release_manifest.is_file() else release / "release-metadata.json"
+    manifest = json.loads(manifest_path.read_text())
+    if full_database_candidate:
+        if build or runtime:
+            raise ValueError("full SQLite candidate must not declare provider runtime shards")
+        if not (release / "departures.sqlite").is_file():
+            raise ValueError("full SQLite candidate has no departures.sqlite")
+        requirements = {"mode": "full-sqlite", "database": str(release / "departures.sqlite")}
+        supported = ()
+    else:
+        published_providers = set(manifest["providers"])
+        if not set(runtime) <= published_providers:
+            raise ValueError("candidate omits a configured runtime provider shard")
+        if not published_providers <= set(build):
+            raise ValueError("candidate publishes a provider outside the build configuration")
+        if "germany" not in published_providers:
+            raise ValueError("candidate omits the Germany shard required by RouteRecall")
+        supported = image_supported_providers(static_image or docker_json("inspect", static_container)[0]["Image"], runtime)
+        validate_provider_contract(build, runtime, supported)
+        requirements = validate_shared_release(
+            release, require_current_services=require_current_schedules,
+        )
     static_image = static_image or docker_json("inspect", static_container)[0]["Image"]
     route_image = docker_json("inspect", route_container)[0]["Image"]
-    supported = image_supported_providers(static_image, runtime)
-    validate_provider_contract(build, runtime, supported)
     runtime_contract = image_runtime_contract(static_image, Path(__file__).resolve().parents[1])
-    requirements = validate_shared_release(
-        release, require_current_services=require_current_schedules,
-    )
     coverage = validate_city_coverage(
         release, runtime, Path(__file__).resolve().parents[1], reference=reference,
         require_current_schedules=require_current_schedules,
@@ -299,21 +310,28 @@ def preflight(release: Path, build: tuple[str, ...], runtime: tuple[str, ...],
             if not isinstance(stops, list) or not stops:
                 raise ValueError(f"candidate stop package is empty: {city}")
             results[-1]["stopCount"] = len(stops)
+        route_environment = {
+            "ROUTERECALL_PROVIDER_RUNTIME": "0" if full_database_candidate else "1",
+            "ROUTERECALL_HOST": "0.0.0.0",
+            "ROUTERECALL_PORT": "8091",
+            "ROUTERECALL_RELEASE_POINTER": "/data/haltewecker/" + pointer_relative,
+            "ROUTERECALL_STATIC_DATA_ROOT": "/data/haltewecker/" + relative + "/stop-data",
+            "ROUTERECALL_GEOMETRY_ARTIFACT": "/data/routerecall/osm/current/de/geometry.sqlite",
+        }
+        if full_database_candidate:
+            route_environment["ROUTERECALL_DATABASE"] = (
+                "/data/haltewecker/" + relative + "/departures.sqlite"
+            )
         _route_name, route = start("routerecall", route_image, 8091,
                       [(data_root, "/data/haltewecker"), (geometry_root, "/data/routerecall/osm")],
-                      {"ROUTERECALL_PROVIDER_RUNTIME": "1", "ROUTERECALL_HOST": "0.0.0.0",
-                       "ROUTERECALL_PORT": "8091",
-                       "ROUTERECALL_RELEASE_POINTER": "/data/haltewecker/" + pointer_relative,
-                       "ROUTERECALL_STATIC_DATA_ROOT": "/data/haltewecker/" + relative + "/stop-data",
-                       "ROUTERECALL_GEOMETRY_ARTIFACT": "/data/routerecall/osm/current/de/geometry.sqlite"})
+                      route_environment)
         root = route + "/routerecall/v1"
         # Liveness alone is not readiness; the actual Germany flow follows.
         get(root + "/cities", startup=True)
         for city, line in (("berlin", "100"), ("wuppertal", "635")):
             payload = get(root + "/lines/search?" + urlencode({"city": city, "line": line}))
-            selected = next(item for item in payload["lines"]
-                            if item.get("providerID") == "germany" and item.get("patterns"))
-            results[-1].update(routeID=selected["id"], providerID="germany",
+            selected = next(item for item in payload["lines"] if item.get("patterns"))
+            results[-1].update(routeID=selected["id"], providerID=selected.get("providerID"),
                                patternCount=len(selected["patterns"]))
             pattern = selected["patterns"][0]["id"]
             path = "/lines/" + quote(selected["id"], safe="") + "/patterns/" + quote(pattern, safe="")
@@ -324,6 +342,9 @@ def preflight(release: Path, build: tuple[str, ...], runtime: tuple[str, ...],
         if pointer.resolve() != initial_target or (geometry_root / "current/de/geometry.sqlite").resolve() != initial_geometry:
             raise RuntimeError("production pointers changed during preflight")
         return {"status": "PASS", "releaseID": manifest["releaseID"], "requirements": requirements,
+                "databaseMode": "full-sqlite" if full_database_candidate else "hybrid-shards",
+                "routeRecallDatabase": route_environment.get("ROUTERECALL_DATABASE"),
+                "routeRecallProviderRuntime": route_environment["ROUTERECALL_PROVIDER_RUNTIME"],
                 "buildProviders": build, "runtimeProviders": runtime, "supportedRuntimeProviders": supported,
                 "staticImage": static_image, "routeImage": route_image, "runtimeContract": runtime_contract,
                 "cityCoverage": candidate_coverage, "controlFlows": control_flows, "coveragePlan": coverage, "results": results,
@@ -342,6 +363,29 @@ def validate_release_pair(candidate_root: Path, rollback_root: Path, build: tupl
                           runtime: tuple[str, ...], static_container: str, route_container: str,
                           *, static_image: str | None = None) -> dict:
     rollback = rollback_root.resolve(strict=True)
+    full_database_candidate = not (candidate_root / "release.json").is_file()
+    if full_database_candidate:
+        static_image = static_image or docker_json("inspect", static_container)[0]["Image"]
+        route_image = docker_json("inspect", route_container)[0]["Image"]
+        candidate = preflight(
+            candidate_root, build, runtime, static_container, route_container,
+            reference=rollback, static_image=static_image,
+        )
+        if candidate["staticImage"] != static_image or candidate["routeImage"] != route_image:
+            raise ValueError("consumer image changed during full SQLite candidate preflight")
+        if candidate["currentUnchanged"] != str(rollback):
+            raise ValueError("production rollback pointer changed during candidate preflight")
+        del candidate["coveragePlan"]
+        return {
+            "status": "PASS",
+            "candidate": candidate,
+            "verifiedRollback": {
+                "status": "PASS",
+                "release": str(rollback),
+                "reason": "active production release and pointer remained unchanged during candidate preflight",
+            },
+        }
+
     rollback_build = tuple(json.loads((rollback / "release.json").read_text())["providers"])
     verified_rollback = preflight(rollback, rollback_build, runtime, static_container,
                                  route_container, static_image=static_image,

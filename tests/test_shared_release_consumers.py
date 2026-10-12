@@ -80,7 +80,7 @@ class ConsumerPreflightTests(unittest.TestCase):
             return {name: hashlib.sha256((repository / name).read_bytes()).hexdigest()
                     for name in json.loads(args[-1])}
         with patch("scripts.validate_shared_release_consumers.docker_json", side_effect=inspect):
-            self.assertEqual(len(image_runtime_contract("sha256:matching", repository)), 8)
+            self.assertEqual(len(image_runtime_contract("sha256:matching", repository)), 7)
 
     def test_reference_only_emits_no_candidate_acceptance(self):
         arguments = ["validator", "--reference-only", "--release", "candidate", "--rollback-release", "rollback",
@@ -156,6 +156,8 @@ class ConsumerPreflightTests(unittest.TestCase):
             rollback = root / "rollback"
             rollback.mkdir()
             (rollback / "release.json").write_text('{"providers":{"germany":{}}}')
+            (root / "candidate").mkdir()
+            (root / "candidate/release.json").write_text('{"providers":{"germany":{}}}')
             plan = {"checks": [{"cityID": "helsinki", "hasSchedule": True}]}
             reports = [{"staticImage": "sha256:tested", "routeImage": "sha256:route", "coveragePlan": plan} for _ in range(2)]
             with patch("scripts.validate_shared_release_consumers.preflight", side_effect=reports) as call:
@@ -167,6 +169,69 @@ class ConsumerPreflightTests(unittest.TestCase):
             self.assertNotIn("require_current_schedules", call.call_args_list[1].kwargs)
             self.assertEqual(call.call_args_list[1].kwargs["reference"], rollback.resolve())
             self.assertEqual(call.call_args_list[1].kwargs["static_image"], "sha256:tested")
+
+    def test_full_sqlite_candidate_is_preflighted_without_provider_shards(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate = root / "candidate"
+            rollback = root / "rollback"
+            candidate.mkdir()
+            rollback.mkdir()
+            (candidate / "release-metadata.json").write_text('{"releaseID":"new"}')
+            (candidate / "departures.sqlite").write_bytes(b"candidate")
+            rollback_target = str(rollback.resolve())
+            report = {
+                "status": "PASS",
+                "staticImage": "sha256:static",
+                "routeImage": "sha256:route",
+                "databaseMode": "full-sqlite",
+                "coveragePlan": {"checks": []},
+                "currentUnchanged": rollback_target,
+            }
+            with patch(
+                "scripts.validate_shared_release_consumers.docker_json",
+                side_effect=[[{"Image": "sha256:static"}], [{"Image": "sha256:route"}]],
+            ), patch(
+                "scripts.validate_shared_release_consumers.preflight",
+                return_value=report,
+            ) as preflight_call:
+                result = validate_release_pair(
+                    candidate,
+                    rollback,
+                    (),
+                    (),
+                    "static",
+                    "route",
+                )
+
+            self.assertEqual(result["status"], "PASS")
+            self.assertEqual(result["candidate"]["databaseMode"], "full-sqlite")
+            self.assertEqual(result["verifiedRollback"]["status"], "PASS")
+            self.assertEqual(preflight_call.call_args.args[1:3], ((), ()))
+            self.assertEqual(preflight_call.call_args.kwargs["reference"], rollback.resolve())
+
+    def test_full_sqlite_candidate_rejects_consumer_image_change_during_preflight(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate = root / "candidate"
+            rollback = root / "rollback"
+            candidate.mkdir()
+            rollback.mkdir()
+            (candidate / "release-metadata.json").write_text('{"releaseID":"new"}')
+            (candidate / "departures.sqlite").write_bytes(b"candidate")
+            with patch(
+                "scripts.validate_shared_release_consumers.docker_json",
+                side_effect=[[{"Image": "sha256:static"}], [{"Image": "sha256:route"}]],
+            ), patch(
+                "scripts.validate_shared_release_consumers.preflight",
+                return_value={
+                    "staticImage": "sha256:static",
+                    "routeImage": "sha256:changed",
+                    "currentUnchanged": str(rollback.resolve()),
+                },
+            ):
+                with self.assertRaisesRegex(ValueError, "consumer image changed"):
+                    validate_release_pair(candidate, rollback, (), (), "static", "route")
 
     def test_pair_rejects_schedule_loss_even_when_both_other_preflights_pass(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -208,7 +273,7 @@ class ConsumerPreflightTests(unittest.TestCase):
                         activation.index('replace_link "$CURRENT_RELEASE" "$candidate_target"'))
         self.assertIn('HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE=legacy', activation)
         self.assertIn('HALTEWECKER_STATIC_DEPARTURES_SHADOW_RUNTIME=0', activation)
-        self.assertIn('DEPARTURES_DATABASE="/data/departures-current.sqlite"', activation)
+        self.assertIn('DEPARTURES_DATABASE="/data/current-release/departures.sqlite"', activation)
         self.assertIn('replace_link "$DEPARTURES_CURRENT" "releases/incremental/$RELEASE_ID/departures.sqlite"', activation)
 
 

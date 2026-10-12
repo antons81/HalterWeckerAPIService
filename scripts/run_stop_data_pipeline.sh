@@ -7,7 +7,9 @@ RESUME_RELEASE_ID=""
 NO_ACTIVATE="${HALTEWECKER_NIGHTLY_NO_ACTIVATE:-0}"
 EXPLICIT_NO_ACTIVATE=0
 INCREMENTAL_NO_ACTIVATE=0
-INCREMENTAL_PRODUCTION="${HALTEWECKER_INCREMENTAL_PRODUCTION:-1}"
+INCREMENTAL_PRODUCTION="${HALTEWECKER_INCREMENTAL_PRODUCTION:-0}"
+UNIFIED_SQLITE_PIPELINE=0
+LEGACY_FULL=0
 INCREMENTAL_PROOF_OVERRIDE="${HALTEWECKER_INCREMENTAL_PROOF_OVERRIDE:-0}"
 INCREMENTAL_MIGRATION="${HALTEWECKER_INCREMENTAL_MIGRATION:-0}"
 ACTIVATE_EXISTING_RELEASE_ID=""
@@ -84,6 +86,7 @@ elif [[ "${1:-}" == "--incremental-no-activate" ]]; then
   NO_ACTIVATE=1
   EXPLICIT_NO_ACTIVATE=1
   INCREMENTAL_NO_ACTIVATE=1
+  UNIFIED_SQLITE_PIPELINE=1
   shift
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
@@ -106,13 +109,16 @@ elif [[ "${1:-}" == "--incremental-no-activate" ]]; then
     esac
   done
 elif [[ "${1:-}" == "--incremental" && "$#" -eq 1 ]]; then
-  INCREMENTAL_PRODUCTION=1
+  INCREMENTAL_PRODUCTION=0
+  UNIFIED_SQLITE_PIPELINE=1
 elif [[ "${1:-}" == "--activate-existing-candidate" && "$#" -eq 2 ]]; then
   RUN_MODE="activate-existing"
   ACTIVATE_EXISTING_RELEASE_ID="$2"
-  INCREMENTAL_PRODUCTION=1
+  echo "[StopData] ERROR: provider-only candidates are no longer activatable; build a full SQLite candidate" >&2
+  exit 64
 elif [[ "${1:-}" == "--legacy-full" && "$#" -eq 1 ]]; then
   INCREMENTAL_PRODUCTION=0
+  LEGACY_FULL=1
 elif [[ "${1:-}" == "--stop-data-only" && "$#" -eq 1 ]]; then
   NO_ACTIVATE=1
   EXPLICIT_NO_ACTIVATE=1
@@ -176,6 +182,12 @@ fi
 if [[ "$RUN_MODE" == "resume" ]]; then
   INCREMENTAL_PRODUCTION=0
 fi
+if [[ "$RUN_MODE" == "normal" || "$RUN_MODE" == "resume" ]]; then
+  INCREMENTAL_PRODUCTION=0
+  if [[ "$LEGACY_FULL" != "1" && "$STOP_DATA_ONLY" != "1" ]]; then
+    UNIFIED_SQLITE_PIPELINE=1
+  fi
+fi
 
 REPO="${REPO:-/srv/haltewecker/pipeline/HalterWeckerAPIService}"
 DATA_ROOT="${DATA_ROOT:-/srv/haltewecker/data}"
@@ -219,6 +231,19 @@ PREVIOUS_DEPARTURES_POINTER_TARGET=""
 PREVIOUS_ROLLBACK_POINTER_PRESENT=0
 PREVIOUS_ROLLBACK_POINTER_TARGET=""
 PREVIOUS_STATIC_RUNTIME_MODE="legacy"
+PREVIOUS_STATIC_PROVIDER_IDS=""
+OLD_RELEASE_ID=""
+VALIDATED_STATIC_IMAGE=""
+VALIDATED_ROUTE_IMAGE=""
+ROUTERECALL_ACTIVATION_IMAGE=""
+ROUTERECALL_ACTIVATION_CONTAINER_ID=""
+ROUTERECALL_ACTIVE_IMAGE=""
+ROUTERECALL_ACTIVE_CONTAINER_ID=""
+ROUTERECALL_ORIGINAL_SHARED_DATABASE=0
+ROUTERECALL_ACTIVE_SHARED_DATABASE=0
+ROUTERECALL_ACTIVATION_RELOAD=0
+ROUTERECALL_PREVIOUS_CONTAINER_PRESERVED=0
+ROUTERECALL_PREVIOUS_CONTAINER_NAME=""
 STOP_DATA_LOCK="${STOP_DATA_LOCK:-/run/lock/haltewecker-stop-data.lock}"
 STATIC_DEPARTURES_LOCK="${STATIC_DEPARTURES_LOCK:-/run/lock/haltewecker-static-departures.lock}"
 STOP_DATA_ENV_FILE="${STOP_DATA_ENV_FILE:-/etc/haltewecker-stop-data.env}"
@@ -293,44 +318,35 @@ if [[ -n "$TRUSTED_COMMON_STOP_DATA" ]]; then
   BUILD_DIR="$TRUSTED_COMMON_STOP_DATA"
 fi
 
-# Incremental mode is the single source of truth for all proven cache layers.
-# Apply it after environment files so stale legacy allowlists cannot override it.
-if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
+# The selected providers use incremental artifacts only as build caches. Every
+# provider is still imported into the single full SQLite database.
+if [[ "$UNIFIED_SQLITE_PIPELINE" == "1" ]]; then
+  configured_incremental_providers="${HALTEWECKER_INCREMENTAL_PROVIDER_IDS-israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd,511-bay-area,australia-translink-seq,australia-transport-nsw,cta-chicago,mbta-boston,stm-montreal}"
+  expected_incremental_providers="israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd,511-bay-area,australia-translink-seq,australia-transport-nsw,cta-chicago,mbta-boston,stm-montreal"
+  if [[ "$configured_incremental_providers" != "$expected_incremental_providers" ]]; then
+    echo "[StopData] ERROR: incremental cache allowlist must match the 13 approved providers" >&2
+    exit 64
+  fi
+  HALTEWECKER_INCREMENTAL_PROVIDER_IDS="$expected_incremental_providers"
+  BUILD_PROVIDER_IDS="$expected_incremental_providers"
+  export HALTEWECKER_INCREMENTAL_PROVIDER_IDS
   export HALTEWECKER_EXTERNAL_BUILD_CACHE=1
   export HALTEWECKER_EXTERNAL_TRANSFORMED_BUILD_CACHE=1
   export HALTEWECKER_EXTERNAL_BUILD_CACHE_ROOT="$CACHE_ROOT/external-build"
-  export HALTEWECKER_INCREMENTAL_PROVIDER_IDS="${HALTEWECKER_INCREMENTAL_PROVIDER_IDS-israel-mot,ttc-surface,ttc-subway,norway,sweden,poland-warsaw,poland-wkd,511-bay-area,australia-translink-seq,australia-transport-nsw,cta-chicago,mbta-boston,stm-montreal}"
-  BUILD_PROVIDER_IDS="$HALTEWECKER_INCREMENTAL_PROVIDER_IDS"
-  if [[ ",$BUILD_PROVIDER_IDS," != *,germany,* ]]; then
-    BUILD_PROVIDER_IDS+=",germany"
-  fi
-  HALTEWECKER_RUNTIME_PROVIDER_IDS="${HALTEWECKER_RUNTIME_PROVIDER_IDS-germany}"
+  HALTEWECKER_RUNTIME_PROVIDER_IDS=""
   export HALTEWECKER_RUNTIME_PROVIDER_IDS
-  if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$FROZEN_COMMON_STOP_DATA" != "1" ]]; then
-    IFS=',' read -r -a runtime_providers <<< "$HALTEWECKER_RUNTIME_PROVIDER_IDS"
-    for provider in "${runtime_providers[@]}"; do
-      if [[ ",$BUILD_PROVIDER_IDS," != *",$provider,"* ]]; then
-        echo "[Nightly] ERROR: runtime providers are absent from the build release: $provider" >&2
-        exit 1
-      fi
-    done
-    if [[ ",$HALTEWECKER_RUNTIME_PROVIDER_IDS," != *,germany,* ]]; then
-      echo "[Nightly] ERROR: Germany must be enabled in the shared hybrid runtime; refusing duplicate full import" >&2
-      exit 1
-    fi
-  fi
-  export HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS="$HALTEWECKER_INCREMENTAL_PROVIDER_IDS"
-  export HALTEWECKER_EXTERNAL_DEPARTURES_V3_PROVIDERS="$HALTEWECKER_INCREMENTAL_PROVIDER_IDS"
-  export HALTEWECKER_EXTERNAL_DEPARTURE_CACHE=1
+  export HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS="$expected_incremental_providers"
+  export HALTEWECKER_EXTERNAL_DEPARTURES_V3_PROVIDERS=""
+  export HALTEWECKER_EXTERNAL_DEPARTURE_CACHE=0
+  export HALTEWECKER_EXTERNAL_DEPARTURE_CACHE_PROVIDERS=""
   export HALTEWECKER_PERSISTENT_NORMALIZED_PROVIDER_ARTIFACT=1
   export HALTEWECKER_PROVIDER_ARTIFACT_ROOT="${HALTEWECKER_PROVIDER_ARTIFACT_ROOT:-$DATA_ROOT/provider-artifacts}"
   export HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT="${HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT:-$HALTEWECKER_PROVIDER_ARTIFACT_ROOT/normalized}"
-  export HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT="${HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT:-$HALTEWECKER_PROVIDER_ARTIFACT_ROOT/static}"
-  export HALTEWECKER_EXTERNAL_DEPARTURE_CACHE_PROVIDERS="$HALTEWECKER_INCREMENTAL_PROVIDER_IDS"
+  export HALTEWECKER_STATIC_DEPARTURES_NORMALIZED_PROVIDER_ARTIFACT=0
   if [[ -n "$RAW_SNAPSHOT_MANIFEST" ]]; then
     export HALTEWECKER_EXTERNAL_BUILD_CACHE_EXACT_ONLY=1
   fi
-  echo "[Nightly] stage=cache-policy schema=3 incrementalProviders=$HALTEWECKER_INCREMENTAL_PROVIDER_IDS providers=$HALTEWECKER_EXTERNAL_DEPARTURES_V3_PROVIDERS allowlist=$HALTEWECKER_EXTERNAL_BUILD_CACHE_PROVIDERS cacheRoot=$HALTEWECKER_EXTERNAL_BUILD_CACHE_ROOT providerArtifactRoot=$HALTEWECKER_PROVIDER_ARTIFACT_ROOT"
+  echo "[Nightly] stage=cache-policy mode=full-sqlite incrementalProviders=$HALTEWECKER_INCREMENTAL_PROVIDER_IDS runtimeProviders=none duplicateDepartureCache=disabled cacheRoot=$HALTEWECKER_EXTERNAL_BUILD_CACHE_ROOT normalizedCacheRoot=$HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT"
 fi
 
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
@@ -718,12 +734,20 @@ inspect_resume() {
 
 prepare_runtime() {
   echo "[StopData] release=$RELEASE_ID preparing candidate runtime readiness"
+  if [[ "$UNIFIED_SQLITE_PIPELINE" == "1" ]]; then
+    echo "[StopData] release=$RELEASE_ID candidate runtime was validated against departures.sqlite; no second import"
+    return 0
+  fi
   if ! READINESS_ONLY=1 \
     RELEASE_ID="$RELEASE_ID" \
     EXTERNAL_GTFS_ARTIFACTS_JSON="$ARTIFACTS_JSON" \
     STATIC_DEPARTURES_CONTAINER_NAME="static-departures-api-$RELEASE_ID" \
     DEPARTURES_DATABASE="/data/releases/$RELEASE_ID/departures.sqlite" \
     STATIC_DATA_ROOT="/data/releases/$RELEASE_ID/stop-data" \
+    HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE=legacy \
+    HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RUNTIME=0 \
+    HALTEWECKER_STATIC_DEPARTURES_SHADOW_RUNTIME=0 \
+    HALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME=0 \
     "$STATIC_DEPARTURES_PIPELINE"; then
     echo "[StopData] ERROR: release=$RELEASE_ID runtime readiness failed" >&2
     return 1
@@ -732,7 +756,45 @@ prepare_runtime() {
 
 activate_runtime() {
   echo "[StopData] release=$RELEASE_ID activating canonical runtime"
-  if ! READINESS_ONLY=1 RELEASE_ID="$RELEASE_ID" EXTERNAL_GTFS_ARTIFACTS_JSON="$ARTIFACTS_JSON" "$STATIC_DEPARTURES_PIPELINE"; then
+  if [[ "$UNIFIED_SQLITE_PIPELINE" == "1" ]]; then
+    local static_image_ref
+    local static_image_id
+    static_image_ref="$(docker inspect --format '{{.Config.Image}}' static-departures-api)" || return 1
+    static_image_id="$(docker inspect --format '{{.Image}}' static-departures-api)" || return 1
+    if [[ -z "$static_image_ref" || -z "$static_image_id" ]] || \
+       [[ "$(docker image inspect --format '{{.Id}}' "$static_image_ref")" != "$static_image_id" ]]; then
+      echo "[StopData] ERROR: cannot pin the validated static API image by its current tag and digest" >&2
+      return 1
+    fi
+    if ! STATIC_DEPARTURES_IMAGE="$static_image_ref" \
+      STATIC_DEPARTURES_EXPECTED_IMAGE="$static_image_id" \
+      HALTEWECKER_RUNTIME_PROVIDER_IDS="" \
+      HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE=legacy \
+      HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RUNTIME=0 \
+      HALTEWECKER_STATIC_DEPARTURES_SHADOW_RUNTIME=0 \
+      HALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME=0 \
+      HALTEWECKER_STATIC_DEPARTURES_HYBRID_PROVIDERS="" \
+      HALTEWECKER_STATIC_DEPARTURES_HYBRID_RELEASE_POINTER="" \
+      HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS="" \
+      HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RELEASE_POINTER="/data/current-release" \
+      DEPARTURES_DATABASE="/data/current-release/departures.sqlite" \
+      STATIC_DATA_ROOT="/data/current-release/stop-data" \
+      READINESS_ONLY=1 RELEASE_ID="$RELEASE_ID" \
+      "$STATIC_DEPARTURES_PIPELINE"; then
+      echo "[StopData] ERROR: release=$RELEASE_ID shared SQLite runtime activation failed" >&2
+      return 1
+    fi
+    echo "[StopData] release=$RELEASE_ID static departures synchronized to the shared SQLite"
+    return 0
+  fi
+  if ! READINESS_ONLY=1 \
+    RELEASE_ID="$RELEASE_ID" \
+    EXTERNAL_GTFS_ARTIFACTS_JSON="$ARTIFACTS_JSON" \
+    HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE=legacy \
+    HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RUNTIME=0 \
+    HALTEWECKER_STATIC_DEPARTURES_SHADOW_RUNTIME=0 \
+    HALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME=0 \
+    "$STATIC_DEPARTURES_PIPELINE"; then
     echo "[StopData] ERROR: release=$RELEASE_ID canonical runtime readiness failed" >&2
     return 1
   fi
@@ -829,6 +891,22 @@ print("[Nightly] stage=source-freshness status=PASS")
 PY
 }
 
+validate_full_sqlite_candidate() {
+  validate_incremental_source_freshness || return 1
+  local static_image
+  local report
+  static_image="$(docker inspect --format '{{.Image}}' static-departures-api)" || return 1
+  report="$(python3 "$REPO/scripts/validate_shared_release_consumers.py" \
+    --release "$RELEASE_DIR" \
+    --rollback-release "$CURRENT_RELEASE" \
+    --static-image "$static_image" \
+    --build-providers "" \
+    --runtime-providers "")" || return 1
+  VALIDATED_STATIC_IMAGE="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["candidate"]["staticImage"])' "$report")" || return 1
+  VALIDATED_ROUTE_IMAGE="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["candidate"]["routeImage"])' "$report")" || return 1
+  echo "[Nightly] stage=incremental-candidate-validation status=PASS release=$RELEASE_ID providers=all mode=full-sqlite"
+}
+
 validate_incremental_consumers() {
   if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" == "1" ]]; then
     echo "[Nightly] stage=consumer-preflight status=DRY-RUN buildProviders=$BUILD_PROVIDER_IDS runtimeProviders=$HALTEWECKER_RUNTIME_PROVIDER_IDS"
@@ -849,19 +927,119 @@ route_recall_activation() {
     echo "[Nightly] stage=routerecall-activation status=DRY-RUN container=$container"
     return 0
   fi
+  local readiness_command="route"
+  local active_image="${ROUTERECALL_ACTIVE_IMAGE:-${ROUTERECALL_ACTIVATION_IMAGE:-}}"
+  local active_container_id="${ROUTERECALL_ACTIVE_CONTAINER_ID:-${ROUTERECALL_ACTIVATION_CONTAINER_ID:-}}"
+  if [[ "${ROUTERECALL_ACTIVE_SHARED_DATABASE:-0}" == "1" ]]; then
+    readiness_command="shared-route"
+  fi
   local deadline=$((SECONDS + ${ROUTERECALL_READINESS_TIMEOUT_SECONDS:-60}))
-  until python3 "$REPO/scripts/active_release_readiness.py" route \
-      --container "$container" --image "$ROUTERECALL_ACTIVATION_IMAGE" \
-      --container-id "$ROUTERECALL_ACTIVATION_CONTAINER_ID"; do
-    if [[ "$(docker inspect --format '{{.Image}}' "$container" 2>/dev/null)" != "$ROUTERECALL_ACTIVATION_IMAGE" ]] || \
-       [[ "$(docker inspect --format '{{.Id}}' "$container" 2>/dev/null)" != "$ROUTERECALL_ACTIVATION_CONTAINER_ID" ]] || \
+  until python3 "$REPO/scripts/active_release_readiness.py" "$readiness_command" \
+      --container "$container" --image "$active_image" \
+      --container-id "$active_container_id"; do
+    if [[ "$(docker inspect --format '{{.Image}}' "$container" 2>/dev/null)" != "$active_image" ]] || \
+       [[ "$(docker inspect --format '{{.Id}}' "$container" 2>/dev/null)" != "$active_container_id" ]] || \
        (( SECONDS >= deadline )); then
       echo "[Nightly] ERROR: RouteRecall readiness/image invariant failed" >&2
       return 1
     fi
     sleep 2
   done
-  echo "[Nightly] stage=routerecall-activation status=PASS action=READINESS_ONLY image=$ROUTERECALL_ACTIVATION_IMAGE"
+  echo "[Nightly] stage=routerecall-activation status=PASS action=READINESS_ONLY image=$active_image"
+}
+
+capture_route_recall_state() {
+  local container="${HALTEWECKER_ROUTERECALL_CONTAINER_NAME:-routerecall-api}"
+  local environment
+  environment="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container")" || return 1
+  ROUTERECALL_ACTIVATION_IMAGE="$(docker inspect --format '{{.Image}}' "$container")" || return 1
+  ROUTERECALL_ACTIVATION_CONTAINER_ID="$(docker inspect --format '{{.Id}}' "$container")" || return 1
+  ROUTERECALL_ACTIVE_IMAGE="$ROUTERECALL_ACTIVATION_IMAGE"
+  ROUTERECALL_ACTIVE_CONTAINER_ID="$ROUTERECALL_ACTIVATION_CONTAINER_ID"
+  ROUTERECALL_ORIGINAL_SHARED_DATABASE=0
+  if printf '%s\n' "$environment" | grep -qx 'ROUTERECALL_PROVIDER_RUNTIME=0' && \
+     printf '%s\n' "$environment" | grep -qx 'ROUTERECALL_DATABASE=/data/haltewecker/current-release/departures.sqlite'; then
+    ROUTERECALL_ORIGINAL_SHARED_DATABASE=1
+  fi
+  ROUTERECALL_ACTIVE_SHARED_DATABASE="$ROUTERECALL_ORIGINAL_SHARED_DATABASE"
+}
+
+activate_route_recall_shared_sqlite() {
+  if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" == "1" ]]; then
+    echo "[Nightly] stage=routerecall-shared-sqlite status=DRY-RUN"
+    return 0
+  fi
+  local container="${HALTEWECKER_ROUTERECALL_CONTAINER_NAME:-routerecall-api}"
+  if [[ "$ROUTERECALL_ORIGINAL_SHARED_DATABASE" == "1" ]]; then
+    if [[ "$ROUTERECALL_ACTIVATION_RELOAD" == "1" ]]; then
+      python3 "$REPO/scripts/active_release_readiness.py" reload-route \
+        --container "$container" --image "$ROUTERECALL_ACTIVE_IMAGE" \
+        --container-id "$ROUTERECALL_ACTIVE_CONTAINER_ID" || return 1
+    fi
+    ROUTERECALL_ACTIVE_SHARED_DATABASE=1
+    route_recall_activation || return 1
+    echo "[Nightly] stage=routerecall-shared-sqlite status=PASS action=existing-read-only-database"
+    return 0
+  fi
+
+  local compose_file="${ROUTERECALL_COMPOSE_FILE:-/srv/routerecall/deployments/haltewecker-shared-sqlite/deploy/routerecall-api.compose.yml}"
+  local image_ref
+  local image_id
+  local rollback_name="${container}-rollback-${RELEASE_ID}"
+  local compose_project
+  if [[ ! -f "$compose_file" ]]; then
+    echo "[Nightly] ERROR: versioned RouteRecall compose file is missing: $compose_file" >&2
+    return 1
+  fi
+  rollback_name="${rollback_name:0:63}"
+  if docker inspect "$rollback_name" >/dev/null 2>&1; then
+    echo "[Nightly] ERROR: RouteRecall rollback container name already exists: $rollback_name" >&2
+    return 1
+  fi
+  image_ref="$(docker inspect --format '{{.Config.Image}}' "$container")" || return 1
+  image_id="$(docker inspect --format '{{.Image}}' "$container")" || return 1
+  if [[ -z "$image_ref" || "$(docker image inspect --format '{{.Id}}' "$image_ref")" != "$image_id" ]]; then
+    echo "[Nightly] ERROR: RouteRecall image reference no longer identifies the preflight image" >&2
+    return 1
+  fi
+
+  ROUTERECALL_PREVIOUS_CONTAINER_NAME="$rollback_name"
+  docker rename "$container" "$rollback_name" || return 1
+  ROUTERECALL_PREVIOUS_CONTAINER_PRESERVED=1
+  docker stop --time 10 "$rollback_name" >/dev/null || return 1
+  compose_project="routerecall-shared-${RELEASE_ID//[^a-zA-Z0-9_-]/-}"
+  if ! ROUTERECALL_IMAGE_REF="$image_ref" \
+    ROUTERECALL_PROVIDER_RUNTIME=0 \
+    ROUTERECALL_DATABASE=/data/haltewecker/current-release/departures.sqlite \
+    ROUTERECALL_RELEASE_POINTER=/data/haltewecker/current-release \
+    ROUTERECALL_STATIC_DATA_ROOT=/data/haltewecker/current-release/stop-data \
+    docker compose -p "$compose_project" --project-directory "$(dirname "$compose_file")" \
+      -f "$compose_file" up -d --no-build --pull never --no-deps --force-recreate routerecall-api; then
+    python3 "$REPO/scripts/active_release_readiness.py" restore-route \
+      --container "$container" --image "$ROUTERECALL_ACTIVATION_IMAGE" \
+      --container-id "$ROUTERECALL_ACTIVATION_CONTAINER_ID" || true
+    ROUTERECALL_ACTIVE_IMAGE="$ROUTERECALL_ACTIVATION_IMAGE"
+    ROUTERECALL_ACTIVE_CONTAINER_ID="$ROUTERECALL_ACTIVATION_CONTAINER_ID"
+    ROUTERECALL_ACTIVE_SHARED_DATABASE="$ROUTERECALL_ORIGINAL_SHARED_DATABASE"
+    ROUTERECALL_PREVIOUS_CONTAINER_PRESERVED=0
+    return 1
+  fi
+  ROUTERECALL_ACTIVE_IMAGE="$(docker inspect --format '{{.Image}}' "$container")" || return 1
+  ROUTERECALL_ACTIVE_CONTAINER_ID="$(docker inspect --format '{{.Id}}' "$container")" || return 1
+  if [[ "$ROUTERECALL_ACTIVE_IMAGE" != "$ROUTERECALL_ACTIVATION_IMAGE" ]]; then
+    echo "[Nightly] ERROR: RouteRecall activated an image that was not preflighted" >&2
+    python3 "$REPO/scripts/active_release_readiness.py" restore-route \
+      --container "$container" --image "$ROUTERECALL_ACTIVATION_IMAGE" \
+      --container-id "$ROUTERECALL_ACTIVATION_CONTAINER_ID" || true
+    ROUTERECALL_ACTIVE_IMAGE="$ROUTERECALL_ACTIVATION_IMAGE"
+    ROUTERECALL_ACTIVE_CONTAINER_ID="$ROUTERECALL_ACTIVATION_CONTAINER_ID"
+    ROUTERECALL_ACTIVE_SHARED_DATABASE="$ROUTERECALL_ORIGINAL_SHARED_DATABASE"
+    ROUTERECALL_PREVIOUS_CONTAINER_PRESERVED=0
+    return 1
+  fi
+  ROUTERECALL_ACTIVE_SHARED_DATABASE=1
+  route_recall_activation || return 1
+  echo "[Nightly] stage=routerecall-shared-sqlite status=PASS action=read-only-common-database oldContainer=$ROUTERECALL_ACTIVATION_CONTAINER_ID newContainer=$ROUTERECALL_ACTIVE_CONTAINER_ID"
 }
 
 haltewecker_activation_readiness() {
@@ -870,9 +1048,115 @@ haltewecker_activation_readiness() {
   if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" == "1" ]]; then
     return 0
   fi
+  local providers=""
+  if [[ "$runtime_mode" == "hybrid" ]]; then
+    providers="${PREVIOUS_STATIC_PROVIDER_IDS:-${HALTEWECKER_RUNTIME_PROVIDER_IDS:-}}"
+  fi
   python3 "$REPO/scripts/active_release_readiness.py" haltewecker \
     --container static-departures-api --release-id "$expected_release" \
-    --providers "$HALTEWECKER_RUNTIME_PROVIDER_IDS" --runtime-mode "$runtime_mode"
+    --providers "$providers" --runtime-mode "$runtime_mode"
+}
+
+capture_full_sqlite_activation_state() {
+  local rollback_pointer="${HALTEWECKER_ROLLBACK_POINTER:-$DATA_ROOT/rollback}"
+  local static_environment
+  local old_stop_data_root
+  local candidate_stop_data_root
+  if [[ ! -L "$CURRENT_RELEASE" ]]; then
+    echo "[Nightly] ERROR: current-release is not a symlink; refusing full SQLite activation" >&2
+    return 1
+  fi
+  OLD_RELEASE_TARGET="$(readlink "$CURRENT_RELEASE")"
+  OLD_RELEASE_ID="$(python3 - "$CURRENT_RELEASE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+for name in ("release.json", "release-metadata.json"):
+    path = root / name
+    if path.is_file():
+        print(json.loads(path.read_text(encoding="utf-8"))["releaseID"])
+        break
+else:
+    raise SystemExit("current production release has no release ID metadata")
+PY
+)" || return 1
+  if [[ -z "$VALIDATED_STATIC_IMAGE" || -z "$VALIDATED_ROUTE_IMAGE" ]]; then
+    echo "[Nightly] ERROR: candidate consumer image identities were not captured by preflight" >&2
+    return 1
+  fi
+  STATIC_ACTIVATION_IMAGE="$(docker inspect --format '{{.Image}}' static-departures-api)" || return 1
+  if [[ "$STATIC_ACTIVATION_IMAGE" != "$VALIDATED_STATIC_IMAGE" ]]; then
+    echo "[Nightly] ERROR: static API image changed after candidate preflight" >&2
+    return 1
+  fi
+  static_environment="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' static-departures-api)" || return 1
+  PREVIOUS_STATIC_RUNTIME_MODE="$(printf '%s\n' "$static_environment" | awk -F= '$1 == "HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE" { print $2; exit }')"
+  if [[ -z "$PREVIOUS_STATIC_RUNTIME_MODE" ]]; then
+    if printf '%s\n' "$static_environment" | grep -qx 'HALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME=1'; then
+      PREVIOUS_STATIC_RUNTIME_MODE="hybrid"
+    else
+      PREVIOUS_STATIC_RUNTIME_MODE="legacy"
+    fi
+  fi
+  PREVIOUS_STATIC_PROVIDER_IDS="$(printf '%s\n' "$static_environment" | awk -F= '$1 == "HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS" { print $2; exit }')"
+  if [[ "$PREVIOUS_STATIC_RUNTIME_MODE" == "hybrid" && -z "$PREVIOUS_STATIC_PROVIDER_IDS" ]]; then
+    PREVIOUS_STATIC_PROVIDER_IDS="$(printf '%s\n' "$static_environment" | awk -F= '$1 == "HALTEWECKER_STATIC_DEPARTURES_HYBRID_PROVIDERS" { print $2; exit }')"
+  fi
+  if [[ "$PREVIOUS_STATIC_RUNTIME_MODE" != "legacy" && "$PREVIOUS_STATIC_RUNTIME_MODE" != "hybrid" ]]; then
+    echo "[Nightly] ERROR: unsupported current static API runtime mode: $PREVIOUS_STATIC_RUNTIME_MODE" >&2
+    return 1
+  fi
+  capture_route_recall_state || return 1
+  if [[ "$ROUTERECALL_ACTIVATION_IMAGE" != "$VALIDATED_ROUTE_IMAGE" ]]; then
+    echo "[Nightly] ERROR: RouteRecall image changed after candidate preflight" >&2
+    return 1
+  fi
+  if [[ "$ROUTERECALL_ORIGINAL_SHARED_DATABASE" != "1" ]]; then
+    local compose_file="${ROUTERECALL_COMPOSE_FILE:-/srv/routerecall/deployments/haltewecker-shared-sqlite/deploy/routerecall-api.compose.yml}"
+    if [[ ! -f "$compose_file" ]] || ! grep -q 'ROUTERECALL_IMAGE_REF' "$compose_file" || \
+       ! grep -q 'ROUTERECALL_DATABASE:' "$compose_file" || \
+       ! grep -q 'ROUTERECALL_PROVIDER_RUNTIME:' "$compose_file"; then
+      echo "[Nightly] ERROR: versioned shared-SQLite RouteRecall compose contract is unavailable: $compose_file" >&2
+      return 1
+    fi
+  fi
+  if [[ -e "$DEPARTURES_CURRENT" || -L "$DEPARTURES_CURRENT" ]]; then
+    if [[ ! -L "$DEPARTURES_CURRENT" ]]; then
+      echo "[Nightly] ERROR: departures-current is not a symlink; refusing activation" >&2
+      return 1
+    fi
+    PREVIOUS_DEPARTURES_POINTER_PRESENT=1
+    PREVIOUS_DEPARTURES_POINTER_TARGET="$(readlink "$DEPARTURES_CURRENT")"
+  else
+    PREVIOUS_DEPARTURES_POINTER_PRESENT=0
+    PREVIOUS_DEPARTURES_POINTER_TARGET=""
+  fi
+  if [[ -e "$rollback_pointer" || -L "$rollback_pointer" ]]; then
+    if [[ ! -L "$rollback_pointer" ]]; then
+      echo "[Nightly] ERROR: rollback pointer is not a symlink: $rollback_pointer" >&2
+      return 1
+    fi
+    PREVIOUS_ROLLBACK_POINTER_PRESENT=1
+    PREVIOUS_ROLLBACK_POINTER_TARGET="$(readlink "$rollback_pointer")"
+  else
+    PREVIOUS_ROLLBACK_POINTER_PRESENT=0
+    PREVIOUS_ROLLBACK_POINTER_TARGET=""
+  fi
+  haltewecker_activation_readiness "$OLD_RELEASE_ID" "$PREVIOUS_STATIC_RUNTIME_MODE" || return 1
+  route_recall_activation || return 1
+  old_stop_data_root="$(python3 "$REPO/scripts/active_release_readiness.py" stop-data-root --release-root "$CURRENT_RELEASE")" || return 1
+  candidate_stop_data_root="$(python3 - "$RELEASE_DIR/stop-data" <<'PY'
+import sys
+from pathlib import Path
+print(Path(sys.argv[1]).resolve(strict=True))
+PY
+)" || return 1
+  if [[ "$candidate_stop_data_root" != "$old_stop_data_root" ]]; then
+    ROUTERECALL_ACTIVATION_RELOAD=1
+  fi
+  activation_disk_preflight
 }
 
 rollback_incremental_consumers() {
@@ -915,6 +1199,10 @@ rollback_incremental_consumers() {
       --image "$ROUTERECALL_ACTIVATION_IMAGE" \
       --container-id "$ROUTERECALL_ACTIVATION_CONTAINER_ID" \
       ${reload_option:+"$reload_option"} || return 1
+    ROUTERECALL_ACTIVE_IMAGE="$ROUTERECALL_ACTIVATION_IMAGE"
+    ROUTERECALL_ACTIVE_CONTAINER_ID="$ROUTERECALL_ACTIVATION_CONTAINER_ID"
+    ROUTERECALL_ACTIVE_SHARED_DATABASE="$ROUTERECALL_ORIGINAL_SHARED_DATABASE"
+    ROUTERECALL_PREVIOUS_CONTAINER_PRESERVED=0
   fi
   route_recall_activation && haltewecker_activation_readiness "$previous_release" "$PREVIOUS_STATIC_RUNTIME_MODE"
 }
@@ -922,8 +1210,8 @@ rollback_incremental_consumers() {
 activation_disk_preflight() {
   local free_kb
   local minimum_free_gb="${HALTEWECKER_INCREMENTAL_MIN_FREE_GB:-20}"
-  if ! [[ "$minimum_free_gb" =~ ^[0-9]+$ ]] || (( minimum_free_gb < 15 )); then
-    echo "[Nightly] ERROR: HALTEWECKER_INCREMENTAL_MIN_FREE_GB must be an integer of at least 15" >&2
+  if ! [[ "$minimum_free_gb" =~ ^[0-9]+$ ]] || (( minimum_free_gb < 20 )); then
+    echo "[Nightly] ERROR: HALTEWECKER_INCREMENTAL_MIN_FREE_GB must be an integer of at least 20" >&2
     return 1
   fi
   free_kb="$(df -Pk "$DATA_ROOT" | awk 'NR == 2 { print $4; exit }')"
@@ -961,6 +1249,8 @@ activate_incremental_production() {
     old_release="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["releaseID"])' "$CURRENT_RELEASE/release.json")" || return 1
     ROUTERECALL_ACTIVATION_IMAGE="$(docker inspect --format '{{.Image}}' "${HALTEWECKER_ROUTERECALL_CONTAINER_NAME:-routerecall-api}")" || return 1
     ROUTERECALL_ACTIVATION_CONTAINER_ID="$(docker inspect --format '{{.Id}}' "${HALTEWECKER_ROUTERECALL_CONTAINER_NAME:-routerecall-api}")" || return 1
+    ROUTERECALL_ACTIVE_IMAGE="$ROUTERECALL_ACTIVATION_IMAGE"
+    ROUTERECALL_ACTIVE_CONTAINER_ID="$ROUTERECALL_ACTIVATION_CONTAINER_ID"
     [[ -n "$ROUTERECALL_ACTIVATION_IMAGE" && -n "$ROUTERECALL_ACTIVATION_CONTAINER_ID" ]] || return 1
     ROUTERECALL_ACTIVATION_STOP_DATA_ROOT="$(python3 "$REPO/scripts/active_release_readiness.py" stop-data-root --release-root "$CURRENT_RELEASE")" || return 1
     local candidate_stop_data_root
@@ -1048,7 +1338,7 @@ activate_incremental_production() {
     HALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME=0 \
     HALTEWECKER_STATIC_DEPARTURES_HYBRID_PROVIDERS="$HALTEWECKER_RUNTIME_PROVIDER_IDS" \
     HALTEWECKER_STATIC_DEPARTURES_HYBRID_RELEASE_POINTER="" \
-    DEPARTURES_DATABASE="/data/departures-current.sqlite" \
+    DEPARTURES_DATABASE="/data/current-release/departures.sqlite" \
     HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS="$HALTEWECKER_RUNTIME_PROVIDER_IDS" \
     HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RELEASE_POINTER="/data/current-release" \
     READINESS_ONLY=1 \
@@ -1162,11 +1452,13 @@ proof_disk_preflight() {
   diagnostics_set_stage "disk-preflight-$budget_stage"
   local free_kb
   local current_stop_data_kb=0
+  local full_database_kb=0
   local margin_kb
   local estimated_additional_kb
   local estimated_free_kb
   local minimum_free_kb
   local expected_artifact_miss_kb
+  local disk_estimate
   local transient_workspace_kb
   local fallback_database_kb=0
   local fallback_database_path
@@ -1177,8 +1469,14 @@ proof_disk_preflight() {
 
   free_kb="$(disk_free_kb)"
   if [[ "$budget_stage" == "stop-data" && "$FROZEN_COMMON_STOP_DATA" != "1" && "$REUSE_STOP_DATA" != "1" && ( -d "$CURRENT" || -L "$CURRENT" ) ]]; then
-    current_stop_data_kb="$(du -skL "$CURRENT" 2>/dev/null | awk '{ print $1; exit }' || true)"
-    current_stop_data_kb="${current_stop_data_kb:-0}"
+    if [[ "$UNIFIED_SQLITE_PIPELINE" == "1" && -f "$CURRENT_RELEASE/departures.sqlite" ]]; then
+      disk_estimate="$(python3 "$REPO/scripts/estimate_full_sqlite_disk.py" \
+        --stop-data "$CURRENT" --database "$CURRENT_RELEASE/departures.sqlite")" || return 1
+      current_stop_data_kb="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["candidateStopDataKiB"])' "$disk_estimate")" || return 1
+    else
+      current_stop_data_kb="$(du -skL "$CURRENT" 2>/dev/null | awk '{ print $1; exit }' || true)"
+      current_stop_data_kb="${current_stop_data_kb:-0}"
+    fi
   fi
   margin_kb=$(( ${HALTEWECKER_PROOF_ESTIMATE_MARGIN_GB:-5} * 1024 * 1024 ))
   expected_artifact_miss_kb="${HALTEWECKER_EXPECTED_ARTIFACT_MISS_KB:-0}"
@@ -1196,7 +1494,7 @@ proof_disk_preflight() {
     echo "[Nightly] ERROR: HALTEWECKER_ADDITIONAL_WORKSPACE_KB must be a non-negative integer in KiB" >&2
     return 1
   fi
-  if [[ ( "$budget_stage" == "stop-data" || "$budget_stage" == "fallback" ) && ( "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ) ]]; then
+  if [[ ( "$budget_stage" == "stop-data" || "$budget_stage" == "fallback" ) && "$UNIFIED_SQLITE_PIPELINE" != "1" && ( "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ) ]]; then
     # The previous full SQLite is the measured lower bound for a new fallback
     # database. An explicit estimate may increase that bound, never lower it.
     fallback_database_path="${HALTEWECKER_FALLBACK_DATABASE_PATH:-}"
@@ -1227,10 +1525,34 @@ proof_disk_preflight() {
       return 1
     fi
   fi
+  if [[ ( "$budget_stage" == "stop-data" || "$budget_stage" == "fallback" ) && "$UNIFIED_SQLITE_PIPELINE" == "1" ]]; then
+    fallback_database_path="$CURRENT_RELEASE/departures.sqlite"
+    if [[ ! -f "$fallback_database_path" && -f "$DEPARTURES_CURRENT" ]]; then
+      fallback_database_path="$DEPARTURES_CURRENT"
+    fi
+    if [[ -f "$fallback_database_path" ]]; then
+      measured_fallback_database_kb="$(python3 -c 'import os,sys; print((os.stat(sys.argv[1]).st_size+1023)//1024)' "$fallback_database_path")" || return 1
+    fi
+    if [[ -n "${HALTEWECKER_FALLBACK_DATABASE_ESTIMATE_GB:-}" ]]; then
+      if ! [[ "$HALTEWECKER_FALLBACK_DATABASE_ESTIMATE_GB" =~ ^[0-9]+$ ]] || (( HALTEWECKER_FALLBACK_DATABASE_ESTIMATE_GB == 0 )); then
+        echo "[Nightly] ERROR: HALTEWECKER_FALLBACK_DATABASE_ESTIMATE_GB must be a positive integer" >&2
+        return 1
+      fi
+      configured_fallback_database_kb=$((HALTEWECKER_FALLBACK_DATABASE_ESTIMATE_GB * 1024 * 1024))
+      if (( configured_fallback_database_kb > measured_fallback_database_kb )); then
+        measured_fallback_database_kb="$configured_fallback_database_kb"
+      fi
+    fi
+    if (( measured_fallback_database_kb <= 0 )); then
+      echo "[Nightly] ERROR: cannot estimate full SQLite candidate; active departures database is missing and no positive size estimate is configured" >&2
+      return 1
+    fi
+    full_database_kb=$(( (measured_fallback_database_kb * 5 + 3) / 4 ))
+  fi
   # Check the complete candidate peak before any expensive work, then recheck
   # remaining allocations against actual free space before each later stage.
   # Existing production and rollback storage is already charged by df.
-  estimated_additional_kb=$((current_stop_data_kb + fallback_database_kb + expected_artifact_miss_kb + transient_workspace_kb + margin_kb))
+  estimated_additional_kb=$((current_stop_data_kb + fallback_database_kb + full_database_kb + expected_artifact_miss_kb + transient_workspace_kb + margin_kb))
   estimated_free_kb=$((free_kb - estimated_additional_kb))
   if [[ "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
     if [[ "$INCREMENTAL_PROOF_OVERRIDE" == "1" ]]; then
@@ -1247,16 +1569,20 @@ proof_disk_preflight() {
       warning_free_kb=$((25 * 1024 * 1024))
       disk_mode="production-shaped-no-activate"
     fi
-  elif [[ "$INCREMENTAL_PRODUCTION" == "1" ]]; then
+  elif [[ "$INCREMENTAL_PRODUCTION" == "1" || "$UNIFIED_SQLITE_PIPELINE" == "1" ]]; then
     production_min_free_gb="${HALTEWECKER_INCREMENTAL_MIN_FREE_GB:-20}"
-    if ! [[ "$production_min_free_gb" =~ ^[0-9]+$ ]] || (( production_min_free_gb < 15 )); then
-      echo "[Nightly] ERROR: HALTEWECKER_INCREMENTAL_MIN_FREE_GB must be an integer of at least 15" >&2
+    if ! [[ "$production_min_free_gb" =~ ^[0-9]+$ ]] || (( production_min_free_gb < 20 )); then
+      echo "[Nightly] ERROR: HALTEWECKER_INCREMENTAL_MIN_FREE_GB must be an integer of at least 20" >&2
       return 1
     fi
     if [[ "$INCREMENTAL_MIGRATION" == "1" ]]; then
       minimum_free_kb=$((production_min_free_gb * 1024 * 1024))
       warning_free_kb=$minimum_free_kb
       disk_mode="incremental-migration"
+    elif [[ "$UNIFIED_SQLITE_PIPELINE" == "1" ]]; then
+      minimum_free_kb=$((production_min_free_gb * 1024 * 1024))
+      warning_free_kb=$minimum_free_kb
+      disk_mode="full-sqlite-production"
     else
       minimum_free_kb=$((production_min_free_gb * 1024 * 1024))
       warning_free_kb=$minimum_free_kb
@@ -1268,20 +1594,13 @@ proof_disk_preflight() {
     disk_mode="proof-or-legacy"
   fi
   local minimum_allowed_kb=$((20 * 1024 * 1024))
-  if [[ "$INCREMENTAL_PRODUCTION" == "1" ]]; then
-    minimum_allowed_kb=$((15 * 1024 * 1024))
-  fi
   if (( minimum_free_kb < minimum_allowed_kb )); then
     echo "[Nightly] ERROR: disk reserve is below the permitted minimum for $disk_mode" >&2
     return 1
   fi
-  unset HALTEWECKER_ALLOW_REDUCED_DISK_RESERVE
   export HALTEWECKER_BUILD_MIN_FREE_GIB=$((minimum_free_kb / 1024 / 1024))
-  if [[ "$INCREMENTAL_PRODUCTION" == "1" && "$HALTEWECKER_BUILD_MIN_FREE_GIB" -lt 20 ]]; then
-    export HALTEWECKER_ALLOW_REDUCED_DISK_RESERVE=1
-  fi
   log_disk_state "before"
-  echo "[Nightly] disk model stage=$budget_stage unavoidable_stop_data_kb=$current_stop_data_kb fallback_database_kb=$fallback_database_kb expected_artifact_miss_kb=$expected_artifact_miss_kb transient_workspace_kb=$transient_workspace_kb safety_reserve_kb=$margin_kb"
+  echo "[Nightly] disk model stage=$budget_stage unavoidable_stop_data_kb=$current_stop_data_kb fallback_database_kb=$fallback_database_kb full_sqlite_candidate_kb=$full_database_kb expected_artifact_miss_kb=$expected_artifact_miss_kb transient_workspace_kb=$transient_workspace_kb safety_reserve_kb=$margin_kb"
   echo "[Nightly] disk estimated_additional_gb=$((estimated_additional_kb / 1024 / 1024)) estimated_stage_free_gb=$((estimated_free_kb / 1024 / 1024)) warning_free_gb=$((warning_free_kb / 1024 / 1024)) minimum_free_gb=$((minimum_free_kb / 1024 / 1024)) mode=$disk_mode reuse_stop_data=$REUSE_STOP_DATA"
   if (( free_kb <= warning_free_kb )); then
     echo "[Nightly] WARNING: disk free is at or below warning threshold for $disk_mode" >&2
@@ -1292,19 +1611,14 @@ proof_disk_preflight() {
   fi
 }
 
-if [[ "$RUN_MODE" == "normal" && ( "$NO_ACTIVATE" == "1" || "$INCREMENTAL_PRODUCTION" == "1" ) ]]; then
+if [[ "$RUN_MODE" == "normal" && ( "$NO_ACTIVATE" == "1" || "$INCREMENTAL_PRODUCTION" == "1" || "$UNIFIED_SQLITE_PIPELINE" == "1" ) ]]; then
   log_disk_state "run-start"
   proof_disk_preflight
 fi
 
 run_disk_guarded() {
-  if [[ "$INCREMENTAL_PRODUCTION" == "1" && "${HALTEWECKER_ALLOW_REDUCED_DISK_RESERVE:-0}" == "1" ]]; then
-    HALTEWECKER_ALLOW_REDUCED_DISK_RESERVE=1 python3 "$REPO/scripts/disk_budget.py" --root "$DATA_ROOT" \
-      --minimum-free-gib "${HALTEWECKER_BUILD_MIN_FREE_GIB:-20}" -- "$@"
-  else
-    python3 "$REPO/scripts/disk_budget.py" --root "$DATA_ROOT" \
-      --minimum-free-gib "${HALTEWECKER_BUILD_MIN_FREE_GIB:-20}" -- "$@"
-  fi
+  python3 "$REPO/scripts/disk_budget.py" --root "$DATA_ROOT" \
+    --minimum-free-gib "${HALTEWECKER_BUILD_MIN_FREE_GIB:-20}" -- "$@"
 }
 
 forecast_provider_disk() {
@@ -1313,7 +1627,7 @@ forecast_provider_disk() {
   local -a forecast_args
   forecast_args=(python3 "$REPO/scripts/estimate_provider_disk.py"
     --repository "$REPO" --stop-data "$forecast_stop_data" --gtfs-artifacts "$ARTIFACTS_JSON"
-    --runtime-provider-ids "${HALTEWECKER_RUNTIME_PROVIDER_IDS:-germany}"
+    --runtime-provider-ids "${HALTEWECKER_RUNTIME_PROVIDER_IDS-}"
     --normalized-cache-root "${HALTEWECKER_NORMALIZED_PROVIDER_CACHE_ROOT:-$DATA_ROOT/provider-artifacts/normalized}"
     --static-artifact-root "${HALTEWECKER_STATIC_PROVIDER_ARTIFACT_ROOT:-$DATA_ROOT/provider-artifacts/static}")
   if [[ -f "$CURRENT_RELEASE/release.json" ]]; then
@@ -1464,18 +1778,18 @@ run_build_stop_packages() {
     cmd+=("${EXTERNAL_GTFS_ARGS[@]}")
   fi
   cmd+=(--output "$BUILD_DIR")
-  if [[ -n "${NL_GTFS_URL:-}" && "$INCREMENTAL_PRODUCTION" != "1" && "$INCREMENTAL_NO_ACTIVATE" != "1" ]]; then
+  if [[ -n "${NL_GTFS_URL:-}" && ( "$UNIFIED_SQLITE_PIPELINE" == "1" || ( "$INCREMENTAL_PRODUCTION" != "1" && "$INCREMENTAL_NO_ACTIVATE" != "1" ) ) ]]; then
     cmd+=(--allow-nl-failure)
   fi
   local sqlite_departures_only=0
-  if [[ "$NO_ACTIVATE" != "1" || ( "$INCREMENTAL_NO_ACTIVATE" == "1" && "$FROZEN_COMMON_STOP_DATA" != "1" ) ]]; then
+  if [[ "$UNIFIED_SQLITE_PIPELINE" == "1" || ( "$INCREMENTAL_NO_ACTIVATE" == "1" && "$FROZEN_COMMON_STOP_DATA" != "1" ) ]]; then
     sqlite_departures_only=1
   fi
   HALTEWECKER_EXTERNAL_DEPARTURES_SQLITE_ONLY="$sqlite_departures_only" \
     run_disk_guarded "${cmd[@]}"
 }
 
-if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
+if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" || "$UNIFIED_SQLITE_PIPELINE" == "1" ]]; then
   # Acquisition pins the actual inputs; reject the resulting allocation peak
   # before stop-data, normalized artifacts, shards or fallback SQL are built.
   forecast_provider_disk
@@ -1484,7 +1798,7 @@ fi
 run_build_stop_packages "${NL_GTFS_URL:-}"
 
 if [[ "${FORCE_PRESERVE_NL:-0}" = "1" || -n "$NL_SOURCE_FAILED" || -f "$BUILD_DIR/.nl-failure" ]]; then
-  if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
+  if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" || "$UNIFIED_SQLITE_PIPELINE" == "1" ]]; then
     echo "[StopData] ERROR: Netherlands GTFS refresh/build failed; stale Dutch assets cannot enter a full-update candidate" >&2
     return 1
   fi
@@ -1852,7 +2166,7 @@ PY
 }
 
 run_static_departures_stage() {
-  if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" ]]; then
+  if [[ "$INCREMENTAL_PRODUCTION" == "1" || "$INCREMENTAL_NO_ACTIVATE" == "1" || "$UNIFIED_SQLITE_PIPELINE" == "1" ]]; then
     forecast_provider_disk fallback "$BUILD_DIR"
   else
     proof_disk_preflight fallback
@@ -1951,7 +2265,9 @@ if [[ -d "$RELEASE_DIR/external-artifacts/ireland" ]]; then
   for ireland_city in dublin cork galway limerick waterford; do
     test -f "$BUILD_DIR/stops/$ireland_city.json"
     test -f "$BUILD_DIR/routes/$ireland_city.json"
-    test -f "$BUILD_DIR/departures/$ireland_city.json"
+    if [[ "$UNIFIED_SQLITE_PIPELINE" != "1" ]]; then
+      test -f "$BUILD_DIR/departures/$ireland_city.json"
+    fi
   done
   python3 - "$BUILD_DIR/manifest.json" "$BUILD_DIR/transit-radar-cities.json" <<'PY'
 import json
@@ -1966,6 +2282,9 @@ if not expected.issubset(manifest_ids) or not expected.issubset(radar_ids):
     raise SystemExit("Ireland stop or radar manifest is incomplete")
 print("[StopData] Ireland external packages validated")
 PY
+fi
+if [[ "$UNIFIED_SQLITE_PIPELINE" == "1" ]]; then
+  validate_full_sqlite_candidate || return 1
 fi
 }
 
@@ -2008,12 +2327,15 @@ if [[ "$RUN_MODE" == "normal" ]]; then
     log_disk_peak
     exit 0
   fi
-  if [[ "$NO_ACTIVATE" == "1" && ( "$INCREMENTAL_NO_ACTIVATE" != "1" || "$FROZEN_COMMON_STOP_DATA" == "1" ) ]]; then
-    echo "[Nightly] stage=legacy-import status=SKIPPED release=$RELEASE_ID reason=no-activate-proof"
+  echo "[Nightly] stage=legacy-import status=started release=$RELEASE_ID"
+  run_static_departures_stage
+  if [[ "$REUSE_STOP_DATA" == "1" ]]; then
+    verify_reused_stop_data_unchanged
+  fi
+  echo "[Nightly] stage=legacy-import status=PASS release=$RELEASE_ID"
+  if [[ "$REUSE_STOP_DATA" == "1" || "$FROZEN_COMMON_STOP_DATA" == "1" ]]; then
+    echo "[StopData] release=$RELEASE_ID state persistence skipped for read-only stop-data reference"
   else
-    echo "[Nightly] stage=legacy-import status=started release=$RELEASE_ID"
-    run_static_departures_stage
-    echo "[Nightly] stage=legacy-import status=PASS release=$RELEASE_ID"
     persist_release_stage "static-departures"
   fi
 else
@@ -2057,7 +2379,13 @@ else
   esac
 fi
 
-if [[ "$NO_ACTIVATE" == "1" || "$INCREMENTAL_PRODUCTION" == "1" ]]; then
+if [[ "$RUN_MODE" == "resume" && "$UNIFIED_SQLITE_PIPELINE" == "1" &&
+      ( "$RESUME_COMPLETED_STAGE" == "static-departures" || "$RESUME_COMPLETED_STAGE" == "handoff-readiness" ) ]]; then
+  echo "[StopData] release=$RELEASE_ID resume=true revalidating full SQLite candidate and consumer images"
+  validate_full_sqlite_candidate || exit 1
+fi
+
+if [[ "$INCREMENTAL_PRODUCTION" == "1" || ( "$INCREMENTAL_NO_ACTIVATE" == "1" && "$UNIFIED_SQLITE_PIPELINE" != "1" ) ]]; then
   forecast_provider_disk provider-artifacts "$BUILD_DIR"
   log_disk_state "incremental-start"
   diagnostics_set_stage "incremental-provider"
@@ -2085,7 +2413,7 @@ if [[ "$NO_ACTIVATE" == "1" || "$INCREMENTAL_PRODUCTION" == "1" ]]; then
     INCREMENTAL_ARGS+=(--trusted-common-stop-data "$TRUSTED_COMMON_STOP_DATA")
   fi
   INCREMENTAL_ARGS+=(--result-json "$RELEASE_DIR/incremental-result.json")
-  if [[ "$INCREMENTAL_PRODUCTION" == "1" || ( "$INCREMENTAL_NO_ACTIVATE" == "1" && "$FROZEN_COMMON_STOP_DATA" != "1" ) ]]; then
+  if [[ "$INCREMENTAL_PRODUCTION" == "1" || ( "$INCREMENTAL_NO_ACTIVATE" == "1" && "$UNIFIED_SQLITE_PIPELINE" != "1" && "$FROZEN_COMMON_STOP_DATA" != "1" ) ]]; then
     if [[ ! -s "$RELEASE_DIR/departures.sqlite" ]]; then
       echo "[Nightly] ERROR: fallback database is missing before release assembly" >&2
       exit 1
@@ -2163,6 +2491,13 @@ PY
   fi
 fi
 
+if [[ "$NO_ACTIVATE" == "1" && "$UNIFIED_SQLITE_PIPELINE" == "1" ]]; then
+  echo "[Nightly] stage=nightly-complete status=PASS release=$RELEASE_ID mode=full-sqlite-no-activate activation=NOT_RUN"
+  log_disk_state "after"
+  log_disk_peak
+  exit 0
+fi
+
 OLD_RELEASE_TARGET=""
 if [[ -L "$CURRENT_RELEASE" ]]; then
   OLD_RELEASE_TARGET="$(readlink "$CURRENT_RELEASE")"
@@ -2174,6 +2509,18 @@ if [[ "$RUN_MODE" == "normal" || "$RESUME_COMPLETED_STAGE" != "handoff-readiness
   persist_release_stage "handoff-readiness"
 else
   echo "[StopData] release=$RELEASE_ID resume=true skipping_completed_stage=handoff-readiness"
+fi
+if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" == "1" ]]; then
+  echo "[Nightly] stage=activation status=PASS mode=DRY_RUN pointerSwitch=NOT_RUN"
+  log_disk_state "after"
+  log_disk_peak
+  exit 0
+fi
+if [[ "$UNIFIED_SQLITE_PIPELINE" == "1" ]]; then
+  if ! capture_full_sqlite_activation_state; then
+    echo "[Nightly] stage=activation status=FAIL reason=pre-activation-state-check" >&2
+    exit 1
+  fi
 fi
 mkdir -p "$ROLLBACK"
 if [[ -d "$CURRENT" && ! -L "$CURRENT" ]]; then
@@ -2196,13 +2543,29 @@ if [[ -z "$OLD_RELEASE_TARGET" && -e "$ROLLBACK/stop-data" ]]; then
 fi
 COMMIT_STARTED=$SECONDS
 echo "[StopData] release=$RELEASE_ID stage=commit started"
-replace_link "$CURRENT" "current-release/stop-data"
-replace_link "$CURRENT_RELEASE" "releases/$RELEASE_ID"
-replace_link "$DEPARTURES_CURRENT" "releases/$RELEASE_ID/departures.sqlite"
+if [[ "$UNIFIED_SQLITE_PIPELINE" == "1" ]]; then
+  local_rollback_pointer="${HALTEWECKER_ROLLBACK_POINTER:-$DATA_ROOT/rollback}"
+  if ! replace_link "$CURRENT" "current-release/stop-data" || \
+     ! replace_link "$local_rollback_pointer" "$OLD_RELEASE_TARGET" || \
+     ! replace_link "$CURRENT_RELEASE" "releases/$RELEASE_ID" || \
+     ! replace_link "$DEPARTURES_CURRENT" "releases/$RELEASE_ID/departures.sqlite"; then
+    echo "[StopData] ERROR: release=$RELEASE_ID pointer activation failed; restoring previous release" >&2
+    rollback_incremental_consumers "$OLD_RELEASE_TARGET" "$OLD_RELEASE_ID" || \
+      echo "[Nightly] ERROR: rollback readiness failed; operator recovery required" >&2
+    exit 1
+  fi
+else
+  replace_link "$CURRENT" "current-release/stop-data"
+  replace_link "$CURRENT_RELEASE" "releases/$RELEASE_ID"
+  replace_link "$DEPARTURES_CURRENT" "releases/$RELEASE_ID/departures.sqlite"
+fi
 
 if ! activate_runtime; then
   echo "[StopData] ERROR: release=$RELEASE_ID readiness failed; restoring previous release" >&2
-  if [[ -n "$OLD_RELEASE_TARGET" ]]; then
+  if [[ "$UNIFIED_SQLITE_PIPELINE" == "1" ]]; then
+    rollback_incremental_consumers "$OLD_RELEASE_TARGET" "$OLD_RELEASE_ID" || \
+      echo "[Nightly] ERROR: rollback readiness failed; operator recovery required" >&2
+  elif [[ -n "$OLD_RELEASE_TARGET" ]]; then
     replace_link "$CURRENT_RELEASE" "$OLD_RELEASE_TARGET"
     replace_link "$CURRENT" "current-release/stop-data"
     replace_link "$DEPARTURES_CURRENT" "$OLD_RELEASE_TARGET/departures.sqlite"
@@ -2212,6 +2575,16 @@ if ! activate_runtime; then
     [[ -e "$ROLLBACK/departures.sqlite" ]] && mv "$ROLLBACK/departures.sqlite" "$DEPARTURES_CURRENT"
   fi
   exit 1
+fi
+if [[ "$UNIFIED_SQLITE_PIPELINE" == "1" ]]; then
+  if ! activate_route_recall_shared_sqlite || \
+     ! route_recall_activation || \
+     ! haltewecker_activation_readiness "$RELEASE_ID" "legacy"; then
+    echo "[StopData] ERROR: release=$RELEASE_ID shared consumer readiness failed; restoring previous release" >&2
+    rollback_incremental_consumers "$OLD_RELEASE_TARGET" "$OLD_RELEASE_ID" || \
+      echo "[Nightly] ERROR: rollback readiness failed; operator recovery required" >&2
+    exit 1
+  fi
 fi
 
 # Publish the handoff only after the release has passed runtime readiness and

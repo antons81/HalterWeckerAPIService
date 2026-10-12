@@ -6,13 +6,13 @@ export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 activation_keys=()
 activation_values=()
 if [[ "${READINESS_ONLY:-0}" == "1" && -n "${STATIC_DEPARTURES_IMAGE:-}" ]]; then
-  for key in STATIC_DEPARTURES_IMAGE HALTEWECKER_RUNTIME_PROVIDER_IDS \
+  for key in STATIC_DEPARTURES_IMAGE STATIC_DEPARTURES_EXPECTED_IMAGE HALTEWECKER_RUNTIME_PROVIDER_IDS \
     HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RUNTIME \
     HALTEWECKER_STATIC_DEPARTURES_SHADOW_RUNTIME \
     HALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME HALTEWECKER_STATIC_DEPARTURES_HYBRID_PROVIDERS \
     HALTEWECKER_STATIC_DEPARTURES_HYBRID_RELEASE_POINTER HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS \
     HALTEWECKER_STATIC_DEPARTURES_PROVIDER_RELEASE_POINTER DEPARTURES_DATABASE STATIC_DATA_ROOT; do
-    if [[ -n "${!key:-}" ]]; then
+    if [[ ${!key+x} == x ]]; then
       activation_keys+=("$key")
       activation_values+=("${!key}")
     fi
@@ -64,7 +64,7 @@ for ((index=0; index<${#activation_keys[@]}; index++)); do
 done
 
 DATA_ROOT="${DATA_ROOT:-/srv/haltewecker/data}"
-if [[ -n "${HALTEWECKER_RUNTIME_PROVIDER_IDS:-}" ]]; then
+if [[ ${HALTEWECKER_RUNTIME_PROVIDER_IDS+x} == x ]]; then
   # The activator's consumer list is independent of the release build list.
   export HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS="$HALTEWECKER_RUNTIME_PROVIDER_IDS"
 fi
@@ -117,6 +117,65 @@ preserve_existing_container() {
   PRESERVED_CONTAINER_RENAMED=1
   docker stop --time "${STATIC_DEPARTURES_STOP_TIMEOUT_SECONDS:-30}" "$PRESERVED_CONTAINER_NAME" >/dev/null
 }
+
+if [[ "${READINESS_ONLY:-0}" == "1" && -n "${STATIC_DEPARTURES_IMAGE:-}" ]]; then
+  if [[ "$CONTAINER_NAME" != "static-departures-api" ]]; then
+    echo "$LOG_PREFIX ERROR: production reconfiguration must target static-departures-api" >&2
+    exit 1
+  fi
+  if [[ -z "$RELEASE_ID" ]]; then
+    echo "$LOG_PREFIX ERROR: production reconfiguration requires a release ID" >&2
+    exit 1
+  fi
+  expected_image="${STATIC_DEPARTURES_EXPECTED_IMAGE:-}"
+  if [[ -z "$expected_image" ]]; then
+    expected_image="$(docker image inspect --format '{{.Id}}' "$STATIC_DEPARTURES_IMAGE")"
+  fi
+  if [[ "$(docker image inspect --format '{{.Id}}' "$STATIC_DEPARTURES_IMAGE")" != "$expected_image" ]]; then
+    echo "$LOG_PREFIX ERROR: static API image reference differs from the preflight image" >&2
+    exit 1
+  fi
+  preserve_existing_container
+  pinned_project="$(printf '%s' "haltewecker-static-${RELEASE_ID//[^a-zA-Z0-9_-]/-}" | tr '[:upper:]' '[:lower:]')"
+  docker compose -p "$pinned_project" -f "$REPO/deploy/static-departures.compose.yml" up -d \
+    --no-build --pull never --no-deps --force-recreate static-departures-api
+  actual_image="$(docker inspect --format '{{.Image}}' "$CONTAINER_NAME")"
+  if [[ "$actual_image" != "$expected_image" ]]; then
+    echo "$LOG_PREFIX ERROR: activated image differs from preflight image" >&2
+    exit 1
+  fi
+  docker exec "$CONTAINER_NAME" python3 - "$RELEASE_ID" <<'PY'
+import json
+import os
+import sys
+import urllib.request
+
+with urllib.request.urlopen(
+    "http://127.0.0.1:8080/static-departures/health", timeout=5
+) as response:
+    payload = json.load(response)
+if response.status != 200:
+    raise SystemExit("static departures health endpoint did not return HTTP 200")
+database = payload.get("database", {})
+if database.get("releaseID") != sys.argv[1]:
+    raise SystemExit("static departures activated a different release")
+if database.get("runtimeMode") in {"provider", "hybrid"} or database.get("fallbackReleaseID"):
+    raise SystemExit("static departures is still using a provider or hybrid runtime")
+if os.environ.get("DEPARTURES_DATABASE") != "/data/current-release/departures.sqlite":
+    raise SystemExit("static departures is not configured for the shared SQLite")
+for key in (
+    "HALTEWECKER_STATIC_DEPARTURES_PROVIDER_IDS",
+    "HALTEWECKER_STATIC_DEPARTURES_HYBRID_PROVIDERS",
+):
+    if os.environ.get(key, ""):
+        raise SystemExit(f"static departures has unexpected runtime providers in {key}")
+PY
+  DEPLOYMENT_ROLLBACK_NEEDED=0
+  trap - EXIT
+  echo "$LOG_PREFIX release=$RELEASE_ID stage=readiness status=PASS mode=shared-sqlite image=$actual_image"
+  exit 0
+fi
+
 if [[ -z "$RELEASE_ID" ]]; then
   if [[ ! -L "$STATIC_DEPARTURES_RELEASE" ]]; then
     echo "$LOG_PREFIX ERROR: no successful stop-data handoff for standalone release-scoped import" >&2

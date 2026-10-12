@@ -1882,53 +1882,6 @@
     "statusMessage": "Realtime-Abfahrten; Radar nicht verfügbar"
   },
   {
-    "id": "radomsko",
-    "name": "Radomsko",
-    "aliases": [],
-    "country": "PL",
-    "timezone": "Europe/Warsaw",
-    "latitude": 51.0671,
-    "longitude": 19.4448,
-    "radiusMeters": 26000,
-    "packageMode": "external",
-    "externalGTFSProvider": "poland-radomsko",
-    "transitRadar": {
-      "providerID": "poland-radomsko",
-      "adapter": "externalGTFS",
-      "isEnabled": true,
-      "isExperimental": false,
-      "features": [
-        "realtimeDepartures",
-        "firstDepartures",
-        "stopLookup",
-        "realtimeDelay",
-        "tripUpdates",
-        "stopSequence"
-      ],
-      "staticBaseURL": "https://api.asoftlabs.app",
-      "boardURL": "https://api.asoftlabs.app/static-departures",
-      "tripUpdatesURL": "https://api.asoftlabs.app/poland/radomsko/realtime/trip-updates",
-      "staticModes": [
-        "bus"
-      ],
-      "realtimeDepartureModes": [
-        "bus"
-      ],
-      "sourceName": "zbiorkom.live community publication",
-      "sourceURL": "https://api.zbiorkom.live/api6-open/radomsko/gtfs/default",
-      "sourceType": "community",
-      "license": "unknown",
-      "supportsVehiclePositions": false,
-      "supportsTripUpdates": true,
-      "supportsAlerts": false,
-      "statusMessage": "Realtime-Abfahrten; Radar nicht verfügbar",
-      "sourcePublisher": "zbiorkom.live",
-      "upstreamOperator": "MPK Radomsko",
-      "provenance": "zbiorkom.live community publication"
-    },
-    "statusMessage": "Realtime-Abfahrten; Radar nicht verfügbar"
-  },
-  {
     "id": "bydgoszcz",
     "name": "Bydgoszcz",
     "aliases": ["Bydgoszcz"],
