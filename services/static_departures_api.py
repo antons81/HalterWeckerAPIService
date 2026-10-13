@@ -1317,7 +1317,6 @@ class Database:
                         WHERE active.service_id=t.service_id
                           AND active.service_date IN (?, ?, ?)
                     )
-                    ORDER BY s.departure_time, t.trip_id, s.stop_sequence
                     """,
                     (*ownership_parameters, *service_dates),
                 ).fetchall()
