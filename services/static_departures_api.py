@@ -1070,6 +1070,30 @@ class Database:
                 return set()
         return {str(row[0]) for row in rows if row[0] is not None}
 
+    def _legacy_unscoped_germany_context(self, city_id: str) -> dict[str, object] | None:
+        """Return a stop-membership-only context for legacy German imports."""
+        with self.lock:
+            if not self._table_columns("provider_city_stops"):
+                return None
+            provider_ids = {
+                str(row[0])
+                for row in self._connection().execute(
+                    "SELECT DISTINCT provider_id FROM provider_city_stops WHERE city_id=?",
+                    (city_id,),
+                ).fetchall()
+                if row[0]
+            }
+        if "germany" not in provider_ids:
+            return None
+        return {
+            "provider_id": "germany",
+            "stop_prefix": "",
+            "identifier_prefix": "",
+            "namespaced": False,
+            "ownership_mode": "city-stop-membership",
+            "timezone": DEFAULT_TIMEZONE,
+        }
+
     def legacy_city_departures(
         self,
         city_id: str,
@@ -1083,39 +1107,22 @@ class Database:
 
         with self.lock:
             connection = self._connection()
-            required_tables = ("provider_city_modes", "provider_city_stops", "provider_entities")
-            if not all(self._table_columns(table) for table in required_tables):
-                raise RuntimeUnavailable("legacy departures require provider ownership metadata")
-            provider_modes = connection.execute(
-                """
-                SELECT provider_id, stop_id_prefix, identifier_prefix, timezone
-                FROM provider_city_modes
-                WHERE city_id=?
-                ORDER BY provider_id
-                """,
-                (resolved_city,),
-            ).fetchall()
-            if not provider_modes:
-                raise RuntimeUnavailable("legacy departures require provider ownership metadata")
+            provider_mode_columns = self._table_columns("provider_city_modes")
+            provider_stop_columns = self._table_columns("provider_city_stops")
+            provider_entity_columns = self._table_columns("provider_entities")
+            if provider_mode_columns:
+                provider_modes = connection.execute(
+                    """
+                    SELECT provider_id, stop_id_prefix, identifier_prefix, timezone
+                    FROM provider_city_modes
+                    WHERE city_id=?
+                    ORDER BY provider_id
+                    """,
+                    (resolved_city,),
+                ).fetchall()
+            else:
+                provider_modes = []
             timezones = {str(row[3] or "") for row in provider_modes if str(row[3] or "")}
-            if len(timezones) > 1:
-                raise RuntimeUnavailable("legacy departures have conflicting provider timezones")
-            provider_contexts = []
-            for provider_id, stop_prefix_value, identifier_prefix_value, _timezone in provider_modes:
-                stop_prefix = str(stop_prefix_value or "")
-                identifier_prefix = str(identifier_prefix_value or "")
-                # Namespaced legacy assets keep provider IDs; raw legacy assets do not.
-                namespaced = bool(
-                    stop_prefix
-                    and any(stop_id.startswith(stop_prefix) for stop_id in stored_stop_ids)
-                )
-                provider_contexts.append({
-                    "provider_id": str(provider_id),
-                    "stop_prefix": stop_prefix,
-                    "identifier_prefix": identifier_prefix or stop_prefix,
-                    "namespaced": namespaced,
-                })
-
             raw_stop_columns = self._table_columns("raw_stops")
             route_columns = self._table_columns("routes")
             has_agencies = bool(self._table_columns("agencies"))
@@ -1149,6 +1156,48 @@ class Database:
             agency_name_expression = "a.agency_name" if agency_join else "''"
             route_type_expression = "r.route_type" if "route_type" in route_columns else "''"
 
+        legacy_germany = self._legacy_unscoped_germany_context(resolved_city)
+        if not provider_modes:
+            if legacy_germany is None:
+                raise RuntimeUnavailable("legacy departures require provider ownership metadata")
+            provider_contexts = [legacy_germany]
+        else:
+            if not provider_stop_columns or not provider_entity_columns:
+                raise RuntimeUnavailable("legacy departures require provider ownership metadata")
+            provider_contexts = []
+        germany_mode_available = any(
+            str(row[0]) == "germany" for row in provider_modes
+        )
+        germany_context_available = any(
+            str(context["provider_id"]) == "germany"
+            for context in provider_contexts
+        )
+        if (
+            legacy_germany is not None
+            and not germany_mode_available
+            and not germany_context_available
+        ):
+            provider_contexts.append(legacy_germany)
+            if legacy_germany.get("timezone"):
+                timezones.add(str(legacy_germany["timezone"]))
+        if len(timezones) > 1:
+            raise RuntimeUnavailable("legacy departures have conflicting provider timezones")
+        for provider_id, stop_prefix_value, identifier_prefix_value, _timezone in provider_modes:
+            stop_prefix = str(stop_prefix_value or "")
+            identifier_prefix = str(identifier_prefix_value or "")
+            # Namespaced legacy assets keep provider IDs; raw legacy assets do not.
+            namespaced = bool(
+                stop_prefix
+                and any(stop_id.startswith(stop_prefix) for stop_id in stored_stop_ids)
+            )
+            provider_contexts.append({
+                "provider_id": str(provider_id),
+                "stop_prefix": stop_prefix,
+                "identifier_prefix": identifier_prefix or stop_prefix,
+                "namespaced": namespaced,
+                "ownership_mode": "provider-entities",
+            })
+
         _, city_timezone, _, _ = self.city_departure_mode(resolved_city)
         timezone_name = next(iter(timezones), city_timezone)
         try:
@@ -1166,36 +1215,74 @@ class Database:
 
         with self.lock:
             connection = self._connection()
-            stop_prefix = "COALESCE(provider_mode.stop_id_prefix,'')"
-            normalized_city_stop = (
-                f"CASE WHEN {stop_prefix}<>'' AND "
-                f"substr(city_stop.stop_id,1,length({stop_prefix}))={stop_prefix} "
-                f"THEN city_stop.stop_id ELSE {stop_prefix} || city_stop.stop_id END"
-            )
-            owned_stops = f"""
-                WITH city_owned_stops AS (
-                    SELECT DISTINCT raw.stop_id
-                    FROM provider_city_stops AS city_stop
-                    JOIN provider_entities AS stop_owner
-                      ON stop_owner.entity_type='raw_stops'
-                     AND stop_owner.provider_id=city_stop.provider_id
-                    JOIN raw_stops AS raw ON raw.stop_id=stop_owner.key_1
-                    LEFT JOIN provider_city_modes AS provider_mode
-                      ON provider_mode.provider_id=city_stop.provider_id
-                     AND provider_mode.city_id=city_stop.city_id
-                    WHERE city_stop.provider_id=?
-                      AND city_stop.city_id=?
-                      AND (
-                          city_stop.stop_id=raw.stop_id
-                          OR city_stop.stop_id={raw_canonical_expression}
-                          OR {normalized_city_stop}=raw.stop_id
-                          OR {normalized_city_stop}={raw_canonical_expression}
-                      )
-                )
-            """
             provider_departures = []
             for provider in provider_contexts:
                 provider_id = str(provider["provider_id"])
+                if provider["ownership_mode"] == "provider-entities":
+                    stop_prefix = "COALESCE(provider_mode.stop_id_prefix,'')"
+                    normalized_city_stop = (
+                        f"CASE WHEN {stop_prefix}<>'' AND "
+                        f"substr(city_stop.stop_id,1,length({stop_prefix}))={stop_prefix} "
+                        f"THEN city_stop.stop_id ELSE {stop_prefix} || city_stop.stop_id END"
+                    )
+                    owned_stops = f"""
+                        WITH city_owned_stops AS (
+                            SELECT DISTINCT raw.stop_id
+                            FROM provider_city_stops AS city_stop
+                            JOIN provider_entities AS stop_owner
+                              ON stop_owner.entity_type='raw_stops'
+                             AND stop_owner.provider_id=city_stop.provider_id
+                            JOIN raw_stops AS raw ON raw.stop_id=stop_owner.key_1
+                            LEFT JOIN provider_city_modes AS provider_mode
+                              ON provider_mode.provider_id=city_stop.provider_id
+                             AND provider_mode.city_id=city_stop.city_id
+                            WHERE city_stop.provider_id=?
+                              AND city_stop.city_id=?
+                              AND (
+                                  city_stop.stop_id=raw.stop_id
+                                  OR city_stop.stop_id={raw_canonical_expression}
+                                  OR {normalized_city_stop}=raw.stop_id
+                                  OR {normalized_city_stop}={raw_canonical_expression}
+                              )
+                        )
+                    """
+                    trip_owner_join = """
+                        JOIN provider_entities AS trip_owner
+                          ON trip_owner.entity_type='trips'
+                         AND trip_owner.provider_id=?
+                         AND trip_owner.key_1=t.trip_id
+                    """
+                    ownership_parameters = (provider_id, resolved_city, provider_id)
+                    platform_parameters = (provider_id, resolved_city)
+                else:
+                    canonical_owner_select = (
+                        """
+                        UNION
+                        SELECT raw.stop_id
+                        FROM provider_city_stops AS city_stop
+                        JOIN raw_stops AS raw
+                          ON raw.canonical_stop_id=city_stop.stop_id
+                        WHERE city_stop.provider_id=? AND city_stop.city_id=?
+                        """
+                        if "canonical_stop_id" in raw_stop_columns
+                        else ""
+                    )
+                    owned_stops = f"""
+                        WITH city_owned_stops AS (
+                            SELECT raw.stop_id
+                            FROM provider_city_stops AS city_stop
+                            JOIN raw_stops AS raw ON raw.stop_id=city_stop.stop_id
+                            WHERE city_stop.provider_id=? AND city_stop.city_id=?
+                            {canonical_owner_select}
+                        )
+                    """
+                    trip_owner_join = ""
+                    ownership_parameters = (
+                        (provider_id, resolved_city, provider_id, resolved_city)
+                        if canonical_owner_select
+                        else (provider_id, resolved_city)
+                    )
+                    platform_parameters = ownership_parameters
                 departure_rows = connection.execute(
                     owned_stops
                     + f"""
@@ -1211,10 +1298,7 @@ class Database:
                     JOIN stop_times AS s ON s.raw_stop_id=owned.stop_id
                     JOIN raw_stops AS rs ON rs.stop_id=s.raw_stop_id
                     JOIN trips AS t ON t.trip_id=s.trip_id
-                    JOIN provider_entities AS trip_owner
-                      ON trip_owner.entity_type='trips'
-                     AND trip_owner.provider_id=?
-                     AND trip_owner.key_1=t.trip_id
+                    {trip_owner_join}
                     LEFT JOIN routes AS r ON r.route_id=t.route_id
                     LEFT JOIN raw_stops AS destination ON destination.stop_id=t.terminal_stop_id
                     {agency_join}
@@ -1225,7 +1309,7 @@ class Database:
                     )
                     ORDER BY s.departure_time, t.trip_id, s.stop_sequence
                     """,
-                    (provider_id, resolved_city, provider_id, *service_dates),
+                    (*ownership_parameters, *service_dates),
                 ).fetchall()
                 platform_rows = connection.execute(
                     owned_stops
@@ -1234,7 +1318,7 @@ class Database:
                     FROM city_owned_stops AS owned
                     JOIN raw_stops AS child ON child.stop_id=owned.stop_id
                     """,
-                    (provider_id, resolved_city),
+                    platform_parameters,
                 ).fetchall()
                 provider_departures.append((provider, departure_rows, platform_rows))
 

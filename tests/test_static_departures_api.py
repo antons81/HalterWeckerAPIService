@@ -546,6 +546,110 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
             self.assertEqual(unknown_status, HTTPStatus.NOT_FOUND)
             self.assertEqual(traversal_status, HTTPStatus.NOT_FOUND)
 
+    def test_legacy_germany_city_without_provider_modes_uses_exact_city_membership(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "current.sqlite"
+            write_database(path, "legacy-germany-compatibility")
+            local_date = datetime.now(ZoneInfo("Europe/Berlin")).date().strftime("%Y%m%d")
+            database = sqlite3.connect(path)
+            try:
+                database.executescript(
+                    """
+                    CREATE TABLE provider_city_modes (
+                        provider_id TEXT NOT NULL,
+                        city_id TEXT NOT NULL,
+                        mode TEXT NOT NULL,
+                        timezone TEXT NOT NULL,
+                        stop_id_prefix TEXT NOT NULL DEFAULT '',
+                        identifier_prefix TEXT NOT NULL DEFAULT '',
+                        PRIMARY KEY (provider_id, city_id)
+                    );
+                    CREATE TABLE provider_city_stops (
+                        provider_id TEXT NOT NULL,
+                        city_id TEXT NOT NULL,
+                        stop_id TEXT NOT NULL,
+                        PRIMARY KEY (provider_id, city_id, stop_id)
+                    );
+                    CREATE TABLE provider_entities (
+                        entity_type TEXT NOT NULL,
+                        provider_id TEXT NOT NULL,
+                        key_1 TEXT NOT NULL,
+                        key_2 TEXT NOT NULL DEFAULT '',
+                        key_3 TEXT NOT NULL DEFAULT '',
+                        PRIMARY KEY (entity_type, provider_id, key_1, key_2, key_3)
+                    );
+                    INSERT INTO city_stops VALUES ('berlin', '74424');
+                    INSERT INTO city_stops VALUES ('berlin', 'vbb:74424');
+                    INSERT INTO city_stops VALUES ('vaxjo', 'se:74424');
+                    INSERT INTO provider_city_stops VALUES ('germany', 'berlin', '74424');
+                    INSERT INTO provider_city_stops VALUES ('sweden', 'vaxjo', 'se:74424');
+                    INSERT INTO provider_city_stops VALUES ('vbb', 'berlin', '74424');
+                    INSERT INTO provider_city_modes VALUES ('vbb', 'berlin', 'canonical', 'Europe/Berlin', 'vbb:', 'vbb:');
+                    INSERT INTO raw_stops VALUES ('74424', '', 'Berlin Stop', '', 10, '74424');
+                    INSERT INTO raw_stops VALUES ('se:74424', '', 'Växjö Busstation', '', 11, 'se:74424');
+                    INSERT INTO raw_stops VALUES ('vbb:74424', '', 'Berlin VBB Stop', '', 12, 'vbb:74424');
+                    INSERT INTO routes VALUES ('616', '616', 'Senftenberg');
+                    INSERT INTO routes VALUES ('se:290', '290', 'Växjö');
+                    INSERT INTO routes VALUES ('vbb:617', '617', 'Berlin');
+                    INSERT INTO trips VALUES ('germany-trip-616', 'germany-service', '616', 'Senftenberg', '0', '');
+                    INSERT INTO trips VALUES ('sweden-trip-290', 'sweden-service', 'se:290', 'Växjö', '0', '');
+                    INSERT INTO trips VALUES ('vbb-trip-617', 'vbb-service', 'vbb:617', 'Berlin', '0', '');
+                    INSERT INTO active_services VALUES ('germany-service', '%s');
+                    INSERT INTO active_services VALUES ('sweden-service', '%s');
+                    INSERT INTO active_services VALUES ('vbb-service', '%s');
+                    INSERT INTO stop_times VALUES ('germany-trip-616', '74424', '12:05:00', 43500, 1);
+                    INSERT INTO stop_times VALUES ('sweden-trip-290', 'se:74424', '12:07:00', 43620, 1);
+                    INSERT INTO stop_times VALUES ('vbb-trip-617', 'vbb:74424', '12:08:00', 43680, 1);
+                    INSERT INTO provider_entities(entity_type, provider_id, key_1)
+                    VALUES ('raw_stops', 'vbb', 'vbb:74424'), ('trips', 'vbb', 'vbb-trip-617');
+                    """ % (local_date, local_date, local_date)
+                )
+                database.commit()
+            finally:
+                database.close()
+
+            with StaticDeparturesHTTPServer(path) as server:
+                berlin = server.get("/departures/berlin.json")
+
+            self.assertEqual(berlin["timezone"], "Europe/Berlin")
+            self.assertEqual([item["r"] for item in berlin["stops"]["74424"]], ["616"])
+            self.assertEqual(
+                [item["r"] for item in berlin["stops"]["vbb:74424"]],
+                ["vbb:617"],
+            )
+            self.assertNotIn("se:74424", berlin["stops"])
+
+    def test_legacy_city_without_provider_ownership_still_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "current.sqlite"
+            write_database(path, "missing-ownership")
+            database = sqlite3.connect(path)
+            try:
+                database.execute("INSERT INTO city_stops VALUES ('fixture', 'stop-parent')")
+                database.execute(
+                    """
+                    CREATE TABLE provider_city_stops (
+                        provider_id TEXT NOT NULL,
+                        city_id TEXT NOT NULL,
+                        stop_id TEXT NOT NULL,
+                        PRIMARY KEY (provider_id, city_id, stop_id)
+                    )
+                    """
+                )
+                database.execute(
+                    "INSERT INTO provider_city_stops VALUES ('unknown-provider', 'fixture', 'stop-parent')"
+                )
+                database.commit()
+            finally:
+                database.close()
+
+            database = Database(str(path), ttl=0)
+            try:
+                with self.assertRaises(static_departures_api.RuntimeUnavailable):
+                    database.legacy_city_departures("fixture")
+            finally:
+                database.close()
+
     @staticmethod
     def _http_status(server: "StaticDeparturesHTTPServer", path: str) -> int:
         try:
