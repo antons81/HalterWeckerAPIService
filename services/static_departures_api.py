@@ -1277,7 +1277,7 @@ class Database:
             try:
                 rows = self._connection().execute(
                     """
-                    SELECT stop_id_prefix
+                    SELECT provider_id, stop_id_prefix
                     FROM provider_city_modes
                     WHERE city_id=?
                     ORDER BY provider_id
@@ -1287,19 +1287,44 @@ class Database:
             except sqlite3.OperationalError:
                 rows = []
 
-        provider_prefixes = tuple(
-            dict.fromkeys(
-                str(row[0] or "")
-                for row in rows
-                if str(row[0] or "")
-            )
+        provider_modes = tuple(
+            (str(row[0]), str(row[1] or ""))
+            for row in rows
         )
-        if not provider_prefixes:
+        if not provider_modes:
             _, _, city_prefix, _ = self.city_departure_mode(city_id)
-            provider_prefixes = (city_prefix,) if city_prefix else ()
+            provider_modes = (("", city_prefix),) if city_prefix else ()
 
-        if any(stop_id.startswith(prefix) for prefix in provider_prefixes if prefix):
+        if any(stop_id.startswith(prefix) for _, prefix in provider_modes if prefix):
             return (stop_id,)
+
+        ownership_schema_available = True
+        with self.lock:
+            try:
+                ownership_rows = self._connection().execute(
+                    """
+                    SELECT modes.stop_id_prefix
+                    FROM provider_city_stops AS stops
+                    JOIN provider_city_modes AS modes
+                      ON modes.provider_id=stops.provider_id
+                     AND modes.city_id=stops.city_id
+                    WHERE stops.city_id=? AND stops.stop_id=?
+                    ORDER BY stops.provider_id
+                    """,
+                    (city_id, stop_id),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                ownership_schema_available = False
+                ownership_rows = []
+
+        if ownership_rows:
+            return tuple(dict.fromkeys(
+                f"{prefix}{stop_id}" if prefix else stop_id
+                for (prefix_value,) in ownership_rows
+                for prefix in (str(prefix_value or ""),)
+            ))
+        if ownership_schema_available:
+            return ()
 
         with self.lock:
             try:
@@ -1309,7 +1334,15 @@ class Database:
                 ).fetchone()
             except sqlite3.OperationalError:
                 row = None
-        return (stop_id,) if row is not None and not provider_prefixes else ()
+
+        if row is None:
+            return ()
+        if not provider_modes:
+            return (stop_id,)
+        if len(provider_modes) == 1:
+            prefix = provider_modes[0][1]
+            return (f"{prefix}{stop_id}" if prefix else stop_id,)
+        return ()
 
     @staticmethod
     def _public_identifier_multi(identifier: str | None, prefixes: tuple[str, ...]) -> str:

@@ -533,6 +533,124 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
             self.assertEqual(board["departures"][0]["tripID"], "ttc-surface:trip-1")
             self.assertEqual(board["departures"][0]["stopID"], "ttc-surface:100")
 
+    def test_public_colon_stop_id_resolves_through_provider_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "current.sqlite"
+            write_database(path, "norway-public-stop-id")
+            database = sqlite3.connect(path)
+            try:
+                database.execute(
+                    """
+                    CREATE TABLE city_departure_modes (
+                        city_id TEXT PRIMARY KEY,
+                        mode TEXT NOT NULL,
+                        timezone TEXT NOT NULL,
+                        stop_id_prefix TEXT NOT NULL DEFAULT '',
+                        identifier_prefix TEXT NOT NULL DEFAULT ''
+                    )
+                    """
+                )
+                database.execute(
+                    "INSERT INTO city_departure_modes VALUES (?, ?, ?, ?, ?)",
+                    ("alesund", "canonical", "Europe/Oslo", "no:", "no:"),
+                )
+                database.execute(
+                    """
+                    CREATE TABLE provider_city_modes (
+                        provider_id TEXT NOT NULL,
+                        city_id TEXT NOT NULL,
+                        mode TEXT NOT NULL,
+                        timezone TEXT NOT NULL,
+                        stop_id_prefix TEXT NOT NULL DEFAULT '',
+                        identifier_prefix TEXT NOT NULL DEFAULT '',
+                        PRIMARY KEY (provider_id, city_id)
+                    )
+                    """
+                )
+                database.execute(
+                    "INSERT INTO provider_city_modes VALUES (?, ?, ?, ?, ?, ?)",
+                    ("norway", "alesund", "canonical", "Europe/Oslo", "no:", "no:"),
+                )
+                database.execute(
+                    """
+                    CREATE TABLE provider_city_stops (
+                        provider_id TEXT NOT NULL,
+                        city_id TEXT NOT NULL,
+                        stop_id TEXT NOT NULL,
+                        PRIMARY KEY (provider_id, city_id, stop_id)
+                    )
+                    """
+                )
+                database.executemany(
+                    "INSERT INTO provider_city_stops VALUES (?, ?, ?)",
+                    [
+                        ("norway", "alesund", "NSR:StopPlace:37480"),
+                        ("norway", "alesund", "no:NSR:StopPlace:37480"),
+                    ],
+                )
+                database.executemany(
+                    "INSERT INTO city_stops VALUES (?, ?)",
+                    [
+                        ("alesund", "NSR:StopPlace:37480"),
+                        ("alesund", "foreign:StopPlace:37480"),
+                    ],
+                )
+                database.executemany(
+                    "INSERT INTO raw_stops VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            "no:NSR:StopPlace:37480",
+                            "",
+                            "Ålesund rutebilstasjon",
+                            "",
+                            10,
+                            "no:NSR:StopPlace:37480",
+                        ),
+                        (
+                            "no:foreign:StopPlace:37480",
+                            "",
+                            "Unowned Stop",
+                            "",
+                            11,
+                            "no:foreign:StopPlace:37480",
+                        ),
+                    ],
+                )
+                database.execute("INSERT INTO routes VALUES (?, ?, ?)", ("no:1", "1", "Airport"))
+                database.execute(
+                    "INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?)",
+                    ("no:trip-1", "no:service-1", "no:1", "Airport", "0", ""),
+                )
+                database.execute(
+                    "INSERT INTO active_services VALUES (?, ?)",
+                    ("no:service-1", "20261013"),
+                )
+                database.executemany(
+                    "INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)",
+                    [
+                        ("no:trip-1", "no:NSR:StopPlace:37480", "12:15:00", 44_100, 1),
+                        ("no:trip-1", "no:foreign:StopPlace:37480", "12:20:00", 44_400, 1),
+                    ],
+                )
+                database.commit()
+            finally:
+                database.close()
+
+            with StaticDeparturesHTTPServer(path) as server:
+                board = server.get(
+                    "/static-departures/board?cityID=alesund&stopID=NSR:StopPlace:37480"
+                    "&from=2026-10-13T12:00:00%2B02:00&to=2026-10-13T12:30:00%2B02:00"
+                )
+                foreign = server.get(
+                    "/static-departures/board?cityID=alesund&stopID=foreign:StopPlace:37480"
+                    "&from=2026-10-13T12:00:00%2B02:00&to=2026-10-13T12:30:00%2B02:00"
+                )
+
+            self.assertEqual(len(board["departures"]), 1)
+            self.assertEqual(board["departures"][0]["scheduledTime"], "12:15:00")
+            self.assertEqual(board["departures"][0]["stopID"], "NSR:StopPlace:37480")
+            self.assertEqual(foreign["departures"], [])
+
     def test_multi_provider_departures_never_fall_back_to_global_raw_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "current.sqlite"
