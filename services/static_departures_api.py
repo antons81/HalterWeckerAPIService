@@ -1269,9 +1269,45 @@ class Database:
         return stop_prefixes, identifier_prefixes
 
     def _explicit_provider_stop_ids(self, city_id: str, stop_id: str) -> tuple[str, ...] | None:
-        """Resolve an already namespaced stop without falling back to a raw ID."""
+        """Resolve a stop through provider ownership when namespace handling is ambiguous."""
         if ":" not in stop_id:
-            return None
+            with self.lock:
+                try:
+                    ownership_rows = self._connection().execute(
+                        """
+                        SELECT modes.provider_id, modes.stop_id_prefix
+                        FROM provider_city_stops AS stops
+                        JOIN provider_city_modes AS modes
+                          ON modes.provider_id=stops.provider_id
+                         AND modes.city_id=stops.city_id
+                        WHERE stops.city_id=? AND stops.stop_id=?
+                        ORDER BY stops.provider_id
+                        """,
+                        (city_id, stop_id),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    return None
+            if not ownership_rows:
+                return None
+
+            candidates = [
+                f"{prefix}{stop_id}" if prefix else stop_id
+                for _provider_id, prefix_value in ownership_rows
+                for prefix in (str(prefix_value or ""),)
+            ]
+            if len({str(row[0]) for row in ownership_rows}) == 1:
+                with self.lock:
+                    raw_stop = self._connection().execute(
+                        """
+                        SELECT 1 FROM raw_stops
+                        WHERE stop_id=? OR canonical_stop_id=?
+                        LIMIT 1
+                        """,
+                        (stop_id, stop_id),
+                    ).fetchone()
+                if raw_stop is not None:
+                    candidates.append(stop_id)
+            return tuple(dict.fromkeys(candidates))
 
         with self.lock:
             try:

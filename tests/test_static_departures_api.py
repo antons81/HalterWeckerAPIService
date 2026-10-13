@@ -533,7 +533,7 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
             self.assertEqual(board["departures"][0]["tripID"], "ttc-surface:trip-1")
             self.assertEqual(board["departures"][0]["stopID"], "ttc-surface:100")
 
-    def test_public_colon_stop_id_resolves_through_provider_ownership(self) -> None:
+    def test_public_stop_ids_resolve_through_provider_ownership(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "current.sqlite"
             write_database(path, "norway-public-stop-id")
@@ -550,9 +550,12 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                     )
                     """
                 )
-                database.execute(
+                database.executemany(
                     "INSERT INTO city_departure_modes VALUES (?, ?, ?, ?, ?)",
-                    ("alesund", "canonical", "Europe/Oslo", "no:", "no:"),
+                    [
+                        ("alesund", "canonical", "Europe/Oslo", "no:", "no:"),
+                        ("vasteras", "canonical", "Europe/Stockholm", "se:", ""),
+                    ],
                 )
                 database.execute(
                     """
@@ -567,9 +570,12 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                     )
                     """
                 )
-                database.execute(
+                database.executemany(
                     "INSERT INTO provider_city_modes VALUES (?, ?, ?, ?, ?, ?)",
-                    ("norway", "alesund", "canonical", "Europe/Oslo", "no:", "no:"),
+                    [
+                        ("norway", "alesund", "canonical", "Europe/Oslo", "no:", "no:"),
+                        ("sweden", "vasteras", "canonical", "Europe/Stockholm", "se:", ""),
+                    ],
                 )
                 database.execute(
                     """
@@ -586,6 +592,8 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                     [
                         ("norway", "alesund", "NSR:StopPlace:37480"),
                         ("norway", "alesund", "no:NSR:StopPlace:37480"),
+                        ("sweden", "vasteras", "1049"),
+                        ("sweden", "vasteras", "se:1049"),
                     ],
                 )
                 database.executemany(
@@ -593,6 +601,8 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                     [
                         ("alesund", "NSR:StopPlace:37480"),
                         ("alesund", "foreign:StopPlace:37480"),
+                        ("vasteras", "1049"),
+                        ("vasteras", "se:1049"),
                     ],
                 )
                 database.executemany(
@@ -614,22 +624,31 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                             11,
                             "no:foreign:StopPlace:37480",
                         ),
+                        ("1049", "", "Västerås Central", "", 12, "1049"),
+                        ("258063", "1049", "Västerås Central Platform", "", 13, "1049"),
+                        ("se:1049", "", "Västerås Central duplicate", "", 14, "se:1049"),
                     ],
                 )
                 database.execute("INSERT INTO routes VALUES (?, ?, ?)", ("no:1", "1", "Airport"))
+                database.execute("INSERT INTO routes VALUES (?, ?, ?)", ("17294", "3", "Västerås"))
                 database.execute(
                     "INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?)",
                     ("no:trip-1", "no:service-1", "no:1", "Airport", "0", ""),
                 )
                 database.execute(
+                    "INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?)",
+                    ("1371673", "service-2", "17294", "Västerås", "0", ""),
+                )
+                database.executemany(
                     "INSERT INTO active_services VALUES (?, ?)",
-                    ("no:service-1", "20261013"),
+                    [("no:service-1", "20261013"), ("service-2", "20261013")],
                 )
                 database.executemany(
                     "INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)",
                     [
                         ("no:trip-1", "no:NSR:StopPlace:37480", "12:15:00", 44_100, 1),
                         ("no:trip-1", "no:foreign:StopPlace:37480", "12:20:00", 44_400, 1),
+                        ("1371673", "258063", "04:23:00", 15_780, 1),
                     ],
                 )
                 database.commit()
@@ -645,11 +664,17 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                     "/static-departures/board?cityID=alesund&stopID=foreign:StopPlace:37480"
                     "&from=2026-10-13T12:00:00%2B02:00&to=2026-10-13T12:30:00%2B02:00"
                 )
+                sweden = server.get(
+                    "/static-departures/board?cityID=vasteras&stopID=1049"
+                    "&from=2026-10-13T04:00:00%2B02:00&to=2026-10-13T05:00:00%2B02:00"
+                )
 
             self.assertEqual(len(board["departures"]), 1)
             self.assertEqual(board["departures"][0]["scheduledTime"], "12:15:00")
             self.assertEqual(board["departures"][0]["stopID"], "NSR:StopPlace:37480")
             self.assertEqual(foreign["departures"], [])
+            self.assertEqual(len(sweden["departures"]), 1)
+            self.assertEqual(sweden["departures"][0]["scheduledTime"], "04:23:00")
 
     def test_multi_provider_departures_never_fall_back_to_global_raw_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
