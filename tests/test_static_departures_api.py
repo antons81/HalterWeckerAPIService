@@ -506,12 +506,61 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
             finally:
                 database.close()
 
+            query_plans: list[list[str]] = []
+
+            class PlanCapturingConnection:
+                def __init__(self, connection: sqlite3.Connection) -> None:
+                    self.connection = connection
+
+                def execute(self, query: str, parameters: tuple[object, ...] = ()):
+                    if "FROM city_owned_stops AS owned" in query and "stop_times AS s" in query:
+                        query_plans.append(
+                            [
+                                str(row[3])
+                                for row in self.connection.execute(
+                                    "EXPLAIN QUERY PLAN " + query,
+                                    parameters,
+                                )
+                            ]
+                        )
+                    return self.connection.execute(query, parameters)
+
+                def close(self) -> None:
+                    self.connection.close()
+
             with StaticDeparturesHTTPServer(path) as server:
-                vaxjo = server.get("/departures/vaxjo.json")
-                schipkau = server.get("/departures/schipkau.json")
-                toronto = server.get("/departures/toronto.json")
-                unknown_status = self._http_status(server, "/departures/not-a-city.json")
-                traversal_status = self._http_status(server, "/departures/../current.json")
+                create_connection = server.database._read_only_connection
+
+                def capture_query_plan() -> PlanCapturingConnection:
+                    return PlanCapturingConnection(create_connection())
+
+                with mock.patch.object(
+                    server.database,
+                    "_read_only_connection",
+                    side_effect=capture_query_plan,
+                ):
+                    vaxjo = server.get("/departures/vaxjo.json")
+                    schipkau = server.get("/departures/schipkau.json")
+                    toronto = server.get("/departures/toronto.json")
+                    unknown_status = self._http_status(server, "/departures/not-a-city.json")
+                    traversal_status = self._http_status(server, "/departures/../current.json")
+
+            sweden_plan = next(
+                plan
+                for plan in query_plans
+                if any("SEARCH trip_owner" in step for step in plan)
+            )
+            owned_stops_step = next(i for i, step in enumerate(sweden_plan) if "SCAN owned" in step)
+            stop_times_step = next(
+                i
+                for i, step in enumerate(sweden_plan)
+                if "SEARCH s USING" in step or "SCAN s" in step
+            )
+            trips_step = next(i for i, step in enumerate(sweden_plan) if "SEARCH t USING" in step)
+            trip_owner_step = next(i for i, step in enumerate(sweden_plan) if "SEARCH trip_owner USING" in step)
+            self.assertLess(owned_stops_step, stop_times_step)
+            self.assertLess(stop_times_step, trips_step)
+            self.assertLess(trips_step, trip_owner_step)
 
             self.assertEqual(vaxjo["timezone"], "Europe/Stockholm")
             self.assertEqual(

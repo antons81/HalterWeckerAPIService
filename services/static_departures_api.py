@@ -1255,11 +1255,16 @@ class Database:
                               )
                         )
                     """
-                    trip_owner_join = """
-                        JOIN provider_entities AS trip_owner
-                          ON trip_owner.entity_type='trips'
-                         AND trip_owner.provider_id=?
-                         AND trip_owner.key_1=t.trip_id
+                    trip_join = """
+                        CROSS JOIN trips AS t
+                        CROSS JOIN provider_entities AS trip_owner
+                        JOIN raw_stops AS rs ON rs.stop_id=s.raw_stop_id
+                    """
+                    trip_owner_predicate = """
+                        AND t.trip_id=s.trip_id
+                        AND trip_owner.entity_type='trips'
+                        AND trip_owner.provider_id=?
+                        AND trip_owner.key_1=t.trip_id
                     """
                     ownership_parameters = (provider_id, resolved_city, provider_id)
                     platform_parameters = (provider_id, resolved_city)
@@ -1285,7 +1290,11 @@ class Database:
                             {canonical_owner_select}
                         )
                     """
-                    trip_owner_join = ""
+                    trip_join = """
+                        JOIN raw_stops AS rs ON rs.stop_id=s.raw_stop_id
+                        JOIN trips AS t ON t.trip_id=s.trip_id
+                    """
+                    trip_owner_predicate = ""
                     ownership_parameters = (
                         (provider_id, resolved_city, provider_id, resolved_city)
                         if canonical_owner_select
@@ -1305,13 +1314,12 @@ class Database:
                            {agency_name_expression}, {route_type_expression}
                     FROM city_owned_stops AS owned
                     CROSS JOIN stop_times AS s
-                    JOIN raw_stops AS rs ON rs.stop_id=s.raw_stop_id
-                    JOIN trips AS t ON t.trip_id=s.trip_id
-                    {trip_owner_join}
+                    {trip_join}
                     LEFT JOIN routes AS r ON r.route_id=t.route_id
                     LEFT JOIN raw_stops AS destination ON destination.stop_id=t.terminal_stop_id
                     {agency_join}
                     WHERE s.raw_stop_id=owned.stop_id
+                      {trip_owner_predicate}
                       AND EXISTS (
                         SELECT 1 FROM active_services AS active
                         WHERE active.service_id=t.service_id
