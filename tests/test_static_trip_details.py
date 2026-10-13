@@ -79,6 +79,35 @@ class StaticTripDetailsTests(unittest.TestCase):
         self.assertIsNone(result["stops"][0]["longitude"])
         self.assertEqual(result["stops"][0]["scheduledArrival"], "24:00:00")
 
+    def test_legacy_city_without_departure_mode_uses_canonical_stop_ownership(self):
+        path = self.root / "legacy-no-mode.sqlite"
+        with sqlite3.connect(path) as db:
+            db.executescript("""
+                CREATE TABLE city_stops(city_id TEXT, stop_id TEXT, PRIMARY KEY(city_id, stop_id));
+                CREATE TABLE routes(route_id TEXT PRIMARY KEY, short_name TEXT, long_name TEXT, agency_id TEXT, route_type TEXT);
+                CREATE TABLE trips(trip_id TEXT PRIMARY KEY, route_id TEXT, headsign TEXT, direction_id TEXT, service_id TEXT);
+                CREATE TABLE active_services(service_id TEXT, service_date TEXT, PRIMARY KEY(service_id, service_date));
+                CREATE TABLE raw_stops(stop_id TEXT PRIMARY KEY, canonical_stop_id TEXT, stop_name TEXT);
+                CREATE TABLE stop_times(trip_id TEXT, raw_stop_id TEXT, stop_sequence INTEGER, arrival_time TEXT, departure_time TEXT);
+                INSERT INTO city_stops VALUES('berlin', 'canonical-stop');
+                INSERT INTO routes VALUES('route', 'M10', '', NULL, '3');
+                INSERT INTO trips VALUES('trip', 'route', 'Ziel', '0', 'service');
+                INSERT INTO active_services VALUES('service', '20261013');
+                INSERT INTO raw_stops VALUES('provider:stop', 'canonical-stop', 'Haltestelle');
+                INSERT INTO stop_times VALUES('trip', 'provider:stop', 1, '12:10:00', '12:10:00');
+            """)
+
+        database = api.Database(str(path))
+        try:
+            result = database.trip_details("berlin", "trip", str(self.root))
+            wrong_city = database.trip_details("hamburg", "trip", str(self.root))
+        finally:
+            database.close()
+
+        self.assertEqual(result["tripID"], "trip")
+        self.assertEqual(result["stops"][0]["name"], "Haltestelle")
+        self.assertIsNone(wrong_city)
+
     def test_provider_namespaced_trip_coordinates_do_not_collide(self):
         catalog = self.root / "stops" / "toronto.json"
         catalog.write_text(json.dumps([

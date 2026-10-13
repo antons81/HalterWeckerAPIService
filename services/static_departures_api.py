@@ -1626,6 +1626,40 @@ class Database:
             tzinfo=timezone,
         ) + timedelta(hours=hour, minutes=minute, seconds=second)
 
+    def _trip_belongs_to_city(
+        self,
+        connection: sqlite3.Connection,
+        city_id: str,
+        trip_id: str,
+    ) -> bool:
+        """Check legacy trip ownership through the city's canonical stop catalog."""
+        raw_stop_columns = self._table_columns("raw_stops")
+        canonical_join = ""
+        if "canonical_stop_id" in raw_stop_columns:
+            canonical_join = """
+                UNION ALL
+                SELECT 1
+                FROM city_stops cs
+                JOIN raw_stops rs ON rs.canonical_stop_id=cs.stop_id
+                JOIN stop_times s ON s.raw_stop_id=rs.stop_id
+                WHERE cs.city_id=? AND s.trip_id=?
+            """
+        try:
+            row = connection.execute(
+                f"""
+                SELECT 1
+                FROM city_stops cs
+                JOIN stop_times s ON s.raw_stop_id=cs.stop_id
+                WHERE cs.city_id=? AND s.trip_id=?
+                {canonical_join}
+                LIMIT 1
+                """,
+                (city_id, trip_id, city_id, trip_id) if canonical_join else (city_id, trip_id),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return False
+        return row is not None
+
     def external_departures_for(
         self,
         city_id: str,
@@ -1788,8 +1822,12 @@ class Database:
             return None
         with self.lock:
             connection = self._connection()
-            if connection.execute("SELECT 1 FROM city_departure_modes WHERE city_id=?", (city_id,)).fetchone() is None:
-                return None
+            try:
+                has_city_mode = connection.execute(
+                    "SELECT 1 FROM city_departure_modes WHERE city_id=?", (city_id,)
+                ).fetchone() is not None
+            except sqlite3.OperationalError:
+                has_city_mode = False
             route_columns = self._table_columns("routes")
             agency_join = "LEFT JOIN agencies ag ON ag.agency_id=r.agency_id" if "agency_id" in route_columns and self._table_columns("agencies") else ""
             agency_fields = "r.agency_id,ag.agency_name" if agency_join else "NULL,NULL"
@@ -1802,6 +1840,8 @@ class Database:
                 WHERE t.trip_id IN ({','.join('?' for _ in candidates)}) ORDER BY t.trip_id LIMIT 1
             """, candidates).fetchone()
             if row is None:
+                return None
+            if not has_city_mode and not self._trip_belongs_to_city(connection, city_id, str(row[0])):
                 return None
             if service_date and connection.execute("SELECT 1 FROM active_services WHERE service_id=? AND service_date=?", (row[8], service_date)).fetchone() is None:
                 return None
