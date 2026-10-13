@@ -1070,6 +1070,280 @@ class Database:
                 return set()
         return {str(row[0]) for row in rows if row[0] is not None}
 
+    def legacy_city_departures(
+        self,
+        city_id: str,
+        now: datetime | None = None,
+    ) -> dict[str, object] | None:
+        """Build the legacy all-city departures JSON from the active SQLite."""
+        resolved_city = self.resolve_city(city_id)
+        stored_stop_ids = self.city_stop_registry(resolved_city)
+        if not stored_stop_ids:
+            return None
+
+        with self.lock:
+            connection = self._connection()
+            required_tables = ("provider_city_modes", "provider_city_stops", "provider_entities")
+            if not all(self._table_columns(table) for table in required_tables):
+                raise RuntimeUnavailable("legacy departures require provider ownership metadata")
+            provider_modes = connection.execute(
+                """
+                SELECT provider_id, stop_id_prefix, identifier_prefix, timezone
+                FROM provider_city_modes
+                WHERE city_id=?
+                ORDER BY provider_id
+                """,
+                (resolved_city,),
+            ).fetchall()
+            if not provider_modes:
+                raise RuntimeUnavailable("legacy departures require provider ownership metadata")
+            timezones = {str(row[3] or "") for row in provider_modes if str(row[3] or "")}
+            if len(timezones) > 1:
+                raise RuntimeUnavailable("legacy departures have conflicting provider timezones")
+            provider_contexts = []
+            for provider_id, stop_prefix_value, identifier_prefix_value, _timezone in provider_modes:
+                stop_prefix = str(stop_prefix_value or "")
+                identifier_prefix = str(identifier_prefix_value or "")
+                # Namespaced legacy assets keep provider IDs; raw legacy assets do not.
+                namespaced = bool(
+                    stop_prefix
+                    and any(stop_id.startswith(stop_prefix) for stop_id in stored_stop_ids)
+                )
+                provider_contexts.append({
+                    "provider_id": str(provider_id),
+                    "stop_prefix": stop_prefix,
+                    "identifier_prefix": identifier_prefix or stop_prefix,
+                    "namespaced": namespaced,
+                })
+
+            raw_stop_columns = self._table_columns("raw_stops")
+            route_columns = self._table_columns("routes")
+            has_agencies = bool(self._table_columns("agencies"))
+            canonical_expression = (
+                "COALESCE(rs.canonical_stop_id, rs.stop_id)"
+                if "canonical_stop_id" in raw_stop_columns
+                else "rs.stop_id"
+            )
+            raw_canonical_expression = (
+                "COALESCE(raw.canonical_stop_id, raw.stop_id)"
+                if "canonical_stop_id" in raw_stop_columns
+                else "raw.stop_id"
+            )
+            platform_expression = (
+                "COALESCE(NULLIF(rs.platform_display,''),NULLIF(rs.platform_code,''))"
+                if "platform_display" in raw_stop_columns
+                else "rs.platform_code"
+            )
+            floor_expression = "rs.floor_display" if "floor_display" in raw_stop_columns else "''"
+            parent_expression = "rs.parent_station" if "parent_station" in raw_stop_columns else "''"
+            child_parent_expression = (
+                "child.parent_station" if "parent_station" in raw_stop_columns else "''"
+            )
+            stop_desc_expression = "rs.stop_desc" if "stop_desc" in raw_stop_columns else "''"
+            agency_id_expression = "r.agency_id" if "agency_id" in route_columns else "''"
+            agency_join = (
+                "LEFT JOIN agencies a ON a.agency_id=r.agency_id"
+                if has_agencies and "agency_id" in route_columns
+                else ""
+            )
+            agency_name_expression = "a.agency_name" if agency_join else "''"
+            route_type_expression = "r.route_type" if "route_type" in route_columns else "''"
+
+        _, city_timezone, _, _ = self.city_departure_mode(resolved_city)
+        timezone_name = next(iter(timezones), city_timezone)
+        try:
+            timezone = ZoneInfo(timezone_name)
+        except (TypeError, ValueError, KeyError):
+            raise RuntimeUnavailable("legacy departures have an invalid city timezone") from None
+        local_now = now or datetime.now(timezone)
+        if local_now.tzinfo is None:
+            local_now = local_now.replace(tzinfo=timezone)
+        local_today = local_now.astimezone(timezone).date()
+        service_dates = tuple(
+            (local_today + timedelta(days=offset)).strftime("%Y%m%d")
+            for offset in (-1, 0, 1)
+        )
+
+        with self.lock:
+            connection = self._connection()
+            stop_prefix = "COALESCE(provider_mode.stop_id_prefix,'')"
+            normalized_city_stop = (
+                f"CASE WHEN {stop_prefix}<>'' AND "
+                f"substr(city_stop.stop_id,1,length({stop_prefix}))={stop_prefix} "
+                f"THEN city_stop.stop_id ELSE {stop_prefix} || city_stop.stop_id END"
+            )
+            owned_stops = f"""
+                WITH city_owned_stops AS (
+                    SELECT DISTINCT raw.stop_id
+                    FROM provider_city_stops AS city_stop
+                    JOIN provider_entities AS stop_owner
+                      ON stop_owner.entity_type='raw_stops'
+                     AND stop_owner.provider_id=city_stop.provider_id
+                    JOIN raw_stops AS raw ON raw.stop_id=stop_owner.key_1
+                    LEFT JOIN provider_city_modes AS provider_mode
+                      ON provider_mode.provider_id=city_stop.provider_id
+                     AND provider_mode.city_id=city_stop.city_id
+                    WHERE city_stop.provider_id=?
+                      AND city_stop.city_id=?
+                      AND (
+                          city_stop.stop_id=raw.stop_id
+                          OR city_stop.stop_id={raw_canonical_expression}
+                          OR {normalized_city_stop}=raw.stop_id
+                          OR {normalized_city_stop}={raw_canonical_expression}
+                      )
+                )
+            """
+            provider_departures = []
+            for provider in provider_contexts:
+                provider_id = str(provider["provider_id"])
+                departure_rows = connection.execute(
+                    owned_stops
+                    + f"""
+                    SELECT s.raw_stop_id, {canonical_expression}, {parent_expression},
+                           s.departure_time, s.stop_sequence, t.trip_id, t.route_id,
+                           COALESCE(NULLIF(r.short_name,''),NULLIF(r.long_name,''),t.route_id),
+                           COALESCE(NULLIF(t.headsign,''),NULLIF(destination.stop_name,''),
+                                    NULLIF(r.short_name,''),NULLIF(r.long_name,''),t.route_id),
+                           t.direction_id, {platform_expression}, {floor_expression},
+                           {stop_desc_expression}, {agency_id_expression},
+                           {agency_name_expression}, {route_type_expression}
+                    FROM city_owned_stops AS owned
+                    JOIN stop_times AS s ON s.raw_stop_id=owned.stop_id
+                    JOIN raw_stops AS rs ON rs.stop_id=s.raw_stop_id
+                    JOIN trips AS t ON t.trip_id=s.trip_id
+                    JOIN provider_entities AS trip_owner
+                      ON trip_owner.entity_type='trips'
+                     AND trip_owner.provider_id=?
+                     AND trip_owner.key_1=t.trip_id
+                    LEFT JOIN routes AS r ON r.route_id=t.route_id
+                    LEFT JOIN raw_stops AS destination ON destination.stop_id=t.terminal_stop_id
+                    {agency_join}
+                    WHERE EXISTS (
+                        SELECT 1 FROM active_services AS active
+                        WHERE active.service_id=t.service_id
+                          AND active.service_date IN (?, ?, ?)
+                    )
+                    ORDER BY s.departure_time, t.trip_id, s.stop_sequence
+                    """,
+                    (provider_id, resolved_city, provider_id, *service_dates),
+                ).fetchall()
+                platform_rows = connection.execute(
+                    owned_stops
+                    + f"""
+                    SELECT child.stop_id, {child_parent_expression}
+                    FROM city_owned_stops AS owned
+                    JOIN raw_stops AS child ON child.stop_id=owned.stop_id
+                    """,
+                    (provider_id, resolved_city),
+                ).fetchall()
+                provider_departures.append((provider, departure_rows, platform_rows))
+
+        public_stop_ids = stored_stop_ids
+
+        def public_stop_id(value: object, provider: dict[str, object]) -> str:
+            identifier = str(value or "")
+            prefix = str(provider["stop_prefix"])
+            if provider["namespaced"]:
+                return identifier if not prefix or identifier.startswith(prefix) else prefix + identifier
+            return self._public_identifier_multi(identifier, (prefix,))
+
+        def public_identifier(value: object, provider: dict[str, object]) -> str:
+            identifier = str(value or "")
+            if provider["namespaced"]:
+                return identifier
+            return self._public_identifier_multi(
+                identifier, (str(provider["identifier_prefix"]),)
+            )
+
+        departures_by_stop: dict[str, list[dict[str, str]]] = {}
+        for provider, departure_rows, _platform_rows in provider_departures:
+            for (
+                raw_stop_id,
+                canonical_stop_id,
+                parent_station,
+                departure_time,
+                stop_sequence,
+                trip_id,
+                route_id,
+                line,
+                destination,
+                direction_id,
+                platform,
+                floor,
+                stop_desc,
+                agency_id,
+                operator,
+                route_type,
+            ) in departure_rows:
+                candidates = (canonical_stop_id, parent_station, raw_stop_id)
+                published_stop_id = next(
+                    (
+                        public_stop_id(candidate, provider)
+                        for candidate in candidates
+                        if public_stop_id(candidate, provider) in public_stop_ids
+                    ),
+                    None,
+                )
+                if published_stop_id is None:
+                    continue
+
+                published_raw_stop_id = public_stop_id(raw_stop_id, provider)
+                public_route_id = public_identifier(route_id, provider)
+                public_trip_id = public_identifier(trip_id, provider)
+                item = {
+                    "t": public_trip_id,
+                    "r": public_route_id,
+                    "h": str(destination or line or public_route_id),
+                    "d": str(direction_id or "0"),
+                    "p": str(departure_time or ""),
+                    "q": str(stop_sequence or 0),
+                }
+                if published_raw_stop_id != published_stop_id:
+                    item["s"] = published_raw_stop_id
+                if platform:
+                    item["platform"] = str(platform)
+                if floor:
+                    item["floor"] = str(floor)
+                if parent_station:
+                    item["parentStation"] = public_stop_id(parent_station, provider)
+                if stop_desc:
+                    item["stopDesc"] = str(stop_desc)
+                if agency_id:
+                    item["agencyID"] = public_identifier(agency_id, provider)
+                if operator:
+                    item["operator"] = str(operator)
+                if route_type:
+                    item["routeType"] = str(route_type)
+                departures_by_stop.setdefault(published_stop_id, []).append(item)
+
+        for items in departures_by_stop.values():
+            unique = {tuple(sorted(item.items())): item for item in items}
+            items[:] = sorted(
+                unique.values(),
+                key=lambda item: (item["p"], item["t"], item["r"]),
+            )
+
+        platforms_by_parent: dict[str, set[str]] = {}
+        for provider, _departure_rows, platform_rows in provider_departures:
+            for child_stop_id, parent_station in platform_rows:
+                parent_id = public_stop_id(parent_station, provider)
+                child_id = public_stop_id(child_stop_id, provider)
+                if parent_id in public_stop_ids and child_id and child_id != parent_id:
+                    platforms_by_parent.setdefault(parent_id, set()).add(child_id)
+
+        return {
+            "generatedAt": datetime.now(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z"),
+            "timezone": timezone_name,
+            "stops": {
+                stop_id: departures_by_stop[stop_id]
+                for stop_id in sorted(departures_by_stop)
+            },
+            "platforms": {
+                parent_id: sorted(child_ids)
+                for parent_id, child_ids in sorted(platforms_by_parent.items())
+            },
+        }
+
     def city_child_stop_ids(
         self,
         city_id: str,
@@ -2548,6 +2822,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(HTTPStatus.OK, {"ok": True, "database": self.database.meta()})
             if parsed.path == "/static-departures/meta":
                 return self.send_json(HTTPStatus.OK, self.database.meta())
+            if parsed.path.startswith("/departures/") and parsed.path.endswith(".json"):
+                city_id = parsed.path[len("/departures/"):-len(".json")]
+                if not city_id or not all(
+                    character.isascii() and (character.isalnum() or character in "-_")
+                    for character in city_id
+                ):
+                    return self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                payload = self.database.legacy_city_departures(city_id)
+                if payload is None:
+                    return self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                return self.send_json(
+                    HTTPStatus.OK,
+                    payload,
+                    "public, max-age=60, stale-while-revalidate=30",
+                )
             if parsed.path == "/static-departures/trip":
                 city_id = query.get("cityID", [""])[0]
                 trip_id = query.get("tripID", [""])[0]

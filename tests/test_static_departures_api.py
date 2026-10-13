@@ -364,6 +364,196 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
             "HalteWecker",
         )
 
+    def test_legacy_city_departures_route_is_provider_scoped(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "current.sqlite"
+            write_database(path, "legacy-compatibility")
+            database = sqlite3.connect(path)
+            try:
+                database.executescript(
+                    """
+                    CREATE TABLE city_departure_modes (
+                        city_id TEXT PRIMARY KEY,
+                        mode TEXT NOT NULL,
+                        timezone TEXT NOT NULL,
+                        stop_id_prefix TEXT NOT NULL DEFAULT '',
+                        identifier_prefix TEXT NOT NULL DEFAULT ''
+                    );
+                    CREATE TABLE provider_city_modes (
+                        provider_id TEXT NOT NULL,
+                        city_id TEXT NOT NULL,
+                        mode TEXT NOT NULL,
+                        timezone TEXT NOT NULL,
+                        stop_id_prefix TEXT NOT NULL DEFAULT '',
+                        identifier_prefix TEXT NOT NULL DEFAULT '',
+                        PRIMARY KEY (provider_id, city_id)
+                    );
+                    CREATE TABLE provider_city_stops (
+                        provider_id TEXT NOT NULL,
+                        city_id TEXT NOT NULL,
+                        stop_id TEXT NOT NULL,
+                        PRIMARY KEY (provider_id, city_id, stop_id)
+                    );
+                    CREATE TABLE provider_entities (
+                        entity_type TEXT NOT NULL,
+                        provider_id TEXT NOT NULL,
+                        key_1 TEXT NOT NULL,
+                        key_2 TEXT NOT NULL DEFAULT '',
+                        key_3 TEXT NOT NULL DEFAULT '',
+                        PRIMARY KEY (entity_type, provider_id, key_1, key_2, key_3)
+                    ) WITHOUT ROWID;
+                    """
+                )
+                database.executemany(
+                    "INSERT INTO city_departure_modes VALUES (?, 'canonical', ?, ?, ?)",
+                    [
+                        ("vaxjo", "Europe/Stockholm", "se:", "se:"),
+                        ("schipkau", "Europe/Berlin", "", "germany:"),
+                        ("toronto", "America/Toronto", "", ""),
+                    ],
+                )
+                database.executemany(
+                    "INSERT INTO provider_city_modes VALUES (?, ?, 'canonical', ?, ?, ?)",
+                    [
+                        ("sweden", "vaxjo", "Europe/Stockholm", "se:", "se:"),
+                        ("germany", "schipkau", "Europe/Berlin", "", "germany:"),
+                        ("ttc-surface", "toronto", "America/Toronto", "ttc-surface:", ""),
+                        ("ttc-subway", "toronto", "America/Toronto", "ttc-subway:", ""),
+                    ],
+                )
+                database.executemany(
+                    "INSERT INTO city_stops VALUES (?, '74424')",
+                    [("vaxjo",), ("schipkau",)],
+                )
+                database.executemany(
+                    "INSERT INTO provider_city_stops VALUES (?, ?, '74424')",
+                    [("sweden", "vaxjo"), ("germany", "schipkau")],
+                )
+                database.executemany(
+                    "INSERT INTO city_stops VALUES ('toronto', ?)",
+                    [("ttc-surface:100",), ("ttc-subway:100",)],
+                )
+                database.executemany(
+                    "INSERT INTO provider_city_stops VALUES (?, 'toronto', ?)",
+                    [
+                        ("ttc-surface", "ttc-surface:100"),
+                        ("ttc-subway", "ttc-subway:100"),
+                    ],
+                )
+                database.executemany(
+                    "INSERT INTO raw_stops VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        ("se:74424", "", "Växjö Busstation", "", 10, "74424"),
+                        ("se:74424-platform", "se:74424", "Växjö Busstation", "1", 11, "74424"),
+                        ("74424", "", "Schipkau, Siedlung", "", 12, "74424"),
+                        ("ttc-surface:100", "", "Toronto Surface", "", 13, "ttc-surface:100"),
+                        ("ttc-subway:100", "", "Toronto Subway", "", 14, "ttc-subway:100"),
+                    ],
+                )
+                database.executemany(
+                    "INSERT INTO routes VALUES (?, ?, ?)",
+                    [
+                        ("se:290", "290", "Växjö"),
+                        ("germany:616", "616", "Senftenberg"),
+                        ("ttc-surface:1", "1", "Surface"),
+                        ("ttc-subway:1", "1", "Subway"),
+                    ],
+                )
+                database.executemany(
+                    "INSERT INTO trips VALUES (?, ?, ?, ?, '0', '')",
+                    [
+                        ("se:trip-290", "se:service-290", "se:290", "Växjö"),
+                        ("germany:trip-616", "germany:service-616", "germany:616", "Senftenberg"),
+                        ("ttc-surface:trip-1", "ttc-surface:service-1", "ttc-surface:1", "Surface"),
+                        ("ttc-subway:trip-1", "ttc-subway:service-1", "ttc-subway:1", "Subway"),
+                    ],
+                )
+                service_date = datetime.now(ZoneInfo("Europe/Stockholm")).date().strftime("%Y%m%d")
+                toronto_service_date = datetime.now(ZoneInfo("America/Toronto")).date().strftime("%Y%m%d")
+                database.executemany(
+                    "INSERT INTO active_services VALUES (?, ?)",
+                    [
+                        ("se:service-290", service_date),
+                        ("germany:service-616", service_date),
+                        ("ttc-surface:service-1", toronto_service_date),
+                        ("ttc-subway:service-1", toronto_service_date),
+                    ],
+                )
+                database.executemany(
+                    "INSERT INTO stop_times VALUES (?, ?, ?, ?, 1)",
+                    [
+                        ("se:trip-290", "se:74424-platform", "12:07:00", 43_620),
+                        ("germany:trip-616", "74424", "12:05:00", 43_500),
+                        ("ttc-surface:trip-1", "ttc-surface:100", "08:01:00", 28_860),
+                        ("ttc-subway:trip-1", "ttc-subway:100", "08:02:00", 28_920),
+                    ],
+                )
+                database.executemany(
+                    "INSERT INTO provider_entities(entity_type, provider_id, key_1) VALUES (?, ?, ?)",
+                    [
+                        ("raw_stops", "sweden", "se:74424"),
+                        ("raw_stops", "sweden", "se:74424-platform"),
+                        ("raw_stops", "germany", "74424"),
+                        ("raw_stops", "ttc-surface", "ttc-surface:100"),
+                        ("raw_stops", "ttc-subway", "ttc-subway:100"),
+                        ("trips", "sweden", "se:trip-290"),
+                        ("trips", "germany", "germany:trip-616"),
+                        ("trips", "ttc-surface", "ttc-surface:trip-1"),
+                        ("trips", "ttc-subway", "ttc-subway:trip-1"),
+                    ],
+                )
+                database.commit()
+            finally:
+                database.close()
+
+            with StaticDeparturesHTTPServer(path) as server:
+                vaxjo = server.get("/departures/vaxjo.json")
+                schipkau = server.get("/departures/schipkau.json")
+                toronto = server.get("/departures/toronto.json")
+                unknown_status = self._http_status(server, "/departures/not-a-city.json")
+                traversal_status = self._http_status(server, "/departures/../current.json")
+
+            self.assertEqual(vaxjo["timezone"], "Europe/Stockholm")
+            self.assertEqual(
+                set(vaxjo),
+                {"generatedAt", "timezone", "stops", "platforms"},
+            )
+            self.assertEqual([item["r"] for item in vaxjo["stops"]["74424"]], ["290"])
+            self.assertEqual(vaxjo["stops"]["74424"][0]["s"], "74424-platform")
+            self.assertTrue(
+                {"t", "r", "h", "d", "p", "q", "s"}.issubset(
+                    vaxjo["stops"]["74424"][0]
+                )
+            )
+            self.assertEqual(vaxjo["platforms"]["74424"], ["74424-platform"])
+            self.assertEqual([item["r"] for item in schipkau["stops"]["74424"]], ["616"])
+            self.assertEqual(
+                [item["r"] for item in toronto["stops"]["ttc-surface:100"]],
+                ["ttc-surface:1"],
+            )
+            self.assertEqual(
+                [item["r"] for item in toronto["stops"]["ttc-subway:100"]],
+                ["ttc-subway:1"],
+            )
+            self.assertEqual(
+                toronto["stops"]["ttc-surface:100"][0]["t"],
+                "ttc-surface:trip-1",
+            )
+            self.assertEqual(
+                toronto["stops"]["ttc-subway:100"][0]["t"],
+                "ttc-subway:trip-1",
+            )
+            self.assertEqual(unknown_status, HTTPStatus.NOT_FOUND)
+            self.assertEqual(traversal_status, HTTPStatus.NOT_FOUND)
+
+    @staticmethod
+    def _http_status(server: "StaticDeparturesHTTPServer", path: str) -> int:
+        try:
+            with urlopen(f"{server.base_url}{path}", timeout=5) as response:
+                return response.status
+        except HTTPError as error:
+            return error.code
+
     def test_health_meta_lines_and_board(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "current.sqlite"
