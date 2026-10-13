@@ -1732,20 +1732,25 @@ class Database:
             try:
                 row = connection.execute(
                     f"""
+                    WITH trip_owner AS MATERIALIZED (
+                        SELECT provider_id, key_1
+                        FROM provider_entities
+                        WHERE entity_type='trips' AND key_1=?
+                    )
                     SELECT 1
-                    FROM provider_entities AS trip_owner
-                    JOIN provider_city_stops AS city_stop
-                      ON city_stop.provider_id=trip_owner.provider_id
-                     AND city_stop.city_id=?
-                    JOIN stop_times AS s ON s.trip_id=trip_owner.key_1
-                    JOIN raw_stops AS rs ON rs.stop_id=s.raw_stop_id
-                    JOIN provider_entities AS stop_owner
-                      ON stop_owner.provider_id=trip_owner.provider_id
-                     AND stop_owner.entity_type='raw_stops'
-                     AND stop_owner.key_1=rs.stop_id
+                    FROM trip_owner
+                    CROSS JOIN provider_city_stops AS city_stop
+                    CROSS JOIN stop_times AS s
+                    CROSS JOIN raw_stops AS rs
+                    CROSS JOIN provider_entities AS stop_owner
                     {provider_mode_join}
-                    WHERE trip_owner.entity_type='trips'
-                      AND trip_owner.key_1=?
+                    WHERE city_stop.provider_id=trip_owner.provider_id
+                      AND city_stop.city_id=?
+                      AND s.trip_id=trip_owner.key_1
+                      AND rs.stop_id=s.raw_stop_id
+                      AND stop_owner.provider_id=trip_owner.provider_id
+                      AND stop_owner.entity_type='raw_stops'
+                      AND stop_owner.key_1=rs.stop_id
                       AND (
                           city_stop.stop_id=rs.stop_id
                           OR city_stop.stop_id={canonical_stop}
@@ -1754,7 +1759,7 @@ class Database:
                       )
                     LIMIT 1
                     """,
-                    (city_id, trip_id),
+                    (trip_id, city_id),
                 ).fetchone()
             except sqlite3.OperationalError:
                 return False
