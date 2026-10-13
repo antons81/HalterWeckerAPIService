@@ -1234,26 +1234,28 @@ class Database:
                         f"substr(city_stop.stop_id,1,length({stop_prefix}))={stop_prefix} "
                         f"THEN city_stop.stop_id ELSE {stop_prefix} || city_stop.stop_id END"
                     )
-                    raw_stop_owner_join = """
-                        JOIN provider_entities AS stop_owner
-                          ON stop_owner.entity_type='raw_stops'
-                         AND stop_owner.provider_id=city_stop.provider_id
-                         AND stop_owner.key_1=raw.stop_id
+                    raw_stop_owner_join = "CROSS JOIN provider_entities AS stop_owner"
+                    raw_stop_owner_predicate = """
+                        AND stop_owner.entity_type='raw_stops'
+                        AND stop_owner.provider_id=city_stop.provider_id
+                        AND stop_owner.key_1=raw.stop_id
                     """
                     canonical_owner_select = (
                         f"""
                         UNION
                         SELECT raw.stop_id
                         FROM selected_city_stops AS city_stop
-                        JOIN raw_stops AS raw
-                          ON raw.canonical_stop_id=city_stop.stop_id
+                        CROSS JOIN raw_stops AS raw
                         {raw_stop_owner_join}
+                        WHERE raw.canonical_stop_id=city_stop.stop_id
+                          {raw_stop_owner_predicate}
                         UNION
                         SELECT raw.stop_id
                         FROM selected_city_stops AS city_stop
-                        JOIN raw_stops AS raw
-                          ON raw.canonical_stop_id=city_stop.normalized_stop_id
+                        CROSS JOIN raw_stops AS raw
                         {raw_stop_owner_join}
+                        WHERE raw.canonical_stop_id=city_stop.normalized_stop_id
+                          {raw_stop_owner_predicate}
                         """
                         if "canonical_stop_id" in raw_stop_columns
                         else ""
@@ -1272,14 +1274,17 @@ class Database:
                         city_owned_stops AS (
                             SELECT raw.stop_id
                             FROM selected_city_stops AS city_stop
-                            JOIN raw_stops AS raw ON raw.stop_id=city_stop.stop_id
+                            CROSS JOIN raw_stops AS raw
                             {raw_stop_owner_join}
+                            WHERE raw.stop_id=city_stop.stop_id
+                              {raw_stop_owner_predicate}
                             UNION
                             SELECT raw.stop_id
                             FROM selected_city_stops AS city_stop
-                            JOIN raw_stops AS raw
-                              ON raw.stop_id=city_stop.normalized_stop_id
+                            CROSS JOIN raw_stops AS raw
                             {raw_stop_owner_join}
+                            WHERE raw.stop_id=city_stop.normalized_stop_id
+                              {raw_stop_owner_predicate}
                             {canonical_owner_select}
                         )
                     """

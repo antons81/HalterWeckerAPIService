@@ -556,6 +556,7 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
             stop_owner_step = next(
                 i for i, step in enumerate(sweden_plan) if "SEARCH stop_owner USING" in step
             )
+            stop_owner_steps = [step for step in sweden_plan if "SEARCH stop_owner USING" in step]
             owned_stops_step = next(i for i, step in enumerate(sweden_plan) if "SCAN owned" in step)
             stop_times_step = next(
                 i
@@ -565,6 +566,8 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
             trips_step = next(i for i, step in enumerate(sweden_plan) if "SEARCH t USING" in step)
             trip_owner_step = next(i for i, step in enumerate(sweden_plan) if "SEARCH trip_owner USING" in step)
             self.assertLess(city_stop_step, stop_owner_step)
+            self.assertTrue(stop_owner_steps)
+            self.assertTrue(all("key_1=?" in step for step in stop_owner_steps))
             self.assertLess(owned_stops_step, stop_times_step)
             self.assertLess(stop_times_step, trips_step)
             self.assertLess(trips_step, trip_owner_step)
