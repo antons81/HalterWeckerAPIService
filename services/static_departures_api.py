@@ -1304,14 +1304,15 @@ class Database:
                            {stop_desc_expression}, {agency_id_expression},
                            {agency_name_expression}, {route_type_expression}
                     FROM city_owned_stops AS owned
-                    JOIN stop_times AS s ON s.raw_stop_id=owned.stop_id
+                    CROSS JOIN stop_times AS s
                     JOIN raw_stops AS rs ON rs.stop_id=s.raw_stop_id
                     JOIN trips AS t ON t.trip_id=s.trip_id
                     {trip_owner_join}
                     LEFT JOIN routes AS r ON r.route_id=t.route_id
                     LEFT JOIN raw_stops AS destination ON destination.stop_id=t.terminal_stop_id
                     {agency_join}
-                    WHERE EXISTS (
+                    WHERE s.raw_stop_id=owned.stop_id
+                      AND EXISTS (
                         SELECT 1 FROM active_services AS active
                         WHERE active.service_id=t.service_id
                           AND active.service_date IN (?, ?, ?)
