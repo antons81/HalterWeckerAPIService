@@ -919,6 +919,15 @@ class Database:
         self.checked_at = now
         return self.connection
 
+    def _read_only_connection(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            f"file:{self.path}?mode=ro",
+            uri=True,
+            check_same_thread=False,
+        )
+        connection.execute("PRAGMA query_only=ON")
+        return connection
+
     def _table_columns(self, table: str) -> set[str]:
         return {
             str(row[1])
@@ -1213,8 +1222,8 @@ class Database:
             for offset in (-1, 0, 1)
         )
 
-        with self.lock:
-            connection = self._connection()
+        connection = self._read_only_connection()
+        try:
             provider_departures = []
             for provider in provider_contexts:
                 provider_id = str(provider["provider_id"])
@@ -1321,6 +1330,8 @@ class Database:
                     platform_parameters,
                 ).fetchall()
                 provider_departures.append((provider, departure_rows, platform_rows))
+        finally:
+            connection.close()
 
         public_stop_ids = stored_stop_ids
 

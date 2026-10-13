@@ -619,6 +619,85 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
             )
             self.assertNotIn("se:74424", berlin["stops"])
 
+    def test_legacy_departures_query_does_not_block_board_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "current.sqlite"
+            write_database(path, "legacy-independent-read")
+            database = sqlite3.connect(path)
+            try:
+                database.executescript(
+                    """
+                    CREATE TABLE provider_city_stops (
+                        provider_id TEXT NOT NULL,
+                        city_id TEXT NOT NULL,
+                        stop_id TEXT NOT NULL,
+                        PRIMARY KEY (provider_id, city_id, stop_id)
+                    ) WITHOUT ROWID;
+                    CREATE TABLE provider_entities (
+                        entity_type TEXT NOT NULL,
+                        provider_id TEXT NOT NULL,
+                        key_1 TEXT NOT NULL,
+                        key_2 TEXT NOT NULL DEFAULT '',
+                        key_3 TEXT NOT NULL DEFAULT '',
+                        PRIMARY KEY (entity_type, provider_id, key_1, key_2, key_3)
+                    ) WITHOUT ROWID;
+                    INSERT INTO provider_city_stops VALUES ('germany', 'dresden', 'stop-parent');
+                    """
+                )
+                database.commit()
+            finally:
+                database.close()
+
+            query_started = threading.Event()
+            continue_query = threading.Event()
+            legacy_errors: list[BaseException] = []
+
+            class BlockingConnection:
+                def __init__(self, connection: sqlite3.Connection) -> None:
+                    self.connection = connection
+
+                def execute(self, query: str, parameters: tuple[object, ...] = ()):
+                    if "WITH city_owned_stops AS (" in query:
+                        query_started.set()
+                        if not continue_query.wait(timeout=5):
+                            raise TimeoutError("legacy query test was not released")
+                    return self.connection.execute(query, parameters)
+
+                def close(self) -> None:
+                    self.connection.close()
+
+            with StaticDeparturesHTTPServer(path) as server:
+                create_connection = server.database._read_only_connection
+
+                def block_legacy_query() -> BlockingConnection:
+                    return BlockingConnection(create_connection())
+
+                def load_legacy_departures() -> None:
+                    try:
+                        server.database.legacy_city_departures("dresden")
+                    except BaseException as error:
+                        legacy_errors.append(error)
+
+                with mock.patch.object(
+                    server.database,
+                    "_read_only_connection",
+                    side_effect=block_legacy_query,
+                ):
+                    legacy_thread = threading.Thread(target=load_legacy_departures)
+                    legacy_thread.start()
+                    try:
+                        self.assertTrue(query_started.wait(timeout=2))
+                        board = server.get(
+                            "/static-departures/board?cityID=dresden&stopID=stop-parent&limit=1"
+                        )
+                        self.assertEqual(board["cityID"], "dresden")
+                    finally:
+                        continue_query.set()
+                        legacy_thread.join(timeout=5)
+
+            self.assertFalse(legacy_thread.is_alive())
+            self.assertEqual(legacy_errors, [])
+
     def test_legacy_city_without_provider_ownership_still_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "current.sqlite"
