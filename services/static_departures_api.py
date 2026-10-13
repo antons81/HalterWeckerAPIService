@@ -1408,7 +1408,28 @@ class Database:
     def _canonical_stop_candidates(self, city_id: str, stop_id: str) -> tuple[str, ...]:
         explicit_ids = self._explicit_provider_stop_ids(city_id, stop_id)
         if explicit_ids is not None:
-            return explicit_ids
+            if not explicit_ids:
+                return ()
+            with self.lock:
+                raw_stop_columns = self._table_columns("raw_stops")
+                if "canonical_stop_id" not in raw_stop_columns:
+                    return explicit_ids
+                try:
+                    rows = self._connection().execute(
+                        f"""
+                        SELECT DISTINCT canonical_stop_id
+                        FROM raw_stops
+                        WHERE stop_id IN ({','.join('?' for _ in explicit_ids)})
+                          AND canonical_stop_id IS NOT NULL
+                          AND canonical_stop_id<>''
+                        """,
+                        explicit_ids,
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    return explicit_ids
+            return tuple(dict.fromkeys(
+                (*explicit_ids, *(str(row[0]) for row in rows))
+            ))
         stop_prefixes, _ = self.city_departure_prefixes(city_id)
         return tuple(dict.fromkeys(
             f"{prefix}{stop_id}" if prefix else stop_id

@@ -556,6 +556,7 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                         ("alesund", "canonical", "Europe/Oslo", "no:", "no:"),
                         ("vasteras", "canonical", "Europe/Stockholm", "se:", ""),
                         ("vaxjo", "canonical", "Europe/Stockholm", "se:", ""),
+                        ("stockholm", "canonical", "Europe/Stockholm", "se:", ""),
                     ],
                 )
                 database.execute(
@@ -577,6 +578,7 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                         ("norway", "alesund", "canonical", "Europe/Oslo", "no:", "no:"),
                         ("sweden", "vasteras", "canonical", "Europe/Stockholm", "se:", ""),
                         ("sweden", "vaxjo", "canonical", "Europe/Stockholm", "se:", ""),
+                        ("sweden", "stockholm", "canonical", "Europe/Stockholm", "se:", ""),
                     ],
                 )
                 database.execute(
@@ -597,6 +599,8 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                         ("sweden", "vasteras", "1049"),
                         ("sweden", "vasteras", "se:1049"),
                         ("sweden", "vaxjo", "74424"),
+                        ("sweden", "stockholm", "9022050012574002"),
+                        ("sweden", "stockholm", "se:9022050012574002"),
                         ("germany", "schipkau", "74424"),
                     ],
                 )
@@ -608,6 +612,8 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                         ("vasteras", "1049"),
                         ("vasteras", "se:1049"),
                         ("vaxjo", "74424"),
+                        ("stockholm", "9022050012574002"),
+                        ("stockholm", "se:9022050012574002"),
                         ("schipkau", "74424"),
                     ],
                 )
@@ -648,6 +654,7 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                         ("74424", "", "Schipkau, Siedlung", "", 15, "74424"),
                         ("74424-617-child", "74424", "Schipkau, Siedlung, Mast 2", "", 16, "74424"),
                         ("se:74424-platform", "", "Växjö Busstation", "1", 17, "74424"),
+                        ("se:9022050012574002", "se:12574", "Ronna skola", "", 0, "se:12574"),
                     ],
                 )
                 database.execute("INSERT INTO routes VALUES (?, ?, ?)", ("no:1", "1", "Airport"))
@@ -655,6 +662,7 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                 database.execute("INSERT INTO routes VALUES (?, ?, ?)", ("germany:616", "616", "Senftenberg"))
                 database.execute("INSERT INTO routes VALUES (?, ?, ?)", ("germany:617", "617", "Großräschen"))
                 database.execute("INSERT INTO routes VALUES (?, ?, ?)", ("se:290", "290", "Växjö"))
+                database.execute("INSERT INTO routes VALUES (?, ?, ?)", ("se:752", "752", "Stockholm"))
                 database.execute(
                     "INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?)",
                     ("no:trip-1", "no:service-1", "no:1", "Airport", "0", ""),
@@ -675,6 +683,10 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                     "INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?)",
                     ("se:trip-290", "se:service-290", "se:290", "Växjö", "0", ""),
                 )
+                database.execute(
+                    "INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?)",
+                    ("se:trip-752", "se:service-752", "se:752", "Stockholm", "0", ""),
+                )
                 database.executemany(
                     "INSERT INTO active_services VALUES (?, ?)",
                     [
@@ -683,6 +695,7 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                         ("germany:service-616", "20261013"),
                         ("germany:service-617", "20261013"),
                         ("se:service-290", "20261013"),
+                        ("se:service-752", "20261017"),
                     ],
                 )
                 database.executemany(
@@ -694,6 +707,7 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                         ("trip-616", "74424", "12:05:00", 43_500, 1),
                         ("trip-617", "74424-617-child", "12:10:00", 43_800, 1),
                         ("se:trip-290", "se:74424-platform", "12:07:00", 43_620, 1),
+                        ("se:trip-752", "se:9022050012574002", "06:51:15", 24_675, 1),
                     ],
                 )
                 database.executemany(
@@ -707,11 +721,13 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                         ("raw_stops", "germany", "74424"),
                         ("raw_stops", "germany", "74424-617-child"),
                         ("raw_stops", "sweden", "se:74424-platform"),
+                        ("raw_stops", "sweden", "se:9022050012574002"),
                         ("trips", "norway", "no:trip-1"),
                         ("trips", "sweden", "1371673"),
                         ("trips", "germany", "trip-616"),
                         ("trips", "germany", "trip-617"),
                         ("trips", "sweden", "se:trip-290"),
+                        ("trips", "sweden", "se:trip-752"),
                     ],
                 )
                 database.commit()
@@ -741,6 +757,13 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                 )
                 vaxjo_lines = server.get("/static-departures/lines?cityID=vaxjo&stopID=74424")
                 schipkau_lines = server.get("/static-departures/lines?cityID=schipkau&stopID=74424")
+                stockholm_lines = server.get(
+                    "/static-departures/lines?cityID=stockholm&stopID=9022050012574002"
+                )
+                stockholm_board = server.get(
+                    "/static-departures/board?cityID=stockholm&stopID=9022050012574002"
+                    "&from=2026-10-17T00:00:00%2B02:00&to=2026-10-18T00:00:00%2B02:00"
+                )
 
             self.assertEqual(len(board["departures"]), 1)
             self.assertEqual(board["departures"][0]["scheduledTime"], "12:15:00")
@@ -761,6 +784,9 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                 {line["line"] for line in schipkau_lines["lines"]},
                 {"616", "617"},
             )
+            self.assertEqual([line["line"] for line in stockholm_lines["lines"]], ["752"])
+            self.assertEqual([departure["line"] for departure in stockholm_board["departures"]], ["752"])
+            self.assertEqual(stockholm_board["departures"][0]["scheduledTime"], "06:51:15")
 
             database = Database(str(path))
             try:
