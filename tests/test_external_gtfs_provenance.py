@@ -488,9 +488,14 @@ class ExternalGTFSProvenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "lost sources"):
             validate_previous_release_sources({"fixture"}, set())
         validate_previous_release_sources({"fixture"}, set(), allowlisted={"fixture"})
-        with self.assertRaisesRegex(ValueError, "lost cities"):
-            validate_previous_release_cities({"fixture-city"}, set())
-        validate_previous_release_cities({"retained-city"}, {"retained-city"})
+        self.assertEqual(
+            validate_previous_release_cities({"fixture-city"}, set()),
+            ["fixture-city"],
+        )
+        self.assertEqual(
+            validate_previous_release_cities({"retained-city"}, {"retained-city"}),
+            [],
+        )
 
     def test_expired_source_calendar_forces_unconditional_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

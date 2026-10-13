@@ -12,7 +12,19 @@ from urllib.parse import parse_qs, urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from scripts.validate_shared_release_consumers import CONTROL_FLOW_PROBE, STATIC_CITY_PROBE, parse_probe_result, image_runtime_contract, image_supported_providers, main, preflight, provider_ids, static_consumer_environment, validate_release_pair
+from scripts.validate_shared_release_consumers import (
+    CONTROL_FLOW_PROBE,
+    STATIC_CITY_PROBE,
+    candidate_control_cities,
+    image_runtime_contract,
+    image_supported_providers,
+    main,
+    parse_probe_result,
+    preflight,
+    provider_ids,
+    static_consumer_environment,
+    validate_release_pair,
+)
 from services.release_activation_requirements import ActivationRequirementError
 
 
@@ -32,8 +44,16 @@ class ConsumerPreflightTests(unittest.TestCase):
         self.assertEqual(rollback["HALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME"], "1")
 
     def test_control_flows_require_public_stop_board_and_trip_stops(self):
-        plan = {"checks": [{"cityID": "wuppertal", "stopID": "10031", "hasSchedule": True,
-                            "from": "2026-10-11T00:00:00", "to": "2026-10-24T23:59:59"}]}
+        plan = {
+            "controlCities": ["wuppertal"],
+            "checks": [{
+                "cityID": "wuppertal",
+                "stopID": "10031",
+                "hasSchedule": True,
+                "from": "2026-10-11T00:00:00",
+                "to": "2026-10-24T23:59:59",
+            }],
+        }
         broken = False
         def response(url, **kwargs):
             path = urlparse(url).path
@@ -54,6 +74,18 @@ class ConsumerPreflightTests(unittest.TestCase):
             broken = True
             with self.assertRaisesRegex(RuntimeError, "trip details lost stops"):
                 exec(CONTROL_FLOW_PROBE, {})
+
+    def test_city_count_changes_only_change_the_available_control_probes(self):
+        coverage = {"checks": [
+            {"cityID": "wuppertal"},
+            {"cityID": "new-city-from-feed"},
+        ]}
+
+        self.assertEqual(candidate_control_cities(coverage), ["wuppertal"])
+        self.assertEqual(
+            candidate_control_cities({"checks": [{"cityID": "new-city-from-feed"}]}),
+            [],
+        )
 
 
     def test_info_logs_do_not_corrupt_explicit_probe_result(self):
@@ -239,7 +271,7 @@ class ConsumerPreflightTests(unittest.TestCase):
             (root / "release.json").write_text('{"providers":{"germany":{}}}')
             reports = [{"staticImage": "image", "routeImage": "route", "coveragePlan": {"checks": [{"cityID": "helsinki", "hasSchedule": available}]}} for available in (True, False)]
             with patch("scripts.validate_shared_release_consumers.preflight", side_effect=reports):
-                with self.assertRaisesRegex(ValueError, "lost scheduled cities: helsinki"):
+                with self.assertRaisesRegex(ValueError, "lost schedules for retained cities: helsinki"):
                     validate_release_pair(root, root, ("germany",), (), "static", "route")
     def test_provider_list_normalizes_whitespace_and_duplicates(self):
         self.assertEqual(provider_ids(" israel-mot, germany,israel-mot, "), ("israel-mot", "germany"))

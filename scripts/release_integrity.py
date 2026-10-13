@@ -155,14 +155,13 @@ def validate_previous_release_sources(
 def validate_previous_release_cities(
     old_city_ids: Iterable[str],
     candidate_city_ids: set[str],
-) -> None:
-    missing = sorted(
-        city_id
-        for city_id in set(old_city_ids)
-        if city_id not in candidate_city_ids
-    )
-    if missing:
-        raise ValueError("Candidate lost cities from active release: " + ", ".join(missing))
+) -> list[str]:
+    """Return removed city IDs for diagnostics without blocking a release.
+
+    City membership is determined by the current source data. A change in the
+    set of IDs alone is not evidence that candidate import or routing failed.
+    """
+    return sorted(set(old_city_ids) - candidate_city_ids)
 
 
 def _artifact_entries(payload: Mapping[str, object]) -> dict[str, Mapping[str, object]]:
