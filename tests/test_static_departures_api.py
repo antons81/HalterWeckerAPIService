@@ -556,7 +556,6 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                         ("alesund", "canonical", "Europe/Oslo", "no:", "no:"),
                         ("vasteras", "canonical", "Europe/Stockholm", "se:", ""),
                         ("vaxjo", "canonical", "Europe/Stockholm", "se:", ""),
-                        ("schipkau", "canonical", "Europe/Berlin", "", ""),
                     ],
                 )
                 database.execute(
@@ -578,7 +577,6 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                         ("norway", "alesund", "canonical", "Europe/Oslo", "no:", "no:"),
                         ("sweden", "vasteras", "canonical", "Europe/Stockholm", "se:", ""),
                         ("sweden", "vaxjo", "canonical", "Europe/Stockholm", "se:", ""),
-                        ("germany", "schipkau", "canonical", "Europe/Berlin", "", ""),
                     ],
                 )
                 database.execute(

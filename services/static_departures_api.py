@@ -1421,9 +1421,12 @@ class Database:
         trip_alias: str = "t",
     ) -> str:
         """Limit shared-catalog stop matches to provider-owned city and trip records."""
-        required_tables = ("provider_entities", "provider_city_stops", "provider_city_modes")
+        required_tables = ("provider_entities", "provider_city_stops")
         with self.lock:
-            table_columns = {table: self._table_columns(table) for table in (*required_tables, "raw_stops")}
+            table_columns = {
+                table: self._table_columns(table)
+                for table in (*required_tables, "provider_city_modes", "raw_stops")
+            }
         if not all(table_columns[table] for table in required_tables):
             return ""
 
@@ -1433,7 +1436,15 @@ class Database:
             else f"{raw_stop_alias}.stop_id"
         )
         provider_mode_columns = table_columns["provider_city_modes"]
-        stop_prefix = "provider_mode.stop_id_prefix" if "stop_id_prefix" in provider_mode_columns else "''"
+        has_provider_mode_prefix = "stop_id_prefix" in provider_mode_columns
+        stop_prefix = "COALESCE(provider_mode.stop_id_prefix,'')" if has_provider_mode_prefix else "''"
+        provider_mode_join = (
+            "LEFT JOIN provider_city_modes AS provider_mode "
+            "ON provider_mode.provider_id=city_stop.provider_id "
+            "AND provider_mode.city_id=city_stop.city_id"
+            if provider_mode_columns
+            else ""
+        )
         normalized_city_stop_id = (
             f"CASE WHEN {stop_prefix}<>'' AND "
             f"substr(city_stop.stop_id,1,length({stop_prefix}))={stop_prefix} "
@@ -1450,9 +1461,7 @@ class Database:
                 JOIN provider_city_stops AS city_stop
                   ON city_stop.provider_id=stop_owner.provider_id
                  AND city_stop.city_id=?
-                JOIN provider_city_modes AS provider_mode
-                  ON provider_mode.provider_id=city_stop.provider_id
-                 AND provider_mode.city_id=city_stop.city_id
+                {provider_mode_join}
                 WHERE stop_owner.entity_type='raw_stops'
                   AND stop_owner.key_1={raw_stop_alias}.stop_id
                   AND (
@@ -1700,13 +1709,21 @@ class Database:
         trip_id: str,
     ) -> bool:
         """Check trip and stop ownership for this city when provider metadata exists."""
-        ownership_tables = ("provider_entities", "provider_city_stops", "provider_city_modes")
+        ownership_tables = ("provider_entities", "provider_city_stops")
         ownership_available = all(self._table_columns(table) for table in ownership_tables)
         if ownership_available:
             raw_stop_columns = self._table_columns("raw_stops")
             canonical_stop = "rs.canonical_stop_id" if "canonical_stop_id" in raw_stop_columns else "rs.stop_id"
             provider_mode_columns = self._table_columns("provider_city_modes")
-            stop_prefix = "provider_mode.stop_id_prefix" if "stop_id_prefix" in provider_mode_columns else "''"
+            has_provider_mode_prefix = "stop_id_prefix" in provider_mode_columns
+            stop_prefix = "COALESCE(provider_mode.stop_id_prefix,'')" if has_provider_mode_prefix else "''"
+            provider_mode_join = (
+                "LEFT JOIN provider_city_modes AS provider_mode "
+                "ON provider_mode.provider_id=city_stop.provider_id "
+                "AND provider_mode.city_id=city_stop.city_id"
+                if provider_mode_columns
+                else ""
+            )
             normalized_city_stop_id = (
                 f"CASE WHEN {stop_prefix}<>'' AND "
                 f"substr(city_stop.stop_id,1,length({stop_prefix}))={stop_prefix} "
@@ -1716,21 +1733,19 @@ class Database:
                 row = connection.execute(
                     f"""
                     SELECT 1
-                    FROM provider_city_modes AS provider_mode
-                    JOIN provider_entities AS trip_owner
-                      ON trip_owner.provider_id=provider_mode.provider_id
-                     AND trip_owner.entity_type='trips'
-                     AND trip_owner.key_1=?
+                    FROM provider_entities AS trip_owner
                     JOIN provider_city_stops AS city_stop
-                      ON city_stop.provider_id=provider_mode.provider_id
-                     AND city_stop.city_id=provider_mode.city_id
+                      ON city_stop.provider_id=trip_owner.provider_id
+                     AND city_stop.city_id=?
                     JOIN stop_times AS s ON s.trip_id=trip_owner.key_1
                     JOIN raw_stops AS rs ON rs.stop_id=s.raw_stop_id
                     JOIN provider_entities AS stop_owner
-                      ON stop_owner.provider_id=provider_mode.provider_id
+                      ON stop_owner.provider_id=trip_owner.provider_id
                      AND stop_owner.entity_type='raw_stops'
                      AND stop_owner.key_1=rs.stop_id
-                    WHERE provider_mode.city_id=?
+                    {provider_mode_join}
+                    WHERE trip_owner.entity_type='trips'
+                      AND trip_owner.key_1=?
                       AND (
                           city_stop.stop_id=rs.stop_id
                           OR city_stop.stop_id={canonical_stop}
@@ -1739,7 +1754,7 @@ class Database:
                       )
                     LIMIT 1
                     """,
-                    (trip_id, city_id),
+                    (city_id, trip_id),
                 ).fetchone()
             except sqlite3.OperationalError:
                 return False
