@@ -555,6 +555,8 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                     [
                         ("alesund", "canonical", "Europe/Oslo", "no:", "no:"),
                         ("vasteras", "canonical", "Europe/Stockholm", "se:", ""),
+                        ("vaxjo", "canonical", "Europe/Stockholm", "se:", ""),
+                        ("schipkau", "canonical", "Europe/Berlin", "", ""),
                     ],
                 )
                 database.execute(
@@ -575,6 +577,8 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                     [
                         ("norway", "alesund", "canonical", "Europe/Oslo", "no:", "no:"),
                         ("sweden", "vasteras", "canonical", "Europe/Stockholm", "se:", ""),
+                        ("sweden", "vaxjo", "canonical", "Europe/Stockholm", "se:", ""),
+                        ("germany", "schipkau", "canonical", "Europe/Berlin", "", ""),
                     ],
                 )
                 database.execute(
@@ -594,6 +598,8 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                         ("norway", "alesund", "no:NSR:StopPlace:37480"),
                         ("sweden", "vasteras", "1049"),
                         ("sweden", "vasteras", "se:1049"),
+                        ("sweden", "vaxjo", "74424"),
+                        ("germany", "schipkau", "74424"),
                     ],
                 )
                 database.executemany(
@@ -603,7 +609,21 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                         ("alesund", "foreign:StopPlace:37480"),
                         ("vasteras", "1049"),
                         ("vasteras", "se:1049"),
+                        ("vaxjo", "74424"),
+                        ("schipkau", "74424"),
                     ],
+                )
+                database.execute(
+                    """
+                    CREATE TABLE provider_entities (
+                        entity_type TEXT NOT NULL,
+                        provider_id TEXT NOT NULL,
+                        key_1 TEXT NOT NULL,
+                        key_2 TEXT NOT NULL DEFAULT '',
+                        key_3 TEXT NOT NULL DEFAULT '',
+                        PRIMARY KEY (entity_type, provider_id, key_1, key_2, key_3)
+                    ) WITHOUT ROWID
+                    """
                 )
                 database.executemany(
                     "INSERT INTO raw_stops VALUES (?, ?, ?, ?, ?, ?)",
@@ -627,10 +647,16 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                         ("1049", "", "Västerås Central", "", 12, "1049"),
                         ("258063", "1049", "Västerås Central Platform", "", 13, "1049"),
                         ("se:1049", "", "Västerås Central duplicate", "", 14, "se:1049"),
+                        ("74424", "", "Schipkau, Siedlung", "", 15, "74424"),
+                        ("74424-617-child", "74424", "Schipkau, Siedlung, Mast 2", "", 16, "74424"),
+                        ("se:74424-platform", "", "Växjö Busstation", "1", 17, "74424"),
                     ],
                 )
                 database.execute("INSERT INTO routes VALUES (?, ?, ?)", ("no:1", "1", "Airport"))
                 database.execute("INSERT INTO routes VALUES (?, ?, ?)", ("17294", "3", "Västerås"))
+                database.execute("INSERT INTO routes VALUES (?, ?, ?)", ("germany:616", "616", "Senftenberg"))
+                database.execute("INSERT INTO routes VALUES (?, ?, ?)", ("germany:617", "617", "Großräschen"))
+                database.execute("INSERT INTO routes VALUES (?, ?, ?)", ("se:290", "290", "Växjö"))
                 database.execute(
                     "INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?)",
                     ("no:trip-1", "no:service-1", "no:1", "Airport", "0", ""),
@@ -639,9 +665,27 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                     "INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?)",
                     ("1371673", "service-2", "17294", "Västerås", "0", ""),
                 )
+                database.execute(
+                    "INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?)",
+                    ("trip-616", "germany:service-616", "germany:616", "Senftenberg", "0", ""),
+                )
+                database.execute(
+                    "INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?)",
+                    ("trip-617", "germany:service-617", "germany:617", "Großräschen", "0", ""),
+                )
+                database.execute(
+                    "INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?)",
+                    ("se:trip-290", "se:service-290", "se:290", "Växjö", "0", ""),
+                )
                 database.executemany(
                     "INSERT INTO active_services VALUES (?, ?)",
-                    [("no:service-1", "20261013"), ("service-2", "20261013")],
+                    [
+                        ("no:service-1", "20261013"),
+                        ("service-2", "20261013"),
+                        ("germany:service-616", "20261013"),
+                        ("germany:service-617", "20261013"),
+                        ("se:service-290", "20261013"),
+                    ],
                 )
                 database.executemany(
                     "INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)",
@@ -649,6 +693,27 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                         ("no:trip-1", "no:NSR:StopPlace:37480", "12:15:00", 44_100, 1),
                         ("no:trip-1", "no:foreign:StopPlace:37480", "12:20:00", 44_400, 1),
                         ("1371673", "258063", "04:23:00", 15_780, 1),
+                        ("trip-616", "74424", "12:05:00", 43_500, 1),
+                        ("trip-617", "74424-617-child", "12:10:00", 43_800, 1),
+                        ("se:trip-290", "se:74424-platform", "12:07:00", 43_620, 1),
+                    ],
+                )
+                database.executemany(
+                    "INSERT INTO provider_entities(entity_type, provider_id, key_1) VALUES (?, ?, ?)",
+                    [
+                        ("raw_stops", "norway", "no:NSR:StopPlace:37480"),
+                        ("raw_stops", "norway", "no:foreign:StopPlace:37480"),
+                        ("raw_stops", "sweden", "1049"),
+                        ("raw_stops", "sweden", "258063"),
+                        ("raw_stops", "sweden", "se:1049"),
+                        ("raw_stops", "germany", "74424"),
+                        ("raw_stops", "germany", "74424-617-child"),
+                        ("raw_stops", "sweden", "se:74424-platform"),
+                        ("trips", "norway", "no:trip-1"),
+                        ("trips", "sweden", "1371673"),
+                        ("trips", "germany", "trip-616"),
+                        ("trips", "germany", "trip-617"),
+                        ("trips", "sweden", "se:trip-290"),
                     ],
                 )
                 database.commit()
@@ -668,6 +733,16 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
                     "/static-departures/board?cityID=vasteras&stopID=1049"
                     "&from=2026-10-13T04:00:00%2B02:00&to=2026-10-13T05:00:00%2B02:00"
                 )
+                vaxjo = server.get(
+                    "/static-departures/board?cityID=vaxjo&stopID=74424"
+                    "&from=2026-10-13T12:00:00%2B02:00&to=2026-10-13T12:30:00%2B02:00"
+                )
+                schipkau = server.get(
+                    "/static-departures/board?cityID=schipkau&stopID=74424"
+                    "&from=2026-10-13T12:00:00%2B02:00&to=2026-10-13T12:30:00%2B02:00"
+                )
+                vaxjo_lines = server.get("/static-departures/lines?cityID=vaxjo&stopID=74424")
+                schipkau_lines = server.get("/static-departures/lines?cityID=schipkau&stopID=74424")
 
             self.assertEqual(len(board["departures"]), 1)
             self.assertEqual(board["departures"][0]["scheduledTime"], "12:15:00")
@@ -675,6 +750,32 @@ class StaticDeparturesEndpointTests(unittest.TestCase):
             self.assertEqual(foreign["departures"], [])
             self.assertEqual(len(sweden["departures"]), 1)
             self.assertEqual(sweden["departures"][0]["scheduledTime"], "04:23:00")
+            self.assertEqual(
+                [(departure["line"], departure["destination"]) for departure in vaxjo["departures"]],
+                [("290", "Växjö")],
+            )
+            self.assertEqual([line["line"] for line in vaxjo_lines["lines"]], ["290"])
+            self.assertEqual(
+                [departure["line"] for departure in schipkau["departures"]],
+                ["616", "617"],
+            )
+            self.assertEqual(
+                {line["line"] for line in schipkau_lines["lines"]},
+                {"616", "617"},
+            )
+
+            database = Database(str(path))
+            try:
+                foreign_trip = database.trip_details("vaxjo", "trip-616", temp)
+                german_trip = database.trip_details("schipkau", "trip-616", temp)
+                swedish_trip = database.trip_details("vasteras", "1371673", temp)
+                vaxjo_swedish_trip = database.trip_details("vaxjo", "se:trip-290", temp)
+            finally:
+                database.close()
+            self.assertIsNone(foreign_trip)
+            self.assertEqual(german_trip["line"], "616")
+            self.assertEqual(swedish_trip["line"], "3")
+            self.assertEqual(vaxjo_swedish_trip["line"], "290")
 
     def test_multi_provider_departures_never_fall_back_to_global_raw_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -1272,8 +1272,9 @@ class Database:
         """Resolve a stop through provider ownership when namespace handling is ambiguous."""
         if ":" not in stop_id:
             with self.lock:
+                connection = self._connection()
                 try:
-                    ownership_rows = self._connection().execute(
+                    ownership_rows = connection.execute(
                         """
                         SELECT modes.provider_id, modes.stop_id_prefix
                         FROM provider_city_stops AS stops
@@ -1287,25 +1288,38 @@ class Database:
                     ).fetchall()
                 except sqlite3.OperationalError:
                     return None
+                provider_entities_available = bool(self._table_columns("provider_entities"))
             if not ownership_rows:
                 return None
 
-            candidates = [
-                f"{prefix}{stop_id}" if prefix else stop_id
-                for _provider_id, prefix_value in ownership_rows
-                for prefix in (str(prefix_value or ""),)
-            ]
-            if len({str(row[0]) for row in ownership_rows}) == 1:
+            candidates: list[str] = []
+            for provider_id_value, prefix_value in ownership_rows:
+                provider_id = str(provider_id_value)
+                prefix = str(prefix_value or "")
+                internal_stop_id = (
+                    stop_id
+                    if not prefix or stop_id.startswith(prefix)
+                    else f"{prefix}{stop_id}"
+                )
+                candidates.append(internal_stop_id)
+                if not prefix or not provider_entities_available:
+                    continue
                 with self.lock:
-                    raw_stop = self._connection().execute(
+                    provider_owned_stop = connection.execute(
                         """
-                        SELECT 1 FROM raw_stops
-                        WHERE stop_id=? OR canonical_stop_id=?
+                        SELECT 1
+                        FROM raw_stops AS raw
+                        JOIN provider_entities AS owner
+                          ON owner.entity_type='raw_stops'
+                         AND owner.key_1=raw.stop_id
+                         AND owner.provider_id=?
+                        WHERE raw.stop_id IN (?, ?)
+                           OR raw.canonical_stop_id IN (?, ?)
                         LIMIT 1
                         """,
-                        (stop_id, stop_id),
+                        (provider_id, stop_id, internal_stop_id, stop_id, internal_stop_id),
                     ).fetchone()
-                if raw_stop is not None:
+                if provider_owned_stop is not None:
                     candidates.append(stop_id)
             return tuple(dict.fromkeys(candidates))
 
@@ -1401,6 +1415,55 @@ class Database:
             for prefix in stop_prefixes
         ))
 
+    def _provider_stop_ownership_predicate(
+        self,
+        raw_stop_alias: str = "rs",
+        trip_alias: str = "t",
+    ) -> str:
+        """Limit shared-catalog stop matches to provider-owned city and trip records."""
+        required_tables = ("provider_entities", "provider_city_stops", "provider_city_modes")
+        with self.lock:
+            table_columns = {table: self._table_columns(table) for table in (*required_tables, "raw_stops")}
+        if not all(table_columns[table] for table in required_tables):
+            return ""
+
+        canonical_stop = (
+            f"{raw_stop_alias}.canonical_stop_id"
+            if "canonical_stop_id" in table_columns["raw_stops"]
+            else f"{raw_stop_alias}.stop_id"
+        )
+        provider_mode_columns = table_columns["provider_city_modes"]
+        stop_prefix = "provider_mode.stop_id_prefix" if "stop_id_prefix" in provider_mode_columns else "''"
+        normalized_city_stop_id = (
+            f"CASE WHEN {stop_prefix}<>'' AND "
+            f"substr(city_stop.stop_id,1,length({stop_prefix}))={stop_prefix} "
+            f"THEN city_stop.stop_id ELSE {stop_prefix} || city_stop.stop_id END"
+        )
+        return f"""
+            EXISTS (
+                SELECT 1
+                FROM provider_entities AS stop_owner
+                JOIN provider_entities AS trip_owner
+                  ON trip_owner.provider_id=stop_owner.provider_id
+                 AND trip_owner.entity_type='trips'
+                 AND trip_owner.key_1={trip_alias}.trip_id
+                JOIN provider_city_stops AS city_stop
+                  ON city_stop.provider_id=stop_owner.provider_id
+                 AND city_stop.city_id=?
+                JOIN provider_city_modes AS provider_mode
+                  ON provider_mode.provider_id=city_stop.provider_id
+                 AND provider_mode.city_id=city_stop.city_id
+                WHERE stop_owner.entity_type='raw_stops'
+                  AND stop_owner.key_1={raw_stop_alias}.stop_id
+                  AND (
+                      city_stop.stop_id={raw_stop_alias}.stop_id
+                      OR city_stop.stop_id={canonical_stop}
+                      OR {normalized_city_stop_id}={raw_stop_alias}.stop_id
+                      OR {normalized_city_stop_id}={canonical_stop}
+                  )
+            )
+        """
+
     def resolve_city(self, city_id: str) -> str:
         with self.lock:
             cursor = self._connection().execute(
@@ -1489,6 +1552,9 @@ class Database:
             canonical_ids = self._canonical_stop_candidates(city_id, stop_id)
             stop_predicate = f"rs.canonical_stop_id IN ({','.join('?' for _ in canonical_ids)})"
             stop_parameters = canonical_ids
+        ownership_predicate = self._provider_stop_ownership_predicate("rs", "t")
+        ownership_parameters = (city_id,) if ownership_predicate else ()
+        ownership_clause = f"AND {ownership_predicate}" if ownership_predicate else ""
         with self.lock:
             cursor = self._connection().execute(
                 f"""
@@ -1503,9 +1569,10 @@ class Database:
                 LEFT JOIN routes r ON r.route_id=t.route_id
                 LEFT JOIN raw_stops AS destination_stops ON destination_stops.stop_id=t.terminal_stop_id
                 WHERE {stop_predicate}
+                  {ownership_clause}
                 ORDER BY 2,1
                 """,
-                stop_parameters
+                (*stop_parameters, *ownership_parameters)
             )
             try:
                 rows = cursor.fetchall()
@@ -1632,7 +1699,52 @@ class Database:
         city_id: str,
         trip_id: str,
     ) -> bool:
-        """Check legacy trip ownership through the city's canonical stop catalog."""
+        """Check trip and stop ownership for this city when provider metadata exists."""
+        ownership_tables = ("provider_entities", "provider_city_stops", "provider_city_modes")
+        ownership_available = all(self._table_columns(table) for table in ownership_tables)
+        if ownership_available:
+            raw_stop_columns = self._table_columns("raw_stops")
+            canonical_stop = "rs.canonical_stop_id" if "canonical_stop_id" in raw_stop_columns else "rs.stop_id"
+            provider_mode_columns = self._table_columns("provider_city_modes")
+            stop_prefix = "provider_mode.stop_id_prefix" if "stop_id_prefix" in provider_mode_columns else "''"
+            normalized_city_stop_id = (
+                f"CASE WHEN {stop_prefix}<>'' AND "
+                f"substr(city_stop.stop_id,1,length({stop_prefix}))={stop_prefix} "
+                f"THEN city_stop.stop_id ELSE {stop_prefix} || city_stop.stop_id END"
+            )
+            try:
+                row = connection.execute(
+                    f"""
+                    SELECT 1
+                    FROM provider_city_modes AS provider_mode
+                    JOIN provider_entities AS trip_owner
+                      ON trip_owner.provider_id=provider_mode.provider_id
+                     AND trip_owner.entity_type='trips'
+                     AND trip_owner.key_1=?
+                    JOIN provider_city_stops AS city_stop
+                      ON city_stop.provider_id=provider_mode.provider_id
+                     AND city_stop.city_id=provider_mode.city_id
+                    JOIN stop_times AS s ON s.trip_id=trip_owner.key_1
+                    JOIN raw_stops AS rs ON rs.stop_id=s.raw_stop_id
+                    JOIN provider_entities AS stop_owner
+                      ON stop_owner.provider_id=provider_mode.provider_id
+                     AND stop_owner.entity_type='raw_stops'
+                     AND stop_owner.key_1=rs.stop_id
+                    WHERE provider_mode.city_id=?
+                      AND (
+                          city_stop.stop_id=rs.stop_id
+                          OR city_stop.stop_id={canonical_stop}
+                          OR {normalized_city_stop_id}=rs.stop_id
+                          OR {normalized_city_stop_id}={canonical_stop}
+                      )
+                    LIMIT 1
+                    """,
+                    (trip_id, city_id),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return False
+            return row is not None
+
         raw_stop_columns = self._table_columns("raw_stops")
         canonical_join = ""
         if "canonical_stop_id" in raw_stop_columns:
@@ -1722,6 +1834,9 @@ class Database:
         )
         requested_limit = max(1, int(limit))
         stop_prefixes, identifier_prefixes = self.city_departure_prefixes(city_id)
+        ownership_predicate = self._provider_stop_ownership_predicate("rs", "t")
+        ownership_parameters = (city_id,) if ownership_predicate else ()
+        ownership_clause = f"AND {ownership_predicate}" if ownership_predicate else ""
         query = f"""
             SELECT a.service_date, s.departure_time, s.stop_sequence, s.raw_stop_id,
                    t.trip_id, t.route_id,
@@ -1738,12 +1853,21 @@ class Database:
             {agency_join}
             LEFT JOIN raw_stops AS destination_stops ON destination_stops.stop_id=t.terminal_stop_id
             WHERE s.raw_stop_id IN ({placeholders})
+              {ownership_clause}
               AND a.service_date BETWEEN ? AND ?
               AND {absolute_key} >= julianday(?) + ? / 86400.0
             ORDER BY {absolute_key}, t.trip_id, t.route_id, s.raw_stop_id, s.stop_sequence
             LIMIT ?
         """
-        parameters = (*stop_ids, service_from, service_to, lower_date, lower_seconds, requested_limit)
+        parameters = (
+            *stop_ids,
+            *ownership_parameters,
+            service_from,
+            service_to,
+            lower_date,
+            lower_seconds,
+            requested_limit,
+        )
         with self.lock:
             rows = self._connection().execute(query, parameters).fetchall()
 
@@ -1822,12 +1946,6 @@ class Database:
             return None
         with self.lock:
             connection = self._connection()
-            try:
-                has_city_mode = connection.execute(
-                    "SELECT 1 FROM city_departure_modes WHERE city_id=?", (city_id,)
-                ).fetchone() is not None
-            except sqlite3.OperationalError:
-                has_city_mode = False
             route_columns = self._table_columns("routes")
             agency_join = "LEFT JOIN agencies ag ON ag.agency_id=r.agency_id" if "agency_id" in route_columns and self._table_columns("agencies") else ""
             agency_fields = "r.agency_id,ag.agency_name" if agency_join else "NULL,NULL"
@@ -1841,7 +1959,7 @@ class Database:
             """, candidates).fetchone()
             if row is None:
                 return None
-            if not has_city_mode and not self._trip_belongs_to_city(connection, city_id, str(row[0])):
+            if not self._trip_belongs_to_city(connection, city_id, str(row[0])):
                 return None
             if service_date and connection.execute("SELECT 1 FROM active_services WHERE service_id=? AND service_date=?", (row[8], service_date)).fetchone() is None:
                 return None
@@ -1912,6 +2030,9 @@ class Database:
             canonical_ids = self._canonical_stop_candidates(city_id, stop_id)
             stop_predicate = f"rs.canonical_stop_id IN ({','.join('?' for _ in canonical_ids)})"
             stop_parameters = canonical_ids
+        ownership_predicate = self._provider_stop_ownership_predicate("rs", "t")
+        ownership_parameters = (city_id,) if ownership_predicate else ()
+        ownership_clause = f"AND {ownership_predicate}" if ownership_predicate else ""
         with self.lock:
             time_predicate, time_parameters = board_predicate(
                 self._connection(), timezone_name, from_date, to_date
@@ -1948,11 +2069,13 @@ class Database:
                 LEFT JOIN routes r ON r.route_id=t.route_id
                 {agency_join}
                 LEFT JOIN raw_stops AS destination_stops ON destination_stops.stop_id=t.terminal_stop_id
-                WHERE {stop_predicate} AND {time_predicate}
+                WHERE {stop_predicate}
+                  {ownership_clause}
+                  AND {time_predicate}
                 ORDER BY {BOARD_EPOCH_SQL},t.trip_id,s.stop_sequence
                 LIMIT ?
                 """,
-                (*stop_parameters, *time_parameters, limit)
+                (*stop_parameters, *ownership_parameters, *time_parameters, limit)
             )
             try:
                 rows = cursor.fetchall()
