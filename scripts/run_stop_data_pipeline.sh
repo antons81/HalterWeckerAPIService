@@ -2261,9 +2261,6 @@ if not expected.issubset(manifest_ids) or not expected.issubset(radar_ids):
 print("[StopData] Ireland external packages validated")
 PY
 fi
-if [[ "$UNIFIED_SQLITE_PIPELINE" == "1" ]]; then
-  validate_full_sqlite_candidate || return 1
-fi
 }
 
 if [[ "$RUN_MODE" == "normal" ]]; then
@@ -2315,6 +2312,9 @@ if [[ "$RUN_MODE" == "normal" ]]; then
     echo "[StopData] release=$RELEASE_ID state persistence skipped for read-only stop-data reference"
   else
     persist_release_stage "static-departures"
+  fi
+  if [[ "$UNIFIED_SQLITE_PIPELINE" == "1" ]]; then
+    validate_full_sqlite_candidate || exit 1
   fi
 else
   inspect_resume

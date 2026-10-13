@@ -825,6 +825,26 @@ assert callable(validate_validation_receipt)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(os.readlink(self.data_root / "current-release"), old_release)
         self.assertEqual(os.readlink(self.data_root / "current"), old_stops)
+        release_id = self.candidate_release_id()
+        state_path = self.data_root / "releases" / release_id / "release-state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["completedStage"], "static-departures")
+
+        resumed = self.run_pipeline(
+            "--resume",
+            release_id,
+            USE_DEFAULT_PRODUCTION="1",
+            HALTEWECKER_ACTIVATION_DRY_RUN="1",
+            CONSUMER_PREFLIGHT_FAIL="0",
+        )
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(
+            (self.root / "static-calls.log").read_text(encoding="utf-8").splitlines(),
+            ["0"],
+        )
+        self.assertEqual(os.readlink(self.data_root / "current-release"), old_release)
+        self.assertEqual(os.readlink(self.data_root / "current"), old_stops)
 
     def test_incremental_cache_allowlist_rejects_unapproved_provider(self) -> None:
         self.configure_resume_pointer_layout()
