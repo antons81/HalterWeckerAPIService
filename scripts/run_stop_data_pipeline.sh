@@ -2202,13 +2202,22 @@ cities = (
 )
 today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
 with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
+    prefixes = ("",)
     for city in cities:
+        mode = connection.execute(
+            "SELECT stop_id_prefix FROM provider_city_modes "
+            "WHERE provider_id=? AND city_id=?",
+            ("sweden", city),
+        ).fetchone()
+        city_prefixes = ("", str(mode[0])) if mode and mode[0] else prefixes
         stop_id = scheduled_stop(
             connection,
             city,
-            ("",),
+            city_prefixes,
+            catalog="provider_city_stops",
             today=today,
             through=today + timedelta(days=1),
+            provider_id="sweden",
             timezone_name="Europe/Stockholm",
         )
         if stop_id is None:

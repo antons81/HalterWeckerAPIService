@@ -89,6 +89,28 @@ def scheduled_stop(
     stop_column = "stop_id" if exact else "canonical_stop_id"
     raw_matches = " OR ".join(f"rs.{stop_column}=?||cs.stop_id" for _ in prefixes)
     provider_filter = " AND cs.provider_id=?" if provider_id is not None else ""
+    ownership_filter = ""
+    if provider_id is not None:
+        try:
+            connection.execute("SELECT 1 FROM provider_entities LIMIT 0")
+            connection.execute(f"SELECT 1 FROM {catalog} LIMIT 0")
+        except sqlite3.OperationalError as error:
+            raise CityCoverageError(
+                f"provider ownership metadata is missing for schedule probe: {provider_id}"
+            ) from error
+        ownership_filter = """
+            AND EXISTS (
+                SELECT 1
+                FROM provider_entities AS stop_owner
+                JOIN provider_entities AS trip_owner
+                  ON trip_owner.provider_id=stop_owner.provider_id
+                 AND trip_owner.entity_type='trips'
+                 AND trip_owner.key_1=t.trip_id
+                WHERE stop_owner.provider_id=?
+                  AND stop_owner.entity_type='raw_stops'
+                  AND stop_owner.key_1=rs.stop_id
+            )
+        """
     if through is not None:
         zone = ZoneInfo(timezone_name)
         lower = datetime.combine(today, datetime.min.time(), zone).timestamp()
@@ -102,16 +124,23 @@ def scheduled_stop(
         calendar_filter = "a.service_date>=?"
         bounds = (today.strftime("%Y%m%d"),)
     stop_filter = " AND cs.stop_id=?" if stop_id is not None else ""
-    parameters = (city, *((provider_id,) if provider_id is not None else ()), *((stop_id,) if stop_id is not None else ()), *prefixes, *bounds)
+    parameters = (
+        city,
+        *((provider_id,) if provider_id is not None else ()),
+        *((stop_id,) if stop_id is not None else ()),
+        *prefixes,
+        *bounds,
+        *((provider_id,) if provider_id is not None else ()),
+    )
     row = connection.execute(
         f"""SELECT cs.stop_id FROM {catalog} AS cs WHERE cs.city_id=?{provider_filter}{stop_filter} AND EXISTS (
             SELECT 1 FROM raw_stops AS rs WHERE ({raw_matches}) AND EXISTS (
                 SELECT 1 FROM stop_times AS st JOIN trips AS t ON t.trip_id=st.trip_id
                 WHERE st.raw_stop_id=rs.stop_id AND EXISTS (
                     SELECT 1 FROM {temporal}active_services AS a WHERE a.service_id=t.service_id AND {calendar_filter}
-                )
+                ){ownership_filter}
             )
-        ) LIMIT 1""", parameters,
+        ) ORDER BY cs.stop_id LIMIT 1""", parameters,
     ).fetchone()
     return str(row[0]) if row else None
 
@@ -267,11 +296,17 @@ def validate_city_coverage(
                            "helsinki": ("fi-hsl:1040401",)}.get(city, ())
             smoke_expected = {stop: False for stop in fixed_stops}
 
-            def select_scheduled(connection, prefixes, **kwargs):
+            def select_scheduled(connection, prefixes, *, provider_id, catalog=None, **kwargs):
                 for stop in fixed_stops:
                     smoke_expected[stop] |= bool(scheduled_stop(
-                        connection, city, prefixes, stop_id=stop, **kwargs))
-                return scheduled_stop(connection, city, prefixes, **kwargs)
+                        connection, city, prefixes, stop_id=stop,
+                        catalog=catalog or "provider_city_stops",
+                        provider_id=provider_id, **kwargs))
+                return scheduled_stop(
+                    connection, city, prefixes,
+                    catalog=catalog or "provider_city_stops",
+                    provider_id=provider_id, **kwargs,
+                )
 
             timezone = "Europe/Berlin"
             if shard:
@@ -296,17 +331,41 @@ def validate_city_coverage(
                         mode = common.execute("SELECT timezone,stop_id_prefix,mode FROM provider_city_modes WHERE city_id=? AND provider_id=?", (city, provider)).fetchone()
                         timezone = str(mode[0])
                         if require_current_schedules:
-                            probe = select_scheduled(structural, tuple(dict.fromkeys(("", str(mode[1])))), catalog="catalog.provider_city_stops", temporal="calendar.", today=today, through=fallback_end, timezone_name=timezone, provider_id=provider, exact=mode[2] == "exact-stop-with-parent-fallback")
+                            probe = select_scheduled(
+                                structural,
+                                tuple(dict.fromkeys(("", str(mode[1])))),
+                                catalog="catalog.provider_city_stops",
+                                temporal="calendar.",
+                                today=today,
+                                through=fallback_end,
+                                timezone_name=timezone,
+                                provider_id=provider,
+                                exact=mode[2] == "exact-stop-with-parent-fallback",
+                            )
                         else:
                             probe = sorted(ids)[0] if ids else None
                         if probe:
                             break
             else:
-                modes = legacy.execute("SELECT timezone,stop_id_prefix FROM provider_city_modes WHERE city_id=?", (city,)).fetchall()
-                timezone = str(modes[0][0]) if modes else timezone
-                mode = legacy.execute("SELECT mode FROM city_departure_modes WHERE city_id=?", (city,)).fetchone()
+                modes = legacy.execute(
+                    "SELECT provider_id,timezone,stop_id_prefix,mode "
+                    "FROM provider_city_modes WHERE city_id=? ORDER BY provider_id",
+                    (city,),
+                ).fetchall()
                 if require_current_schedules:
-                    probe = select_scheduled(legacy, tuple(dict.fromkeys(("", *(str(row[1]) for row in modes)))), today=today, through=fallback_end, timezone_name=timezone, exact=bool(mode and mode[0] == "exact-stop-with-parent-fallback"))
+                    for provider, provider_timezone, prefix, mode in modes:
+                        timezone = str(provider_timezone)
+                        probe = select_scheduled(
+                            legacy,
+                            tuple(dict.fromkeys(("", str(prefix)))),
+                            today=today,
+                            through=fallback_end,
+                            timezone_name=timezone,
+                            exact=mode == "exact-stop-with-parent-fallback",
+                            provider_id=str(provider),
+                        )
+                        if probe:
+                            break
                 else:
                     probe = sorted(ids)[0] if ids else None
             smoke_checks.extend({"cityID": city, "stopID": stop, "hasSchedule": expected}

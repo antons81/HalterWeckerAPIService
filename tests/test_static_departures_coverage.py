@@ -18,8 +18,8 @@ from scripts.static_departures_coverage import CityCoverageError, scheduled_stop
 
 
 class CityCoverageTests(unittest.TestCase):
-    cities = ("wien", "helsinki", "bochum", "small-non-pilot-city", "israel", "toronto", "chicago", "oslo", "stockholm")
-    pilots = {"israel": "israel-mot", "toronto": "ttc-surface", "chicago": "cta-chicago", "oslo": "norway", "stockholm": "sweden"}
+    cities = ("wien", "helsinki", "bochum", "wuppertal", "small-non-pilot-city", "israel", "toronto", "chicago", "oslo", "stockholm", "vasteras")
+    pilots = {"israel": "israel-mot", "toronto": "ttc-surface", "chicago": "cta-chicago", "oslo": "norway", "stockholm": "sweden", "vasteras": "sweden"}
 
     def test_stop_selection_excludes_services_beyond_http_window(self):
         self.mutate_database("UPDATE active_services SET service_date='20261101'")
@@ -49,6 +49,57 @@ class CityCoverageTests(unittest.TestCase):
         with closing(sqlite3.connect(self.database)) as connection:
             self.assertIsNone(scheduled_stop(connection, "wien", ("",), catalog="provider_city_stops", today=date(2026, 10, 10), provider_id="unrelated"))
             self.assertEqual(scheduled_stop(connection, "wien", ("",), catalog="provider_city_stops", today=date(2026, 10, 10), provider_id="non-pilot-wien"), "wien-stop")
+
+    def test_provider_schedule_probe_fails_closed_without_ownership_metadata(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("DROP TABLE provider_entities")
+            with self.assertRaisesRegex(CityCoverageError, "ownership metadata is missing"):
+                scheduled_stop(
+                    connection,
+                    "wien",
+                    ("",),
+                    catalog="provider_city_stops",
+                    today=date(2026, 10, 10),
+                    provider_id="non-pilot-wien",
+                )
+
+    def test_vasteras_ignores_german_canonical_collision_and_selects_owned_swedish_stop(self):
+        report = self.validate()
+        check = next(row for row in report["checks"] if row["cityID"] == "vasteras")
+
+        self.assertTrue(check["hasSchedule"])
+        self.assertEqual(check["stopID"], "3049")
+
+    def test_vasteras_does_not_pass_from_german_schedule_when_swedish_has_none(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("DELETE FROM stop_times WHERE raw_stop_id='se:3049'")
+            connection.commit()
+        self.pin_database()
+
+        report = self.validate()
+        check = next(row for row in report["checks"] if row["cityID"] == "vasteras")
+
+        self.assertFalse(check["hasSchedule"])
+        self.assertEqual(check["stopID"], "vasteras-stop")
+
+    def test_vasteras_rejects_swedish_stop_with_foreign_trip_owner(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "DELETE FROM provider_entities "
+                "WHERE entity_type='trips' AND provider_id='sweden' "
+                "AND key_1='sweden-3049-trip'"
+            )
+            connection.execute(
+                "INSERT INTO provider_entities(entity_type,provider_id,key_1) "
+                "VALUES ('trips','germany','sweden-3049-trip')"
+            )
+            connection.commit()
+        self.pin_database()
+
+        report = self.validate()
+        check = next(row for row in report["checks"] if row["cityID"] == "vasteras")
+
+        self.assertFalse(check["hasSchedule"])
 
     def test_fixed_stop_expectation_does_not_use_other_city_departures(self):
         with closing(sqlite3.connect(self.database)) as connection:
@@ -82,6 +133,7 @@ class CityCoverageTests(unittest.TestCase):
                 CREATE TABLE provider_city_modes(provider_id TEXT, city_id TEXT, timezone TEXT, stop_id_prefix TEXT, mode TEXT DEFAULT 'canonical');
                 CREATE TABLE city_departure_modes(city_id TEXT, mode TEXT);
                 CREATE TABLE provider_city_stops(provider_id TEXT, city_id TEXT, stop_id TEXT);
+                CREATE TABLE provider_entities(entity_type TEXT, provider_id TEXT, key_1 TEXT, key_2 TEXT DEFAULT '', key_3 TEXT DEFAULT '');
                 CREATE TABLE raw_stops(stop_id TEXT, canonical_stop_id TEXT);
                 CREATE TABLE stop_times(raw_stop_id TEXT, trip_id TEXT, departure_seconds INTEGER DEFAULT 28800);
                 CREATE TABLE trips(trip_id TEXT, service_id TEXT);
@@ -97,10 +149,37 @@ class CityCoverageTests(unittest.TestCase):
                 provider = self.pilots.get(city, "non-pilot-" + city)
                 connection.execute("INSERT INTO city_stops VALUES (?,?)", (city, stop))
                 connection.execute("INSERT INTO provider_city_stops VALUES (?,?,?)", (provider, city, stop))
-                connection.execute("INSERT INTO provider_city_modes(provider_id,city_id,timezone,stop_id_prefix) VALUES (?,?,?,?)", (provider, city, "UTC", ""))
+                prefix = "se:" if city == "vasteras" else ""
+                connection.execute("INSERT INTO provider_city_modes(provider_id,city_id,timezone,stop_id_prefix) VALUES (?,?,?,?)", (provider, city, "UTC", prefix))
                 connection.execute("INSERT INTO raw_stops VALUES (?,?)", (stop, stop))
                 connection.execute("INSERT INTO trips VALUES (?,?)", (city + "-trip", "service"))
                 connection.execute("INSERT INTO stop_times(raw_stop_id,trip_id) VALUES (?,?)", (stop, city + "-trip"))
+                connection.executemany("INSERT INTO provider_entities(entity_type,provider_id,key_1) VALUES (?,?,?)", (
+                    ("raw_stops", provider, stop), ("trips", provider, city + "-trip"),
+                ))
+            connection.execute("DELETE FROM stop_times WHERE trip_id='vasteras-trip'")
+            connection.execute("INSERT INTO city_stops VALUES ('vasteras','1049')")
+            connection.execute("INSERT INTO provider_city_stops VALUES ('sweden','vasteras','1049')")
+            connection.executemany("INSERT INTO raw_stops VALUES (?,?)", (
+                ("se:1049", "1049"), ("de:1049", "1049"), ("se:3049", "3049"),
+            ))
+            connection.execute("INSERT INTO provider_city_stops VALUES ('sweden','vasteras','3049')")
+            connection.execute("INSERT INTO city_stops VALUES ('vasteras','3049')")
+            connection.execute("INSERT INTO trips VALUES ('germany-1049-trip','service')")
+            connection.execute("INSERT INTO trips VALUES ('sweden-3049-trip','service')")
+            connection.executemany("INSERT INTO stop_times(raw_stop_id,trip_id) VALUES (?,?)", (
+                ("de:1049", "germany-1049-trip"), ("se:3049", "sweden-3049-trip"),
+            ))
+            connection.executemany(
+                "INSERT INTO provider_entities(entity_type,provider_id,key_1) VALUES (?,?,?)",
+                (
+                    ("raw_stops", "sweden", "se:1049"),
+                    ("raw_stops", "germany", "de:1049"),
+                    ("trips", "germany", "germany-1049-trip"),
+                    ("raw_stops", "sweden", "se:3049"),
+                    ("trips", "sweden", "sweden-3049-trip"),
+                ),
+            )
             connection.execute("INSERT INTO active_services VALUES ('service','20261010')")
             connection.commit()
         self.common = self.release / "common.sqlite"
@@ -155,6 +234,8 @@ class CityCoverageTests(unittest.TestCase):
         self.assertEqual(report["supportedCities"], len(self.cities))
         self.assertEqual({row["backend"] for row in report["checks"]}, {"sqlite"})
         self.assertTrue(all(row["hasSchedule"] for row in report["checks"]))
+        vasteras = next(row for row in report["checks"] if row["cityID"] == "vasteras")
+        self.assertEqual(vasteras["stopID"], "3049")
 
     def test_full_sqlite_candidate_rejects_provider_runtime_dependency(self):
         (self.release / "release.json").unlink()
