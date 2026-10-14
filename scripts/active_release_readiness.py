@@ -174,8 +174,19 @@ def reload_route(container: str, image: str, identifier: str) -> None:
 
 def stop_data_root(release_root: str) -> Path:
     root = Path(release_root).resolve(strict=True)
-    entry = json.loads((root / "release.json").read_text())["stopData"]
-    relative = entry.get("path", "stop-data") if isinstance(entry, dict) else entry
+    release_manifest = root / "release.json"
+    if release_manifest.is_file():
+        payload = json.loads(release_manifest.read_text(encoding="utf-8"))
+        entry = payload["stopData"]
+        relative = entry.get("path", "stop-data") if isinstance(entry, dict) else entry
+    else:
+        metadata_path = root / "release-metadata.json"
+        if not metadata_path.is_file():
+            raise RuntimeError(f"release metadata is missing: {root}")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("releaseID") != root.name:
+            raise RuntimeError(f"release metadata ID does not match directory: {root}")
+        relative = "stop-data"
     return (root / str(relative or "stop-data")).resolve(strict=True)
 
 

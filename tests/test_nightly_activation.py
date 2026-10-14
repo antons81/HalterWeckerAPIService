@@ -66,6 +66,27 @@ class RouteReadinessTests(unittest.TestCase):
                 (root / name / "release.json").write_text('{"stopData":{"path":"../shared"}}')
             self.assertEqual(readiness.stop_data_root(str(root / "old")),
                              readiness.stop_data_root(str(root / "new")))
+
+    def test_full_sqlite_release_metadata_uses_its_stop_data_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            release = Path(directory) / "20261013T044307Z-399083"
+            stop_data = release / "stop-data"
+            stop_data.mkdir(parents=True)
+            (release / "release-metadata.json").write_text(json.dumps({
+                "releaseID": release.name,
+                "stopManifestVersion": "2026-10-14",
+            }))
+
+            self.assertEqual(readiness.stop_data_root(str(release)), stop_data.resolve())
+
+    def test_full_sqlite_release_metadata_must_match_its_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            release = Path(directory) / "20261013T044307Z-399083"
+            (release / "stop-data").mkdir(parents=True)
+            (release / "release-metadata.json").write_text('{"releaseID":"other-release"}')
+
+            with self.assertRaisesRegex(RuntimeError, "ID does not match"):
+                readiness.stop_data_root(str(release))
     def test_success_preserves_image_and_container(self):
         state = json.dumps([{"Image": "image", "Id": "container"}])
         with mock.patch.object(readiness, "docker", side_effect=[state, "", state]) as docker:
