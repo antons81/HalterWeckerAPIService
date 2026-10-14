@@ -1221,6 +1221,23 @@ activation_disk_preflight() {
   fi
 }
 
+remove_persistent_rollback_links() {
+  local rollback_pointer="${HALTEWECKER_ROLLBACK_POINTER:-$DATA_ROOT/rollback}"
+  local pointer
+  for pointer in "$rollback_pointer" "$PREVIOUS"; do
+    if [[ -e "$pointer" || -L "$pointer" ]] && [[ ! -L "$pointer" ]]; then
+      echo "[Nightly] ERROR: refusing to remove non-symlink rollback path: $pointer" >&2
+      return 1
+    fi
+  done
+  for pointer in "$rollback_pointer" "$PREVIOUS"; do
+    if [[ -L "$pointer" ]] && ! rm -f -- "$pointer"; then
+      echo "[Nightly] ERROR: unable to remove rollback link: $pointer" >&2
+      return 1
+    fi
+  done
+}
+
 activate_incremental_production() {
   local old_target=""
   local old_release=""
@@ -1307,7 +1324,7 @@ activate_incremental_production() {
   activation_disk_preflight || return 1
   # Static HTTP consumers follow the same atomic generation pointer as the API.
   replace_link "$CURRENT" "current-release/stop-data" || return 1
-  # Retain the release that passed the full rollback consumer contract.
+  # Keep the current release reachable as rollback only while activation is in flight.
   if ! replace_link "$rollback_pointer" "$old_target"; then
     rollback_incremental_consumers "$old_target" "$old_release" || echo "[Nightly] ERROR: rollback readiness failed; operator recovery required" >&2
     return 1
@@ -1358,7 +1375,12 @@ activate_incremental_production() {
     rollback_incremental_consumers "$old_target" "$old_release" || echo "[Nightly] ERROR: rollback readiness failed; operator recovery required" >&2
     return 1
   fi
-  echo "[Nightly] stage=activation status=PASS mode=FULL_INCREMENTAL old=$old_target new=$candidate_target rollback=VERIFIED"
+  if ! remove_persistent_rollback_links; then
+    echo "[Nightly] ERROR: unable to clear rollback links after successful activation" >&2
+    rollback_incremental_consumers "$old_target" "$old_release" || echo "[Nightly] ERROR: rollback readiness failed; operator recovery required" >&2
+    return 1
+  fi
+  echo "[Nightly] stage=activation status=PASS mode=FULL_INCREMENTAL old=$old_target new=$candidate_target rollback=NOT_RETAINED"
 }
 
 cd "$REPO"
@@ -2578,10 +2600,9 @@ fi
 # all canonical release pointers have been activated.
 replace_link "$STATIC_DEPARTURES_RELEASE" "releases/$RELEASE_ID"
 
-if [[ -n "$OLD_RELEASE_TARGET" ]]; then
-  mkdir -p "$(dirname "$PREVIOUS")"
-  rm -rf "$PREVIOUS"
-  ln -s "../releases/${OLD_RELEASE_TARGET#releases/}/stop-data" "$PREVIOUS"
+if ! remove_persistent_rollback_links; then
+  echo "[Nightly] ERROR: release is active but rollback-link cleanup failed" >&2
+  exit 1
 fi
 persist_release_stage "commit"
 echo "[StopData] release=$RELEASE_ID stage=commit duration=$(elapsed_seconds "$COMMIT_STARTED")"

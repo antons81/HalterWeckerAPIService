@@ -749,7 +749,11 @@ assert callable(validate_validation_receipt)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.data_root / "current" / "release-marker").read_text(encoding="utf-8"), "new")
-        self.assertEqual((self.data_root / "previous" / "stop-data" / "release-marker").read_text(encoding="utf-8"), "old")
+        self.assertFalse(os.path.lexists(self.data_root / "previous" / "stop-data"))
+        legacy_release = next(
+            path for path in (self.data_root / "releases").glob("legacy-*")
+        )
+        self.assertEqual((legacy_release / "stop-data" / "release-marker").read_text(encoding="utf-8"), "old")
         self.assertRegex(result.stdout, r"release=.* stage=commit duration=")
         self.assertIn("static departures synchronized", result.stdout)
         self.assertEqual(self.systemctl_calls(), [])
@@ -768,10 +772,6 @@ assert callable(validate_validation_receipt)
         self.assertEqual(state["completedStage"], "commit")
         self.assertEqual(
             (self.data_root / "current" / "release-marker").read_text(),
-            "new",
-        )
-        self.assertNotEqual(
-            (self.data_root / "previous" / "stop-data" / "release-marker").read_text(),
             "new",
         )
 
@@ -1828,7 +1828,8 @@ assert callable(validate_validation_receipt)
         static_calls = (self.root / "static-calls.log").read_text(encoding="utf-8").splitlines()
         systemctl_calls = self.systemctl_calls()
         link_calls = (self.root / "link-calls.log").read_text(encoding="utf-8").splitlines()
-        previous_target = os.readlink(self.data_root / "previous" / "stop-data")
+        self.assertFalse(os.path.lexists(self.data_root / "previous" / "stop-data"))
+        self.assertFalse(os.path.lexists(self.data_root / "rollback"))
 
         resumed = self.run_pipeline("--resume", release_id)
 
@@ -1851,7 +1852,8 @@ assert callable(validate_validation_receipt)
             (self.root / "link-calls.log").read_text(encoding="utf-8").splitlines(),
             link_calls,
         )
-        self.assertEqual(os.readlink(self.data_root / "previous" / "stop-data"), previous_target)
+        self.assertFalse(os.path.lexists(self.data_root / "previous" / "stop-data"))
+        self.assertFalse(os.path.lexists(self.data_root / "rollback"))
         self.assertFalse(list(release_dir.glob(".release-state-*.tmp")))
 
     def test_already_committed_resume_does_not_rewrite_state(self) -> None:
@@ -1871,8 +1873,8 @@ assert callable(validate_validation_receipt)
         systemctl_calls = self.systemctl_calls()
         link_calls = (self.root / "link-calls.log").read_text(encoding="utf-8").splitlines()
         previous_path = self.data_root / "previous" / "stop-data"
-        previous_target = os.readlink(previous_path)
-        previous_mtime_ns = previous_path.lstat().st_mtime_ns
+        self.assertFalse(os.path.lexists(previous_path))
+        self.assertFalse(os.path.lexists(self.data_root / "rollback"))
 
         resumed = self.run_pipeline("--resume", release_id)
 
@@ -1899,8 +1901,8 @@ assert callable(validate_validation_receipt)
             (self.root / "link-calls.log").read_text(encoding="utf-8").splitlines(),
             link_calls,
         )
-        self.assertEqual(os.readlink(previous_path), previous_target)
-        self.assertEqual(previous_path.lstat().st_mtime_ns, previous_mtime_ns)
+        self.assertFalse(os.path.lexists(previous_path))
+        self.assertFalse(os.path.lexists(self.data_root / "rollback"))
 
 
 if __name__ == "__main__":

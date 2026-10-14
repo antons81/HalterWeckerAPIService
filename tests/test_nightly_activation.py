@@ -183,6 +183,69 @@ class RouteReadinessTests(unittest.TestCase):
 
 
 class NightlyActivationTests(unittest.TestCase):
+    def test_rollback_link_cleanup_removes_only_links_and_keeps_release_data(self):
+        source = PIPELINE.read_text()
+        start = source.index("remove_persistent_rollback_links() {")
+        end = source.index("\nactivate_incremental_production() {", start)
+        cleanup = source[start:end]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "releases/old"
+            stop_data = release / "stop-data"
+            stop_data.mkdir(parents=True)
+            (release / "departures.sqlite").write_bytes(b"release-data")
+            (root / "previous").mkdir()
+            (root / "rollback").symlink_to(release)
+            (root / "previous/stop-data").symlink_to(stop_data)
+            harness = f'''\
+set -euo pipefail
+DATA_ROOT={str(root)!r}
+PREVIOUS="$DATA_ROOT/previous/stop-data"
+'''
+            result = subprocess.run(
+                ["bash", "-c", harness + cleanup + "\nremove_persistent_rollback_links"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(os.path.lexists(root / "rollback"))
+            self.assertFalse(os.path.lexists(root / "previous/stop-data"))
+            self.assertEqual((release / "departures.sqlite").read_bytes(), b"release-data")
+
+    def test_rollback_link_cleanup_refuses_non_symlink_paths_without_partial_removal(self):
+        source = PIPELINE.read_text()
+        start = source.index("remove_persistent_rollback_links() {")
+        end = source.index("\nactivate_incremental_production() {", start)
+        cleanup = source[start:end]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "releases/old"
+            release.mkdir(parents=True)
+            (root / "previous").mkdir()
+            (root / "rollback").symlink_to(release)
+            (root / "previous/stop-data").write_text("user data", encoding="utf-8")
+            harness = f'''\
+set -euo pipefail
+DATA_ROOT={str(root)!r}
+PREVIOUS="$DATA_ROOT/previous/stop-data"
+'''
+            result = subprocess.run(
+                ["bash", "-c", harness + cleanup + "\nremove_persistent_rollback_links"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue((root / "rollback").is_symlink())
+            self.assertEqual((root / "previous/stop-data").read_text(encoding="utf-8"), "user data")
+
+    def test_full_sqlite_commit_cleans_rollback_links_instead_of_publishing_previous(self):
+        source = PIPELINE.read_text()
+        commit_start = source.index("# Publish the handoff only after the release")
+        commit_end = source.index('\necho "[StopData] release=$RELEASE_ID stage=commit duration=', commit_start)
+        commit = source[commit_start:commit_end]
+        self.assertIn("remove_persistent_rollback_links", commit)
+        self.assertNotIn('ln -s "../releases/${OLD_RELEASE_TARGET#releases/}/stop-data"', commit)
+
     def test_route_reconfiguration_uses_preflight_image_and_read_only_sqlite(self):
         source = PIPELINE.read_text()
         start = source.index("route_recall_activation() {")
@@ -252,7 +315,8 @@ python3() {
             self.assertIn("shared-route", (root / "readiness.log").read_text())
 
     def activate(self, *, route_fail=False, static_fail=False, image_change=False, pipeline_fail=False, root_change=False,
-                 coverage_fail=False, rollback_fail=False, dry_run=False, source_freshness_fail=False):
+                 coverage_fail=False, rollback_fail=False, dry_run=False, source_freshness_fail=False,
+                 existing_rollback=False, existing_previous=False):
         source = PIPELINE.read_text()
         freshness_start = source.index("validate_incremental_source_freshness() {")
         freshness = source[freshness_start:source.index("\nvalidate_incremental_consumers() {", freshness_start)]
@@ -265,6 +329,10 @@ python3() {
             (root / "previous/release.json").write_text('{"releaseID":"previous"}')
             (root / "current-release").symlink_to("previous")
             (root / "current").symlink_to("current-release/stop-data")
+            if existing_rollback:
+                (root / "rollback").symlink_to("saved-rollback")
+            if existing_previous:
+                (root / "previous/stop-data").symlink_to("saved-previous")
             (root / "image").write_text("image-original")
             runner = root / "static-runner"
             runner.write_text('#!/bin/bash\nexit "${PIPELINE_FAIL:-0}"\n')
@@ -276,6 +344,7 @@ CURRENT_RELEASE="$ROOT/current-release"
 CURRENT="$ROOT/current"
 DEPARTURES_CURRENT="$ROOT/departures-current.sqlite"
 DATA_ROOT="$ROOT"
+PREVIOUS="$ROOT/previous/stop-data"
 RELEASE_ID=candidate
 INCREMENTAL_RELEASE_DIR="$ROOT/candidate"
 ARTIFACTS_JSON="$ROOT/gtfs-artifacts.json"
@@ -333,88 +402,111 @@ python3() {
             result = subprocess.run(["bash", "-c", harness + functions + "\nactivate_incremental_production"],
                                     env=env, capture_output=True, text=True)
             target = os.readlink(root / "current-release")
+            rollback_pointer = root / "rollback"
+            rollback_target = os.readlink(rollback_pointer) if rollback_pointer.is_symlink() else None
+            previous_pointer = root / "previous/stop-data"
+            previous_target = os.readlink(previous_pointer) if previous_pointer.is_symlink() else None
             calls = (root / "docker-calls").read_text() if (root / "docker-calls").exists() else ""
             probes = (root / "probes").read_text() if (root / "probes").exists() else ""
             image = (root / "image").read_text().strip()
-        return result, target, calls, probes, image
+        return result, target, calls, probes, image, rollback_target, previous_target
 
     def test_incomplete_coverage_blocks_switch_even_when_artifact_validation_passes(self):
-        result, target, calls, _, _ = self.activate(coverage_fail=True)
+        result, target, calls, _, _, _, _ = self.activate(coverage_fail=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(target, "previous")
         self.assertEqual(calls, "")
 
     def test_unhealthy_rollback_blocks_switch(self):
-        result, target, calls, _, _ = self.activate(rollback_fail=True)
+        result, target, calls, _, _, _, _ = self.activate(rollback_fail=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(target, "previous")
         self.assertNotIn("restart", calls)
 
     def test_expired_source_blocks_activation_before_any_production_mutation(self):
-        result, target, calls, probes, _ = self.activate(source_freshness_fail=True)
+        result, target, calls, probes, _, _, _ = self.activate(source_freshness_fail=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(target, "previous")
         self.assertEqual(calls, "")
         self.assertIn("source-freshness", probes)
 
     def test_activation_dry_run_never_switches_or_restarts(self):
-        result, target, calls, _, _ = self.activate(dry_run=True)
+        result, target, calls, _, _, rollback_target, _ = self.activate(dry_run=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(target, "previous")
         self.assertEqual(calls, "")
+        self.assertIsNone(rollback_target)
 
     def test_success_never_builds_or_restarts_route(self):
-        result, target, calls, _, image = self.activate()
+        result, target, calls, _, image, rollback_target, previous_target = self.activate(
+            existing_rollback=True, existing_previous=True,
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(target, "releases/incremental/candidate")
         self.assertEqual(image, "image-original")
+        self.assertIsNone(rollback_target)
+        self.assertIsNone(previous_target)
+        self.assertIn("rollback=NOT_RETAINED", result.stdout)
         for forbidden in ("build", "compose", "restart", "pull", "rename"):
             self.assertNotIn(forbidden, calls)
 
     def test_route_failure_rolls_back_and_repeats_readiness(self):
-        result, target, calls, probes, _ = self.activate(route_fail=True)
+        result, target, calls, probes, _, rollback_target, _ = self.activate(route_fail=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(target, "previous")
         self.assertIn("restore-route", probes)
         self.assertIn("--release-id previous", probes)
         self.assertNotIn("build", calls)
+        self.assertIsNone(rollback_target)
+
+    def test_failed_activation_restores_previous_rollback_pointer(self):
+        result, target, _, _, _, rollback_target, previous_target = self.activate(
+            route_fail=True, existing_rollback=True, existing_previous=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(target, "previous")
+        self.assertEqual(rollback_target, "saved-rollback")
+        self.assertEqual(previous_target, "saved-previous")
 
     def test_changed_stop_data_root_restarts_same_image_only(self):
-        result, target, calls, probes, image = self.activate(root_change=True)
+        result, target, calls, probes, image, rollback_target, _ = self.activate(root_change=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(target, "releases/incremental/candidate")
         self.assertEqual(image, "image-original")
+        self.assertIsNone(rollback_target)
         self.assertIn("reload-route", probes)
         self.assertEqual(calls.count("restart routerecall-api"), 1)
         self.assertNotIn("build", calls)
 
     def test_changed_root_failure_reloads_previous_release_without_build(self):
-        result, target, calls, probes, image = self.activate(root_change=True, route_fail=True)
+        result, target, calls, probes, image, rollback_target, _ = self.activate(root_change=True, route_fail=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(target, "previous")
         self.assertEqual(image, "image-original")
+        self.assertIsNone(rollback_target)
         self.assertIn("--reload", probes)
         self.assertEqual(calls.count("restart routerecall-api"), 2)
         self.assertNotIn("build", calls)
 
     def test_static_gate_failure_rolls_back(self):
-        result, target, _, probes, _ = self.activate(static_fail=True)
+        result, target, _, probes, _, _, _ = self.activate(static_fail=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(target, "previous")
         self.assertIn("--release-id previous", probes)
 
     def test_static_pipeline_failure_rolls_back(self):
-        result, target, _, probes, _ = self.activate(pipeline_fail=True)
+        result, target, _, probes, _, _, _ = self.activate(pipeline_fail=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(target, "previous")
         self.assertIn("restore-route", probes)
 
     def test_changed_image_fails_and_restores_previous_state(self):
-        result, target, calls, _, image = self.activate(image_change=True)
+        result, target, calls, _, image, rollback_target, _ = self.activate(image_change=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(target, "previous")
         self.assertEqual(image, "image-original")
         self.assertNotIn("build", calls)
+        self.assertIsNone(rollback_target)
 
 
 if __name__ == "__main__":
