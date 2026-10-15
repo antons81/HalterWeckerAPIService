@@ -298,7 +298,7 @@ def preflight(release: Path, build: tuple[str, ...], runtime: tuple[str, ...],
     try:
         relative = release.relative_to(data_root).as_posix()
         pointer_relative = candidate_pointer.relative_to(data_root).as_posix()
-        runtime_mode = "legacy" if require_current_schedules else "hybrid"
+        runtime_mode = "legacy" if full_database_candidate else "hybrid"
         static_name, static = start("stopdata", static_image, 8080,
                        [(data_root, "/data")],
                        static_consumer_environment(runtime_mode, runtime, relative, pointer_relative))
