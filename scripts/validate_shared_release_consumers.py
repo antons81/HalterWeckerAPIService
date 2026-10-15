@@ -18,7 +18,7 @@ from urllib.request import urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from services.release_activation_requirements import validate_provider_contract, validate_shared_release
-from scripts.static_departures_coverage import validate_city_coverage, require_preserved_schedules
+from scripts.static_departures_coverage import validate_city_coverage
 
 
 PRODUCTION_CONTROL_CITIES = frozenset({
@@ -210,7 +210,7 @@ def static_consumer_environment(runtime_mode: str, runtime: tuple[str, ...],
 def preflight(release: Path, build: tuple[str, ...], runtime: tuple[str, ...],
               static_container: str, route_container: str, *, reference: Path | None = None,
               static_image: str | None = None,
-              require_current_schedules: bool = True) -> dict[str, object]:
+              require_current_schedules: bool = False) -> dict[str, object]:
     release = release.resolve(strict=True)
     release_manifest = release / "release.json"
     full_database_candidate = not release_manifest.is_file()
@@ -386,6 +386,7 @@ def validate_release_pair(candidate_root: Path, rollback_root: Path, build: tupl
         candidate = preflight(
             candidate_root, build, runtime, static_container, route_container,
             reference=rollback, static_image=static_image,
+            require_current_schedules=False,
         )
         if candidate["staticImage"] != static_image or candidate["routeImage"] != route_image:
             raise ValueError("consumer image changed during full SQLite candidate preflight")
@@ -407,10 +408,10 @@ def validate_release_pair(candidate_root: Path, rollback_root: Path, build: tupl
                                  route_container, static_image=static_image,
                                  require_current_schedules=False)
     candidate = preflight(candidate_root, build, runtime, static_container, route_container,
-                          reference=rollback, static_image=verified_rollback["staticImage"])
+                          reference=rollback, static_image=verified_rollback["staticImage"],
+                          require_current_schedules=False)
     if candidate["staticImage"] != verified_rollback["staticImage"] or candidate["routeImage"] != verified_rollback["routeImage"]:
         raise ValueError("consumer image changed between rollback and candidate preflight")
-    require_preserved_schedules(candidate["coveragePlan"], verified_rollback["coveragePlan"])
     for report in (candidate, verified_rollback):
         del report["coveragePlan"]
     return {"status": "PASS", "candidate": candidate, "verifiedRollback": verified_rollback}

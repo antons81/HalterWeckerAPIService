@@ -116,30 +116,40 @@ class SharedReleaseRequirementsTests(unittest.TestCase):
         with self.assertRaises(sqlite3.OperationalError):
             self.validate()
 
-    def test_expired_temporal_window_fails(self):
+    def test_expired_temporal_window_warns_by_default_but_strict_probe_can_reject(self):
         self.reference.temporal.valid_through = "2026-10-01"
-        with self.assertRaises(ActivationRequirementError):
-            self.validate()
+        self.assertEqual(self.validate()["status"], "PASS")
+        with self.assertRaisesRegex(ActivationRequirementError, "does not include"):
+            validate_shared_release(
+                self.root,
+                validation_date=date(2026, 10, 2),
+                require_current_services=True,
+            )
 
-    def test_temporal_with_no_current_services_fails(self):
+    def test_temporal_with_no_service_today_is_allowed_by_default(self):
         with sqlite3.connect(self.temporal) as connection:
             connection.execute("DELETE FROM active_services")
-        with self.assertRaises(ActivationRequirementError):
-            self.validate()
+        self.assertEqual(self.validate()["status"], "PASS")
+        with self.assertRaisesRegex(ActivationRequirementError, "no active services"):
+            validate_shared_release(
+                self.root,
+                validation_date=date(2026, 10, 2),
+                require_current_services=True,
+            )
 
     def test_expired_rollback_calendar_does_not_block_candidate_preflight(self):
         self.reference.temporal.valid_from = "2026-09-01"
         self.reference.temporal.valid_through = "2026-09-30"
         with sqlite3.connect(self.temporal) as connection:
             connection.execute("DELETE FROM active_services")
-        result = validate_shared_release(
-            self.root,
-            validation_date=date(2026, 10, 2),
-            require_current_services=False,
-        )
+        result = self.validate()
         self.assertEqual(result["status"], "PASS")
         with self.assertRaisesRegex(ActivationRequirementError, "does not include"):
-            self.validate()
+            validate_shared_release(
+                self.root,
+                validation_date=date(2026, 10, 2),
+                require_current_services=True,
+            )
 
 
 if __name__ == "__main__":

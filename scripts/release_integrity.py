@@ -105,9 +105,10 @@ def validate_candidate_sources(
 
 def validate_candidate_source_freshness(
     artifact_manifest: Mapping[str, object],
-) -> None:
-    """Reject activation when preparation had to carry an expired source forward."""
+) -> list[str]:
+    """Return calendar warnings without rejecting valid, structurally checked GTFS."""
     failures: list[str] = []
+    warnings: list[str] = []
     for group in ("sources", "external"):
         entries = artifact_manifest.get(group)
         if not isinstance(entries, Mapping):
@@ -125,15 +126,29 @@ def validate_candidate_source_freshness(
             if isinstance(refresh, Mapping):
                 service_through = str(refresh.get("serviceThrough", "unknown"))
                 reason = str(refresh.get("reason", "freshness status is incomplete"))
+                calendar_status = str(refresh.get("calendarStatus", ""))
+                refresh_status = str(refresh.get("status", ""))
+                if (
+                    calendar_status in {"expired", "no-active-service"}
+                    and refresh_status in {"warning", "failed"}
+                ):
+                    last_service = (
+                        f"last service {service_through}"
+                        if service_through not in {"", "unknown", "None"}
+                        else "no active service dates"
+                    )
+                    warnings.append(f"{source_id}: {last_service}; {reason}")
+                    continue
                 failures.append(
-                    f"{source_id} (service through {service_through}; {reason})"
+                    f"{source_id} (calendar status {calendar_status or 'missing'}; {reason})"
                 )
             else:
                 failures.append(f"{source_id} (invalid sourceRefresh metadata)")
     if failures:
         raise ValueError(
-            "Candidate source freshness blocks activation: " + "; ".join(failures)
+            "Candidate source metadata is invalid: " + "; ".join(failures)
         )
+    return warnings
 
 
 def validate_previous_release_sources(

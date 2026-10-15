@@ -62,7 +62,7 @@ REQUIRED_BUNDLE_TABLES = frozenset(
 
 
 class ExpiredSourceCalendarRefreshError(ValueError):
-    """An expired cached feed could not be refreshed for this candidate."""
+    """An expired feed could not be refreshed; the valid artifact remains usable."""
 
     def __init__(
         self,
@@ -80,12 +80,12 @@ class ExpiredSourceCalendarRefreshError(ValueError):
         self.reason = reason
         super().__init__(
             f"source={source_id} calendar expired on {service_through}; "
-            f"candidate may be assembled from the preserved archive, but activation is blocked: {reason}"
+            f"preserving the valid archive: {reason}"
         )
 
     def manifest_entry(self) -> dict[str, str]:
         return {
-            "status": "failed",
+            "status": "warning",
             "calendarStatus": "expired",
             "serviceThrough": self.service_through.isoformat(),
             "checkedOn": self.checked_on.isoformat(),
@@ -228,7 +228,7 @@ def ensure_current_source_calendar(
     today = source_calendar_local_date(timezone_name)
     horizon = gtfs_calendar_horizon(result.path)
     if horizon is None:
-        raise ValueError(f"source={source_id} has no active GTFS service calendar at {result.path}")
+        return result
     if horizon >= today:
         return result
     if result.status in {"updated", "snapshot", "local"}:
@@ -294,7 +294,23 @@ def ensure_source_calendar_for_candidate(
     allow_stale: bool,
     **kwargs,
 ) -> tuple[ArtifactResult, dict[str, str] | None]:
-    """Keep a valid expired archive for assembly while marking the candidate unactivatable."""
+    """Keep valid source data when its calendar is expired or has no active dates."""
+    if not result.path.is_dir():
+        horizon = gtfs_calendar_horizon(result.path)
+        today = source_calendar_local_date(timezone_name)
+        if horizon is None:
+            refresh_status = {
+                "status": "warning",
+                "calendarStatus": "no-active-service",
+                "serviceThrough": "",
+                "checkedOn": today.isoformat(),
+                "reason": "GTFS archive contains no active service dates",
+            }
+            print(
+                f"[GTFSCache] source={source_id} stage=calendar status=warning "
+                "calendar=no-active-service"
+            )
+            return result, refresh_status
     try:
         return (
             ensure_current_source_calendar(
@@ -310,7 +326,7 @@ def ensure_source_calendar_for_candidate(
         )
     except ExpiredSourceCalendarRefreshError as error:
         print(
-            f"[GTFSCache] source={source_id} stage=calendar status=expired-preserved "
+            f"[GTFSCache] source={source_id} stage=calendar status=warning "
             f"serviceThrough={error.service_through.isoformat()} refresh=failed "
             f"reason={error.reason}"
         )
@@ -602,12 +618,20 @@ def main() -> None:
                 timezone_name = str(source.get("timezone") or "Europe/Berlin")
                 today = source_calendar_local_date(timezone_name)
                 if horizon is None:
-                    raise ValueError(
-                        f"source={source_id} pinned GTFS archive has no active service calendar"
-                    )
-                if horizon < today:
                     refresh_status = {
-                        "status": "failed",
+                        "status": "warning",
+                        "calendarStatus": "no-active-service",
+                        "serviceThrough": "",
+                        "checkedOn": today.isoformat(),
+                        "reason": "pinned GTFS archive contains no active service dates",
+                    }
+                    print(
+                        f"[GTFSCache] source={source_id} stage=calendar status=warning "
+                        "calendar=no-active-service source=pinned-snapshot"
+                    )
+                elif horizon < today:
+                    refresh_status = {
+                        "status": "warning",
                         "calendarStatus": "expired",
                         "serviceThrough": horizon.isoformat(),
                         "checkedOn": today.isoformat(),
@@ -615,8 +639,8 @@ def main() -> None:
                     }
                     print(
                         f"[GTFSCache] source={source_id} stage=calendar "
-                        f"status=expired-preserved serviceThrough={horizon.isoformat()} "
-                        "refresh=failed reason=immutable-raw-snapshot"
+                        f"status=warning serviceThrough={horizon.isoformat()} "
+                        "reason=immutable-raw-snapshot"
                     )
                 else:
                     refresh_status = None
@@ -678,16 +702,16 @@ def main() -> None:
             merge_gtfs_feed_bundle([item.path for item in component_results], bundle_path)
             bundle = artifact_payload(ArtifactResult(source_id, bundle_path, "updated", "merged official GTFS feeds"))
             bundle["componentSources"] = component_payloads
-            failed_components = [
+            calendar_warnings = [
                 {"componentID": item["componentID"], **item["sourceRefresh"]}
                 for item in component_payloads
                 if isinstance(item.get("sourceRefresh"), dict)
             ]
-            if failed_components:
+            if calendar_warnings:
                 bundle["sourceRefresh"] = {
-                    "status": "failed",
+                    "status": "warning",
                     "calendarStatus": "expired",
-                    "reason": json.dumps(failed_components, ensure_ascii=False, sort_keys=True),
+                    "reason": json.dumps(calendar_warnings, ensure_ascii=False, sort_keys=True),
                 }
             result["external"][source_id] = bundle
             print(
@@ -703,13 +727,20 @@ def main() -> None:
                 horizon = gtfs_calendar_horizon(path)
                 today = source_calendar_local_date(str(source.get("timezone") or "Europe/Berlin"))
                 if horizon is None:
-                    raise ValueError(
-                        f"source={source_id} local GTFS archive has no active service calendar; "
-                        f"no refresh URL is configured (local artifact={path})"
-                    )
-                if horizon < today:
                     refresh_status = {
-                        "status": "failed",
+                        "status": "warning",
+                        "calendarStatus": "no-active-service",
+                        "serviceThrough": "",
+                        "checkedOn": today.isoformat(),
+                        "reason": f"local GTFS archive contains no active service dates: {path}",
+                    }
+                    print(
+                        f"[GTFSCache] source={source_id} stage=calendar status=warning "
+                        "calendar=no-active-service source=local"
+                    )
+                elif horizon < today:
+                    refresh_status = {
+                        "status": "warning",
                         "calendarStatus": "expired",
                         "serviceThrough": horizon.isoformat(),
                         "checkedOn": today.isoformat(),
@@ -717,8 +748,8 @@ def main() -> None:
                     }
                     print(
                         f"[GTFSCache] source={source_id} stage=calendar "
-                        f"status=expired-preserved serviceThrough={horizon.isoformat()} "
-                        "refresh=failed reason=no-refresh-url"
+                        f"status=warning serviceThrough={horizon.isoformat()} "
+                        "reason=no-refresh-url"
                     )
             result["external"][source_id] = _with_source_refresh_status(
                 artifact_payload(

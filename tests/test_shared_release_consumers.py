@@ -149,6 +149,9 @@ class ConsumerPreflightTests(unittest.TestCase):
             fail = True
             with self.assertRaisesRegex(RuntimeError, "lost scheduled departures: non-pilot-city"):
                 exec(compile(STATIC_CITY_PROBE, "candidate HTTP probe", "exec"), {})
+            for check in plan["checks"]:
+                check["hasSchedule"] = False
+            exec(compile(STATIC_CITY_PROBE, "candidate HTTP probe", "exec"), {})
 
     def test_fixed_smoke_stop_can_have_no_services_without_hiding_city_loss(self):
         cities = ("wien", "helsinki", "bochum", "berlin")
@@ -198,7 +201,7 @@ class ConsumerPreflightTests(unittest.TestCase):
             self.assertEqual(call.call_args_list[0].args[0], rollback.resolve())
             self.assertIs(call.call_args_list[0].kwargs["require_current_schedules"], False)
             self.assertEqual(call.call_args_list[1].args[0], root / "candidate")
-            self.assertNotIn("require_current_schedules", call.call_args_list[1].kwargs)
+            self.assertIs(call.call_args_list[1].kwargs["require_current_schedules"], False)
             self.assertEqual(call.call_args_list[1].kwargs["reference"], rollback.resolve())
             self.assertEqual(call.call_args_list[1].kwargs["static_image"], "sha256:tested")
 
@@ -241,6 +244,7 @@ class ConsumerPreflightTests(unittest.TestCase):
             self.assertEqual(result["verifiedRollback"]["status"], "PASS")
             self.assertEqual(preflight_call.call_args.args[1:3], ((), ()))
             self.assertEqual(preflight_call.call_args.kwargs["reference"], rollback.resolve())
+            self.assertIs(preflight_call.call_args.kwargs["require_current_schedules"], False)
 
     def test_full_sqlite_candidate_rejects_consumer_image_change_during_preflight(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -265,14 +269,16 @@ class ConsumerPreflightTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "consumer image changed"):
                     validate_release_pair(candidate, rollback, (), (), "static", "route")
 
-    def test_pair_rejects_schedule_loss_even_when_both_other_preflights_pass(self):
+    def test_pair_allows_schedule_end_date_to_change_without_losing_structural_preflight(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "release.json").write_text('{"providers":{"germany":{}}}')
             reports = [{"staticImage": "image", "routeImage": "route", "coveragePlan": {"checks": [{"cityID": "helsinki", "hasSchedule": available}]}} for available in (True, False)]
             with patch("scripts.validate_shared_release_consumers.preflight", side_effect=reports):
-                with self.assertRaisesRegex(ValueError, "lost schedules for retained cities: helsinki"):
-                    validate_release_pair(root, root, ("germany",), (), "static", "route")
+                self.assertEqual(
+                    validate_release_pair(root, root, ("germany",), (), "static", "route")["status"],
+                    "PASS",
+                )
     def test_provider_list_normalizes_whitespace_and_duplicates(self):
         self.assertEqual(provider_ids(" israel-mot, germany,israel-mot, "), ("israel-mot", "germany"))
 

@@ -883,11 +883,16 @@ from release_integrity import validate_candidate_source_freshness
 
 artifacts = json.loads(artifacts_path.read_text(encoding="utf-8"))
 try:
-    validate_candidate_source_freshness(artifacts)
+    calendar_warnings = validate_candidate_source_freshness(artifacts)
 except ValueError as error:
     print(f"[Nightly] stage=source-freshness status=FAIL reason={error}", file=sys.stderr)
     raise SystemExit(1) from error
-print("[Nightly] stage=source-freshness status=PASS")
+for warning in calendar_warnings:
+    print(f"[Nightly] stage=source-freshness status=WARN {warning}")
+print(
+    "[Nightly] stage=source-freshness status=PASS "
+    f"calendarWarnings={len(calendar_warnings)}"
+)
 PY
 }
 

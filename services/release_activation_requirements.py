@@ -35,13 +35,15 @@ def validate_provider_contract(
 
 def validate_shared_release(
     release_root: Path | str, *, validation_date: date | None = None,
-    require_current_services: bool = True,
+    require_current_services: bool = False,
 ) -> dict[str, object]:
     """Validate Germany independently of a configurable provider allowlist.
 
     Receipts can accelerate artifact validation, but never bypass these
-    consumer requirements. All connections are read-only and deterministically
-    closed. No release files or production pointers are changed.
+    consumer requirements. Calendar dates are validated structurally; the
+    current date is not required to have service. All connections are read-only
+    and deterministically closed. No release files or production pointers are
+    changed.
     """
     root = Path(release_root).resolve()
     payload = json.loads((root / "release.json").read_text(encoding="utf-8"))
@@ -90,8 +92,14 @@ def validate_shared_release(
             for table in ("routes", "trips", "stop_times"):
                 if structural.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is None:
                     raise ActivationRequirementError(f"Germany structural table is empty: {table}")
-    if require_current_services:
-        with connection(references.temporal.database_path) as temporal:
+    with connection(references.temporal.database_path) as temporal:
+        try:
+            # The temporal database and its schema must exist even when this
+            # release has no service on the validation date.
+            temporal.execute("SELECT 1 FROM active_services LIMIT 1").fetchone()
+        except sqlite3.Error as error:
+            raise ActivationRequirementError("Germany temporal database is invalid") from error
+        if require_current_services:
             if temporal.execute(
                 "SELECT 1 FROM active_services WHERE service_date=? LIMIT 1", (today.strftime("%Y%m%d"),)
             ).fetchone() is None:

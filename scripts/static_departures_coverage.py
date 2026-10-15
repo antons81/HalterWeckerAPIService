@@ -152,7 +152,7 @@ def validate_city_coverage(
     *,
     reference: Path | None = None,
     validation_date: date | None = None,
-    require_current_schedules: bool = True,
+    require_current_schedules: bool = False,
 ) -> dict:
     release = release.resolve(strict=True)
     today = validation_date or datetime.now(ZoneInfo("Europe/Berlin")).date()

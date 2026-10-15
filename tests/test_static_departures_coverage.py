@@ -209,6 +209,9 @@ class CityCoverageTests(unittest.TestCase):
 
     def validate(self, **kwargs):
         runtime = kwargs.pop("runtime", tuple(self.pilots.values()))
+        use_default_calendar_policy = kwargs.pop("use_default_calendar_policy", False)
+        if not use_default_calendar_policy:
+            kwargs.setdefault("require_current_schedules", True)
         with patch("scripts.static_departures_coverage._package_cities", return_value=self.package_cities), \
              patch("scripts.static_departures_coverage.load_release_manifest", return_value=self.manifest), \
              patch("scripts.static_departures_coverage.load_external_gtfs_sources", return_value=self.sources), \
@@ -305,6 +308,16 @@ class CityCoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(CityCoverageError, "today and tomorrow"):
             self.validate()
 
+    def test_yesterday_calendar_passes_default_candidate_policy_with_empty_today_board(self):
+        self.mutate_database("UPDATE metadata SET value='2026-10-09' WHERE key='validFrom'")
+        self.mutate_database("UPDATE metadata SET value='2026-10-09' WHERE key='validThrough'")
+        self.mutate_database("UPDATE active_services SET service_date='20261009'")
+
+        report = self.validate(use_default_calendar_policy=True)
+
+        self.assertEqual(report["supportedCities"], len(self.cities))
+        self.assertTrue(all(not row["hasSchedule"] for row in report["checks"]))
+
     def test_expired_rollback_calendar_keeps_structural_city_coverage(self):
         self.mutate_database("UPDATE metadata SET value='2026-09-10' WHERE key='validFrom'")
         self.mutate_database("UPDATE metadata SET value='2026-09-30' WHERE key='validThrough'")
@@ -327,7 +340,7 @@ class CityCoverageTests(unittest.TestCase):
             report = self.validate(reference=reference)
             self.assertEqual(report["supportedCities"], len(self.cities))
 
-    def test_scheduled_city_cannot_become_empty_in_candidate(self):
+    def test_schedule_preservation_helper_detects_loss_when_explicitly_requested(self):
         rollback = self.validate()
         self.mutate_database("DELETE FROM stop_times WHERE trip_id='helsinki-trip'")
         candidate = self.validate()

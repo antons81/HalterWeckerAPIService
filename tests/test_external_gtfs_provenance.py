@@ -26,7 +26,7 @@ from external_gtfs import (  # noqa: E402
     validate_kyiv_gtfs_archive,
 )
 from build_stop_packages import load_gtfs_archive  # noqa: E402
-from gtfs_source_cache import ArtifactResult, GTFSArtifactCache  # noqa: E402
+from gtfs_source_cache import ArtifactResult, GTFSArtifactCache, validate_gtfs_archive  # noqa: E402
 from prepare_custom_gtfs_artifacts import resolve_source  # noqa: E402
 from prepare_gtfs_artifacts import (  # noqa: E402
     artifact_payload,
@@ -537,53 +537,44 @@ class ExternalGTFSProvenanceTests(unittest.TestCase):
             self.assertIs(request.call_args.kwargs["force_download"], True)
             self.assertIs(request.call_args.kwargs["allow_stale"], False)
 
-    def test_expired_cached_source_is_preserved_for_assembly_but_marked_unactivatable(self) -> None:
+    def test_midnight_expired_source_is_preserved_warned_and_does_not_block_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            today = date(2026, 10, 11)
+            today = date(2026, 10, 15)
             expired = _write_bundle_feed(
-                root / "gdansk-expired.zip", "gdansk", service_end=date(2026, 10, 8)
+                root / "gzm-expired.zip", "gzm", service_end=date(2026, 10, 14)
             )
-            initial = ArtifactResult("poland-gdansk", expired, "unchanged", "remote metadata")
+            initial = ArtifactResult("poland-gzm", expired, "updated", "downloaded")
             cache = GTFSArtifactCache(root / "cache")
-            with (
-                mock.patch("prepare_gtfs_artifacts.source_calendar_local_date", return_value=today),
-                mock.patch(
-                    "prepare_gtfs_artifacts.resolve_one",
-                    side_effect=urllib.error.HTTPError(
-                        "https://gtfs.example/feed.zip", 500, "upstream unavailable", {}, None,
-                    ),
-                ) as request,
-            ):
+            with mock.patch("prepare_gtfs_artifacts.source_calendar_local_date", return_value=today):
                 preserved, refresh_status = ensure_source_calendar_for_candidate(
                     cache,
                     initial,
-                    source_id="poland-gdansk",
+                    source_id="poland-gzm",
                     url="https://gtfs.example/feed.zip",
                     timezone_name="Europe/Warsaw",
                     allow_stale=True,
-                    retry_attempts=3,
                 )
 
             self.assertEqual(preserved.path, expired)
-            self.assertEqual(refresh_status["status"], "failed")
+            self.assertEqual(refresh_status["status"], "warning")
             self.assertEqual(refresh_status["calendarStatus"], "expired")
-            self.assertEqual(refresh_status["serviceThrough"], "2026-10-08")
-            self.assertEqual(request.call_args.kwargs["retry_attempts"], 3)
-            self.assertIs(request.call_args.kwargs["force_download"], True)
+            self.assertEqual(refresh_status["serviceThrough"], "2026-10-14")
 
             payload = {
                 "sources": {},
                 "external": {
-                    "poland-gdansk": artifact_payload(preserved)
-                    | {"sourceRefresh": refresh_status}
+                    "poland-gzm": artifact_payload(preserved) | {"sourceRefresh": refresh_status},
+                    "poland-gdansk": {
+                        "path": "fresh.zip",
+                        "sourceRefresh": {"status": "succeeded", "calendarStatus": "current"},
+                    },
                 },
             }
-            with self.assertRaisesRegex(
-                ValueError,
-                "Candidate source freshness blocks activation: poland-gdansk .*service through 2026-10-08",
-            ):
-                validate_candidate_source_freshness(payload)
+            warnings = validate_candidate_source_freshness(payload)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("poland-gzm: last service 2026-10-14", warnings[0])
+            self.assertNotIn("poland-gdansk", warnings[0])
 
     def test_prepare_artifacts_continues_after_expired_source_refresh_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -651,7 +642,7 @@ class ExternalGTFSProvenanceTests(unittest.TestCase):
             artifacts = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 artifacts["external"]["poland-gdansk"]["sourceRefresh"]["status"],
-                "failed",
+                "warning",
             )
             self.assertEqual(artifacts["external"]["fixture-after"]["status"], "updated")
             self.assertTrue(Path(artifacts["external"]["poland-gdansk"]["path"]).is_file())
@@ -662,8 +653,69 @@ class ExternalGTFSProvenanceTests(unittest.TestCase):
                 root,
                 environ={},
             )
-            with self.assertRaisesRegex(ValueError, "Candidate source freshness blocks activation"):
-                validate_candidate_source_freshness(artifacts)
+            warnings = validate_candidate_source_freshness(artifacts)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("poland-gdansk: last service 2026-10-08", warnings[0])
+
+    def test_future_service_calendar_passes_without_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            future = _write_bundle_feed(
+                root / "future.zip", "future", service_end=date(2026, 11, 1)
+            )
+            result = ArtifactResult("poland-gzm", future, "updated", "downloaded")
+            with mock.patch(
+                "prepare_gtfs_artifacts.source_calendar_local_date",
+                return_value=date(2026, 10, 15),
+            ):
+                _, status = ensure_source_calendar_for_candidate(
+                    GTFSArtifactCache(root / "cache"), result,
+                    source_id="poland-gzm", url="https://gtfs.example/feed.zip",
+                    timezone_name="Europe/Warsaw", allow_stale=True,
+                )
+            self.assertIsNone(status)
+            self.assertEqual(validate_candidate_source_freshness({"external": {}}), [])
+
+    def test_valid_gtfs_without_active_service_dates_is_a_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = _write_bundle_feed(
+                root / "no-service.zip", "no-service", service_end=date(2026, 10, 14)
+            )
+            with zipfile.ZipFile(archive, "r") as source:
+                members = {name: source.read(name) for name in source.namelist()}
+            calendar = members["calendar.txt"].decode("utf-8")
+            members["calendar.txt"] = calendar.replace(
+                "1,1,1,1,1,1,1,20260101,20261014",
+                "0,0,0,0,0,0,0,20260101,20261014",
+            ).encode("utf-8")
+            no_service = root / "no-active-days.zip"
+            with zipfile.ZipFile(no_service, "w") as output:
+                for name, data in members.items():
+                    output.writestr(name, data)
+            validate_gtfs_archive(no_service)
+            artifact = ArtifactResult("poland-gzm", no_service, "updated", "downloaded")
+            with mock.patch(
+                "prepare_gtfs_artifacts.source_calendar_local_date",
+                return_value=date(2026, 10, 15),
+            ):
+                preserved, status = ensure_source_calendar_for_candidate(
+                    GTFSArtifactCache(root / "cache"), artifact,
+                    source_id="poland-gzm", url="https://gtfs.example/feed.zip",
+                    timezone_name="Europe/Warsaw", allow_stale=True,
+                )
+            self.assertEqual(preserved.path, no_service)
+            self.assertEqual(status["calendarStatus"], "no-active-service")
+            self.assertIn("poland-gzm: no active service dates", validate_candidate_source_freshness({
+                "external": {"poland-gzm": {"sourceRefresh": status}}
+            })[0])
+
+    def test_corrupted_gtfs_archive_remains_a_hard_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "corrupt.zip"
+            path.write_bytes(b"not a zip archive")
+            with self.assertRaises(zipfile.BadZipFile):
+                validate_gtfs_archive(path)
 
     def test_candidate_source_freshness_allows_unmarked_and_confirmed_current_sources(self) -> None:
         validate_candidate_source_freshness({
