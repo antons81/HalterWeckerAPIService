@@ -1337,6 +1337,57 @@ for release_path in "${RELEASE_DELETE_PATHS[@]}"; do
 done
 fi
 
+cleanup_verified_rollback_image() {
+    local image_id="$1"
+    local revision="$2"
+    local candidate_container_id="$3"
+    local static_container="$4"
+    local active_image image_tags referenced_containers referenced_id
+
+    active_image="$("$DOCKER_BIN" inspect --format '{{.Image}}' "$static_container" 2>/dev/null || true)"
+    if [[ -z "$active_image" || "$active_image" == "$image_id" ]]; then
+        echo "KEEP_IMAGE $image_id reason=active-or-unverifiable-static-image"
+        return 0
+    fi
+
+    referenced_containers="$("$DOCKER_BIN" ps -a --filter "ancestor=$image_id" --format '{{.ID}}' 2>/dev/null || true)"
+    while read -r referenced_id; do
+        [[ -n "$referenced_id" && "$referenced_id" != "$candidate_container_id" ]] || continue
+        echo "KEEP_IMAGE $image_id reason=referenced-by-other-container"
+        return 0
+    done <<< "$referenced_containers"
+
+    image_tags="$("$DOCKER_BIN" image inspect --format '{{json .RepoTags}}' "$image_id" 2>/dev/null || true)"
+    if ! python3 - "$image_tags" "$revision" <<'PY'
+import json
+import sys
+
+try:
+    tags = json.loads(sys.argv[1])
+except (IndexError, json.JSONDecodeError):
+    raise SystemExit(1)
+revision = sys.argv[2]
+expected = {
+    f"haltewecker-static-departures:board-{revision}",
+    f"haltewecker-static-departures:verified-rollback-{revision}",
+}
+if not isinstance(tags, list) or not tags or not set(tags).issubset(expected):
+    raise SystemExit(1)
+PY
+    then
+        echo "KEEP_IMAGE $image_id reason=image-tags-not-temporary-verified-rollback"
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        echo "WOULD_DELETE_IMAGE $image_id reason=unreferenced-verified-rollback tags=$image_tags"
+    elif "$DOCKER_BIN" image rm "$image_id" >/dev/null; then
+        echo "DELETE_IMAGE $image_id reason=unreferenced-verified-rollback tags=$image_tags"
+    else
+        echo "KEEP_IMAGE $image_id reason=image-remove-failed"
+    fi
+}
+
 cleanup_pipeline_rollback_containers() {
     if (( RELEASE_APPLY_ALLOWED != 1 )); then
         echo "Docker rollback-container cleanup skipped reason=retention-safety-preflight-incomplete"
@@ -1380,6 +1431,7 @@ PY
     fi
 
     local container_rows container_id container_name inspect_row status image_id writable_bytes
+    local verified_rollback verified_revision
     if ! container_rows="$("$DOCKER_BIN" ps -a --format '{{.ID}} {{.Names}}' 2>/dev/null)"; then
         echo "Docker rollback-container cleanup skipped reason=container-list-failed"
         return 0
@@ -1391,7 +1443,12 @@ PY
     local removed=0
     while read -r container_id container_name; do
         [[ -n "$container_id" && -n "$container_name" ]] || continue
-        if [[ ! "$container_name" =~ ^(static-departures-api|routerecall-api)-rollback-[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        verified_rollback=0
+        verified_revision=""
+        if [[ "$container_name" =~ ^static-departures-api-verified-rollback-([A-Za-z0-9][A-Za-z0-9._-]*)$ ]]; then
+            verified_rollback=1
+            verified_revision="${BASH_REMATCH[1]}"
+        elif [[ ! "$container_name" =~ ^(static-departures-api|routerecall-api)-rollback-[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
             continue
         fi
         inspect_row="$("$DOCKER_BIN" inspect --size --format '{{.Name}}|{{.State.Status}}|{{.Image}}|{{.SizeRw}}' "$container_id" 2>/dev/null || true)"
@@ -1409,11 +1466,17 @@ PY
         fi
         if [[ "$DRY_RUN" == "1" ]]; then
             echo "WOULD_DELETE_CONTAINER $container_name reason=stopped-pipeline-rollback-after-production-readiness writable_layer_bytes=$writable_bytes image=$image_id"
+            if (( verified_rollback == 1 )); then
+                cleanup_verified_rollback_image "$image_id" "$verified_revision" "$container_id" "$static_container"
+            fi
             continue
         fi
         if "$DOCKER_BIN" rm "$container_id" >/dev/null; then
             echo "DELETE_CONTAINER $container_name reason=stopped-pipeline-rollback-after-production-readiness writable_layer_bytes=$writable_bytes image=$image_id"
             removed=$((removed + 1))
+            if (( verified_rollback == 1 )); then
+                cleanup_verified_rollback_image "$image_id" "$verified_revision" "$container_id" "$static_container"
+            fi
         else
             echo "KEEP_CONTAINER $container_name reason=container-remove-failed"
         fi
