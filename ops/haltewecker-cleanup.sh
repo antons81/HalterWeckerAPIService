@@ -1342,7 +1342,9 @@ cleanup_verified_rollback_image() {
     local revision="$2"
     local candidate_container_id="$3"
     local static_container="$4"
-    local active_image image_tags referenced_containers referenced_id
+    local active_image image_tags safe_image_tags referenced_containers referenced_id
+    local referenced_name
+    local -a safe_tags=()
 
     active_image="$("$DOCKER_BIN" inspect --format '{{.Image}}' "$static_container" 2>/dev/null || true)"
     if [[ -z "$active_image" || "$active_image" == "$image_id" ]]; then
@@ -1350,15 +1352,19 @@ cleanup_verified_rollback_image() {
         return 0
     fi
 
-    referenced_containers="$("$DOCKER_BIN" ps -a --filter "ancestor=$image_id" --format '{{.ID}}' 2>/dev/null || true)"
-    while read -r referenced_id; do
+    referenced_containers="$("$DOCKER_BIN" ps -a --filter "ancestor=$image_id" --format '{{.ID}} {{.Names}}' 2>/dev/null || true)"
+    while read -r referenced_id referenced_name; do
         [[ -n "$referenced_id" && "$referenced_id" != "$candidate_container_id" ]] || continue
+        if [[ -z "$candidate_container_id" && "$DRY_RUN" == "1" &&
+              "$referenced_name" == "static-departures-api-verified-rollback-$revision" ]]; then
+            return 0
+        fi
         echo "KEEP_IMAGE $image_id reason=referenced-by-other-container"
         return 0
     done <<< "$referenced_containers"
 
     image_tags="$("$DOCKER_BIN" image inspect --format '{{json .RepoTags}}' "$image_id" 2>/dev/null || true)"
-    if ! python3 - "$image_tags" "$revision" <<'PY'
+    safe_image_tags="$(python3 - "$image_tags" "$revision" <<'PY'
 import json
 import sys
 
@@ -1371,21 +1377,52 @@ expected = {
     f"haltewecker-static-departures:board-{revision}",
     f"haltewecker-static-departures:verified-rollback-{revision}",
 }
-if not isinstance(tags, list) or not tags or not set(tags).issubset(expected):
+if (
+    not isinstance(tags, list)
+    or not tags
+    or not set(tags).issubset(expected)
+    or f"haltewecker-static-departures:verified-rollback-{revision}" not in tags
+):
     raise SystemExit(1)
+for tag in sorted(set(tags)):
+    print(tag)
 PY
-    then
+    )" || {
+        echo "KEEP_IMAGE $image_id reason=image-tags-not-temporary-verified-rollback"
+        return 0
+    }
+    while IFS= read -r safe_tag; do
+        [[ -n "$safe_tag" ]] && safe_tags+=("$safe_tag")
+    done <<< "$safe_image_tags"
+    if (( ${#safe_tags[@]} == 0 )); then
         echo "KEEP_IMAGE $image_id reason=image-tags-not-temporary-verified-rollback"
         return 0
     fi
 
     if [[ "$DRY_RUN" == "1" ]]; then
         echo "WOULD_DELETE_IMAGE $image_id reason=unreferenced-verified-rollback tags=$image_tags"
-    elif "$DOCKER_BIN" image rm "$image_id" >/dev/null; then
+    elif "$DOCKER_BIN" image rm "${safe_tags[@]}" >/dev/null; then
         echo "DELETE_IMAGE $image_id reason=unreferenced-verified-rollback tags=$image_tags"
     else
         echo "KEEP_IMAGE $image_id reason=image-remove-failed"
     fi
+}
+
+cleanup_orphan_verified_rollback_images() {
+    local static_container="$1"
+    local image_rows image_short_id image_id image_tag revision
+
+    image_rows="$("$DOCKER_BIN" image ls --format '{{.ID}} {{.Repository}}:{{.Tag}}' 2>/dev/null || true)"
+    while read -r image_short_id image_tag; do
+        [[ "$image_tag" =~ ^haltewecker-static-departures:verified-rollback-([A-Za-z0-9][A-Za-z0-9._-]*)$ ]] || continue
+        revision="${BASH_REMATCH[1]}"
+        image_id="$("$DOCKER_BIN" image inspect --format '{{.Id}}' "$image_tag" 2>/dev/null || true)"
+        if [[ ! "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "KEEP_IMAGE $image_tag reason=image-identity-unavailable"
+            continue
+        fi
+        cleanup_verified_rollback_image "$image_id" "$revision" "" "$static_container"
+    done <<< "$image_rows"
 }
 
 cleanup_pipeline_rollback_containers() {
@@ -1437,6 +1474,7 @@ PY
         return 0
     fi
     if [[ -z "$container_rows" ]]; then
+        cleanup_orphan_verified_rollback_images "$static_container"
         echo "Docker rollback-container cleanup status=PASS removed=0"
         return 0
     fi
@@ -1481,6 +1519,7 @@ PY
             echo "KEEP_CONTAINER $container_name reason=container-remove-failed"
         fi
     done <<< "$container_rows"
+    cleanup_orphan_verified_rollback_images "$static_container"
     echo "Docker rollback-container cleanup status=PASS removed=$removed"
 }
 

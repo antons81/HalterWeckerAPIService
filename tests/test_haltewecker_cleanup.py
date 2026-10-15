@@ -154,17 +154,25 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             "    for row in fixture.get('containers', []):\n"
             "        if row['id'] in removed: continue\n"
             "        if ancestor is not None and row['image'] != ancestor: continue\n"
-            "        print(row['id'] if ancestor is not None else row['id'] + ' ' + row['name'])\n"
+            "        print(row['id'] + ' ' + row['name'])\n"
             "elif args and args[0] == 'rm' and len(args) == 2:\n"
             "    removed.append(args[1]); removed_path.write_text(json.dumps(removed))\n"
+            "elif args and args[0] == 'image' and args[1] == 'ls':\n"
+            "    for image_id, image in fixture.get('images', {}).items():\n"
+            "        for tag in image['tags']:\n"
+            "            if tag not in removed_images: print(image_id[:12] + ' ' + tag)\n"
             "elif args and args[0] == 'image' and args[1] == 'inspect':\n"
             "    template = args[args.index('--format') + 1]\n"
-            "    image = fixture.get('images', {}).get(args[-1])\n"
+            "    target = args[-1]\n"
+            "    image_id = next((key for key, value in fixture.get('images', {}).items() if key == target or key.startswith(target) or target in value['tags']), None)\n"
+            "    image = fixture.get('images', {}).get(image_id)\n"
             "    if image is None: raise SystemExit(1)\n"
-            "    if template == '{{json .RepoTags}}': print(json.dumps(image['tags'])); raise SystemExit(0)\n"
+            "    tags = [tag for tag in image['tags'] if tag not in removed_images]\n"
+            "    if template == '{{json .RepoTags}}': print(json.dumps(tags)); raise SystemExit(0)\n"
+            "    if template == '{{.Id}}': print(image_id); raise SystemExit(0)\n"
             "    raise SystemExit(2)\n"
-            "elif args and args[0] == 'image' and args[1] == 'rm' and len(args) == 3:\n"
-            "    removed_images.append(args[2]); removed_images_path.write_text(json.dumps(removed_images))\n"
+            "elif args and args[0] == 'image' and args[1] == 'rm' and len(args) >= 3:\n"
+            "    removed_images.extend(args[2:]); removed_images_path.write_text(json.dumps(removed_images))\n"
             "else: raise SystemExit(2)\n",
             encoding="utf-8",
         )
@@ -483,7 +491,10 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             )
             self.assertEqual(
                 json.loads((root / "docker-removed-images.json").read_text()),
-                [image],
+                [
+                    "haltewecker-static-departures:board-21ad15d",
+                    "haltewecker-static-departures:verified-rollback-21ad15d",
+                ],
             )
 
     def test_verified_rollback_image_with_unrelated_tag_is_preserved(self) -> None:
@@ -528,6 +539,39 @@ class HalteWeckerCleanupTests(unittest.TestCase):
                 output,
             )
             self.assertEqual(json.loads((root / "docker-removed-images.json").read_text()), [])
+
+    def test_orphan_verified_rollback_image_is_cleaned_without_container(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            active = data_root / "releases" / "active-release"
+            active.mkdir(parents=True)
+            (active / "release-metadata.json").write_text(
+                '{"releaseID":"active-release"}\n', encoding="utf-8"
+            )
+            (data_root / "current-release").symlink_to(active)
+            fixture = self.healthy_docker_fixture()
+            image = "sha256:" + "7" * 64
+            fixture["images"] = {
+                image: {
+                    "tags": [
+                        "haltewecker-static-departures:board-21ad15d",
+                        "haltewecker-static-departures:verified-rollback-21ad15d",
+                    ]
+                }
+            }
+
+            result = self.run_cleaner(root, data_root, dry_run=False, docker_fixture=fixture)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn("DELETE_IMAGE " + image, output)
+            self.assertEqual(
+                json.loads((root / "docker-removed-images.json").read_text()),
+                [
+                    "haltewecker-static-departures:board-21ad15d",
+                    "haltewecker-static-departures:verified-rollback-21ad15d",
+                ],
+            )
 
     def test_repo_cleanup_uses_data_root_cache_when_gtfs_override_is_absent(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
