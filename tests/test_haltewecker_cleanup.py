@@ -100,7 +100,7 @@ class HalteWeckerCleanupTests(unittest.TestCase):
         docker = root / "docker"
         docker.write_text(
             "#!/usr/bin/env python3\n"
-            "import json, os, sys\n"
+            "import json, os, subprocess, sys\n"
             "from pathlib import Path\n"
             "fixture = json.loads(Path(os.environ['DOCKER_FIXTURE']).read_text())\n"
             "args = sys.argv[1:]\n"
@@ -121,7 +121,22 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             "elif args and args[0] == 'exec':\n"
             "    name = args[1]\n"
             "    if name == 'static-departures-api' and fixture.get('staticReady'):\n"
-            "        print(fixture['releaseID']); raise SystemExit(0)\n"
+            "        database = {'releaseID': fixture['releaseID']}\n"
+            "        for key in ('runtimeMode', 'fallbackReleaseID'):\n"
+            "            if key in fixture: database[key] = fixture[key]\n"
+            "        payload = json.dumps({'database': database})\n"
+            "        environment = os.environ.copy()\n"
+            "        environment['DEPARTURES_DATABASE'] = fixture.get('departuresDatabase', '/data/current-release/departures.sqlite')\n"
+            "        environment['DOCKER_HEALTH_PAYLOAD'] = payload\n"
+            "        health_check = args[args.index('-c') + 1]\n"
+            "        harness = ('import io, os, sys, urllib.request\\n'\n"
+            "                   'class Response(io.BytesIO):\\n    status = 200\\n'\n"
+            "                   'urllib.request.urlopen = lambda *a, **k: Response(os.environ[\"DOCKER_HEALTH_PAYLOAD\"].encode())\\n'\n"
+            "                   'exec(compile(sys.argv[1], \"<docker-health-check>\", \"exec\"), {})\\n')\n"
+            "        checked = subprocess.run([sys.executable, '-c', harness, health_check], env=environment, capture_output=True, text=True)\n"
+            "        if checked.stdout: print(checked.stdout, end='')\n"
+            "        if checked.stderr: print(checked.stderr, end='', file=sys.stderr)\n"
+            "        raise SystemExit(checked.returncode)\n"
             "    if name == 'routerecall-api' and fixture.get('routeReadonly'):\n"
             "        raise SystemExit(0)\n"
             "    raise SystemExit(1)\n"
@@ -342,6 +357,50 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             )
             self.assertNotIn("WOULD_DELETE_CONTAINER", output)
             self.assertEqual(json.loads((root / "docker-removed.json").read_text()), [])
+
+    def test_explicit_non_legacy_runtime_mode_blocks_rollback_container_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            active = data_root / "releases" / "active-release"
+            active.mkdir(parents=True)
+            (active / "release-metadata.json").write_text(
+                '{"releaseID":"active-release"}\n', encoding="utf-8"
+            )
+            (data_root / "current-release").symlink_to(active)
+            fixture = self.healthy_docker_fixture()
+            fixture["runtimeMode"] = "provider-only"
+
+            result = self.run_cleaner(root, data_root, docker_fixture=fixture)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn(
+                "Docker rollback-container cleanup skipped reason=production-readiness-check-failed",
+                output,
+            )
+            self.assertNotIn("WOULD_DELETE_CONTAINER", output)
+
+    def test_fallback_release_blocks_rollback_container_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            active = data_root / "releases" / "active-release"
+            active.mkdir(parents=True)
+            (active / "release-metadata.json").write_text(
+                '{"releaseID":"active-release"}\n', encoding="utf-8"
+            )
+            (data_root / "current-release").symlink_to(active)
+            fixture = self.healthy_docker_fixture()
+            fixture["fallbackReleaseID"] = "fallback-release"
+
+            result = self.run_cleaner(root, data_root, docker_fixture=fixture)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn(
+                "Docker rollback-container cleanup skipped reason=production-readiness-check-failed",
+                output,
+            )
+            self.assertNotIn("WOULD_DELETE_CONTAINER", output)
 
     def test_repo_cleanup_uses_data_root_cache_when_gtfs_override_is_absent(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

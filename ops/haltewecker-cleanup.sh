@@ -1442,7 +1442,10 @@ with urllib.request.urlopen("http://127.0.0.1:8080/static-departures/health", ti
         raise SystemExit(1)
     payload = json.load(response)
 database = payload.get("database", {})
-if database.get("runtimeMode") != "legacy" or database.get("fallbackReleaseID"):
+runtime_mode = database.get("runtimeMode")
+if runtime_mode is not None and runtime_mode != "legacy":
+    raise SystemExit(1)
+if database.get("fallbackReleaseID"):
     raise SystemExit(1)
 if os.environ.get("DEPARTURES_DATABASE") != "/data/current-release/departures.sqlite":
     raise SystemExit(1)
