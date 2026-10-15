@@ -4,6 +4,7 @@ set -euo pipefail
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 FLOCK_BIN="${FLOCK_BIN:-flock}"
 LSOF_BIN="${LSOF_BIN:-lsof}"
+DOCKER_BIN="${DOCKER_BIN:-docker}"
 DATA_ROOT="${DATA_ROOT:-/srv/haltewecker/data}"
 DATA="$(cd "$DATA_ROOT" && pwd -P)"
 RELEASES="$DATA/releases"
@@ -1335,6 +1336,136 @@ for release_path in "${RELEASE_DELETE_PATHS[@]}"; do
     fi
 done
 fi
+
+cleanup_pipeline_rollback_containers() {
+    if (( RELEASE_APPLY_ALLOWED != 1 )); then
+        echo "Docker rollback-container cleanup skipped reason=retention-safety-preflight-incomplete"
+        return 0
+    fi
+    if ! command -v "$DOCKER_BIN" >/dev/null 2>&1; then
+        echo "Docker rollback-container cleanup skipped reason=docker-unavailable"
+        return 0
+    fi
+
+    local active_release active_release_id
+    active_release="$(readlink -f -- "$DATA/current-release" 2>/dev/null || true)"
+    if [[ -z "$active_release" || ! -d "$active_release" || ! -f "$active_release/release-metadata.json" ]]; then
+        echo "Docker rollback-container cleanup skipped reason=active-release-unavailable"
+        return 0
+    fi
+    active_release_id="$(python3 - "$active_release/release-metadata.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")).get("releaseID", "")
+except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if not isinstance(value, str) or not value:
+    raise SystemExit(1)
+print(value)
+PY
+)" || {
+        echo "Docker rollback-container cleanup skipped reason=active-release-id-unavailable"
+        return 0
+    }
+
+    local static_container route_container
+    static_container="${HALTEWECKER_STATIC_API_CONTAINER:-static-departures-api}"
+    route_container="${HALTEWECKER_ROUTERECALL_CONTAINER:-routerecall-api}"
+    if ! production_containers_ready_for_rollback_cleanup "$static_container" "$route_container" "$active_release" "$active_release_id"; then
+        echo "Docker rollback-container cleanup skipped reason=production-readiness-check-failed"
+        return 0
+    fi
+
+    local container_rows container_id container_name inspect_row status image_id writable_bytes
+    if ! container_rows="$("$DOCKER_BIN" ps -a --format '{{.ID}} {{.Names}}' 2>/dev/null)"; then
+        echo "Docker rollback-container cleanup skipped reason=container-list-failed"
+        return 0
+    fi
+    if [[ -z "$container_rows" ]]; then
+        echo "Docker rollback-container cleanup status=PASS removed=0"
+        return 0
+    fi
+    local removed=0
+    while read -r container_id container_name; do
+        [[ -n "$container_id" && -n "$container_name" ]] || continue
+        if [[ ! "$container_name" =~ ^(static-departures-api|routerecall-api)-rollback-[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            continue
+        fi
+        inspect_row="$("$DOCKER_BIN" inspect --size --format '{{.Name}}|{{.State.Status}}|{{.Image}}|{{.SizeRw}}' "$container_id" 2>/dev/null || true)"
+        IFS='|' read -r inspect_name status image_id writable_bytes <<< "$inspect_row"
+        if [[ "${inspect_name#/}" != "$container_name" || "$status" != "exited" || ! "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "KEEP_CONTAINER $container_name reason=container-identity-or-state-changed"
+            continue
+        fi
+        if [[ ! "$writable_bytes" =~ ^[0-9]+$ ]]; then
+            writable_bytes=0
+        fi
+        if ! production_containers_ready_for_rollback_cleanup "$static_container" "$route_container" "$active_release" "$active_release_id"; then
+            echo "KEEP_CONTAINER $container_name reason=production-readiness-changed"
+            continue
+        fi
+        if [[ "$DRY_RUN" == "1" ]]; then
+            echo "WOULD_DELETE_CONTAINER $container_name reason=stopped-pipeline-rollback-after-production-readiness writable_layer_bytes=$writable_bytes image=$image_id"
+            continue
+        fi
+        if "$DOCKER_BIN" rm "$container_id" >/dev/null; then
+            echo "DELETE_CONTAINER $container_name reason=stopped-pipeline-rollback-after-production-readiness writable_layer_bytes=$writable_bytes image=$image_id"
+            removed=$((removed + 1))
+        else
+            echo "KEEP_CONTAINER $container_name reason=container-remove-failed"
+        fi
+    done <<< "$container_rows"
+    echo "Docker rollback-container cleanup status=PASS removed=$removed"
+}
+
+production_containers_ready_for_rollback_cleanup() {
+    local static_container="$1"
+    local route_container="$2"
+    local expected_release_path="$3"
+    local expected_release="$4"
+    local current_release static_health route_health reported_release
+    current_release="$(readlink -f -- "$DATA/current-release" 2>/dev/null || true)"
+    [[ "$current_release" == "$expected_release_path" ]] || return 1
+    static_health="$("$DOCKER_BIN" inspect --format '{{.State.Health.Status}}' "$static_container" 2>/dev/null || true)"
+    route_health="$("$DOCKER_BIN" inspect --format '{{.State.Health.Status}}' "$route_container" 2>/dev/null || true)"
+    [[ "$static_health" == "healthy" && "$route_health" == "healthy" ]] || return 1
+    reported_release="$("$DOCKER_BIN" exec "$static_container" python3 -c '
+import json
+import os
+import urllib.request
+
+with urllib.request.urlopen("http://127.0.0.1:8080/static-departures/health", timeout=5) as response:
+    if response.status != 200:
+        raise SystemExit(1)
+    payload = json.load(response)
+database = payload.get("database", {})
+if database.get("runtimeMode") != "legacy" or database.get("fallbackReleaseID"):
+    raise SystemExit(1)
+if os.environ.get("DEPARTURES_DATABASE") != "/data/current-release/departures.sqlite":
+    raise SystemExit(1)
+print(database.get("releaseID", ""))
+' 2>/dev/null || true)"
+    [[ "$reported_release" == "$expected_release" ]] || return 1
+    "$DOCKER_BIN" exec "$route_container" python3 -c '
+import os
+import sqlite3
+
+path = "/data/haltewecker/current-release/departures.sqlite"
+if os.environ.get("ROUTERECALL_DATABASE") != path or os.environ.get("ROUTERECALL_PROVIDER_RUNTIME") != "0":
+    raise SystemExit(1)
+connection = sqlite3.connect("file:" + path + "?mode=ro", uri=True, timeout=3)
+try:
+    connection.execute("PRAGMA query_only=ON")
+    connection.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+finally:
+    connection.close()
+' >/dev/null 2>&1
+}
+
+cleanup_pipeline_rollback_containers
 
 echo "Cleanup reported reclaimable estimate (legacy mixed counters; not inode-union total): $(format_size "$RECLAIMABLE_BYTES") ($RECLAIMABLE_BYTES bytes)"
 

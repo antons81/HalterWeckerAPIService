@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -62,6 +63,7 @@ INTEGRITY_BASE_PATHS = (
 )
 INTEGRITY_OPTIONAL_PATHS = ("austrian-artifacts.json",)
 INTEGRITY_STATIC_PATHS = ("departures.sqlite",)
+MUTABLE_RUNTIME_MANIFEST = "manifest/transit-radar-cities.json"
 
 
 class ResumeError(ValueError):
@@ -200,11 +202,47 @@ def _candidate_integrity_evidence(
         if not valid:
             raise ResumeError(f"integrity artifact is missing: {path}")
         try:
-            digest, size = artifact_provenance(path)
+            if relative == "stop-data":
+                digest, size = _stop_data_integrity_provenance(path)
+            else:
+                digest, size = artifact_provenance(path)
         except (OSError, ValueError) as error:
             raise ResumeError(f"cannot fingerprint integrity artifact {path}") from error
         files[relative] = {"sha256": digest, "size": size}
     return {"schemaVersion": INTEGRITY_SCHEMA_VERSION, "files": files}
+
+
+def _stop_data_integrity_provenance(path: Path) -> tuple[str, int]:
+    runtime_manifest = path / MUTABLE_RUNTIME_MANIFEST
+    if runtime_manifest.exists():
+        try:
+            payload = json.loads(runtime_manifest.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("runtime transit radar manifest is invalid") from error
+        if not isinstance(payload, dict) or not isinstance(payload.get("cities"), list):
+            raise ValueError("runtime transit radar manifest is invalid")
+
+    # The manifest updater refreshes this runtime-owned file after activation.
+    digest_builder = hashlib.sha256()
+    total_size = 0
+    files = sorted(
+        item
+        for item in path.rglob("*")
+        if item.is_file() and item.relative_to(path).as_posix() != MUTABLE_RUNTIME_MANIFEST
+    )
+    if not files:
+        raise ValueError(f"Artifact directory is empty: {path}")
+    for file_path in files:
+        relative_path = file_path.relative_to(path).as_posix().encode("utf-8")
+        digest_builder.update(len(relative_path).to_bytes(8, "big"))
+        digest_builder.update(relative_path)
+        file_size = file_path.stat().st_size
+        total_size += file_size
+        digest_builder.update(file_size.to_bytes(8, "big"))
+        with file_path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest_builder.update(chunk)
+    return digest_builder.hexdigest(), total_size
 
 
 def _validated_integrity_payload(

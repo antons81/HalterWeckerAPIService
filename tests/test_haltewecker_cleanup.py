@@ -25,6 +25,7 @@ class HalteWeckerCleanupTests(unittest.TestCase):
         open_paths: tuple[Path, ...] = (),
         retention_count: int = 1,
         pipeline_repo: Path | None = None,
+        docker_fixture: dict[str, object] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         systemctl = root / "systemctl"
         systemctl.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
@@ -83,6 +84,56 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             encoding="utf-8",
         )
         du.chmod(0o755)
+        docker_fixture_path = root / "docker-fixture.json"
+        docker_removed_path = root / "docker-removed.json"
+        if docker_fixture is None:
+            docker_fixture = {
+                "health": {},
+                "containers": [],
+                "releaseID": "",
+                "staticReady": False,
+                "routeReadonly": False,
+            }
+        docker_fixture_path.write_text(json.dumps(docker_fixture), encoding="utf-8")
+        if not docker_removed_path.exists():
+            docker_removed_path.write_text("[]\n", encoding="utf-8")
+        docker = root / "docker"
+        docker.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "fixture = json.loads(Path(os.environ['DOCKER_FIXTURE']).read_text())\n"
+            "args = sys.argv[1:]\n"
+            "removed_path = Path(os.environ['DOCKER_REMOVED'])\n"
+            "removed = json.loads(removed_path.read_text())\n"
+            "if args and args[0] == 'inspect':\n"
+            "    template = args[args.index('--format') + 1] if '--format' in args else ''\n"
+            "    target = args[-1]\n"
+            "    if template == '{{.State.Health.Status}}':\n"
+            "        health = fixture.get('health', {})\n"
+            "        if target not in health: raise SystemExit(1)\n"
+            "        print(health[target]); raise SystemExit(0)\n"
+            "    row = next((item for item in fixture.get('containers', []) if item['id'] == target), None)\n"
+            "    if row is None: raise SystemExit(1)\n"
+            "    if '.SizeRw' in template:\n"
+            "        print('/' + row['name'] + '|' + row['status'] + '|' + row['image'] + '|' + str(row.get('writableBytes', 0)))\n"
+            "    else: raise SystemExit(2)\n"
+            "elif args and args[0] == 'exec':\n"
+            "    name = args[1]\n"
+            "    if name == 'static-departures-api' and fixture.get('staticReady'):\n"
+            "        print(fixture['releaseID']); raise SystemExit(0)\n"
+            "    if name == 'routerecall-api' and fixture.get('routeReadonly'):\n"
+            "        raise SystemExit(0)\n"
+            "    raise SystemExit(1)\n"
+            "elif args and args[0] == 'ps':\n"
+            "    for row in fixture.get('containers', []):\n"
+            "        if row['id'] not in removed: print(row['id'] + ' ' + row['name'])\n"
+            "elif args and args[0] == 'rm' and len(args) == 2:\n"
+            "    removed.append(args[1]); removed_path.write_text(json.dumps(removed))\n"
+            "else: raise SystemExit(2)\n",
+            encoding="utf-8",
+        )
+        docker.chmod(0o755)
         environment = os.environ.copy()
         environment.update(
             {
@@ -93,6 +144,9 @@ class HalteWeckerCleanupTests(unittest.TestCase):
                 "SYSTEMCTL_BIN": str(systemctl),
                 "FLOCK_BIN": str(flock),
                 "LSOF_BIN": str(lsof),
+                "DOCKER_BIN": str(docker),
+                "DOCKER_FIXTURE": str(docker_fixture_path),
+                "DOCKER_REMOVED": str(docker_removed_path),
                 "PATH": f"{root}:{environment.get('PATH', '')}",
                 "HALTEWECKER_CLEANUP_DRY_RUN": "1" if dry_run else "0",
                 "HALTEWECKER_RELEASE_RETENTION_COUNT": str(retention_count),
@@ -107,6 +161,58 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             text=True,
             check=False,
         )
+
+    @staticmethod
+    def healthy_docker_fixture() -> dict[str, object]:
+        return {
+            "health": {
+                "static-departures-api": "healthy",
+                "routerecall-api": "healthy",
+            },
+            "releaseID": "active-release",
+            "staticReady": True,
+            "routeReadonly": True,
+            "containers": [
+                {
+                    "id": "active-static",
+                    "name": "static-departures-api",
+                    "status": "running",
+                    "image": "sha256:" + "a" * 64,
+                },
+                {
+                    "id": "active-route",
+                    "name": "routerecall-api",
+                    "status": "running",
+                    "image": "sha256:" + "b" * 64,
+                },
+                {
+                    "id": "old-static",
+                    "name": "static-departures-api-rollback-old-release",
+                    "status": "exited",
+                    "image": "sha256:" + "c" * 64,
+                    "writableBytes": 8192,
+                },
+                {
+                    "id": "old-route",
+                    "name": "routerecall-api-rollback-old-release",
+                    "status": "exited",
+                    "image": "sha256:" + "d" * 64,
+                    "writableBytes": 16384,
+                },
+                {
+                    "id": "running-rollback",
+                    "name": "static-departures-api-rollback-in-progress",
+                    "status": "running",
+                    "image": "sha256:" + "e" * 64,
+                },
+                {
+                    "id": "unrelated",
+                    "name": "caddy",
+                    "status": "exited",
+                    "image": "sha256:" + "f" * 64,
+                },
+            ],
+        }
 
     @staticmethod
     def make_old(path: Path, age_days: int = 2) -> None:
@@ -145,6 +251,97 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             self.assertIn('[ArtifactRetention] summary=', result.stdout)
             self.assertIn('"dry_run":true', result.stdout)
+
+    def test_dry_run_lists_only_stopped_pipeline_rollback_containers_after_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            active = data_root / "releases" / "active-release"
+            active.mkdir(parents=True)
+            (active / "release-metadata.json").write_text(
+                '{"releaseID":"active-release"}\n', encoding="utf-8"
+            )
+            (data_root / "current-release").symlink_to(active)
+
+            result = self.run_cleaner(
+                root,
+                data_root,
+                docker_fixture=self.healthy_docker_fixture(),
+            )
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn(
+                "WOULD_DELETE_CONTAINER static-departures-api-rollback-old-release",
+                output,
+            )
+            self.assertIn(
+                "WOULD_DELETE_CONTAINER routerecall-api-rollback-old-release",
+                output,
+            )
+            self.assertNotIn("WOULD_DELETE_CONTAINER static-departures-api-rollback-in-progress", output)
+            self.assertNotIn("WOULD_DELETE_CONTAINER caddy", output)
+            self.assertEqual(json.loads((root / "docker-removed.json").read_text()), [])
+            self.assertTrue(active.exists())
+
+    def test_apply_removes_only_stopped_pipeline_rollback_containers_without_volumes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            active = data_root / "releases" / "active-release"
+            active.mkdir(parents=True)
+            (active / "release-metadata.json").write_text(
+                '{"releaseID":"active-release"}\n', encoding="utf-8"
+            )
+            (data_root / "current-release").symlink_to(active)
+            fixture = self.healthy_docker_fixture()
+
+            first = self.run_cleaner(root, data_root, dry_run=False, docker_fixture=fixture)
+            output = first.stdout + first.stderr
+            self.assertEqual(first.returncode, 0, output)
+            self.assertIn(
+                "DELETE_CONTAINER static-departures-api-rollback-old-release",
+                output,
+            )
+            self.assertIn(
+                "DELETE_CONTAINER routerecall-api-rollback-old-release",
+                output,
+            )
+            self.assertEqual(
+                json.loads((root / "docker-removed.json").read_text()),
+                ["old-static", "old-route"],
+            )
+
+            second = self.run_cleaner(root, data_root, dry_run=False, docker_fixture=fixture)
+            second_output = second.stdout + second.stderr
+            self.assertEqual(second.returncode, 0, second_output)
+            self.assertIn("Docker rollback-container cleanup status=PASS removed=0", second_output)
+            self.assertEqual(
+                json.loads((root / "docker-removed.json").read_text()),
+                ["old-static", "old-route"],
+            )
+
+    def test_rollback_containers_are_kept_when_route_recall_is_not_read_only_healthy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            active = data_root / "releases" / "active-release"
+            active.mkdir(parents=True)
+            (active / "release-metadata.json").write_text(
+                '{"releaseID":"active-release"}\n', encoding="utf-8"
+            )
+            (data_root / "current-release").symlink_to(active)
+            fixture = self.healthy_docker_fixture()
+            fixture["routeReadonly"] = False
+
+            result = self.run_cleaner(root, data_root, docker_fixture=fixture)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn(
+                "Docker rollback-container cleanup skipped reason=production-readiness-check-failed",
+                output,
+            )
+            self.assertNotIn("WOULD_DELETE_CONTAINER", output)
+            self.assertEqual(json.loads((root / "docker-removed.json").read_text()), [])
 
     def test_repo_cleanup_uses_data_root_cache_when_gtfs_override_is_absent(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

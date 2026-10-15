@@ -339,6 +339,47 @@ class ReleaseStateTests(unittest.TestCase):
         with self.assertRaisesRegex(ResumeError, "candidate integrity"):
             self._inspect()
 
+    def test_runtime_transit_manifest_created_after_snapshot_does_not_invalidate_release(self) -> None:
+        self._write_state("static-departures")
+        runtime_manifest = self.candidate / "stop-data" / "manifest" / "transit-radar-cities.json"
+        runtime_manifest.parent.mkdir(parents=True)
+        runtime_manifest.write_text(
+            json.dumps({"schemaVersion": 1, "cities": [{"id": "updated-city"}]}),
+            encoding="utf-8",
+        )
+
+        info = self._inspect()
+
+        self.assertEqual(info.status, "candidate-not-activated")
+        self.assertEqual(info.next_stage, "handoff-readiness")
+
+    def test_runtime_transit_manifest_refresh_is_structurally_checked(self) -> None:
+        runtime_manifest = self.candidate / "stop-data" / "manifest" / "transit-radar-cities.json"
+        runtime_manifest.parent.mkdir(parents=True)
+        runtime_manifest.write_text(
+            json.dumps({"schemaVersion": 1, "cities": [{"id": "before"}]}),
+            encoding="utf-8",
+        )
+        self._write_state("static-departures")
+        runtime_manifest.write_text(
+            json.dumps({"schemaVersion": 1, "cities": [{"id": "after"}]}),
+            encoding="utf-8",
+        )
+
+        info = self._inspect()
+
+        self.assertEqual(info.status, "candidate-not-activated")
+        self.assertEqual(info.next_stage, "handoff-readiness")
+
+    def test_invalid_runtime_transit_manifest_fails_integrity_check(self) -> None:
+        self._write_state("static-departures")
+        runtime_manifest = self.candidate / "stop-data" / "manifest" / "transit-radar-cities.json"
+        runtime_manifest.parent.mkdir(parents=True)
+        runtime_manifest.write_text("[]", encoding="utf-8")
+
+        with self.assertRaisesRegex(ResumeError, "cannot fingerprint integrity artifact"):
+            self._inspect()
+
     def test_candidate_fifo_is_refused_without_reading_it(self) -> None:
         self._write_state("candidate-validation")
         fifo_path = self.candidate / "stop-data" / "routes" / "unsupported.fifo"
