@@ -25,13 +25,23 @@ class RouteReadinessTests(unittest.TestCase):
             connection.executescript("CREATE TABLE metadata(key TEXT,value TEXT); "
                 "CREATE TABLE stop_times(raw_stop_id TEXT,trip_id TEXT,departure_seconds INTEGER,stop_sequence INTEGER); "
                 "CREATE TABLE raw_stops(stop_id TEXT PRIMARY KEY,canonical_stop_id TEXT,parent_station TEXT,location_type INTEGER); "
-                "CREATE TABLE trips(trip_id TEXT,service_id TEXT); "
+                "CREATE TABLE trips(trip_id TEXT,service_id TEXT,route_id TEXT,city_id TEXT); "
+                "CREATE TABLE routes(route_id TEXT,short_name TEXT,long_name TEXT); "
                 "CREATE TABLE active_services(service_id TEXT,service_date TEXT);")
             today = datetime.now(ZoneInfo("Europe/Berlin")).date()
             connection.execute("INSERT INTO metadata VALUES ('validThrough',?)",
                                ((today + timedelta(days=13)).isoformat(),))
-            connection.execute("INSERT INTO trips VALUES ('trip','service')")
-            connection.execute("INSERT INTO active_services VALUES ('service',?)", (today.strftime("%Y%m%d"),))
+            connection.executemany("INSERT INTO trips VALUES (?,?,?,?)",
+                                   [("trip", "service", "route-u3", "wien"),
+                                    ("trip-u1", "service-u1", "route-u1", "wien"),
+                                    ("foreign-u1", "service-foreign", "route-foreign-u1", "berlin")])
+            connection.executemany("INSERT INTO routes VALUES (?,?,?)",
+                                   [("route-u1", "U1", ""), ("route-u3", "U3", ""),
+                                    ("route-foreign-u1", "U1", "")])
+            connection.executemany("INSERT INTO active_services VALUES (?,?)",
+                                   [("service", today.strftime("%Y%m%d")),
+                                    ("service-u1", today.strftime("%Y%m%d")),
+                                    ("service-foreign", today.strftime("%Y%m%d"))])
             connection.executemany(
                 "INSERT INTO raw_stops VALUES (?,?,?,?)",
                 [("stop", "stop", "", 1), ("stop-child", "stop", "stop", 0)],
@@ -40,6 +50,8 @@ class RouteReadinessTests(unittest.TestCase):
                 "INSERT INTO stop_times VALUES ('stop-child','trip',?,?)",
                 [(-86400, sequence) for sequence in range(1000)] + [(43200, 1000)],
             )
+            connection.execute("INSERT INTO stop_times VALUES ('stop-child','trip-u1',43260,1)")
+            connection.execute("INSERT INTO stop_times VALUES ('stop-child','foreign-u1',36000,1)")
             connection.commit()
             connection.close()
             class FixtureDatabase:
@@ -66,7 +78,7 @@ class RouteReadinessTests(unittest.TestCase):
                     return (stop,)
                 def _provider_stop_ownership_predicate(self, raw_stop_alias, trip_alias):
                     self.ownership_checks.append((raw_stop_alias, trip_alias))
-                    return ""
+                    return f"{trip_alias}.city_id=?"
                 def board(self, city, stop, limit, from_date, to_date):
                     from services.gtfs_board_window import service_day_epoch
                     self.calls.append((city, stop, limit, from_date, to_date))
@@ -96,11 +108,12 @@ class RouteReadinessTests(unittest.TestCase):
             with mock.patch.dict(sys.modules, {"static_departures_api": module,
                                               "gtfs_board_window": __import__("services.gtfs_board_window", fromlist=["*"])}):
                 exec(readiness.LEGACY_SMOKE_EXPECTATION, scope)
-            start, end, timezone_name, scheduled, prewarm_seconds = scope["smoke_expectation"](
+            start, end, timezone_name, scheduled, prewarm_seconds, scheduled_lines = scope["smoke_expectation"](
                 str(path), "wien", "stop")
             self.assertEqual(timezone_name, "Europe/Berlin")
             self.assertTrue(scheduled)
             self.assertGreaterEqual(prewarm_seconds, 0)
+            self.assertEqual(scheduled_lines, {})
             self.assertEqual(start.date(), today)
             self.assertEqual(end.date(), today + timedelta(days=1))
             self.assertEqual((start.hour, start.minute), (0, 0))
@@ -111,8 +124,19 @@ class RouteReadinessTests(unittest.TestCase):
             self.assertLess(request_end.timestamp(), end.timestamp())
             self.assertEqual(FixtureDatabase.calls[-1],
                              ("wien", "stop", 3, start, request_end))
+            _, _, _, _, _, scheduled_lines = scope["smoke_expectation"](
+                str(path), "wien", "stop", required_lines=("U1", "U3"))
+            self.assertEqual(set(scheduled_lines), {"U1", "U3"})
+            from services.gtfs_board_window import service_day_epoch
+            expected_wien_u1 = service_day_epoch(today.strftime("%Y%m%d"), "Europe/Berlin") + 43260
+            self.assertEqual(scheduled_lines["U1"], expected_wien_u1)
+            self.assertEqual(FixtureDatabase.calls[-3],
+                             ("wien", "stop", 3, start, request_end))
+            self.assertEqual(FixtureDatabase.calls[-2][2], 100)
+            self.assertEqual(FixtureDatabase.calls[-1][2], 100)
             self.assertFalse(scope["smoke_expectation"](str(path), "wien", "not-served")[3])
-            self.assertEqual(FixtureDatabase.ownership_checks, [("rs", "t"), ("rs", "t")])
+            self.assertEqual(FixtureDatabase.ownership_checks,
+                             [("rs", "t"), ("rs", "t"), ("rs", "t")])
             self.assertNotIn('metadata["validThrough"]', readiness.LEGACY_SMOKE_EXPECTATION)
             self.assertIn("database.board(", readiness.LEGACY_SMOKE_EXPECTATION)
             self.assertNotIn("_external_stop_time_ids", readiness.LEGACY_SMOKE_EXPECTATION)
@@ -274,13 +298,17 @@ class RouteReadinessTests(unittest.TestCase):
             'sql_prewarm_seconds=%.3f',
             'http_seconds=%.3f',
             'row.get("line")',
-            'observed_wien_lines.update(lines)',
-            '{"U1", "U3"}.issubset(observed_wien_lines)',
+            'required_lines = ("U1", "U3") if city == "wien" and stop == "at:49:1320:5" else ()',
+            'MIN({BOARD_EPOCH_SQL})',
+            'city=wien scheduled_lines=%s',
+            'scheduled Wien line is missing from API board:',
+            'api_match=True',
+            'limit=100,',
             'transit-radar-cities.json',
         ):
             self.assertIn(value, readiness.STATIC_PROBE)
         source_check = readiness.STATIC_PROBE.index(
-            "start, end, zone, scheduled, sql_prewarm_seconds = smoke_expectation(")
+            "start, end, zone, scheduled, sql_prewarm_seconds, scheduled_lines = smoke_expectation(")
         http_board = readiness.STATIC_PROBE.index(
             'payload = get("/static-departures/board?"')
         self.assertLess(source_check, http_board)

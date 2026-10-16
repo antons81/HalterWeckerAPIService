@@ -35,7 +35,7 @@ from datetime import datetime, timedelta
 import time
 from zoneinfo import ZoneInfo
 from static_departures_api import Database
-from gtfs_board_window import board_predicate
+from gtfs_board_window import BOARD_EPOCH_SQL, board_predicate
 
 def local_calendar_day_window(timezone_name, local_date=None):
     zone = ZoneInfo(timezone_name)
@@ -44,7 +44,7 @@ def local_calendar_day_window(timezone_name, local_date=None):
     end = datetime.combine(day + timedelta(days=1), datetime.min.time(), zone)
     return start, end
 
-def smoke_expectation(database_path, city, stop):
+def smoke_expectation(database_path, city, stop, limit=3, required_lines=()):
     database = Database(database_path)
     try:
         mode, timezone_name, _, _ = database.city_departure_mode(city)
@@ -58,6 +58,7 @@ def smoke_expectation(database_path, city, stop):
             stop_ids = database._canonical_stop_candidates(city, stop)
             stop_column = "rs.canonical_stop_id"
         scheduled = False
+        scheduled_line_epochs = {}
         if stop_ids:
             ownership_predicate = database._provider_stop_ownership_predicate("rs", "t")
             ownership_clause = "AND " + ownership_predicate if ownership_predicate else ""
@@ -78,17 +79,41 @@ def smoke_expectation(database_path, city, stop):
                 "WHERE " + stop_predicate + " " + ownership_clause + " AND " + time_predicate + " LIMIT 1",
                 (*stop_ids, *ownership_parameters, *time_parameters),
             ).fetchone() is not None
+            if required_lines:
+                line_expression = "COALESCE(NULLIF(r.short_name,''),NULLIF(r.long_name,''),t.route_id)"
+                line_placeholders = ",".join("?" for _ in required_lines)
+                rows = connection.execute(
+                    f"SELECT {line_expression}, MIN({BOARD_EPOCH_SQL}) "
+                    "FROM stop_times s "
+                    "JOIN raw_stops rs ON rs.stop_id=s.raw_stop_id "
+                    "JOIN trips t ON t.trip_id=s.trip_id "
+                    "JOIN active_services a ON a.service_id=t.service_id "
+                    "LEFT JOIN routes r ON r.route_id=t.route_id "
+                    "WHERE " + stop_predicate + " " + ownership_clause +
+                    f" AND {line_expression} IN ({line_placeholders}) AND " + time_predicate +
+                    f" GROUP BY {line_expression}",
+                    (*stop_ids, *ownership_parameters, *required_lines, *time_parameters),
+                ).fetchall()
+                scheduled_line_epochs = {
+                    str(line): float(epoch)
+                    for line, epoch in rows
+                    if line is not None and epoch is not None
+                }
         # Use the runtime board query itself to resolve parent stops and provider ownership,
         # and to warm the exact SQLite access path before the timed HTTP readiness request.
         database.board(
             city,
             stop,
-            3,
+            limit,
             start,
             end - timedelta(microseconds=1),
         )
+        for departure_epoch in scheduled_line_epochs.values():
+            route_start = datetime.fromtimestamp(departure_epoch - 15, ZoneInfo(timezone_name))
+            route_end = datetime.fromtimestamp(departure_epoch + 15, ZoneInfo(timezone_name))
+            database.board(city, stop, 100, route_start, route_end)
         prewarm_seconds = time.monotonic() - prewarm_started
-        return start, end, timezone_name, scheduled, prewarm_seconds
+        return start, end, timezone_name, scheduled, prewarm_seconds, scheduled_line_epochs
     finally:
         if database.connection is not None:
             database.connection.close()
@@ -133,14 +158,17 @@ for city in ("duisburg", "dusseldorf"):
     if not isinstance(payload, list) or not payload:
         raise RuntimeError("empty stop package: " + city)
 get("/static-stop-data/transit-radar-cities.json")
-observed_wien_lines = set()
 for city, stop in (
     ("wien", "at:49:1876:0:1"),
     ("wien", "at:49:1320:5"),
     ("helsinki", "fi-hsl:1040401"),
 ):
-    start, end, zone, scheduled, sql_prewarm_seconds = smoke_expectation(
-        os.environ.get("DEPARTURES_DATABASE", "/data/departures-current.sqlite"), city, stop)
+    required_lines = ("U1", "U3") if city == "wien" and stop == "at:49:1320:5" else ()
+    start, end, zone, scheduled, sql_prewarm_seconds, scheduled_lines = smoke_expectation(
+        os.environ.get("DEPARTURES_DATABASE", "/data/departures-current.sqlite"),
+        city, stop, 3, required_lines)
+    if required_lines:
+        print("[Readiness] city=wien scheduled_lines=%s" % (",".join(sorted(scheduled_lines)) or "none"))
     request_end = end - timedelta(microseconds=1)
     http_started = time.monotonic()
     payload = get("/static-departures/board?" + urlencode(dict(
@@ -155,12 +183,24 @@ for city, stop in (
     if epochs != sorted(epochs) or any(not start.timestamp() <= value < end.timestamp() for value in epochs):
         raise RuntimeError("invalid departure times: " + city + "/" + stop)
     lines = [str(row.get("line") or "") for row in departures]
-    if city == "wien":
-        observed_wien_lines.update(lines)
     print("[Readiness] city=%s stop=%s sql_prewarm_seconds=%.3f http_seconds=%.3f scheduled=%s departures=%d lines=%s" % (
         city, stop, sql_prewarm_seconds, http_seconds, scheduled, len(departures), ",".join(lines)))
-if not {"U1", "U3"}.issubset(observed_wien_lines):
-    raise RuntimeError("missing active Wien U1/U3 departures: " + ",".join(sorted(observed_wien_lines)))
+    for line, departure_epoch in scheduled_lines.items():
+        route_start = datetime.fromtimestamp(departure_epoch - 15, ZoneInfo(zone))
+        route_end = datetime.fromtimestamp(departure_epoch + 15, ZoneInfo(zone))
+        route_payload = get("/static-departures/board?" + urlencode(dict(
+            cityID="wien", stopID="at:49:1320:5", limit=100,
+            **{"from": route_start.isoformat(), "to": route_end.isoformat()})))
+        route_departures = route_payload.get("departures")
+        if not isinstance(route_departures, list):
+            raise RuntimeError("invalid scheduled Wien line board: " + line)
+        from static_departures_api import departure_datetime
+        matching = [row for row in route_departures
+                    if str(row.get("line") or "") == line
+                    and abs(departure_datetime(row, zone).timestamp() - departure_epoch) <= 1]
+        if not matching:
+            raise RuntimeError("scheduled Wien line is missing from API board: " + line)
+        print("[Readiness] city=wien line=%s scheduled=True api_match=True" % line)
 '''
 
 
