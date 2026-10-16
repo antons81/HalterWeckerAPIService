@@ -32,38 +32,63 @@ for city, line in (("berlin", "100"), ("wuppertal", "635")):
 
 LEGACY_SMOKE_EXPECTATION = '''
 from datetime import datetime, timedelta
+import time
 from zoneinfo import ZoneInfo
 from static_departures_api import Database
-from gtfs_board_window import service_day_epoch
+from gtfs_board_window import board_predicate
+
+def local_calendar_day_window(timezone_name, local_date=None):
+    zone = ZoneInfo(timezone_name)
+    day = local_date or datetime.now(zone).date()
+    start = datetime.combine(day, datetime.min.time(), zone)
+    end = datetime.combine(day + timedelta(days=1), datetime.min.time(), zone)
+    return start, end
 
 def smoke_expectation(database_path, city, stop):
     database = Database(database_path)
     try:
-        _, timezone_name, _, _ = database.city_departure_mode(city)
-        zone = ZoneInfo(timezone_name)
+        mode, timezone_name, _, _ = database.city_departure_mode(city)
+        start, end = local_calendar_day_window(timezone_name)
+        prewarm_started = time.monotonic()
         connection = database._connection()
-        metadata = dict(connection.execute("SELECT key,value FROM metadata"))
-        start = datetime.combine(datetime.now(zone).date(), datetime.min.time(), zone)
-        end = datetime.fromisoformat(metadata["validThrough"]).replace(tzinfo=zone) + timedelta(days=1)
-        if end <= start:
-            raise RuntimeError("fallback schedule window expired")
-        stop_ids = database._external_stop_time_ids(city, stop)
-        if not stop_ids:
-            return start, end, timezone_name, False
-        connection.create_function("readiness_service_epoch", 1,
-                                   lambda day: service_day_epoch(str(day), timezone_name),
-                                   deterministic=True)
-        placeholders = ",".join("?" for _ in stop_ids)
-        # Test source existence independently of board ordering and its row limit.
-        row = connection.execute(
-            "SELECT 1 FROM stop_times st JOIN trips t ON t.trip_id=st.trip_id "
-            "JOIN active_services a ON a.service_id=t.service_id "
-            "WHERE st.raw_stop_id IN (" + placeholders + ") "
-            "AND readiness_service_epoch(a.service_date)+st.departure_seconds>=? "
-            "AND readiness_service_epoch(a.service_date)+st.departure_seconds<? LIMIT 1",
-            (*stop_ids, start.timestamp(), end.timestamp()),
-        ).fetchone()
-        return start, end, timezone_name, row is not None
+        if mode == "exact-stop-with-parent-fallback":
+            stop_ids = database._query_stop_ids(city, stop)
+            stop_column = "s.raw_stop_id"
+        else:
+            stop_ids = database._canonical_stop_candidates(city, stop)
+            stop_column = "rs.canonical_stop_id"
+        scheduled = False
+        if stop_ids:
+            ownership_predicate = database._provider_stop_ownership_predicate("rs", "t")
+            ownership_clause = "AND " + ownership_predicate if ownership_predicate else ""
+            ownership_parameters = (city,) if ownership_predicate else ()
+            time_predicate, time_parameters = board_predicate(
+                connection,
+                timezone_name,
+                start,
+                end - timedelta(microseconds=1),
+            )
+            placeholders = ",".join("?" for _ in stop_ids)
+            stop_predicate = f"{stop_column} IN ({placeholders})"
+            scheduled = connection.execute(
+                "SELECT 1 FROM stop_times s "
+                "JOIN raw_stops rs ON rs.stop_id=s.raw_stop_id "
+                "JOIN trips t ON t.trip_id=s.trip_id "
+                "JOIN active_services a ON a.service_id=t.service_id "
+                "WHERE " + stop_predicate + " " + ownership_clause + " AND " + time_predicate + " LIMIT 1",
+                (*stop_ids, *ownership_parameters, *time_parameters),
+            ).fetchone() is not None
+        # Use the runtime board query itself to resolve parent stops and provider ownership,
+        # and to warm the exact SQLite access path before the timed HTTP readiness request.
+        database.board(
+            city,
+            stop,
+            3,
+            start,
+            end - timedelta(microseconds=1),
+        )
+        prewarm_seconds = time.monotonic() - prewarm_started
+        return start, end, timezone_name, scheduled, prewarm_seconds
     finally:
         if database.connection is not None:
             database.connection.close()
@@ -71,7 +96,7 @@ def smoke_expectation(database_path, city, stop):
 
 
 STATIC_PROBE = LEGACY_SMOKE_EXPECTATION + '''
-import json, os, sys
+import json, os, sys, time
 from urllib.parse import urlencode
 from urllib.request import urlopen
 root = "http://127.0.0.1:8080"
@@ -108,15 +133,20 @@ for city in ("duisburg", "dusseldorf"):
     if not isinstance(payload, list) or not payload:
         raise RuntimeError("empty stop package: " + city)
 get("/static-stop-data/transit-radar-cities.json")
+observed_wien_lines = set()
 for city, stop in (
     ("wien", "at:49:1876:0:1"),
     ("wien", "at:49:1320:5"),
     ("helsinki", "fi-hsl:1040401"),
 ):
-    start, end, zone, scheduled = smoke_expectation(
+    start, end, zone, scheduled, sql_prewarm_seconds = smoke_expectation(
         os.environ.get("DEPARTURES_DATABASE", "/data/departures-current.sqlite"), city, stop)
+    request_end = end - timedelta(microseconds=1)
+    http_started = time.monotonic()
     payload = get("/static-departures/board?" + urlencode(dict(
-        cityID=city, stopID=stop, limit=3, **{"from": start.isoformat(), "to": end.isoformat()})))
+        cityID=city, stopID=stop, limit=3,
+        **{"from": start.isoformat(), "to": request_end.isoformat()})))
+    http_seconds = time.monotonic() - http_started
     departures = payload.get("departures")
     if not isinstance(departures, list) or (scheduled and not departures):
         raise RuntimeError("empty departures response: " + city + "/" + stop)
@@ -124,6 +154,13 @@ for city, stop in (
     epochs = [departure_datetime(row, zone).timestamp() for row in departures]
     if epochs != sorted(epochs) or any(not start.timestamp() <= value < end.timestamp() for value in epochs):
         raise RuntimeError("invalid departure times: " + city + "/" + stop)
+    lines = [str(row.get("line") or "") for row in departures]
+    if city == "wien":
+        observed_wien_lines.update(lines)
+    print("[Readiness] city=%s stop=%s sql_prewarm_seconds=%.3f http_seconds=%.3f scheduled=%s departures=%d lines=%s" % (
+        city, stop, sql_prewarm_seconds, http_seconds, scheduled, len(departures), ",".join(lines)))
+if not {"U1", "U3"}.issubset(observed_wien_lines):
+    raise RuntimeError("missing active Wien U1/U3 departures: " + ",".join(sorted(observed_wien_lines)))
 '''
 
 
@@ -246,8 +283,8 @@ def main() -> None:
     elif args.consumer == "reload-route":
         reload_route(args.container, args.image, args.container_id)
     else:
-        docker("exec", "-e", f"HALTEWECKER_EXPECTED_RUNTIME_MODE={args.runtime_mode}",
-               args.container, "python3", "-c", STATIC_PROBE, args.release_id, args.providers)
+        print(docker("exec", "-e", f"HALTEWECKER_EXPECTED_RUNTIME_MODE={args.runtime_mode}",
+                     args.container, "python3", "-c", STATIC_PROBE, args.release_id, args.providers))
 
 
 if __name__ == "__main__":

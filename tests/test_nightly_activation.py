@@ -14,41 +14,126 @@ PIPELINE = Path(__file__).resolve().parents[1] / "scripts/run_stop_data_pipeline
 
 
 class RouteReadinessTests(unittest.TestCase):
-    def test_smoke_source_expectation_distinguishes_empty_calendar_and_limited_board(self):
+    def test_smoke_expectation_uses_one_local_day_and_runtime_board_prewarm(self):
         import sqlite3
         import types
-        from datetime import datetime
+        from datetime import datetime, timedelta
         from zoneinfo import ZoneInfo
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "departures.sqlite"
             connection = sqlite3.connect(path)
             connection.executescript("CREATE TABLE metadata(key TEXT,value TEXT); "
-                "CREATE TABLE stop_times(raw_stop_id TEXT,trip_id TEXT,departure_seconds INTEGER); "
+                "CREATE TABLE stop_times(raw_stop_id TEXT,trip_id TEXT,departure_seconds INTEGER,stop_sequence INTEGER); "
+                "CREATE TABLE raw_stops(stop_id TEXT PRIMARY KEY,canonical_stop_id TEXT,parent_station TEXT,location_type INTEGER); "
                 "CREATE TABLE trips(trip_id TEXT,service_id TEXT); "
                 "CREATE TABLE active_services(service_id TEXT,service_date TEXT);")
             today = datetime.now(ZoneInfo("Europe/Berlin")).date()
-            connection.execute("INSERT INTO metadata VALUES ('validThrough',?)", (today.isoformat(),))
+            connection.execute("INSERT INTO metadata VALUES ('validThrough',?)",
+                               ((today + timedelta(days=13)).isoformat(),))
             connection.execute("INSERT INTO trips VALUES ('trip','service')")
             connection.execute("INSERT INTO active_services VALUES ('service',?)", (today.strftime("%Y%m%d"),))
-            connection.executemany("INSERT INTO stop_times VALUES ('stop','trip',?)", [(-86400,)] * 1000 + [(43200,)])
+            connection.executemany(
+                "INSERT INTO raw_stops VALUES (?,?,?,?)",
+                [("stop", "stop", "", 1), ("stop-child", "stop", "stop", 0)],
+            )
+            connection.executemany(
+                "INSERT INTO stop_times VALUES ('stop-child','trip',?,?)",
+                [(-86400, sequence) for sequence in range(1000)] + [(43200, 1000)],
+            )
             connection.commit()
             connection.close()
             class FixtureDatabase:
+                calls = []
+                ownership_checks = []
                 def __init__(self, path):
                     self.connection = sqlite3.connect(path)
                 def city_departure_mode(self, city):
-                    return "exact", "Europe/Berlin", "", ""
+                    return "exact-stop-with-parent-fallback", "Europe/Berlin", "", ""
                 def _connection(self):
                     return self.connection
-                def _external_stop_time_ids(self, city, stop):
+                def _query_stop_ids(self, city, stop):
+                    row = self.connection.execute(
+                        "SELECT location_type FROM raw_stops WHERE stop_id=?", (stop,)
+                    ).fetchone()
+                    if row and row[0] == 1:
+                        children = self.connection.execute(
+                            "SELECT stop_id FROM raw_stops WHERE parent_station=? ORDER BY stop_id",
+                            (stop,),
+                        ).fetchall()
+                        return (stop, *(child[0] for child in children))
                     return (stop,)
+                def _canonical_stop_candidates(self, city, stop):
+                    return (stop,)
+                def _provider_stop_ownership_predicate(self, raw_stop_alias, trip_alias):
+                    self.ownership_checks.append((raw_stop_alias, trip_alias))
+                    return ""
+                def board(self, city, stop, limit, from_date, to_date):
+                    from services.gtfs_board_window import service_day_epoch
+                    self.calls.append((city, stop, limit, from_date, to_date))
+                    self.connection.create_function(
+                        "readiness_service_epoch", 1,
+                        lambda day: service_day_epoch(str(day), "Europe/Berlin"),
+                        deterministic=True,
+                    )
+                    stop_ids = self._query_stop_ids(city, stop)
+                    placeholders = ",".join("?" for _ in stop_ids)
+                    return self.connection.execute(
+                        "SELECT st.departure_seconds "
+                        "FROM stop_times st JOIN raw_stops rs ON rs.stop_id=st.raw_stop_id "
+                        "JOIN trips t ON t.trip_id=st.trip_id "
+                        "JOIN active_services a ON a.service_id=t.service_id "
+                        "WHERE st.raw_stop_id IN (" + placeholders + ") "
+                        "AND readiness_service_epoch(a.service_date)+st.departure_seconds>=? "
+                        "AND readiness_service_epoch(a.service_date)+st.departure_seconds<=? "
+                        "ORDER BY readiness_service_epoch(a.service_date)+st.departure_seconds, "
+                        "t.trip_id, st.stop_sequence LIMIT ?",
+                        (*stop_ids, from_date.timestamp(), to_date.timestamp(), limit),
+                    ).fetchall()
+                def close(self):
+                    self.connection.close()
             module = types.SimpleNamespace(Database=FixtureDatabase)
             scope = {}
             with mock.patch.dict(sys.modules, {"static_departures_api": module,
                                               "gtfs_board_window": __import__("services.gtfs_board_window", fromlist=["*"])}):
                 exec(readiness.LEGACY_SMOKE_EXPECTATION, scope)
-            self.assertTrue(scope["smoke_expectation"](str(path), "wien", "stop")[3])
+            start, end, timezone_name, scheduled, prewarm_seconds = scope["smoke_expectation"](
+                str(path), "wien", "stop")
+            self.assertEqual(timezone_name, "Europe/Berlin")
+            self.assertTrue(scheduled)
+            self.assertGreaterEqual(prewarm_seconds, 0)
+            self.assertEqual(start.date(), today)
+            self.assertEqual(end.date(), today + timedelta(days=1))
+            self.assertEqual((start.hour, start.minute), (0, 0))
+            self.assertEqual((end.hour, end.minute), (0, 0))
+            self.assertIn(end.timestamp() - start.timestamp(), {23 * 3600, 24 * 3600, 25 * 3600})
+            request_end = end - timedelta(microseconds=1)
+            self.assertEqual(request_end.date(), today)
+            self.assertLess(request_end.timestamp(), end.timestamp())
+            self.assertEqual(FixtureDatabase.calls[-1],
+                             ("wien", "stop", 3, start, request_end))
             self.assertFalse(scope["smoke_expectation"](str(path), "wien", "not-served")[3])
+            self.assertEqual(FixtureDatabase.ownership_checks, [("rs", "t"), ("rs", "t")])
+            self.assertNotIn('metadata["validThrough"]', readiness.LEGACY_SMOKE_EXPECTATION)
+            self.assertIn("database.board(", readiness.LEGACY_SMOKE_EXPECTATION)
+            self.assertNotIn("_external_stop_time_ids", readiness.LEGACY_SMOKE_EXPECTATION)
+
+    def test_smoke_window_respects_dst_local_calendar_days(self):
+        import types
+        from datetime import date, timedelta
+        module = types.SimpleNamespace(Database=object)
+        scope = {}
+        with mock.patch.dict(sys.modules, {"static_departures_api": module,
+                                          "gtfs_board_window": __import__("services.gtfs_board_window", fromlist=["*"])}):
+            exec(readiness.LEGACY_SMOKE_EXPECTATION, scope)
+
+        for local_date, expected_hours in ((date(2026, 3, 29), 23), (date(2026, 10, 25), 25)):
+            start, end = scope["local_calendar_day_window"]("Europe/Berlin", local_date)
+            self.assertEqual(start.date(), local_date)
+            self.assertEqual(end.date(), local_date + timedelta(days=1))
+            self.assertEqual((start.hour, start.minute), (0, 0))
+            self.assertEqual((end.hour, end.minute), (0, 0))
+            self.assertEqual(end.timestamp() - start.timestamp(), expected_hours * 3600)
+            self.assertEqual(start.tzinfo, end.tzinfo)
 
 
     def test_required_reload_restarts_exact_container_without_build(self):
@@ -173,13 +258,32 @@ class RouteReadinessTests(unittest.TestCase):
             '"duisburg", "dusseldorf"',
             '/static-departures/health',
             '/static-departures/board',
+            'local_calendar_day_window(timezone_name)',
+            'request_end = end - timedelta(microseconds=1)',
             '"wien", "at:49:1876:0:1"',
             '"wien", "at:49:1320:5"',
             '"helsinki", "fi-hsl:1040401"',
+            'with urlopen(root + path, timeout=15)',
+            'response.status != 200',
+            'not isinstance(departures, list)',
+            '(scheduled and not departures)',
             'empty departures response:',
+            'epochs != sorted(epochs)',
+            'not start.timestamp() <= value < end.timestamp()',
+            'database.board(',
+            'sql_prewarm_seconds=%.3f',
+            'http_seconds=%.3f',
+            'row.get("line")',
+            'observed_wien_lines.update(lines)',
+            '{"U1", "U3"}.issubset(observed_wien_lines)',
             'transit-radar-cities.json',
         ):
             self.assertIn(value, readiness.STATIC_PROBE)
+        source_check = readiness.STATIC_PROBE.index(
+            "start, end, zone, scheduled, sql_prewarm_seconds = smoke_expectation(")
+        http_board = readiness.STATIC_PROBE.index(
+            'payload = get("/static-departures/board?"')
+        self.assertLess(source_check, http_board)
 
 
 class NightlyActivationTests(unittest.TestCase):
