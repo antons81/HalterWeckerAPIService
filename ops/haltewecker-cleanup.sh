@@ -281,7 +281,15 @@ import sys
 from pathlib import Path
 
 manifest = Path(sys.argv[1])
-provenance_file = "provenance" in manifest.parts or "provenance" in manifest.name.lower()
+provenance_file = (
+    "provenance" in manifest.parts
+    or "provenance" in manifest.name.lower()
+    or manifest.name in {
+        "gtfs-artifacts.json",
+        "custom-gtfs-artifacts.json",
+        "austrian-artifacts.json",
+    }
+)
 
 try:
     with open(sys.argv[1], encoding="utf-8") as handle:

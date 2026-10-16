@@ -1177,6 +1177,108 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             self.assertTrue(active.exists())
             self.assertTrue((active / "manifest.json").exists())
 
+    def test_missing_gtfs_source_provenance_does_not_block_unretained_release_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            releases = data_root / "releases"
+            active_id = "20261014T223508Z-1273074"
+            active = releases / active_id
+            active_stop_data = active / "stop-data"
+            active_stop_data.mkdir(parents=True)
+            (active / "departures.sqlite").write_bytes(b"active-database")
+            missing_sources = {
+                "israel-mot": {"path": str(data_root / "cache/gtfs/israel-mot/missing.zip")},
+                "poland-gdansk": {"path": str(data_root / "cache/gtfs/poland-gdansk/missing.zip")},
+            }
+            (active / "release-metadata.json").write_text(
+                json.dumps({"releaseID": active_id, "inputProvenance": missing_sources}),
+                encoding="utf-8",
+            )
+            (data_root / "current-release").symlink_to(active)
+
+            failed_id = "20261015T223505Z-56956"
+            failed = releases / failed_id
+            (failed / "stop-data").mkdir(parents=True)
+            (failed / "departures.sqlite").write_bytes(b"failed-candidate-database")
+            (failed / "release-metadata.json").write_text(
+                json.dumps({"releaseID": failed_id}), encoding="utf-8"
+            )
+            (failed / "release-state.json").write_text(
+                '{"releaseID":"20261015T223505Z-56956","completedStage":"handoff-readiness"}\n',
+                encoding="utf-8",
+            )
+            self.make_age_hours(failed, 13)
+
+            (active / "gtfs-artifacts.json").write_text(
+                json.dumps({"sources": missing_sources}), encoding="utf-8"
+            )
+            (active / "custom-gtfs-artifacts.json").write_text(
+                json.dumps({"sources": {"vbb": {"path": str(data_root / "cache/gtfs/vbb/missing.zip")}}}),
+                encoding="utf-8",
+            )
+            (active / "austrian-artifacts.json").write_text(
+                json.dumps({"sources": [{"path": str(data_root / "cache/gtfs/austria/missing.zip")}]}),
+                encoding="utf-8",
+            )
+            (active_stop_data / "manifest.json").write_text(
+                json.dumps({"inputProvenance": missing_sources}), encoding="utf-8"
+            )
+            provenance = active_stop_data / "provenance"
+            provenance.mkdir()
+            (provenance / "input-artifacts.json").write_text(
+                json.dumps({"sources": missing_sources}), encoding="utf-8"
+            )
+
+            pipeline = self.make_summary_helper(root)
+            result = self.run_cleaner(root, data_root, dry_run=False, pipeline_repo=pipeline)
+            output = result.stdout + result.stderr
+
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn("reason=missing-provenance-source", output)
+            self.assertNotIn("CLEANUP_SKIPPED reason=dependency-graph-unresolved", output)
+            self.assertIn(f"DELETE {failed.resolve()} reason=outside-retention-and-unreferenced", output)
+            self.assertFalse(failed.exists(), output)
+            self.assertTrue(active.exists())
+            self.assertTrue((active / "departures.sqlite").exists())
+
+    def test_gtfs_artifact_runtime_dependencies_remain_protected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data"
+            releases = data_root / "releases"
+            active_id = "20261014T223508Z-1273074"
+            active = releases / active_id
+            (active / "stop-data").mkdir(parents=True)
+            (active / "departures.sqlite").write_bytes(b"active-database")
+            (active / "release-metadata.json").write_text(
+                json.dumps({"releaseID": active_id}), encoding="utf-8"
+            )
+            (data_root / "current-release").symlink_to(active)
+
+            dependency_id = "20261015T223505Z-56956"
+            dependency = releases / dependency_id
+            (dependency / "stop-data").mkdir(parents=True)
+            (dependency / "departures.sqlite").write_bytes(b"runtime-database")
+            (dependency / "release-metadata.json").write_text(
+                json.dumps({"releaseID": dependency_id}), encoding="utf-8"
+            )
+            self.make_age_hours(dependency, 13)
+            (active / "gtfs-artifacts.json").write_text(
+                json.dumps({"runtimeDependencies": [{"path": str(dependency)}]}),
+                encoding="utf-8",
+            )
+
+            pipeline = self.make_summary_helper(root)
+            result = self.run_cleaner(root, data_root, dry_run=False, pipeline_repo=pipeline)
+            output = result.stdout + result.stderr
+
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn("manifest-dependency:", output)
+            self.assertIn("KEEP   " + str(dependency.resolve()), output)
+            self.assertTrue(dependency.exists())
+            self.assertTrue(active.exists())
+
     def test_missing_relative_runtime_database_blocks_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
