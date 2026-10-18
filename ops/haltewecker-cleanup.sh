@@ -106,10 +106,24 @@ if [[ -n "$LOCKS" ]]; then
     for lock_path in "${LOCK_PATHS[@]}"; do
         [[ -n "$lock_path" ]] || continue
         mkdir -p "$(dirname "$lock_path")"
+        if [[ -L "$lock_path" ]]; then
+            echo "CLEANUP_SKIPPED reason=pipeline-lock-not-regular lock=$lock_path"
+            exit 0
+        fi
+        if [[ ! -e "$lock_path" ]]; then
+            if ! (set -o noclobber; : > "$lock_path") 2>/dev/null && [[ ! -e "$lock_path" ]]; then
+                echo "CLEANUP_SKIPPED reason=pipeline-lock-unavailable lock=$lock_path"
+                exit 0
+            fi
+        fi
+        if [[ ! -f "$lock_path" || -L "$lock_path" ]]; then
+            echo "CLEANUP_SKIPPED reason=pipeline-lock-not-regular lock=$lock_path"
+            exit 0
+        fi
         case "$lock_index" in
-            0) exec 8>>"$lock_path"; lock_fd=8 ;;
-            1) exec 9>>"$lock_path"; lock_fd=9 ;;
-            2) exec 10>>"$lock_path"; lock_fd=10 ;;
+            0) exec 8<"$lock_path"; lock_fd=8 ;;
+            1) exec 9<"$lock_path"; lock_fd=9 ;;
+            2) exec 10<"$lock_path"; lock_fd=10 ;;
             *)
                 echo "CLEANUP_SKIPPED reason=too-many-pipeline-locks"
                 exit 0

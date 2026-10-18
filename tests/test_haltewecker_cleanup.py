@@ -27,6 +27,7 @@ class HalteWeckerCleanupTests(unittest.TestCase):
         pipeline_repo: Path | None = None,
         docker_fixture: dict[str, object] | None = None,
         missing_locks: tuple[str, ...] = (),
+        read_only_locks: tuple[str, ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         systemctl = root / "systemctl"
         systemctl.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
@@ -200,6 +201,8 @@ class HalteWeckerCleanupTests(unittest.TestCase):
         for lock in (root / "stop.lock", root / "static.lock", root / "vbb.lock"):
             if lock.name not in missing_locks:
                 lock.touch()
+                if lock.name in read_only_locks:
+                    lock.chmod(0o444)
         return subprocess.run(
             [str(CLEANUP_SCRIPT)],
             env=environment,
@@ -311,7 +314,12 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             active.mkdir(parents=True)
             (data / "current-release").symlink_to(active)
 
-            result = self.run_cleaner(root, data, missing_locks=("vbb.lock",))
+            result = self.run_cleaner(
+                root,
+                data,
+                missing_locks=("vbb.lock",),
+                read_only_locks=("stop.lock", "static.lock"),
+            )
 
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             self.assertTrue((root / "vbb.lock").is_file())
