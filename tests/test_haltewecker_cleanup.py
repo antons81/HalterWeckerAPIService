@@ -26,6 +26,7 @@ class HalteWeckerCleanupTests(unittest.TestCase):
         retention_count: int = 1,
         pipeline_repo: Path | None = None,
         docker_fixture: dict[str, object] | None = None,
+        missing_locks: tuple[str, ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         systemctl = root / "systemctl"
         systemctl.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
@@ -197,7 +198,8 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             }
         )
         for lock in (root / "stop.lock", root / "static.lock", root / "vbb.lock"):
-            lock.touch()
+            if lock.name not in missing_locks:
+                lock.touch()
         return subprocess.run(
             [str(CLEANUP_SCRIPT)],
             env=environment,
@@ -300,6 +302,20 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             self.assertIn('[ArtifactRetention] summary=', result.stdout)
             self.assertIn('"dry_run":true', result.stdout)
+
+    def test_missing_vbb_lock_is_created_without_failing_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data = root / "data"
+            active = data / "releases" / "active"
+            active.mkdir(parents=True)
+            (data / "current-release").symlink_to(active)
+
+            result = self.run_cleaner(root, data, missing_locks=("vbb.lock",))
+
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertTrue((root / "vbb.lock").is_file())
+            self.assertNotIn("pipeline-lock-held", result.stdout)
 
     def test_dry_run_lists_only_stopped_pipeline_rollback_containers_after_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

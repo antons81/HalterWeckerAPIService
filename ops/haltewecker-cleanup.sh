@@ -107,9 +107,9 @@ if [[ -n "$LOCKS" ]]; then
         [[ -n "$lock_path" ]] || continue
         mkdir -p "$(dirname "$lock_path")"
         case "$lock_index" in
-            0) exec 8<"$lock_path"; lock_fd=8 ;;
-            1) exec 9<"$lock_path"; lock_fd=9 ;;
-            2) exec 10<"$lock_path"; lock_fd=10 ;;
+            0) exec 8>>"$lock_path"; lock_fd=8 ;;
+            1) exec 9>>"$lock_path"; lock_fd=9 ;;
+            2) exec 10>>"$lock_path"; lock_fd=10 ;;
             *)
                 echo "CLEANUP_SKIPPED reason=too-many-pipeline-locks"
                 exit 0
