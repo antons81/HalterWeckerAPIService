@@ -1,4 +1,5 @@
 import hashlib
+import getpass
 import json
 import os
 import subprocess
@@ -28,9 +29,16 @@ class HalteWeckerCleanupTests(unittest.TestCase):
         docker_fixture: dict[str, object] | None = None,
         missing_locks: tuple[str, ...] = (),
         read_only_locks: tuple[str, ...] = (),
+        simulate_root: bool = False,
+        lock_service_user: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         systemctl = root / "systemctl"
-        systemctl.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        systemctl.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = show ]; then printf '%s\\n' \"$HALTEWECKER_TEST_LOCK_USER\"; exit 0; fi\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
         systemctl.chmod(0o755)
         flock = root / "flock"
         flock.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -61,6 +69,28 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             encoding="utf-8",
         )
         readlink.chmod(0o755)
+        identity_bin = root / "identity-bin"
+        identity_bin.mkdir(exist_ok=True)
+        id_command = identity_bin / "id"
+        id_command.write_text(
+            "#!/bin/sh\n"
+            "case \"$1\" in\n"
+            "  -u) echo 0 ;;\n"
+            "  -un) echo root ;;\n"
+            "  *) exit 2 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        id_command.chmod(0o755)
+        runuser = root / "runuser"
+        runuser.write_text(
+            "#!/bin/sh\n"
+            "[ \"$1\" = -u ] && shift 2\n"
+            "[ \"$1\" = -- ] && shift\n"
+            "exec \"$@\"\n",
+            encoding="utf-8",
+        )
+        runuser.chmod(0o755)
         stat = root / "stat"
         stat.write_text(
             "#!/usr/bin/env python3\n"
@@ -186,6 +216,8 @@ class HalteWeckerCleanupTests(unittest.TestCase):
                 "GTFS_CACHE_ROOT": str(root / "cache" / "gtfs"),
                 "HALTEWECKER_PIPELINE_REPO": str(pipeline_repo or REPOSITORY_ROOT),
                 "HALTEWECKER_CLEANUP_LOCKS": f"{root / 'stop.lock'}:{root / 'static.lock'}:{root / 'vbb.lock'}",
+                "HALTEWECKER_TEST_LOCK_USER": lock_service_user or getpass.getuser(),
+                "RUNUSER_BIN": str(runuser),
                 "SYSTEMCTL_BIN": str(systemctl),
                 "FLOCK_BIN": str(flock),
                 "LSOF_BIN": str(lsof),
@@ -198,6 +230,8 @@ class HalteWeckerCleanupTests(unittest.TestCase):
                 "HALTEWECKER_RELEASE_RETENTION_COUNT": str(retention_count),
             }
         )
+        if simulate_root:
+            environment["PATH"] = f"{identity_bin}:{environment['PATH']}"
         for lock in (root / "stop.lock", root / "static.lock", root / "vbb.lock"):
             if lock.name not in missing_locks:
                 lock.touch()
@@ -324,6 +358,26 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             self.assertTrue((root / "vbb.lock").is_file())
             self.assertNotIn("pipeline-lock-held", result.stdout)
+
+    def test_root_cleanup_creates_missing_lock_as_pipeline_service_user(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data = root / "data"
+            active = data / "releases" / "active"
+            active.mkdir(parents=True)
+            (data / "current-release").symlink_to(active)
+
+            result = self.run_cleaner(
+                root,
+                data,
+                missing_locks=("vbb.lock",),
+                simulate_root=True,
+                lock_service_user="deploy",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertTrue((root / "vbb.lock").is_file())
+            self.assertIn('[ArtifactRetention] summary=', result.stdout)
 
     def test_dry_run_lists_only_stopped_pipeline_rollback_containers_after_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

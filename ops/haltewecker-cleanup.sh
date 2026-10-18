@@ -5,6 +5,7 @@ SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 FLOCK_BIN="${FLOCK_BIN:-flock}"
 LSOF_BIN="${LSOF_BIN:-lsof}"
 DOCKER_BIN="${DOCKER_BIN:-docker}"
+RUNUSER_BIN="${RUNUSER_BIN:-runuser}"
 DATA_ROOT="${DATA_ROOT:-/srv/haltewecker/data}"
 DATA="$(cd "$DATA_ROOT" && pwd -P)"
 RELEASES="$DATA/releases"
@@ -111,8 +112,30 @@ if [[ -n "$LOCKS" ]]; then
             exit 0
         fi
         if [[ ! -e "$lock_path" ]]; then
-            if ! (set -o noclobber; : > "$lock_path") 2>/dev/null && [[ ! -e "$lock_path" ]]; then
-                echo "CLEANUP_SKIPPED reason=pipeline-lock-unavailable lock=$lock_path"
+            case "$lock_index" in
+                0) lock_service=haltewecker-stop-data.service ;;
+                1) lock_service=haltewecker-static-departures.service ;;
+                2) lock_service=haltewecker-vbb-refresh.service ;;
+                *) lock_service= ;;
+            esac
+            if [[ -z "$lock_service" ]] || ! lock_service_user="$("$SYSTEMCTL_BIN" show --property=User --value "$lock_service" 2>/dev/null)"; then
+                echo "CLEANUP_SKIPPED reason=pipeline-lock-owner-unavailable lock=$lock_path"
+                exit 0
+            fi
+            [[ -n "$lock_service_user" ]] || lock_service_user=root
+            current_user="$(id -un)"
+            if [[ "$current_user" == "$lock_service_user" ]]; then
+                if ! (set -o noclobber; : > "$lock_path") 2>/dev/null && [[ ! -e "$lock_path" ]]; then
+                    echo "CLEANUP_SKIPPED reason=pipeline-lock-unavailable lock=$lock_path"
+                    exit 0
+                fi
+            elif [[ "$(id -u)" == 0 ]] && command -v "$RUNUSER_BIN" >/dev/null 2>&1; then
+                if ! "$RUNUSER_BIN" -u "$lock_service_user" -- bash -c 'umask 022; set -o noclobber; : > "$1"' bash "$lock_path" 2>/dev/null && [[ ! -e "$lock_path" ]]; then
+                    echo "CLEANUP_SKIPPED reason=pipeline-lock-unavailable lock=$lock_path"
+                    exit 0
+                fi
+            else
+                echo "CLEANUP_SKIPPED reason=pipeline-lock-owner-mismatch lock=$lock_path service_user=$lock_service_user"
                 exit 0
             fi
         fi
