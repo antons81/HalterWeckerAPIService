@@ -31,12 +31,13 @@ class HalteWeckerCleanupTests(unittest.TestCase):
         read_only_locks: tuple[str, ...] = (),
         simulate_root: bool = False,
         lock_service_user: str | None = None,
+        pipeline_active: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         systemctl = root / "systemctl"
         systemctl.write_text(
             "#!/bin/sh\n"
             "if [ \"$1\" = show ]; then printf '%s\\n' \"$HALTEWECKER_TEST_LOCK_USER\"; exit 0; fi\n"
-            "exit 1\n",
+            f"exit {0 if pipeline_active else 1}\n",
             encoding="utf-8",
         )
         systemctl.chmod(0o755)
@@ -1419,6 +1420,91 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, output)
             self.assertIn("WOULD_DELETE " + str(successful.resolve()) + " reason=expired-staging", output)
             self.assertIn("KEEP   " + str(failed.resolve()) + " reason=recent-staging", output)
+
+    @staticmethod
+    def make_stopped_pipeline_build(data_root: Path) -> Path:
+        candidate = data_root / "releases" / "20261020T223508Z-2431886"
+        (candidate / "stop-data").mkdir(parents=True)
+        (candidate / "departures-next.sqlite").write_bytes(b"unfinished-sqlite")
+        (candidate / "release-state.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "releaseID": candidate.name,
+            "completedStage": "candidate-validation",
+        }))
+        return candidate
+
+    def test_recent_stopped_pipeline_build_is_deleted_without_twelve_hour_wait(self) -> None:
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                data = root / "data"
+                candidate = self.make_stopped_pipeline_build(data)
+                # Source metadata may contain success words; the pipeline state is authoritative.
+                (candidate / "source-metadata.json").write_text('{"status":"success"}')
+                pipeline = self.make_summary_helper(root)
+                result = self.run_cleaner(root, data, dry_run=dry_run, pipeline_repo=pipeline)
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 0, output)
+                action = "WOULD_DELETE" if dry_run else "DELETE"
+                self.assertIn(f"{action} {candidate.resolve()} reason=stopped-unpublished-pipeline-build", output)
+                self.assertNotIn("reason=unknown-release-state", output)
+                self.assertNotIn("reason=recent-unpublished", output)
+                self.assertEqual(candidate.exists(), dry_run, output)
+
+    def test_stopped_pipeline_build_keeps_active_open_and_referenced_data(self) -> None:
+        for protection in ("active", "open", "reference", "service", "scan-error"):
+            with self.subTest(protection=protection), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                data = root / "data"
+                candidate = self.make_stopped_pipeline_build(data)
+                active = data / "releases" / "20261019T223508Z-1393567"
+                active.mkdir()
+                (data / "current-release").symlink_to(candidate if protection == "active" else active)
+                if protection == "reference":
+                    (active / "manifest.json").write_text(json.dumps({"path": str(candidate)}))
+                pipeline = self.make_summary_helper(
+                    root, errors=("process-scan-denied",) if protection == "scan-error" else (),
+                )
+                result = self.run_cleaner(
+                    root, data, dry_run=False, pipeline_repo=pipeline,
+                    open_paths=(candidate / "departures-next.sqlite",) if protection == "open" else (),
+                    pipeline_active=protection == "service",
+                )
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 0, output)
+                self.assertTrue(candidate.exists(), output)
+                self.assertTrue((candidate / "departures-next.sqlite").exists(), output)
+                self.assertNotIn(f"DELETE {candidate.resolve()}", output)
+
+    def test_stopped_build_state_parser_keeps_unverified_or_resumable_builds(self) -> None:
+        for case in ("malformed", "mismatched-id", "commit", "unknown-stage", "schema", "resume"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                data = root / "data"
+                candidate = self.make_stopped_pipeline_build(data)
+                state_path = candidate / "release-state.json"
+                state = json.loads(state_path.read_text())
+                if case == "malformed":
+                    state_path.write_text("{invalid")
+                else:
+                    if case == "mismatched-id":
+                        state["releaseID"] = "another-release"
+                    elif case == "commit":
+                        state["completedStage"] = "commit"
+                    elif case == "unknown-stage":
+                        state["completedStage"] = "unknown"
+                    elif case == "schema":
+                        state["schemaVersion"] = 99
+                    elif case == "resume":
+                        (candidate / "departures-next.sqlite.resume.json").write_text(json.dumps({
+                            "resumeSupported": True, "releaseID": candidate.name,
+                        }))
+                    state_path.write_text(json.dumps(state))
+                result = self.run_cleaner(root, data, dry_run=False, pipeline_repo=self.make_summary_helper(root))
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 0, output)
+                self.assertTrue(candidate.exists(), output)
+                self.assertTrue((candidate / "departures-next.sqlite").exists(), output)
 
     def test_release_scoped_staging_uses_success_state_or_six_hour_failure_ttl(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

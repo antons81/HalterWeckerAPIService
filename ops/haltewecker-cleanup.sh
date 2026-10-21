@@ -626,6 +626,39 @@ is_known_abandoned_build_name() {
     return 1
 }
 
+# All pipeline services are inactive and their locks are held before this check.
+# A persisted pre-commit stage identifies a stopped, unpublished pipeline build.
+# Unknown, malformed, mismatched, or committed state remains protected by TTL.
+is_stopped_pipeline_build() {
+    local build_path="$1"
+    [[ -f "$build_path/release-state.json" && ! -L "$build_path/release-state.json" ]] || return 1
+    [[ ! -e "$build_path/departures.sqlite" ]] || return 1
+    [[ ! -e "$build_path/departures-next.sqlite.resume" &&
+       ! -L "$build_path/departures-next.sqlite.resume" &&
+       ! -e "$build_path/departures-next.sqlite.resume.json" &&
+       ! -L "$build_path/departures-next.sqlite.resume.json" ]] || return 1
+    python3 - "$build_path" <<'PY_STATE'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+try:
+    state = json.loads((root / "release-state.json").read_text())
+    valid = (
+        isinstance(state, dict)
+        and state.get("schemaVersion") == 1
+        and state.get("releaseID") == root.name
+        and state.get("completedStage") in {
+            "build", "candidate-validation", "static-departures", "handoff-readiness"
+        }
+    )
+except (OSError, ValueError):
+    valid = False
+sys.exit(0 if valid else 1)
+PY_STATE
+}
+
 build_state_for() {
     local build_path="$1"
     local metadata contents
@@ -842,6 +875,12 @@ for release_path in "${release_entries[@]-}"; do
         fi
         if ! path_is_strictly_inside "$release_path" "$RELEASES"; then
             echo "KEEP   $release_path reason=outside-root-or-symlink-escape"
+            continue
+        fi
+        if is_stopped_pipeline_build "$release_path"; then
+            # Defer deletion to the shared dependency/open-inode safety preflight.
+            RELEASE_DELETE_PATHS+=("$release_path")
+            echo "DELETE-CANDIDATE $release_path reason=stopped-unpublished-pipeline-build"
             continue
         fi
         if ! age_seconds="$(artifact_age_seconds "$release_path")"; then
@@ -1081,6 +1120,11 @@ cleanup_release_scoped_staging() {
             continue
         fi
 
+        if is_stopped_pipeline_build "$RELEASES/$release_name"; then
+            # The entire build is handled after the full process scan below.
+            echo "ACTIVE STAGING $staging_path status=KEEP reason=queued-with-stopped-build"
+            continue
+        fi
         release_state="$(build_state_for "$RELEASES/$release_name")"
         case "$release_state" in
             published)
@@ -1352,8 +1396,14 @@ for release_path in "${RELEASE_DELETE_PATHS[@]}"; do
         echo "KEEP   $release_path reason=retention-preflight-not-complete"
         continue
     fi
-    if ! path_is_strictly_inside "$release_path" "$RELEASES" ||
-       ! is_published_release_candidate "$release_path"; then
+    release_delete_reason=outside-retention-and-unreferenced
+    if is_stopped_pipeline_build "$release_path"; then
+        release_delete_reason=stopped-unpublished-pipeline-build
+    elif ! is_published_release_candidate "$release_path"; then
+        echo "KEEP   $release_path reason=release-candidate-recheck-failed"
+        continue
+    fi
+    if ! path_is_strictly_inside "$release_path" "$RELEASES"; then
         echo "KEEP   $release_path reason=release-candidate-recheck-failed"
         continue
     fi
@@ -1374,9 +1424,9 @@ for release_path in "${RELEASE_DELETE_PATHS[@]}"; do
         continue
     fi
     if [[ "$DRY_RUN" == "1" ]]; then
-        echo "WOULD_DELETE $release_path reason=outside-retention-and-unreferenced"
+        echo "WOULD_DELETE $release_path reason=$release_delete_reason"
     else
-        echo "DELETE $release_path reason=outside-retention-and-unreferenced"
+        echo "DELETE $release_path reason=$release_delete_reason"
         rm -rf -- "$release_path"
     fi
 done
