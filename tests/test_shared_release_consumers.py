@@ -48,34 +48,42 @@ class ConsumerPreflightTests(unittest.TestCase):
         release = Path("/srv/haltewecker/data/releases/candidate")
         data_root = Path("/srv/haltewecker/data")
         geometry_root = Path("/srv/routerecall/data/osm")
-        environment, mounts = route_consumer_configuration(
-            release,
-            data_root,
-            geometry_root,
-            full_database_candidate=True,
-            release_relative="releases/candidate",
-            pointer_relative="staging/probe/current-release",
-        )
+        with tempfile.TemporaryDirectory() as temporary_root:
+            route_data_root = Path(temporary_root) / "routerecall-data"
+            environment, mounts = route_consumer_configuration(
+                release,
+                data_root,
+                geometry_root,
+                route_data_root,
+                full_database_candidate=True,
+                release_relative="releases/candidate",
+                pointer_relative="staging/probe/current-release",
+            )
+            current_pointer = route_data_root / "current-release"
+            self.assertTrue(current_pointer.is_symlink())
+            self.assertEqual(current_pointer.resolve().name, "candidate")
+            self.assertTrue((current_pointer.resolve() / "departures.sqlite").parent.is_dir())
 
-        self.assertEqual(
-            environment["ROUTERECALL_RELEASE_POINTER"],
-            "/data/haltewecker/current-release",
-        )
-        self.assertEqual(
-            environment["ROUTERECALL_DATABASE"],
-            "/data/haltewecker/current-release/departures.sqlite",
-        )
-        self.assertEqual(
-            environment["ROUTERECALL_STATIC_DATA_ROOT"],
-            "/data/haltewecker/current-release/stop-data",
-        )
-        self.assertEqual(
-            mounts,
-            [
-                (release, "/data/haltewecker/current-release"),
-                (geometry_root, "/data/routerecall/osm"),
-            ],
-        )
+            self.assertEqual(
+                environment["ROUTERECALL_RELEASE_POINTER"],
+                "/data/haltewecker/current-release",
+            )
+            self.assertEqual(
+                environment["ROUTERECALL_DATABASE"],
+                "/data/haltewecker/current-release/departures.sqlite",
+            )
+            self.assertEqual(
+                environment["ROUTERECALL_STATIC_DATA_ROOT"],
+                "/data/haltewecker/current-release/stop-data",
+            )
+            self.assertEqual(
+                mounts,
+                [
+                    (route_data_root, "/data/haltewecker"),
+                    (release.resolve(), "/data/haltewecker/releases/candidate"),
+                    (geometry_root, "/data/routerecall/osm"),
+                ],
+            )
 
     def test_control_flows_require_public_stop_board_and_trip_stops(self):
         plan = {

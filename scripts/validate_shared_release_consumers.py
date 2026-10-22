@@ -211,6 +211,7 @@ def route_consumer_configuration(
     release: Path,
     data_root: Path,
     geometry_root: Path,
+    route_data_root: Path,
     *,
     full_database_candidate: bool,
     release_relative: str,
@@ -224,12 +225,20 @@ def route_consumer_configuration(
     }
     if full_database_candidate:
         transit_root = "/data/haltewecker/current-release"
+        release_mount = route_data_root / "releases" / release.name
+        release_mount.parent.mkdir(parents=True, exist_ok=True)
+        release_mount.mkdir(exist_ok=True)
+        current_pointer = route_data_root / "current-release"
+        current_pointer.symlink_to(Path("releases") / release.name)
         environment.update({
             "ROUTERECALL_RELEASE_POINTER": transit_root,
             "ROUTERECALL_DATABASE": transit_root + "/departures.sqlite",
             "ROUTERECALL_STATIC_DATA_ROOT": transit_root + "/stop-data",
         })
-        mounts = [(release.resolve(), transit_root)]
+        mounts = [
+            (route_data_root, "/data/haltewecker"),
+            (release.resolve(), f"/data/haltewecker/releases/{release.name}"),
+        ]
     else:
         environment.update({
             "ROUTERECALL_RELEASE_POINTER": "/data/haltewecker/" + pointer_relative,
@@ -363,6 +372,7 @@ def preflight(release: Path, build: tuple[str, ...], runtime: tuple[str, ...],
             release,
             data_root,
             geometry_root,
+            Path(pointer_workspace.name) / "routerecall-data",
             full_database_candidate=full_database_candidate,
             release_relative=relative,
             pointer_relative=pointer_relative,
