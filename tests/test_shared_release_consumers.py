@@ -22,6 +22,7 @@ from scripts.validate_shared_release_consumers import (
     parse_probe_result,
     preflight,
     provider_ids,
+    route_consumer_configuration,
     static_consumer_environment,
     validate_release_pair,
 )
@@ -42,6 +43,39 @@ class ConsumerPreflightTests(unittest.TestCase):
             "hybrid", ("israel-mot",), "releases/incremental/rollback", "staging/probe/current-release",
         )
         self.assertEqual(rollback["HALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME"], "1")
+
+    def test_full_sqlite_route_preflight_mounts_candidate_at_canonical_transit_paths(self):
+        release = Path("/srv/haltewecker/data/releases/candidate")
+        data_root = Path("/srv/haltewecker/data")
+        geometry_root = Path("/srv/routerecall/data/osm")
+        environment, mounts = route_consumer_configuration(
+            release,
+            data_root,
+            geometry_root,
+            full_database_candidate=True,
+            release_relative="releases/candidate",
+            pointer_relative="staging/probe/current-release",
+        )
+
+        self.assertEqual(
+            environment["ROUTERECALL_RELEASE_POINTER"],
+            "/data/haltewecker/current-release",
+        )
+        self.assertEqual(
+            environment["ROUTERECALL_DATABASE"],
+            "/data/haltewecker/current-release/departures.sqlite",
+        )
+        self.assertEqual(
+            environment["ROUTERECALL_STATIC_DATA_ROOT"],
+            "/data/haltewecker/current-release/stop-data",
+        )
+        self.assertEqual(
+            mounts,
+            [
+                (release, "/data/haltewecker/current-release"),
+                (geometry_root, "/data/routerecall/osm"),
+            ],
+        )
 
     def test_control_flows_require_public_stop_board_and_trip_stops(self):
         plan = {

@@ -207,6 +207,39 @@ def static_consumer_environment(runtime_mode: str, runtime: tuple[str, ...],
     }
 
 
+def route_consumer_configuration(
+    release: Path,
+    data_root: Path,
+    geometry_root: Path,
+    *,
+    full_database_candidate: bool,
+    release_relative: str,
+    pointer_relative: str,
+) -> tuple[dict[str, str], list[tuple[Path, str]]]:
+    environment = {
+        "ROUTERECALL_PROVIDER_RUNTIME": "0" if full_database_candidate else "1",
+        "ROUTERECALL_HOST": "0.0.0.0",
+        "ROUTERECALL_PORT": "8091",
+        "ROUTERECALL_GEOMETRY_ARTIFACT": "/data/routerecall/osm/current/de/geometry.sqlite",
+    }
+    if full_database_candidate:
+        transit_root = "/data/haltewecker/current-release"
+        environment.update({
+            "ROUTERECALL_RELEASE_POINTER": transit_root,
+            "ROUTERECALL_DATABASE": transit_root + "/departures.sqlite",
+            "ROUTERECALL_STATIC_DATA_ROOT": transit_root + "/stop-data",
+        })
+        mounts = [(release.resolve(), transit_root)]
+    else:
+        environment.update({
+            "ROUTERECALL_RELEASE_POINTER": "/data/haltewecker/" + pointer_relative,
+            "ROUTERECALL_STATIC_DATA_ROOT": "/data/haltewecker/" + release_relative + "/stop-data",
+        })
+        mounts = [(data_root, "/data/haltewecker")]
+    mounts.append((geometry_root, "/data/routerecall/osm"))
+    return environment, mounts
+
+
 def preflight(release: Path, build: tuple[str, ...], runtime: tuple[str, ...],
               static_container: str, route_container: str, *, reference: Path | None = None,
               static_image: str | None = None,
@@ -326,21 +359,16 @@ def preflight(release: Path, build: tuple[str, ...], runtime: tuple[str, ...],
             if not isinstance(stops, list) or not stops:
                 raise ValueError(f"candidate stop package is empty: {city}")
             results[-1]["stopCount"] = len(stops)
-        route_environment = {
-            "ROUTERECALL_PROVIDER_RUNTIME": "0" if full_database_candidate else "1",
-            "ROUTERECALL_HOST": "0.0.0.0",
-            "ROUTERECALL_PORT": "8091",
-            "ROUTERECALL_RELEASE_POINTER": "/data/haltewecker/" + pointer_relative,
-            "ROUTERECALL_STATIC_DATA_ROOT": "/data/haltewecker/" + relative + "/stop-data",
-            "ROUTERECALL_GEOMETRY_ARTIFACT": "/data/routerecall/osm/current/de/geometry.sqlite",
-        }
-        if full_database_candidate:
-            route_environment["ROUTERECALL_DATABASE"] = (
-                "/data/haltewecker/" + relative + "/departures.sqlite"
-            )
+        route_environment, route_mounts = route_consumer_configuration(
+            release,
+            data_root,
+            geometry_root,
+            full_database_candidate=full_database_candidate,
+            release_relative=relative,
+            pointer_relative=pointer_relative,
+        )
         _route_name, route = start("routerecall", route_image, 8091,
-                      [(data_root, "/data/haltewecker"), (geometry_root, "/data/routerecall/osm")],
-                      route_environment)
+                                   route_mounts, route_environment)
         root = route + "/routerecall/v1"
         # Liveness alone is not readiness; the actual Germany flow follows.
         get(root + "/cities", startup=True)
