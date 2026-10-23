@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import io
 import json
 import math
@@ -75,6 +76,14 @@ BKG_MUNICIPALITIES_URL = (
     "&outputFormat=application/json"
 )
 BKG_PAGE_SIZE = 2_000
+NRW_MUNICIPALITIES_URL = (
+    "https://www.arcgishostedserver.nrw.de/arcgis/rest/services/Hosted/"
+    "VG250_GEM/FeatureServer/0/query"
+)
+GERMAN_STATE_ABBREVIATIONS = dict(zip(
+    (f"{code:02d}" for code in range(1, 17)),
+    ("SH", "HH", "NI", "HB", "NW", "HE", "RP", "BW", "BY", "SL", "BE", "BB", "MV", "SN", "ST", "TH"),
+))
 SPATIAL_GRID_SIZE_DEGREES = 0.25
 SUPPORTED_TRANSIT_RADAR_ADAPTERS = {
     "bwTrias",
@@ -393,10 +402,10 @@ def valid_bbox(value: object) -> tuple[float, float, float, float] | None:
     return minimum_longitude, minimum_latitude, maximum_longitude, maximum_latitude
 
 
-def load_municipalities(source: str) -> list[dict[str, object]]:
+def municipalities_from_features(features: list[dict[str, object]]) -> list[dict[str, object]]:
     municipalities = []
     seen_codes: set[str] = set()
-    for feature in load_municipality_features(source):
+    for feature in features:
         if not isinstance(feature, dict):
             continue
         properties = feature.get("properties")
@@ -424,6 +433,150 @@ def load_municipalities(source: str) -> list[dict[str, object]]:
 
     if not municipalities:
         raise ValueError("No valid German municipalities were loaded from BKG.")
+    return municipalities
+
+
+def municipality_geometry_bbox(geometry: object) -> list[float]:
+    """Validate GeoJSON longitude/latitude rings and derive their bounding box."""
+    if not isinstance(geometry, dict):
+        raise ValueError("Municipality has no geometry.")
+    coordinates = geometry.get("coordinates")
+    if geometry.get("type") == "Polygon":
+        polygons = [coordinates]
+    elif geometry.get("type") == "MultiPolygon":
+        polygons = coordinates
+    else:
+        raise ValueError("Municipality geometry must be Polygon or MultiPolygon.")
+    if not isinstance(polygons, list) or not polygons:
+        raise ValueError("Municipality geometry is empty.")
+    minimum_longitude, minimum_latitude = math.inf, math.inf
+    maximum_longitude, maximum_latitude = -math.inf, -math.inf
+    for polygon in polygons:
+        if not isinstance(polygon, list) or not polygon:
+            raise ValueError("Municipality polygon is empty.")
+        for ring in polygon:
+            if not isinstance(ring, list) or len(ring) < 4 or ring[0] != ring[-1]:
+                raise ValueError("Municipality polygon has an invalid ring.")
+            for point in ring:
+                if not isinstance(point, list) or len(point) < 2:
+                    raise ValueError("Municipality polygon has an invalid point.")
+                longitude, latitude = float(point[0]), float(point[1])
+                if not (-180 <= longitude <= 180 and -90 <= latitude <= 90):
+                    raise ValueError("Municipality coordinates are not EPSG:4326.")
+                minimum_longitude = min(minimum_longitude, longitude)
+                minimum_latitude = min(minimum_latitude, latitude)
+                maximum_longitude = max(maximum_longitude, longitude)
+                maximum_latitude = max(maximum_latitude, latitude)
+    return [minimum_longitude, minimum_latitude, maximum_longitude, maximum_latitude]
+
+
+def load_nrw_municipality_features() -> list[dict[str, object]]:
+    """Read the nationwide BKG VG250 copy published on the NRW geoportal."""
+    def query(parameters: dict[str, object]) -> dict[str, object]:
+        request = urllib.request.Request(
+            NRW_MUNICIPALITIES_URL + "?" + urlencode(parameters),
+            headers={"User-Agent": "HalteWeckerStopPipeline/1.0"},
+        )
+        with urlopen_with_tls(request, timeout=180) as response:
+            payload = json.load(response)
+        if not isinstance(payload, dict) or "error" in payload:
+            raise ValueError("NRW municipality query failed.")
+        return payload
+
+    # GF=4 selects land geometries, excluding sea/lake variants with the same AGS.
+    expected_count = int(query({"where": "gf=4", "returnCountOnly": "true", "f": "json"})["count"])
+    if expected_count <= 0:
+        raise ValueError("NRW municipality source is empty.")
+    features: list[dict[str, object]] = []
+    codes: set[str] = set()
+    states: set[str] = set()
+    while len(features) < expected_count:
+        payload = query({
+            "where": "gf=4", "outFields": "ags,gen,sn_l", "outSR": 4326,
+            "orderByFields": "fid ASC", "resultOffset": len(features),
+            "resultRecordCount": BKG_PAGE_SIZE, "returnGeometry": "true", "f": "geojson",
+        })
+        page = payload.get("features")
+        if not isinstance(page, list) or not page:
+            raise ValueError("NRW municipality source returned an incomplete page.")
+        for feature in page:
+            properties = feature.get("properties", {}) if isinstance(feature, dict) else {}
+            code = properties.get("ags")
+            name = properties.get("gen")
+            state = properties.get("sn_l")
+            if (not isinstance(code, str) or not re.fullmatch(r"\d{8}", code)
+                    or code in codes or not isinstance(name, str) or not name.strip()
+                    or state not in GERMAN_STATE_ABBREVIATIONS or not code.startswith(state)):
+                raise ValueError("NRW municipality has invalid or duplicate attributes.")
+            feature["bbox"] = municipality_geometry_bbox(feature.get("geometry"))
+            properties["lkz"] = GERMAN_STATE_ABBREVIATIONS[state]
+            features.append(feature)
+            codes.add(code)
+            states.add(state)
+    if len(features) != expected_count or states != set(GERMAN_STATE_ABBREVIATIONS):
+        raise ValueError("NRW municipality source is incomplete.")
+    return features
+
+
+def load_municipalities(source: str, *, cache_root: Path | None = None) -> list[dict[str, object]]:
+    """Refresh boundaries; retain validated reference data through source outages."""
+    is_remote = urlsplit(source).scheme in ("http", "https")
+    cache_path = None
+    if cache_root is not None and is_remote:
+        key = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        cache_path = cache_root / f"municipalities-{key}.json"
+    origin = "bkg"
+    try:
+        features = load_municipality_features(source)
+        municipalities = municipalities_from_features(features)
+    except (OSError, ValueError, TypeError, KeyError) as source_error:
+        if not is_remote:
+            raise
+        if cache_path is not None and cache_path.is_file():
+            try:
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                features = cached["features"]
+                encoded = json.dumps(features, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                if (cached["source"] != source or cached["featureCount"] != len(features)
+                        or cached["sha256"] != hashlib.sha256(encoded).hexdigest()):
+                    raise ValueError("Municipality cache metadata/checksum mismatch.")
+                municipalities = municipalities_from_features(features)
+            except (OSError, ValueError, TypeError, KeyError) as cache_error:
+                print(f"[StopData] source=bkg status=WARN cache=invalid reason={cache_error}", flush=True)
+            else:
+                print(
+                    f"[StopData] source=bkg status=WARN fallback=validated-cache "
+                    f"origin={cached.get('origin', 'unknown')} retrievedAt={cached.get('retrievedAt', 'unknown')} "
+                    f"reason={source_error}", flush=True,
+                )
+                return municipalities
+        if source != BKG_MUNICIPALITIES_URL:
+            raise
+        print(f"[StopData] source=bkg status=WARN fallback=nrw-vg250 reason={source_error}", flush=True)
+        features = load_nrw_municipality_features()
+        municipalities = municipalities_from_features(features)
+        origin = NRW_MUNICIPALITIES_URL
+        print(
+            "[StopData] source=bkg status=WARN fallback=nrw-vg250 referenceDate=unconfirmed "
+            f"municipalities={len(municipalities)}", flush=True,
+        )
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        encoded = json.dumps(features, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        payload = {
+            "source": source, "origin": origin, "retrievedAt": datetime.now().astimezone().isoformat(),
+            "featureCount": len(features), "sha256": hashlib.sha256(encoded).hexdigest(), "features": features,
+        }
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=cache_path.parent,
+                                             prefix=".municipalities-", suffix=".tmp", delete=False) as target:
+                temporary_path = Path(target.name)
+                json.dump(payload, target, ensure_ascii=False, separators=(",", ":"))
+            os.replace(temporary_path, cache_path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
     return municipalities
 
 
@@ -3076,7 +3229,9 @@ def main(argv: list[str] | None = None) -> None:
         german_stop_rows = load_table(german_archive, "stops.txt")
         stops = canonicalize(german_stop_rows)
         german_stop_count = len(stops)
-        municipalities = timed_stage("bkg", "fetch", lambda: load_municipalities(args.municipalities_url))
+        municipalities = timed_stage("bkg", "fetch", lambda: load_municipalities(
+            args.municipalities_url, cache_root=Path(args.gtfs_cache_root) / "bkg"
+        ))
         german_cities = german_branch_cities(cities)
         manifest, skipped_stop_count, package_stops_by_city_id = timed_stage(
             "germany", "packages", lambda: build_stop_packages(
