@@ -1227,7 +1227,7 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             result = self.run_cleaner(root, data_root)
             output = result.stdout + result.stderr
             self.assertEqual(result.returncode, 0, output)
-            self.assertIn("WOULD_DELETE " + str(validation.resolve()) + " reason=expired-validation", output)
+            self.assertIn("WOULD_DELETE " + str(validation.resolve()) + " reason=unused-validation", output)
             self.assertTrue(active_release.exists())
 
     def test_missing_provenance_allows_obsolete_release_cleanup(self) -> None:
@@ -1400,7 +1400,7 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             self.assertTrue(opened.exists(), output)
             self.assertIn("active-runtime-open-file", output)
 
-    def test_successful_orphan_staging_is_immediate_and_failed_staging_has_six_hour_ttl(self) -> None:
+    def test_unused_successful_and_failed_staging_are_immediately_cleanup_eligible(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             data_root = root / "data"
@@ -1418,8 +1418,10 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             result = self.run_cleaner(root, data_root)
             output = result.stdout + result.stderr
             self.assertEqual(result.returncode, 0, output)
-            self.assertIn("WOULD_DELETE " + str(successful.resolve()) + " reason=expired-staging", output)
-            self.assertIn("KEEP   " + str(failed.resolve()) + " reason=recent-staging", output)
+            self.assertIn("WOULD_DELETE " + str(successful.resolve()) + " reason=unused-staging", output)
+            self.assertIn("WOULD_DELETE " + str(failed.resolve()) + " reason=unused-staging", output)
+            self.assertIn("policy=unused-without-age-delay", output)
+            self.assertNotIn("max-age-hours=6", output)
 
     @staticmethod
     def make_stopped_pipeline_build(data_root: Path) -> Path:
@@ -1506,7 +1508,7 @@ class HalteWeckerCleanupTests(unittest.TestCase):
                 self.assertTrue(candidate.exists(), output)
                 self.assertTrue((candidate / "departures-next.sqlite").exists(), output)
 
-    def test_release_scoped_staging_uses_success_state_or_six_hour_failure_ttl(self) -> None:
+    def test_release_scoped_staging_has_no_age_delay_without_references_or_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             data_root = root / "data"
@@ -1534,12 +1536,12 @@ class HalteWeckerCleanupTests(unittest.TestCase):
                 output,
             )
             self.assertIn(
-                "ACTIVE STAGING " + str(failed_staging.resolve())
-                + " status=KEEP reason=inside-failed-staging-window",
+                "WOULD_DELETE " + str(failed_staging.resolve())
+                + " reason=failed-or-interrupted-without-resume",
                 output,
             )
 
-    def test_failed_validation_is_retained_until_twelve_hour_diagnostic_ttl(self) -> None:
+    def test_unused_validation_is_removed_immediately_regardless_of_age(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             data_root = root / "data"
@@ -1547,17 +1549,19 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             recent = data_root / "validation" / "failed-recent"
             recent.mkdir(parents=True)
             (recent / "result.json").write_text('{"status":"failed"}\n', encoding="utf-8")
-            self.make_age_hours(recent, 11.9)
+            self.make_age_hours(recent, 0.01)
             expired = data_root / "validation" / "failed-expired"
             expired.mkdir(parents=True)
             (expired / "result.json").write_text('{"status":"failed"}\n', encoding="utf-8")
             self.make_age_hours(expired, 12.1)
 
-            result = self.run_cleaner(root, data_root)
+            result = self.run_cleaner(root, data_root, dry_run=False)
             output = result.stdout + result.stderr
             self.assertEqual(result.returncode, 0, output)
-            self.assertIn("KEEP   " + str(recent.resolve()) + " reason=recent-validation", output)
-            self.assertIn("WOULD_DELETE " + str(expired.resolve()) + " reason=expired-validation", output)
+            self.assertIn("DELETE " + str(recent.resolve()) + " reason=unused-validation", output)
+            self.assertIn("DELETE " + str(expired.resolve()) + " reason=unused-validation", output)
+            self.assertFalse(recent.exists())
+            self.assertFalse(expired.exists())
 
     def test_abandoned_build_uses_twelve_hour_ttl_and_protects_symlink_reference(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1599,7 +1603,7 @@ class HalteWeckerCleanupTests(unittest.TestCase):
                 output,
             )
 
-    def test_legacy_standalone_departure_uses_twelve_hour_ttl(self) -> None:
+    def test_unused_legacy_standalone_departure_is_removed_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             data_root = root / "data"
@@ -1610,15 +1614,44 @@ class HalteWeckerCleanupTests(unittest.TestCase):
             legacy = data_root / "departures" / "releases" / "legacy.sqlite"
             legacy.parent.mkdir(parents=True)
             legacy.write_bytes(b"obsolete")
-            self.make_age_hours(legacy, 12.1)
+            self.make_age_hours(legacy, 0.01)
 
-            result = self.run_cleaner(root, data_root)
+            result = self.run_cleaner(root, data_root, dry_run=False)
             output = result.stdout + result.stderr
             self.assertEqual(result.returncode, 0, output)
             self.assertIn(
-                "WOULD_DELETE " + str(legacy.resolve()) + " reason=obsolete-unbound-departures-backup",
+                "DELETE " + str(legacy.resolve()) + " size=8 reason=obsolete-unbound-departures-backup",
                 output,
             )
+            self.assertFalse(legacy.exists())
+            self.assertTrue(release.exists())
+
+    def test_no_age_delay_preserves_referenced_validation_staging_and_legacy_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data = root / "data"
+            active = data / "releases" / "20261023T000000Z-current"
+            active.mkdir(parents=True)
+            (data / "current-release").symlink_to(active)
+            validation = data / "validation" / "referenced"
+            staging = data / "staging" / "referenced"
+            for directory in (validation, staging):
+                directory.mkdir(parents=True)
+                (directory / "state.json").write_text('{"status":"published"}')
+            (data / "active-validation").symlink_to(validation)
+            (data / "active-staging").symlink_to(staging)
+            legacy = data / "departures" / "releases" / "current.sqlite"
+            legacy.parent.mkdir(parents=True)
+            legacy.write_bytes(b"active-database")
+            (data / "departures-current.sqlite").symlink_to(legacy)
+
+            result = self.run_cleaner(root, data, dry_run=False)
+            output = result.stdout + result.stderr
+
+            self.assertEqual(result.returncode, 0, output)
+            for path in (active, validation, staging, legacy):
+                self.assertTrue(path.exists(), output)
+                self.assertNotIn("DELETE " + str(path.resolve()) + " ", output)
 
 
 if __name__ == "__main__":

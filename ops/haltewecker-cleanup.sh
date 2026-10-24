@@ -13,9 +13,6 @@ DEPARTURE_RELEASES="$DATA/departures/releases"
 ROLLBACK_ROOT="$DATA/temp/current-rollback"
 DRY_RUN="${HALTEWECKER_CLEANUP_DRY_RUN:-0}"
 ABANDONED_RELEASE_MAX_AGE_HOURS="${HALTEWECKER_ABANDONED_RELEASE_MAX_AGE_HOURS:-12}"
-VALIDATION_MAX_AGE_HOURS="${HALTEWECKER_VALIDATION_MAX_AGE_HOURS:-12}"
-STAGING_MAX_AGE_HOURS="${HALTEWECKER_STAGING_MAX_AGE_HOURS:-6}"
-LEGACY_EXTRA_BACKUP_MAX_AGE_HOURS="${HALTEWECKER_LEGACY_EXTRA_BACKUP_MAX_AGE_HOURS:-12}"
 PIPELINE_REPO="${HALTEWECKER_PIPELINE_REPO:-/srv/haltewecker/pipeline/HalterWeckerAPIService}"
 GTFS_CACHE_ROOT="${GTFS_CACHE_ROOT:-$DATA/cache/gtfs}"
 GTFS_ORPHAN_TEMP_MAX_AGE_HOURS="${HALTEWECKER_GTFS_ORPHAN_TEMP_MAX_AGE_HOURS:-24}"
@@ -71,7 +68,7 @@ artifact_age_seconds() {
     printf '%s\n' "$((now - mtime))"
 }
 
-for ttl_name in ABANDONED_RELEASE_MAX_AGE_HOURS VALIDATION_MAX_AGE_HOURS STAGING_MAX_AGE_HOURS LEGACY_EXTRA_BACKUP_MAX_AGE_HOURS PARTITION_MAX_AGE_HOURS; do
+for ttl_name in ABANDONED_RELEASE_MAX_AGE_HOURS PARTITION_MAX_AGE_HOURS; do
     ttl_value="${!ttl_name}"
     if ! ttl_seconds_from_hours "$ttl_value" >/dev/null; then
         echo "Invalid TTL: ${ttl_name}=${ttl_value}" >&2
@@ -931,19 +928,17 @@ for release_path in "${release_entries[@]-}"; do
     fi
 done
 
-cleanup_expired_artifacts() {
+cleanup_unused_artifacts() {
     local root="$1"
-    local ttl_hours="$2"
-    local reason="$3"
-    local entry age_seconds ttl_seconds state open_files active_validation
+    local reason="$2"
+    local entry age_seconds state open_files
 
     if [[ ! -d "$root" ]]; then
         echo "Artifact retention: directory-missing path=$root"
         return 0
     fi
 
-    ttl_seconds="$(ttl_seconds_from_hours "$ttl_hours")"
-    echo "Artifact retention: directory=$root max-age-hours=$ttl_hours"
+    echo "Artifact retention: directory=$root policy=unused-without-age-delay"
     while IFS= read -r -d '' entry; do
         if dependency_reason="$(dependency_reason_for_path "$entry" 2>/dev/null)"; then
             echo "KEEP   $entry reason=$dependency_reason"
@@ -978,79 +973,28 @@ cleanup_expired_artifacts() {
             echo "KEEP   $entry reason=outside-root-or-symlink-escape"
             continue
         fi
-        if ! age_seconds="$(artifact_age_seconds "$entry")"; then
-            echo "KEEP   $entry reason=unreliable-mtime"
-            continue
-        fi
-        if [[ "$reason" == "validation" ]]; then
-            active_validation="$(active_release_validation_pass_matches "$entry" || true)"
-            if [[ "$active_validation" == "1" ]]; then
-                ttl_seconds=0
-                echo "Validation retention: active release PASS receipt is cleanup-eligible path=$entry"
-            fi
-        elif [[ "$reason" == "staging" ]]; then
+        if [[ "$reason" == "staging" ]]; then
             state="$(build_state_for "$entry")"
             case "$state" in
-                published)
-                    ttl_seconds=0
-                    echo "Staging retention: successful orphan is cleanup-eligible path=$entry"
-                    ;;
-                incomplete|absent)
-                    ttl_seconds="$(ttl_seconds_from_hours "$STAGING_MAX_AGE_HOURS")"
-                    ;;
+                published|incomplete|absent) ;;
                 *)
                     echo "KEEP   $entry reason=unknown-staging-state"
                     continue
                     ;;
             esac
         fi
-        if (( age_seconds < ttl_seconds )); then
-            echo "KEEP   $entry reason=recent-$reason age=$(format_age_hours "$age_seconds")h"
-            continue
-        fi
+        age_seconds="$(artifact_age_seconds "$entry" || printf '0')"
         if [[ "$DRY_RUN" == "1" ]]; then
-            emit_would_delete "$entry" "expired-$reason" "$age_seconds"
+            emit_would_delete "$entry" "unused-$reason" "$age_seconds"
         else
-            echo "DELETE $entry reason=expired-$reason age=$(format_age_hours "$age_seconds")h"
+            echo "DELETE $entry reason=unused-$reason age=$(format_age_hours "$age_seconds")h"
             rm -rf -- "$entry"
         fi
     done < <(find "$root" -mindepth 1 -maxdepth 1 -print0)
 }
 
-active_release_id() {
-    local current
-    current="$(readlink -f -- "$DATA/current-release" 2>/dev/null || true)"
-    [[ -n "$current" ]] || return 1
-    basename -- "$current"
-}
-
-active_release_validation_pass_matches() {
-    local entry="$1"
-    local release_id
-    release_id="$(active_release_id || true)"
-    [[ -n "$release_id" ]] || return 1
-    python3 - "$entry" "$release_id" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-entry = Path(sys.argv[1])
-release_id = sys.argv[2]
-candidates = [entry] if entry.is_file() else list(entry.rglob("validation-receipt.json")) if entry.is_dir() else []
-for candidate in candidates:
-    try:
-        payload = json.loads(candidate.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        continue
-    if payload.get("result") == "PASS" and payload.get("releaseID") == release_id:
-        print("1")
-        raise SystemExit(0)
-print("0")
-PY
-}
-
-cleanup_expired_artifacts "$DATA/validation" "$VALIDATION_MAX_AGE_HOURS" "validation"
-cleanup_expired_artifacts "$DATA/staging" "$STAGING_MAX_AGE_HOURS" "staging"
+cleanup_unused_artifacts "$DATA/validation" "validation"
+cleanup_unused_artifacts "$DATA/staging" "staging"
 
 
 staging_has_supported_resume() {
@@ -1132,14 +1076,6 @@ cleanup_release_scoped_staging() {
                 disposition="successful-release-publication"
                 ;;
             incomplete|absent)
-                if ! age_seconds="$(artifact_age_seconds "$staging_path")"; then
-                    echo "ACTIVE STAGING $staging_path status=KEEP reason=unreliable-mtime"
-                    continue
-                fi
-                if (( age_seconds < $(ttl_seconds_from_hours "$STAGING_MAX_AGE_HOURS") )); then
-                    echo "ACTIVE STAGING $staging_path status=KEEP reason=inside-failed-staging-window age=$(format_age_hours "$age_seconds")h"
-                    continue
-                fi
                 disposition="failed-or-interrupted-without-resume"
                 ;;
             *)
@@ -1234,7 +1170,7 @@ if [[ -d "$DEPARTURE_RELEASES" ]]; then
     )
 
     departure_entries=("$DEPARTURE_RELEASES"/*.sqlite)
-    echo "Legacy standalone departure retention: directory=$DEPARTURE_RELEASES max-age-hours=$LEGACY_EXTRA_BACKUP_MAX_AGE_HOURS"
+    echo "Legacy standalone departure retention: directory=$DEPARTURE_RELEASES policy=unused-without-age-delay"
     for departure_path in "${departure_entries[@]}"; do
         [[ -e "$departure_path" || -L "$departure_path" ]] || continue
 
@@ -1251,14 +1187,7 @@ if [[ -d "$DEPARTURE_RELEASES" ]]; then
             echo "LEGACY EXTRA BACKUP $departure_path status=KEEP reason=invalid-or-nonregular"
             continue
         fi
-        if ! departure_age_seconds="$(artifact_age_seconds "$departure_path")"; then
-            echo "LEGACY EXTRA BACKUP $departure_path status=KEEP reason=unreliable-mtime"
-            continue
-        fi
-        if (( departure_age_seconds < $(ttl_seconds_from_hours "$LEGACY_EXTRA_BACKUP_MAX_AGE_HOURS") )); then
-            echo "LEGACY EXTRA BACKUP $departure_path status=KEEP reason=inside-recovery-window age=$(format_age_hours "$departure_age_seconds")h"
-            continue
-        fi
+        departure_age_seconds="$(artifact_age_seconds "$departure_path" || printf '0')"
 
         echo "LEGACY EXTRA BACKUP $departure_path status=RECLAIMABLE reason=obsolete-unbound-departures-backup age=$(format_age_hours "$departure_age_seconds")h"
         bytes="$(path_size_bytes "$departure_path")"
