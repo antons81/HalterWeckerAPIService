@@ -216,6 +216,99 @@ class RouteReadinessTests(unittest.TestCase):
             readiness.check_shared_route("route", "image", "container")
         self.assertEqual([call.args[0] for call in docker.call_args_list], ["inspect", "exec", "inspect"])
 
+    def shared_probe(self, *, stale_search=False, stale_pattern=False, switch_pointer=False):
+        import io
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "new-release").mkdir()
+            (root / "old-release").mkdir()
+            pointer = root / "current-release"
+            pointer.symlink_to("new-release")
+            class Reply(io.StringIO):
+                status = 200
+            count = 0
+            def respond(*_args, **_kwargs):
+                nonlocal count
+                count += 1
+                if count in (1, 3):
+                    release = "old-release" if stale_search else "new-release"
+                    data = {"lines": [{"id": "route", "providerID": "germany",
+                        "releaseID": release, "patterns": [{"id": "pattern"}]}]}
+                else:
+                    data = {"line": {"releaseID": "old-release" if stale_pattern else "new-release"},
+                            "pattern": {"stops": [{"id": "actual-stop"}]}}
+                if switch_pointer and count == 4:
+                    pointer.unlink()
+                    pointer.symlink_to("old-release")
+                return Reply(json.dumps(data))
+            with mock.patch.dict(os.environ, {"ROUTERECALL_RELEASE_POINTER": str(pointer)}), mock.patch.object(
+                sys, "argv", ["-c", "--shared-release"]), mock.patch(
+                "urllib.request.urlopen", side_effect=respond) as requests:
+                exec(readiness.ROUTE_PROBE, {})
+            return requests.call_count
+
+    def test_shared_probe_requires_current_release_in_search_and_pattern(self):
+        self.assertEqual(self.shared_probe(), 4)
+        with self.assertRaisesRegex(RuntimeError, "search.*stale"):
+            self.shared_probe(stale_search=True)
+        with self.assertRaisesRegex(RuntimeError, "pattern.*stale"):
+            self.shared_probe(stale_pattern=True)
+
+    def test_shared_probe_rejects_a_pointer_change_during_readiness(self):
+        with self.assertRaisesRegex(RuntimeError, "changed during"):
+            self.shared_probe(switch_pointer=True)
+
+    def test_dynamic_detection_requires_code_support_not_just_environment(self):
+        source = PIPELINE.read_text()
+        start = source.index("capture_route_recall_state() {")
+        functions = source[start:source.index("\nactivate_route_recall_shared_sqlite() {", start)]
+        environment = "\n".join([
+            "ROUTERECALL_PROVIDER_RUNTIME=0",
+            "ROUTERECALL_DATABASE=/data/haltewecker/current-release/departures.sqlite",
+            "ROUTERECALL_RELEASE_POINTER=/data/haltewecker/current-release",
+        ])
+        harness = r'''set -eu
+docker() {
+  case "$*" in
+    *"{{range .Config.Env}}"*) printf '%s\n' "$ROUTE_ENV";;
+    *"{{.Image}}"*) echo image-original;;
+    *"{{.Id}}"*) echo container-original;;
+    exec*) return "$CAPABILITY_EXIT";;
+    *) return 99;;
+  esac
+}
+'''
+        for exit_code, expected in ((0, "1 1"), (1, "1 0")):
+            with self.subTest(capability_exit=exit_code):
+                result = subprocess.run(["bash", "-c", harness + functions +
+                    '\ncapture_route_recall_state\necho "$ROUTERECALL_ORIGINAL_SHARED_DATABASE $ROUTERECALL_DYNAMIC_RELEASE_POINTER"'],
+                    env=dict(os.environ, ROUTE_ENV=environment, CAPABILITY_EXIT=str(exit_code)),
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+
+    def test_capability_probe_inspects_factory_without_starting_another_server(self):
+        import types
+        source = PIPELINE.read_text()
+        start = source.index("capture_route_recall_state() {")
+        capture = source[start:source.index("\nactivate_route_recall_shared_sqlite() {", start)]
+        probe = capture.split("python3 -c '\n", 1)[1].split("\n' >/dev/null", 1)[0]
+        calls = []
+        scope = {"TransitReleaseRepositoryPool": object, "calls": calls}
+        exec("def dynamic_factory():\n    calls.append('started')\n    return {'repository_pool': TransitReleaseRepositoryPool()}\n"
+             "def legacy_factory():\n    calls.append('started')\n    return {'repository': None}\n", scope)
+        for name, supported in (("dynamic_factory", True), ("legacy_factory", False)):
+            module = types.SimpleNamespace(TransitReleaseRepositoryPool=object, create_server=scope[name])
+            with self.subTest(factory=name), mock.patch.dict(sys.modules, {"routerecall_api": module}), mock.patch.object(
+                sys, "path", list(sys.path)):
+                if supported:
+                    exec(probe, {})
+                else:
+                    with self.assertRaises(SystemExit) as error:
+                        exec(probe, {})
+                    self.assertEqual(error.exception.code, 1)
+        self.assertEqual(calls, [])
+
     def test_shared_route_rejects_provider_runtime_before_http(self):
         state = json.dumps([{
             "Image": "image",
@@ -448,7 +541,8 @@ python3() {
 
     def activate(self, *, route_fail=False, static_fail=False, image_change=False, pipeline_fail=False, root_change=False,
                  coverage_fail=False, rollback_fail=False, dry_run=False, source_freshness_fail=False,
-                 existing_rollback=False, existing_previous=False):
+                 existing_rollback=False, existing_previous=False, dynamic_route=False,
+                 shared_route=False, full_sqlite=False):
         source = PIPELINE.read_text()
         freshness_start = source.index("validate_incremental_source_freshness() {")
         freshness = source[freshness_start:source.index("\nvalidate_incremental_consumers() {", freshness_start)]
@@ -456,7 +550,7 @@ python3() {
         activation = source[activation_start:source.index('\ncd "$REPO"', activation_start)]
         functions = freshness + "\n" + activation
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             (root / "previous").mkdir()
             (root / "previous/release.json").write_text('{"releaseID":"previous"}')
             (root / "current-release").symlink_to("previous")
@@ -465,6 +559,12 @@ python3() {
                 (root / "rollback").symlink_to("saved-rollback")
             if existing_previous:
                 (root / "previous/stop-data").symlink_to("saved-previous")
+            (root / "old-stops").mkdir()
+            (root / "candidate").mkdir()
+            if root_change:
+                (root / "candidate/stop-data").mkdir()
+            else:
+                (root / "candidate/stop-data").symlink_to(root / "old-stops")
             (root / "image").write_text("image-original")
             runner = root / "static-runner"
             runner.write_text('#!/bin/bash\nexit "${PIPELINE_FAIL:-0}"\n')
@@ -479,6 +579,10 @@ DATA_ROOT="$ROOT"
 PREVIOUS="$ROOT/previous/stop-data"
 RELEASE_ID=candidate
 INCREMENTAL_RELEASE_DIR="$ROOT/candidate"
+RELEASE_DIR="$ROOT/candidate"
+VALIDATED_STATIC_IMAGE=image-original
+VALIDATED_ROUTE_IMAGE=image-original
+ROUTERECALL_ACTIVATION_RELOAD=0
 ARTIFACTS_JSON="$ROOT/gtfs-artifacts.json"
 HALTEWECKER_RUNTIME_PROVIDER_IDS=israel-mot
 STATIC_ACTIVATION_IMAGE=image-original
@@ -495,15 +599,23 @@ validate_incremental_consumers() { [[ "$COVERAGE_FAIL" == 0 ]]; }
 docker() {
   echo "$*" >> "$ROOT/docker-calls"
   if [[ "$*" == *"{{range .Config.Env}}"* ]]; then
-    printf 'HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE=hybrid\nHALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME=1\n'
+    if [[ "$*" == *routerecall-api* && ( "$DYNAMIC_ROUTE" == 1 || "$SHARED_ROUTE" == 1 ) ]]; then
+      printf 'ROUTERECALL_PROVIDER_RUNTIME=0\nROUTERECALL_DATABASE=/data/haltewecker/current-release/departures.sqlite\nROUTERECALL_RELEASE_POINTER=/data/haltewecker/current-release\n'
+    else
+      printf 'HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE=hybrid\nHALTEWECKER_STATIC_DEPARTURES_HYBRID_RUNTIME=1\n'
+    fi
     return 0
   fi
+  if [[ "$1" == exec ]]; then [[ "$DYNAMIC_ROUTE" == 1 ]]; return; fi
   if [[ "$*" == *"{{.Image}}"* ]]; then cat "$ROOT/image"; return 0; fi
   if [[ "$*" == *"{{.Id}}"* ]]; then echo original-container; return 0; fi
   return 1
 }
 python3() {
   if [[ "$1" == "-" ]]; then
+    if [[ "$2" == "$CURRENT_RELEASE" || "$2" == "$RELEASE_DIR/stop-data" ]]; then
+      "$REAL_PYTHON" "$@"; return
+    fi
     echo source-freshness >> "$ROOT/probes"
     [[ "$SOURCE_FRESHNESS_FAIL" == 0 ]]
     return
@@ -513,9 +625,9 @@ python3() {
   local target
   target=$(readlink "$CURRENT_RELEASE")
   case "$2" in
-    stop-data-root) if [[ "$*" == *"/candidate"* && "$ROOT_CHANGED" == 1 ]]; then echo new-root; else echo old-root; fi;;
+    stop-data-root) if [[ "$*" == *"/candidate"* && "$ROOT_CHANGED" == 1 ]]; then echo "$ROOT/candidate/stop-data"; else echo "$ROOT/old-stops"; fi;;
     reload-route) echo 'restart routerecall-api' >> "$ROOT/docker-calls";;
-    route) [[ "$target" == previous || "$ROUTE_FAIL" == 0 ]] && [[ $(cat "$ROOT/image") == image-original ]];;
+    route|shared-route) [[ "$target" == previous || "$ROUTE_FAIL" == 0 ]] && [[ $(cat "$ROOT/image") == image-original ]];;
     restore-route) echo image-original > "$ROOT/image"; if [[ "$*" == *"--reload"* ]]; then echo 'restart routerecall-api' >> "$ROOT/docker-calls"; fi;;
     haltewecker) if [[ "$target" == previous ]]; then [[ "$ROLLBACK_FAIL" == 0 ]]; else [[ "$STATIC_FAIL" == 0 ]]; fi;;
     *) return 99;;
@@ -530,8 +642,11 @@ python3() {
                        PIPELINE_FAIL=str(int(pipeline_fail)), ROOT_CHANGED=str(int(root_change)),
                        COVERAGE_FAIL=str(int(coverage_fail)), ROLLBACK_FAIL=str(int(rollback_fail)),
                        SOURCE_FRESHNESS_FAIL=str(int(source_freshness_fail)),
+                       DYNAMIC_ROUTE=str(int(dynamic_route)), SHARED_ROUTE=str(int(shared_route)),
                        HALTEWECKER_ACTIVATION_DRY_RUN=str(int(dry_run)))
-            result = subprocess.run(["bash", "-c", harness + functions + "\nactivate_incremental_production"],
+            entry = ("capture_full_sqlite_activation_state\nactivate_route_recall_shared_sqlite"
+                     if full_sqlite else "activate_incremental_production")
+            result = subprocess.run(["bash", "-c", harness + functions + "\n" + entry],
                                     env=env, capture_output=True, text=True)
             target = os.readlink(root / "current-release")
             rollback_pointer = root / "rollback"
@@ -599,6 +714,54 @@ python3() {
         self.assertEqual(target, "previous")
         self.assertEqual(rollback_target, "saved-rollback")
         self.assertEqual(previous_target, "saved-previous")
+
+    def test_dynamic_route_follows_new_root_without_restart_or_recreation(self):
+        result, target, calls, probes, image, rollback, _ = self.activate(root_change=True, dynamic_route=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(target, "releases/incremental/candidate")
+        self.assertEqual(image, "image-original")
+        self.assertIsNone(rollback)
+        self.assertIn("shared-route", probes)
+        self.assertNotIn("reload-route", probes)
+        for forbidden in ("restart", "compose", "build", "pull", "rename"):
+            self.assertNotIn(forbidden, calls)
+
+    def test_stale_dynamic_route_rolls_back_without_restart(self):
+        result, target, calls, probes, image, rollback, _ = self.activate(
+            root_change=True, dynamic_route=True, route_fail=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(target, "previous")
+        self.assertEqual(image, "image-original")
+        self.assertIsNone(rollback)
+        self.assertIn("restore-route", probes)
+        self.assertNotIn("--reload", probes)
+        for forbidden in ("restart", "compose", "build", "pull", "rename"):
+            self.assertNotIn(forbidden, calls)
+
+    def test_dynamic_full_sqlite_activation_does_not_restart_shared_route(self):
+        result, _, calls, probes, image, _, _ = self.activate(
+            root_change=True, dynamic_route=True, shared_route=True, full_sqlite=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(image, "image-original")
+        self.assertIn("shared-route", probes)
+        self.assertNotIn("reload-route", probes)
+        for forbidden in ("restart", "compose", "build", "pull", "rename"):
+            self.assertNotIn(forbidden, calls)
+
+    def test_legacy_shared_image_keeps_reload_with_same_pointer_environment(self):
+        result, _, calls, probes, image, _, _ = self.activate(
+            root_change=True, dynamic_route=False, shared_route=True, full_sqlite=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(image, "image-original")
+        self.assertIn("reload-route", probes)
+        self.assertEqual(calls.count("restart routerecall-api"), 1)
+        self.assertNotIn("build", calls)
+
+    def test_legacy_shared_image_with_reused_root_does_not_restart(self):
+        result, _, calls, probes, _, _, _ = self.activate(shared_route=True, full_sqlite=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("reload-route", probes)
+        self.assertNotIn("restart", calls)
 
     def test_changed_stop_data_root_restarts_same_image_only(self):
         result, target, calls, probes, image, rollback_target, _ = self.activate(root_change=True)

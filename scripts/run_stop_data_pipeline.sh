@@ -241,6 +241,7 @@ ROUTERECALL_ACTIVE_IMAGE=""
 ROUTERECALL_ACTIVE_CONTAINER_ID=""
 ROUTERECALL_ORIGINAL_SHARED_DATABASE=0
 ROUTERECALL_ACTIVE_SHARED_DATABASE=0
+ROUTERECALL_DYNAMIC_RELEASE_POINTER=0
 ROUTERECALL_ACTIVATION_RELOAD=0
 ROUTERECALL_PREVIOUS_CONTAINER_PRESERVED=0
 ROUTERECALL_PREVIOUS_CONTAINER_NAME=""
@@ -967,6 +968,23 @@ capture_route_recall_state() {
     ROUTERECALL_ORIGINAL_SHARED_DATABASE=1
   fi
   ROUTERECALL_ACTIVE_SHARED_DATABASE="$ROUTERECALL_ORIGINAL_SHARED_DATABASE"
+  ROUTERECALL_DYNAMIC_RELEASE_POINTER=0
+  if [[ "$ROUTERECALL_ORIGINAL_SHARED_DATABASE" == "1" ]] && \
+     printf '%s\n' "$environment" | grep -qx 'ROUTERECALL_RELEASE_POINTER=/data/haltewecker/current-release' && \
+     docker exec -e PYTHONDONTWRITEBYTECODE=1 "$container" python3 -c '
+import sys
+sys.path.insert(0, "/app/services")
+import routerecall_api as api
+factory_code = getattr(getattr(api, "create_server", None), "__code__", None)
+if not (hasattr(api, "TransitReleaseRepositoryPool")
+        and factory_code is not None
+        and "TransitReleaseRepositoryPool" in factory_code.co_names
+        and "repository_pool" in factory_code.co_consts):
+    raise SystemExit(1)
+' >/dev/null 2>&1; then
+    # The environment alone is insufficient: older images can still pin stop-data.
+    ROUTERECALL_DYNAMIC_RELEASE_POINTER=1
+  fi
 }
 
 activate_route_recall_shared_sqlite() {
@@ -1158,7 +1176,8 @@ from pathlib import Path
 print(Path(sys.argv[1]).resolve(strict=True))
 PY
 )" || return 1
-  if [[ "$candidate_stop_data_root" != "$old_stop_data_root" ]]; then
+  if [[ "$candidate_stop_data_root" != "$old_stop_data_root" && \
+        "${ROUTERECALL_DYNAMIC_RELEASE_POINTER:-0}" != "1" ]]; then
     ROUTERECALL_ACTIVATION_RELOAD=1
   fi
   activation_disk_preflight
@@ -1269,15 +1288,13 @@ activate_incremental_production() {
   old_release="$(basename "$(readlink -f "$CURRENT_RELEASE")")"
   if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" != "1" ]]; then
     old_release="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["releaseID"])' "$CURRENT_RELEASE/release.json")" || return 1
-    ROUTERECALL_ACTIVATION_IMAGE="$(docker inspect --format '{{.Image}}' "${HALTEWECKER_ROUTERECALL_CONTAINER_NAME:-routerecall-api}")" || return 1
-    ROUTERECALL_ACTIVATION_CONTAINER_ID="$(docker inspect --format '{{.Id}}' "${HALTEWECKER_ROUTERECALL_CONTAINER_NAME:-routerecall-api}")" || return 1
-    ROUTERECALL_ACTIVE_IMAGE="$ROUTERECALL_ACTIVATION_IMAGE"
-    ROUTERECALL_ACTIVE_CONTAINER_ID="$ROUTERECALL_ACTIVATION_CONTAINER_ID"
+    capture_route_recall_state || return 1
     [[ -n "$ROUTERECALL_ACTIVATION_IMAGE" && -n "$ROUTERECALL_ACTIVATION_CONTAINER_ID" ]] || return 1
     ROUTERECALL_ACTIVATION_STOP_DATA_ROOT="$(python3 "$REPO/scripts/active_release_readiness.py" stop-data-root --release-root "$CURRENT_RELEASE")" || return 1
     local candidate_stop_data_root
     candidate_stop_data_root="$(python3 "$REPO/scripts/active_release_readiness.py" stop-data-root --release-root "$INCREMENTAL_RELEASE_DIR")" || return 1
-    if [[ "$candidate_stop_data_root" != "$ROUTERECALL_ACTIVATION_STOP_DATA_ROOT" ]]; then
+    if [[ "$candidate_stop_data_root" != "$ROUTERECALL_ACTIVATION_STOP_DATA_ROOT" && \
+          "${ROUTERECALL_DYNAMIC_RELEASE_POINTER:-0}" != "1" ]]; then
       ROUTERECALL_ACTIVATION_RELOAD=1
     fi
   fi
@@ -1342,7 +1359,7 @@ activate_incremental_production() {
     rollback_incremental_consumers "$old_target" "$old_release" || echo "[Nightly] ERROR: rollback readiness failed; operator recovery required" >&2
     return 1
   }
-  # The DB adapter hot-reloads; the API's resolved stop-data root is startup-bound.
+  # Only legacy APIs have a startup-bound stop-data root; dynamic APIs hot-reload both.
   if [[ "$ROUTERECALL_ACTIVATION_RELOAD" == "1" ]]; then
     if ! python3 "$REPO/scripts/active_release_readiness.py" reload-route \
         --container "${HALTEWECKER_ROUTERECALL_CONTAINER_NAME:-routerecall-api}" \

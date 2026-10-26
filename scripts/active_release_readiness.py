@@ -10,9 +10,17 @@ from pathlib import Path
 
 ROUTE_PROBE = '''
 import json
+import os
+import sys
+from pathlib import Path
 from urllib.parse import quote, urlencode
 from urllib.request import urlopen
 root = "http://127.0.0.1:8091/routerecall/v1"
+pointer = None
+expected_release = None
+if sys.argv[1:] == ["--shared-release"]:
+    pointer = Path(os.environ["ROUTERECALL_RELEASE_POINTER"])
+    expected_release = pointer.resolve(strict=True)
 for city, line in (("berlin", "100"), ("wuppertal", "635")):
     with urlopen(root + "/lines/search?" + urlencode(dict(city=city, line=line)), timeout=15) as response:
         if response.status != 200:
@@ -20,13 +28,20 @@ for city, line in (("berlin", "100"), ("wuppertal", "635")):
         payload = json.load(response)
     selected = next(item for item in payload["lines"]
                     if item.get("providerID") == "germany" and item.get("patterns"))
+    if expected_release is not None and selected.get("releaseID") != expected_release.name:
+        raise RuntimeError("RouteRecall search is serving a stale or unexpected transit release")
     pattern = selected["patterns"][0]["id"]
     path = "/lines/" + quote(selected["id"], safe="") + "/patterns/" + quote(pattern, safe="")
     with urlopen(root + path + "?" + urlencode(dict(city=city)), timeout=15) as response:
         if response.status != 200:
             raise RuntimeError("Germany pattern did not return HTTP 200")
-        if not json.load(response)["pattern"].get("stops"):
+        payload = json.load(response)
+        if not payload["pattern"].get("stops"):
             raise RuntimeError("Germany pattern has no stops")
+        if expected_release is not None and payload.get("line", {}).get("releaseID") != expected_release.name:
+            raise RuntimeError("RouteRecall pattern is serving a stale or unexpected transit release")
+if pointer is not None and pointer.resolve(strict=True) != expected_release:
+    raise RuntimeError("Active transit release changed during RouteRecall readiness")
 '''
 
 
@@ -239,7 +254,7 @@ def check_shared_route(container: str, image: str, identifier: str) -> None:
         raise RuntimeError("RouteRecall is not configured for the shared departures SQLite")
     if environment.get("ROUTERECALL_RELEASE_POINTER") != "/data/haltewecker/current-release":
         raise RuntimeError("RouteRecall release pointer is not the shared release pointer")
-    docker("exec", container, "python3", "-c", ROUTE_PROBE)
+    docker("exec", container, "python3", "-c", ROUTE_PROBE, "--shared-release")
     require_identity(container, image, identifier)
 
 
