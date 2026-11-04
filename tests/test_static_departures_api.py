@@ -1724,5 +1724,131 @@ class StaticDeparturesStaticFileTests(unittest.TestCase):
                     self.assertEqual(status, 404)
 
 
+class CityIDCompatibilityTests(unittest.TestCase):
+    aliases = {
+        "bremen": "bremen-04011000",
+        "ennepetal": "ennepetal-05954008",
+        "koeln": "koln",
+        "munchen": "muenchen",
+    }
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        (self.root / "stops").mkdir()
+        database_path = self.root / "current.sqlite"
+        write_database(database_path, "city-id-compatibility")
+        with sqlite3.connect(database_path) as database:
+            database.execute("DELETE FROM city_aliases")
+            for canonical in self.aliases.values():
+                database.execute(
+                    "INSERT OR IGNORE INTO city_stops "
+                    "SELECT ?, stop_id FROM city_stops WHERE city_id='dresden'",
+                    (canonical,),
+                )
+                (self.root / "stops" / f"{canonical}.json").write_text(json.dumps([
+                    {"id": "stop-platform", "latitude": 53.0, "longitude": 8.8},
+                    {"id": "terminal", "latitude": 53.1, "longitude": 8.9},
+                ]))
+        patcher = mock.patch.object(static_departures_api, "STATIC_DATA_ROOT", str(self.root))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.server = StaticDeparturesHTTPServer(database_path)
+        self.server.__enter__()
+        self.addCleanup(self.server.__exit__)
+
+    def test_old_and_canonical_ids_return_identical_boards_and_lines_without_database_aliases(self) -> None:
+        for alias, canonical in self.aliases.items():
+            for endpoint, collection in (("board", "departures"), ("lines", "lines")):
+                with self.subTest(alias=alias, endpoint=endpoint):
+                    path = f"/static-departures/{endpoint}?stopID=stop-parent&cityID="
+                    expected = self.server.get(path + canonical)
+                    actual = self.server.get(path + alias)
+                    self.assertEqual(actual.pop("requestedCityID"), alias)
+                    self.assertEqual(actual, expected)
+                    self.assertEqual(actual["cityID"], canonical)
+                    self.assertTrue(actual[collection])
+
+    def test_trip_details_use_canonical_membership_and_coordinates(self) -> None:
+        for alias, canonical in self.aliases.items():
+            with self.subTest(alias=alias):
+                path = "/static-departures/trip?tripID=trip-1&serviceDate=2026-07-28&cityID="
+                expected = self.server.get(path + canonical)
+                actual = self.server.get(path + alias)
+                self.assertEqual(actual, expected)
+                self.assertEqual(actual["stops"][0]["latitude"], 53.0)
+                self.assertEqual(actual["stops"][1]["longitude"], 8.9)
+
+    def test_legacy_city_export_accepts_old_ids(self) -> None:
+        with sqlite3.connect(self.root / "current.sqlite") as database:
+            database.execute(
+                "CREATE TABLE provider_city_stops (provider_id, city_id, stop_id)"
+            )
+            database.execute(
+                "INSERT INTO provider_city_stops "
+                "SELECT 'germany', city_id, stop_id FROM city_stops"
+            )
+            database.execute(
+                "INSERT OR IGNORE INTO active_services VALUES ('service-1', ?)",
+                (date.today().strftime("%Y%m%d"),),
+            )
+        for alias, canonical in self.aliases.items():
+            with self.subTest(alias=alias):
+                actual = self.server.get(f"/departures/{alias}.json")
+                expected = self.server.get(f"/departures/{canonical}.json")
+                for key in ("timezone", "stops", "platforms"):
+                    self.assertEqual(actual[key], expected[key])
+                self.assertTrue(actual["stops"])
+
+    def test_static_packages_and_head_resolve_both_path_prefixes(self) -> None:
+        for prefix in ("/static-stop-data/", "/static-stop-data-dev/"):
+            for alias, canonical in self.aliases.items():
+                with self.subTest(prefix=prefix, alias=alias):
+                    path = f"{prefix}stops/{alias}.json"
+                    expected = (self.root / "stops" / f"{canonical}.json").read_bytes()
+                    with urlopen(self.server.base_url + path, timeout=5) as response:
+                        self.assertEqual(response.read(), expected)
+                    request = Request(self.server.base_url + path, method="HEAD")
+                    with urlopen(request, timeout=5) as response:
+                        self.assertEqual(int(response.headers["Content-Length"]), len(expected))
+                        self.assertEqual(response.read(), b"")
+
+    def test_aliases_follow_atomically_replaced_packages_without_creating_files(self) -> None:
+        canonical = self.aliases["bremen"]
+        path = "/static-stop-data/stops/bremen.json"
+        self.assertEqual(len(self.server.get(path)), 2)
+        replacement = self.root / "stops" / ".replacement.json"
+        replacement.write_text('[{"id":"new-generation"}]')
+        replacement.replace(self.root / "stops" / f"{canonical}.json")
+        self.assertEqual(self.server.get(path), [{"id": "new-generation"}])
+        self.assertFalse((self.root / "stops" / "bremen.json").exists())
+
+    def test_unknown_cities_and_unrelated_stops_remain_not_found(self) -> None:
+        for path in (
+            "/static-departures/board?cityID=unknown&stopID=stop-parent",
+            "/static-departures/board?cityID=bremen&stopID=unrelated-stop",
+            "/static-stop-data/stops/radomsko.json",
+            "/static-stop-data/stops/%2e%2e/bremen.json",
+        ):
+            with self.subTest(path=path), self.assertRaises(HTTPError) as raised:
+                self.server.get(path)
+            expected = 403 if "%2e%2e" in path else 404
+            self.assertEqual(raised.exception.code, expected)
+
+    def test_parallel_alias_requests_keep_their_own_city_identity(self) -> None:
+        requested = list(self.aliases) * 8
+        def fetch(alias: str) -> tuple[str, dict[str, object]]:
+            return alias, self.server.get(
+                f"/static-departures/board?cityID={alias}&stopID=stop-parent&limit=1"
+            )
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(fetch, requested))
+        for alias, payload in results:
+            self.assertEqual(payload["cityID"], self.aliases[alias])
+            self.assertEqual(payload["requestedCityID"], alias)
+            self.assertEqual(len(payload["departures"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

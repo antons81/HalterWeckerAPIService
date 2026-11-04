@@ -1,0 +1,8 @@
+# Created by Anton Stremovskiy on 03.11.2026.
+# Import inside api.asoftlabs.app before its catch-all handle.
+# Canonical IDs are resolved from config/city-id-aliases.json by the API.
+@legacyCityPackages path_regexp legacyCityPackages ^/(stops|lines|routes)/(bremen|ennepetal|koeln|munchen)\.json$
+handle @legacyCityPackages {
+    rewrite * /static-stop-data{uri}
+    reverse_proxy static-departures-api:8080
+}

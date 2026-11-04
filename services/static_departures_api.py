@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import re
 import resource
 import shutil
 import sqlite3
@@ -18,7 +19,8 @@ from datetime import date, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Callable
+from types import MappingProxyType
+from typing import Callable, Mapping
 from urllib.parse import parse_qs, unquote, urlparse
 from zoneinfo import ZoneInfo
 
@@ -96,6 +98,30 @@ try:
 except ImportError:
     from services.vbb_overlay_provider import normalize_vbb_radar_manifest
 
+
+def load_city_id_aliases() -> Mapping[str, str]:
+    """Load one immutable compatibility registry for all HTTP entry points."""
+    directory = Path(__file__).resolve().parent
+    if directory.name == "services":
+        directory = directory.parent
+    payload = json.loads(
+        (directory / "config" / "city-id-aliases.json").read_text(encoding="utf-8")
+    )
+    pattern = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+    if not isinstance(payload, dict) or any(
+        not isinstance(alias, str)
+        or not isinstance(target, str)
+        or not pattern.fullmatch(alias)
+        or not pattern.fullmatch(target)
+        or alias == target
+        or target in payload
+        for alias, target in payload.items()
+    ):
+        raise ValueError("City ID aliases must map legacy IDs directly to canonical IDs.")
+    return MappingProxyType(payload)
+
+
+CITY_ID_ALIASES = load_city_id_aliases()
 
 DEFAULT_TIMEZONE = "Europe/Berlin"
 MBTA_NAMESPACE = "mbta-boston:"
@@ -2662,7 +2688,8 @@ class Handler(BaseHTTPRequestHandler):
         if cache_control:
             self.send_header("Cache-Control", cache_control)
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def send_ireland_realtime(self, filename: str) -> None:
         """Serve an atomically replaced NTA JSON snapshot without rewriting it."""
@@ -2696,6 +2723,11 @@ class Handler(BaseHTTPRequestHandler):
         segments = [part for part in unquote(relative).split("/") if part not in ("", ".")]
         if any(part == ".." for part in segments):
             return self.send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+        if len(segments) == 2 and segments[0] in {"stops", "lines", "routes"}:
+            filename = segments[1]
+            if filename.endswith(".json"):
+                city_id = filename[:-5]
+                segments[1] = f"{CITY_ID_ALIASES.get(city_id, city_id)}.json"
         candidate = root.joinpath(*segments).resolve()
         try:
             candidate.relative_to(root.resolve())
@@ -2715,7 +2747,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header("Cache-Control", "public, max-age=300, stale-while-revalidate=60")
                     self.end_headers()
                     try:
-                        self.wfile.write(body)
+                        if self.command != "HEAD":
+                            self.wfile.write(body)
                     except OSError:
                         pass
                     return
@@ -2725,8 +2758,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(size))
             self.send_header("Cache-Control", "public, max-age=300, stale-while-revalidate=60")
             self.end_headers()
-            with candidate.open("rb") as source:
-                shutil.copyfileobj(source, self.wfile)
+            if self.command != "HEAD":
+                with candidate.open("rb") as source:
+                    shutil.copyfileobj(source, self.wfile)
         except OSError:
             try:
                 self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -2807,6 +2841,15 @@ class Handler(BaseHTTPRequestHandler):
         except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError, KeyError):
             LOGGER.exception("Invalid Israel static request path=%s", parsed_path)
             return self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Israel static data unavailable"})
+
+    def do_HEAD(self) -> None:
+        parsed_path = urlparse(self.path).path
+        for prefix in STATIC_DATA_PATH_PREFIXES:
+            if parsed_path.startswith(prefix):
+                return self.send_static_file(parsed_path[len(prefix):])
+        self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
+        self.send_header("Allow", "GET, POST")
+        self.end_headers()
 
     def do_GET(self) -> None:
         parsed, query = urlparse(self.path), parse_qs(urlparse(self.path).query)
@@ -2965,7 +3008,8 @@ class Handler(BaseHTTPRequestHandler):
                     for character in city_id
                 ):
                     return self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
-                payload = self.database.legacy_city_departures(city_id)
+                canonical_city = CITY_ID_ALIASES.get(city_id, city_id)
+                payload = self.database.legacy_city_departures(canonical_city)
                 if payload is None:
                     return self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return self.send_json(
@@ -2979,7 +3023,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not city_id or not trip_id:
                     return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "cityID and tripID are required"})
                 try:
-                    details = self.database.trip_details(city_id, trip_id, STATIC_DATA_ROOT, query.get("serviceDate", [None])[0])
+                    canonical_city = CITY_ID_ALIASES.get(city_id, city_id)
+                    details = self.database.trip_details(canonical_city, trip_id, STATIC_DATA_ROOT, query.get("serviceDate", [None])[0])
                 except ValueError:
                     return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid trip request"})
                 if details is None:
@@ -2988,7 +3033,7 @@ class Handler(BaseHTTPRequestHandler):
             city, stop = query.get("cityID", [None])[0], query.get("stopID", [None])[0]
             if not city or not stop:
                 return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "cityID and stopID are required"})
-            resolved_city = self.database.resolve_city(city)
+            resolved_city = self.database.resolve_city(CITY_ID_ALIASES.get(city, city))
             if not city_has_requested_stop(self.database, resolved_city, stop):
                 return self.send_json(HTTPStatus.NOT_FOUND, {"error": "unknown cityID/stopID"})
             if parsed.path == "/static-departures/lines":
