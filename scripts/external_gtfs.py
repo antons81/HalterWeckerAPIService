@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import math
 import os
 import re
@@ -160,6 +161,9 @@ except ImportError:
         departure_partition_key,
         departure_stop_set_digest,
     )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 # Sweden's legacy trip index applies headsigns collected from all provider
@@ -2099,14 +2103,34 @@ def build_external_lines_bounded(
                 if str(row.get("route_id", "")).strip()
             ),
         )
-        connection.executemany(
-            "INSERT INTO trip_routes VALUES (?, ?)",
-            (
-                (str(row.get("trip_id", "")).strip(), str(row.get("route_id", "")).strip())
-                for row in _source_iter_table(archive, "trips.txt", context)
-                if str(row.get("trip_id", "")).strip() and str(row.get("route_id", "")).strip()
-            ),
-        )
+        duplicate_count = 0
+        trip_routes = connection.cursor()
+        for row in _source_iter_table(archive, "trips.txt", context):
+            trip_id = str(row.get("trip_id", "")).strip()
+            route_id = str(row.get("route_id", "")).strip()
+            if not trip_id or not route_id:
+                continue
+            trip_routes.execute(
+                "INSERT INTO trip_routes VALUES (?, ?) ON CONFLICT(trip_id) DO NOTHING",
+                (trip_id, route_id),
+            )
+            if trip_routes.rowcount:
+                continue
+            (existing_route_id,) = trip_routes.execute(
+                "SELECT route_id FROM trip_routes WHERE trip_id = ?", (trip_id,)
+            ).fetchone()
+            if existing_route_id != route_id:
+                raise ValueError(
+                    f"GTFS trips.txt has conflicting route_id values for trip_id {trip_id!r} "
+                    f"(namespace={namespace!r}): {existing_route_id!r} and {route_id!r}"
+                )
+            duplicate_count += 1
+        if duplicate_count:
+            LOGGER.warning(
+                "[ExternalGTFS] stage=lines namespace=%r duplicate_trip_route_rows=%d",
+                namespace,
+                duplicate_count,
+            )
         connection.executemany(
             "INSERT INTO feed_stops VALUES (?, ?)",
             (

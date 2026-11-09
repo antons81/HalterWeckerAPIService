@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import urllib.error
 import zipfile
+from contextlib import closing
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -2276,7 +2277,8 @@ class ExternalStopAndDepartureTests(unittest.TestCase):
                 _, package_stops = build_external_stop_packages(
                     archive, cities, out, stop_id_mode="exact"
                 )
-                lines = build_external_lines(archive, package_stops)
+                with self.assertNoLogs(external_gtfs_module.LOGGER, level="WARNING"):
+                    lines = build_external_lines(archive, package_stops)
                 build_external_departure_index(
                     archive, cities, out, timezone_name="Europe/Stockholm"
                 )
@@ -2300,6 +2302,81 @@ class ExternalStopAndDepartureTests(unittest.TestCase):
             self.assertEqual(by_trip["T3"]["p"], "25:15:00")
             # exact IDs only — no shortened alternate keys
             self.assertNotIn("0001001", departures["stops"])
+
+    def test_lines_accept_repeated_trip_routes_without_changing_services(self) -> None:
+        trips = (
+            "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+            "R1,S1,T1,Depot,0\n"
+            "R1,S2,T1,Depot,0\n"
+            "R1,S3,T1,Depot,0\n"
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            archive_path = _gtfs_zip(
+                Path(temp) / "duplicates.zip",
+                stops=(
+                    "stop_id,stop_name,stop_lat,stop_lon\n"
+                    "9022001000001001,Central,59.331,18.058\n"
+                ),
+                trips=trips,
+            )
+            stop_id = "israel:9022001000001001"
+            package_stops = {"city": [{"id": stop_id}]}
+            expected = {
+                stop_id: {
+                    "israel:R1": {
+                        "routeID": "israel:R1",
+                        "agencyID": None,
+                        "names": ["17", "Line 17"],
+                        "routeType": 0,
+                    },
+                },
+            }
+            with zipfile.ZipFile(archive_path) as archive:
+                with closing(NormalizedProviderContext.from_archive(archive)) as context:
+                    for input_context in (None, context):
+                        with self.subTest(normalized=input_context is not None):
+                            with self.assertLogs(external_gtfs_module.LOGGER, level="WARNING") as logs:
+                                lines = build_external_lines(
+                                    archive, package_stops, namespace="israel:", context=input_context
+                                )
+                            self.assertEqual(lines, expected)
+                            self.assertEqual(len(logs.records), 1)
+                            self.assertIn("duplicate_trip_route_rows=2", logs.output[0])
+
+                    self.assertCountEqual(
+                        [row["service_id"] for row in context.iter_table("trips.txt")],
+                        ["S1", "S2", "S3"],
+                    )
+                self.assertEqual(archive.read("trips.txt").decode(), trips)
+
+    def test_lines_reject_conflicting_routes_for_one_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            archive_path = _gtfs_zip(
+                Path(temp) / "conflict.zip",
+                stops=(
+                    "stop_id,stop_name,stop_lat,stop_lon\n"
+                    "9022001000001001,Central,59.331,18.058\n"
+                ),
+                routes=(
+                    "route_id,route_short_name,route_long_name,route_type\n"
+                    "R1,17,Line 17,0\n"
+                    "R2,18,Line 18,0\n"
+                ),
+                trips=(
+                    "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+                    "R1,S1,T1,Depot,0\n"
+                    "R2,S2,T1,Central,0\n"
+                ),
+            )
+            package_stops = {"city": [{"id": "9022001000001001"}]}
+            with zipfile.ZipFile(archive_path) as archive:
+                with closing(NormalizedProviderContext.from_archive(archive)) as context:
+                    for input_context in (None, context):
+                        with self.subTest(normalized=input_context is not None):
+                            with self.assertRaisesRegex(
+                                ValueError, r"conflicting route_id values for trip_id 'T1'.*'R1' and 'R2'"
+                            ):
+                                build_external_lines(archive, package_stops, context=input_context)
 
     def test_calendar_dates_only_feed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
