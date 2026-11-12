@@ -639,6 +639,37 @@ PY
             return []
         return self.systemctl_log.read_text(encoding="utf-8").splitlines()
 
+    def test_new_release_id_uses_berlin_day_and_explicit_seasonal_timezone(self) -> None:
+        self.write_mock("date", """#!/usr/bin/env bash
+if [ "$#" = 1 ] && [ "$1" = "+%Y%m%dT%H%M%S%Z" ]; then
+  exec "$REAL_PYTHON" - "$TZ" "$TEST_RELEASE_INSTANT" <<'PY_DATE'
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import sys
+
+assert sys.argv[1] == "Europe/Berlin"
+instant = datetime.fromisoformat(sys.argv[2])
+print(instant.astimezone(ZoneInfo(sys.argv[1])).strftime("%Y%m%dT%H%M%S%Z"))
+PY_DATE
+fi
+exec /bin/date "$@"
+""")
+        for instant, expected in (
+            ("2026-11-11T23:35:00+00:00", "20261112T003500CET"),
+            ("2026-06-11T22:35:00+00:00", "20260612T003500CEST"),
+            ("2026-12-31T23:35:00+00:00", "20270101T003500CET"),
+            ("2026-10-25T00:35:00+00:00", "20261025T023500CEST"),
+            ("2026-10-25T01:35:00+00:00", "20261025T023500CET"),
+        ):
+            with self.subTest(instant=instant):
+                result = self.run_pipeline("--stop-data-only", TZ="UTC", TEST_RELEASE_INSTANT=instant)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertRegex(result.stdout, rf"release={expected}-[0-9]+")
+                self.assertTrue(any(
+                    path.name.startswith(expected + "-")
+                    for path in (self.data_root / "releases").iterdir()
+                ))
+
     def test_nightly_systemd_path_is_explicit_incremental_and_non_legacy(self) -> None:
         wrapper = NIGHTLY_WRAPPER.read_text(encoding="utf-8")
         service = NIGHTLY_SERVICE.read_text(encoding="utf-8")

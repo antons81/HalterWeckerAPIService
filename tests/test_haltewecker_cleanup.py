@@ -32,6 +32,8 @@ class HalteWeckerCleanupTests(unittest.TestCase):
         simulate_root: bool = False,
         lock_service_user: str | None = None,
         pipeline_active: bool = False,
+        arguments: tuple[str, ...] = (),
+        mode_from_environment: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         systemctl = root / "systemctl"
         systemctl.write_text(
@@ -231,6 +233,8 @@ class HalteWeckerCleanupTests(unittest.TestCase):
                 "HALTEWECKER_RELEASE_RETENTION_COUNT": str(retention_count),
             }
         )
+        if not mode_from_environment:
+            environment.pop("HALTEWECKER_CLEANUP_DRY_RUN", None)
         if simulate_root:
             environment["PATH"] = f"{identity_bin}:{environment['PATH']}"
         for lock in (root / "stop.lock", root / "static.lock", root / "vbb.lock"):
@@ -239,7 +243,7 @@ class HalteWeckerCleanupTests(unittest.TestCase):
                 if lock.name in read_only_locks:
                     lock.chmod(0o444)
         return subprocess.run(
-            [str(CLEANUP_SCRIPT)],
+            [str(CLEANUP_SCRIPT), *arguments],
             env=environment,
             capture_output=True,
             text=True,
@@ -321,6 +325,143 @@ class HalteWeckerCleanupTests(unittest.TestCase):
         (path / "validation-receipt.json").write_text(
             json.dumps({"releaseID": release_id, "result": "PASS"}), encoding="utf-8"
         )
+
+    def test_cli_defaults_to_apply_and_dry_run_needs_no_mode_environment(self) -> None:
+        for arguments in ((), ("--dry-run",)):
+            with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                data = root / "data"
+                old = data / "releases/incremental/20261110T003503CET-old"
+                current = data / "releases/incremental/20261111T003503CET-current"
+                self.make_incremental_release(old, old.name)
+                self.make_incremental_release(current, current.name)
+                (data / "current-release").symlink_to(current)
+                result = self.run_cleaner(
+                    root, data, arguments=arguments, mode_from_environment=False,
+                    pipeline_repo=self.make_summary_helper(root),
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(current.is_dir())
+                self.assertEqual(old.is_dir(), bool(arguments))
+
+    def test_dry_run_argument_overrides_apply_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data = root / "data"
+            old = data / "releases/incremental/20261110T003503CET-old"
+            current = data / "releases/incremental/20261111T003503CET-current"
+            self.make_incremental_release(old, old.name)
+            self.make_incremental_release(current, current.name)
+            (data / "current-release").symlink_to(current)
+            result = self.run_cleaner(
+                root, data, dry_run=False, arguments=("--dry-run",),
+                pipeline_repo=self.make_summary_helper(root),
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(old.is_dir())
+            self.assertTrue(current.is_dir())
+
+    def test_cli_rejects_unknown_arguments_before_accessing_data(self) -> None:
+        for arguments, expected in ((("--unknown",), 64), (("--apply",), 64), (("--help",), 0)):
+            with self.subTest(arguments=arguments):
+                environment = os.environ.copy()
+                environment["DATA_ROOT"] = "/missing-cleanup-test-data"
+                result = subprocess.run(
+                    [str(CLEANUP_SCRIPT), *arguments], env=environment,
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, expected, result.stderr)
+
+    def test_stale_austrian_input_aliases_do_not_block_old_release_cleanup(self) -> None:
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                data = root / "data"
+                old = data / "releases/incremental/20261109T233503Z-old"
+                current = data / "releases/incremental/20261111T003503CET-current"
+                self.make_incremental_release(old, old.name)
+                self.make_incremental_release(current, current.name)
+                (data / "current-release").symlink_to(current)
+                aliases = data / "austria"
+                aliases.mkdir()
+                for index, provider in enumerate(("tirol", "vor", "steiermark", "salzburg")):
+                    target = root / "cache/gtfs/austria" / provider / ("a" * 64 + ".zip")
+                    link = aliases / f"{provider}-2026.zip"
+                    link.symlink_to(target if index % 2 else os.path.relpath(target, aliases))
+                result = self.run_cleaner(
+                    root, data, dry_run=dry_run, pipeline_repo=self.make_summary_helper(root),
+                )
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 0, output)
+                self.assertNotIn("CLEANUP_SKIPPED reason=dependency-graph-unresolved", output)
+                self.assertEqual(output.count("reason=missing-provenance-source"), 8)
+                self.assertEqual(old.is_dir(), dry_run)
+                self.assertTrue(current.is_dir())
+                self.assertTrue(all(link.is_symlink() for link in aliases.iterdir()))
+
+    def test_missing_explicit_runtime_dependency_through_input_alias_blocks_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data = root / "data"
+            old = data / "releases/incremental/20261109T233503Z-old"
+            current = data / "releases/incremental/20261111T003503CET-current"
+            self.make_incremental_release(old, old.name)
+            self.make_incremental_release(current, current.name)
+            (data / "current-release").symlink_to(current)
+            alias = data / "austria/tirol-2026.zip"
+            alias.parent.mkdir()
+            alias.symlink_to(root / "cache/gtfs/austria/tirol" / ("a" * 64 + ".zip"))
+            (current / "release.json").write_text(json.dumps({
+                "releaseID": current.name,
+                "runtimeDependencies": {"feed": {"path": str(alias)}},
+            }))
+            result = self.run_cleaner(
+                root, data, dry_run=False, pipeline_repo=self.make_summary_helper(root),
+            )
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn("CLEANUP_SKIPPED reason=dependency-graph-unresolved", output)
+            self.assertTrue(current.is_dir())
+            self.assertTrue(old.is_dir())
+
+    def test_unrecognized_input_alias_targets_still_block_cleanup(self) -> None:
+        for target_name in ("data/releases/missing/provider.sqlite", "cache/gtfs/austria/vor/" + "a" * 64 + ".zip",
+                            "cache/gtfs/austria/tirol/unknown.zip"):
+            with self.subTest(target=target_name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                data = root / "data"
+                current = data / "releases/incremental/20261111T003503CET-current"
+                self.make_incremental_release(current, current.name)
+                (data / "current-release").symlink_to(current)
+                alias = data / "austria/tirol-2026.zip"
+                alias.parent.mkdir()
+                alias.symlink_to(root / target_name)
+                result = self.run_cleaner(root, data)
+                output = result.stdout + result.stderr
+                self.assertIn("CLEANUP_SKIPPED reason=dependency-graph-unresolved", output)
+                self.assertTrue(current.is_dir())
+
+    def test_retention_orders_local_and_utc_release_names_by_actual_time(self) -> None:
+        for older_name, newer_name, active_name in (
+            ("20261112T001000CET-old", "20261111T232000Z-newer", "20261112T030000CET-current"),
+            ("20261025T025900CEST-old", "20261025T020100CET-newer", "20261025T040000CET-current"),
+        ):
+            with self.subTest(older=older_name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                data = root / "data"
+                releases = data / "releases/incremental"
+                old, newer, current = (releases / name for name in (older_name, newer_name, active_name))
+                for release in (old, newer, current):
+                    self.make_incremental_release(release, release.name)
+                (data / "current-release").symlink_to(current)
+                result = self.run_cleaner(
+                    root, data, dry_run=False, retention_count=2,
+                    pipeline_repo=self.make_summary_helper(root),
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(old.exists(), result.stdout)
+                self.assertTrue(newer.is_dir())
+                self.assertTrue(current.is_dir())
 
     def test_cleanup_and_pipeline_share_the_canonical_default_root(self) -> None:
         cleanup_source = CLEANUP_SCRIPT.read_text(encoding="utf-8")

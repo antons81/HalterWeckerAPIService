@@ -6,12 +6,33 @@ FLOCK_BIN="${FLOCK_BIN:-flock}"
 LSOF_BIN="${LSOF_BIN:-lsof}"
 DOCKER_BIN="${DOCKER_BIN:-docker}"
 RUNUSER_BIN="${RUNUSER_BIN:-runuser}"
+DRY_RUN="${HALTEWECKER_CLEANUP_DRY_RUN:-0}"
+for argument in "$@"; do
+    case "$argument" in
+        --dry-run)
+            DRY_RUN=1
+            ;;
+        --help|-h)
+            echo "Usage: $0 [--dry-run]"
+            echo "Without arguments, apply the configured cleanup policy."
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $argument. Use --help." >&2
+            exit 64
+            ;;
+    esac
+done
+
 DATA_ROOT="${DATA_ROOT:-/srv/haltewecker/data}"
 DATA="$(cd "$DATA_ROOT" && pwd -P)"
 RELEASES="$DATA/releases"
 DEPARTURE_RELEASES="$DATA/departures/releases"
 ROLLBACK_ROOT="$DATA/temp/current-rollback"
-DRY_RUN="${HALTEWECKER_CLEANUP_DRY_RUN:-0}"
+if [[ "$DRY_RUN" != "0" && "$DRY_RUN" != "1" ]]; then
+    echo "Cleanup mode must be 0 or 1" >&2
+    exit 64
+fi
 ABANDONED_RELEASE_MAX_AGE_HOURS="${HALTEWECKER_ABANDONED_RELEASE_MAX_AGE_HOURS:-12}"
 PIPELINE_REPO="${HALTEWECKER_PIPELINE_REPO:-/srv/haltewecker/pipeline/HalterWeckerAPIService}"
 GTFS_CACHE_ROOT="${GTFS_CACHE_ROOT:-$DATA/cache/gtfs}"
@@ -272,13 +293,12 @@ dependency_reason_for_path() {
 dependency_enqueue() {
     local path="$1"
     local reason="$2"
-    local target raw_target lexical_target
+    local target lexical_target
 
     if [[ -L "$path" ]]; then
-        raw_target="$(readlink -- "$path" 2>/dev/null || true)"
         target="$(readlink -f -- "$path" 2>/dev/null || true)"
         if [[ -z "$target" || ! -e "$path" ]]; then
-            lexical_target="$(readlink -m -- "$(dirname "$path")/$raw_target" 2>/dev/null || true)"
+            lexical_target="$(readlink -m -- "$path" 2>/dev/null || true)"
             DEPENDENCY_GRAPH_UNRESOLVED=1
             dependency_mark_path "$lexical_target" "$reason;unresolved-dependency"
             echo "KEEP   $lexical_target reason=$reason;unresolved-dependency"
@@ -453,9 +473,34 @@ emit_unresolved_dependency_keeps() {
     done
 }
 
-while IFS= read -r -d '' symlink_path; do
-    dependency_enqueue "$symlink_path" "active-symlink:$symlink_path"
-done < <(find "$DATA" -path "$RELEASES" -prune -o -type l -print0)
+is_austrian_gtfs_input_alias() {
+    local path="$1"
+    local name source_id target expected_directory
+    [[ "$(dirname "$path")" == "$DATA/austria" ]] || return 1
+    name="${path##*/}"
+    [[ "$name" =~ ^([[:alnum:]][[:alnum:]_-]*)-[0-9]{4}\.zip$ ]] || return 1
+    source_id="${BASH_REMATCH[1]}"
+    target="$(readlink -m -- "$path" 2>/dev/null || true)"
+    expected_directory="$(readlink -m -- "$GTFS_CACHE_ROOT/austria/$source_id" 2>/dev/null || true)"
+    [[ -n "$target" && -n "$expected_directory" &&
+       "$(dirname "$target")" == "$expected_directory" &&
+       "${target##*/}" =~ ^[0-9a-f]{64}\.zip$ ]]
+}
+
+enqueue_data_symlinks() {
+    local symlink_path
+    while IFS= read -r -d '' symlink_path; do
+        # These aliases identify raw inputs. Explicit runtime dependencies below
+        # still pass through dependency_enqueue and must resolve successfully.
+        if is_austrian_gtfs_input_alias "$symlink_path"; then
+            [[ -e "$symlink_path" ]] || echo "WARNING $symlink_path reason=missing-provenance-source"
+            continue
+        fi
+        dependency_enqueue "$symlink_path" "active-symlink:$symlink_path"
+    done < <(find "$DATA" -path "$RELEASES" -prune -o -type l -print0)
+}
+
+enqueue_data_symlinks
 
 while IFS= read -r -d '' symlink_path; do
     if [[ "$symlink_path" == "$RELEASES/pilot-current" ]]; then
@@ -569,7 +614,24 @@ for rollback_path in "$ROLLBACK_ROOT"/*; do
 done
 
 is_release_name() {
-    [[ "$1" =~ ^((scoped-)?[0-9]{8}T[0-9]{6}Z-[[:alnum:]]+|vbb-refresh-[0-9]{8}T[0-9]{6}Z-[[:alnum:]]+-[[:alnum:]]+)$ ]]
+    [[ "$1" =~ ^((scoped-)?[0-9]{8}T[0-9]{6}(Z|CET|CEST)-[[:alnum:]]+|vbb-refresh-[0-9]{8}T[0-9]{6}Z-[[:alnum:]]+-[[:alnum:]]+)$ ]]
+}
+
+release_sort_timestamp() {
+    python3 - "$1" <<'PYTHON'
+from datetime import datetime, timedelta, timezone
+import sys
+
+timestamp = sys.argv[1]
+for suffix, offset in (("CEST", 2), ("CET", 1), ("Z", 0)):
+    if timestamp.endswith(suffix):
+        local = datetime.strptime(timestamp[:-len(suffix)], "%Y%m%dT%H%M%S")
+        moment = local.replace(tzinfo=timezone(timedelta(hours=offset)))
+        print(moment.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+        break
+else:
+    raise SystemExit("Unrecognized release timestamp")
+PYTHON
 }
 
 is_published_release() {
@@ -785,7 +847,10 @@ for release_path in "${release_entries[@]-}"; do
         scoped-*) sortable_name="${sortable_name#scoped-}" ;;
         vbb-refresh-*) sortable_name="${sortable_name#vbb-refresh-}" ;;
     esac
-    sortable_timestamp="${sortable_name%%-*}"
+    if ! sortable_timestamp="$(release_sort_timestamp "${sortable_name%%-*}")"; then
+        append_reason "$release_key" "invalid-release-timestamp"
+        continue
+    fi
     duplicate_index=-1
     for index in "${!ORDERED_CANDIDATE_IDS[@]}"; do
         if [[ "${ORDERED_CANDIDATE_IDS[$index]}" == "$release_name" ]]; then
@@ -1299,9 +1364,7 @@ cleanup_published_artifacts() {
 
 cleanup_published_artifacts
 
-while IFS= read -r -d '' symlink_path; do
-    dependency_enqueue "$symlink_path" "active-symlink:$symlink_path"
-done < <(find "$DATA" -path "$RELEASES" -prune -o -type l -print0)
+enqueue_data_symlinks
 while IFS= read -r -d '' symlink_path; do
     if [[ "$symlink_path" == "$RELEASES/pilot-current" ]]; then
         dependency_enqueue "$symlink_path" "protected-by-pilot-current"

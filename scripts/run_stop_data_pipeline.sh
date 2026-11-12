@@ -204,7 +204,7 @@ if [[ "$RUN_MODE" == "resume" || "$RUN_MODE" == "activate-existing" ]]; then
   fi
   RELEASE_ID="$TARGET_RELEASE_ID"
 else
-  RELEASE_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  RELEASE_ID="$(TZ=Europe/Berlin date +%Y%m%dT%H%M%S%Z)-$$"
 fi
 RELEASE_DIR="$RELEASES/$RELEASE_ID"
 RELEASE_DIR_PREEXISTED=0
