@@ -241,7 +241,7 @@ PY
 )"
 fi
 
-if [[ -z "$AUSTRIAN_GTFS_PATH" && -d "$AUSTRIAN_GTFS_DIR" && ! -f "$AUSTRIAN_GTFS_DIR/.env" ]]; then
+if [[ -z "$AUSTRIAN_GTFS_PATH" && -z "${AUSTRIAN_GTFS_ARTIFACTS_JSON:-}" && -d "$AUSTRIAN_GTFS_DIR" && ! -f "$AUSTRIAN_GTFS_DIR/.env" && ! -f "$AUSTRIAN_GTFS_DIR/artifacts.json" ]]; then
   while IFS= read -r candidate; do
     AUSTRIAN_GTFS_PATH="$candidate"
   done < <(find "$AUSTRIAN_GTFS_DIR" -maxdepth 1 -type f -name '*.zip' -print | sort)
@@ -261,9 +261,12 @@ fi
 if [[ -n "$RELEASE_ID" ]]; then
   IMPORT_ARGS+=(--release-id "$RELEASE_ID")
 fi
-if [[ -n "$AUSTRIAN_GTFS_PATH" ]]; then
+if [[ -n "${AUSTRIAN_GTFS_ARTIFACTS_JSON:-}" ]]; then
+  IMPORT_ARGS+=(--austrian-gtfs-dir "$AUSTRIAN_GTFS_DIR" --austrian-artifacts "$AUSTRIAN_GTFS_ARTIFACTS_JSON"
+                --austrian-sources "$REPO/config/austrian-sources.json")
+elif [[ -n "$AUSTRIAN_GTFS_PATH" ]]; then
   IMPORT_ARGS+=(--austrian-gtfs "$AUSTRIAN_GTFS_PATH")
-elif [[ -d "$AUSTRIAN_GTFS_DIR" && -f "$AUSTRIAN_GTFS_DIR/.env" ]]; then
+elif [[ -f "$AUSTRIAN_GTFS_DIR/artifacts.json" || ( -d "$AUSTRIAN_GTFS_DIR" && -f "$AUSTRIAN_GTFS_DIR/.env" ) ]]; then
   IMPORT_ARGS+=(--austrian-gtfs-dir "$AUSTRIAN_GTFS_DIR" --austrian-sources "$REPO/config/austrian-sources.json")
 fi
 EXTERNAL_GTFS_IMPORT_ARGS=()

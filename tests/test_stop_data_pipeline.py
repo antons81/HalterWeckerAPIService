@@ -1102,6 +1102,57 @@ assert callable(validate_validation_receipt)
         self.assertIn("run_kind=incremental-no-activate", report)
         self.assertIn(f"release_id={release_id}", report)
 
+    def test_current_austrian_manifest_reaches_stop_and_departure_builds(self) -> None:
+        import hashlib
+        import zipfile
+
+        archive = self.root / "current-austrian.zip"
+        with zipfile.ZipFile(archive, "w") as feed:
+            for table in ("stops.txt", "routes.txt", "trips.txt", "stop_times.txt"):
+                feed.writestr(table, "fixture\n")
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        registry = json.loads((REPOSITORY_ROOT / "config/austrian-sources.json").read_text())
+        fixture = self.root / "austrian-fixture.json"
+        fixture.write_text(json.dumps({"sources": [
+            {"source": source["id"], "datasetId": source["datasetId"], "year": 2027,
+             "path": str(archive), "immutablePath": str(archive), "sha256": digest, "size": archive.stat().st_size}
+            for source in registry
+        ]}))
+        python_mock = self.bin_directory / "python3"
+        code = python_mock.read_text()
+        marker = 'case "${1:-}" in\n'
+        self.assertIn(marker, code)
+        download_case = """  *validate_austrian_stop_packages.py) exit 0 ;;
+  *download_austrian_gtfs.py)
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --output-json) cp "$AUSTRIAN_MANIFEST_FIXTURE" "$2"; shift 2 ;;
+        --output) mkdir -p "$2"; cp "$AUSTRIAN_MANIFEST_FIXTURE" "$2/artifacts.json"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    ;;
+"""
+        python_mock.write_text(code.replace(marker, marker + download_case, 1))
+        static_mock = self.bin_directory / "static-departures-pipeline"
+        static_mock.write_text(static_mock.read_text().replace(
+            'set -euo pipefail\n',
+            'set -euo pipefail\nprintf "%s\\n" "${AUSTRIAN_GTFS_ARTIFACTS_JSON:-}" >> "$AUSTRIAN_STATIC_LOG"\n', 1))
+        env_file = self.root / "custom-mvo.env"
+        env_file.write_text("")
+        austria = self.root / "austrian-inputs"
+        result = self.run_pipeline(
+            MVO_ENV_FILE=str(env_file), AUSTRIAN_DATA_ROOT=str(austria), AUSTRIAN_GTFS_URL="",
+            AUSTRIAN_MANIFEST_FIXTURE=str(fixture), AUSTRIAN_STATIC_LOG=str(self.root / "austrian-static.log"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        import shlex
+        arguments = shlex.split((self.root / "build-args.log").read_text())
+        expected = Path(arguments[arguments.index("--output") + 1]).parent / "austrian-artifacts.json"
+        self.assertEqual(arguments[arguments.index("--austrian-artifacts") + 1], str(expected))
+        self.assertTrue(expected.is_file())
+        self.assertIn(str(expected), (self.root / "austrian-static.log").read_text().splitlines())
+        self.assertFalse((austria / ".env").exists())
+
     def test_incremental_prebuild_reports_missing_austrian_sources_before_build(self) -> None:
         result = self.run_pipeline(
             "--incremental-no-activate",

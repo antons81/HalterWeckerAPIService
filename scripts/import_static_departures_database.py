@@ -3,6 +3,11 @@
 
 from __future__ import annotations
 
+try:
+    from .austrian_artifacts import resolve_austrian_artifacts
+except ImportError:
+    from austrian_artifacts import resolve_austrian_artifacts
+
 import argparse
 import json
 import os
@@ -783,16 +788,15 @@ def import_austrian_gtfs(
     cities_path: Path,
     gtfs_dir: Path,
     registry_path: Path,
+    artifacts_manifest: Path | None = None,
 ) -> set[str]:
     registry = load_austrian_sources(registry_path)
+    inputs = resolve_austrian_artifacts(registry, gtfs_dir, artifacts_manifest)
     expected_city_ids = configured_austrian_static_city_ids(cities_path)
     imported_city_ids: set[str] = set()
     for source in registry:
         source_id = str(source["id"])
-        candidates = sorted(gtfs_dir.glob(f"{source_id}-*.zip"))
-        if not candidates:
-            raise ValueError(f"Missing Austrian GTFS archive for source {source_id}")
-        with load_gtfs_archive(str(candidates[-1])) as archive:
+        with load_gtfs_archive(str(inputs[source_id])) as archive:
             stop_prefix = "" if source.get("preserveStopIDs", False) else str(source["identifierPrefix"])
             timed_stage(
                 f"austria:{source_id}",
@@ -1196,6 +1200,7 @@ def main() -> None:
     parser.add_argument("--gtfs-url", default="")
     parser.add_argument("--austrian-gtfs", default="")
     parser.add_argument("--austrian-gtfs-dir", default="")
+    parser.add_argument("--austrian-artifacts", default="")
     parser.add_argument("--austrian-sources", default=str(DEFAULT_REGISTRY))
     parser.add_argument("--stop-data", required=True, help="Read-only current stop dataset")
     parser.add_argument("--next", default="", help="Fresh database output path (required unless --add-external).")
@@ -1290,6 +1295,7 @@ def main() -> None:
                     Path(args.cities),
                     Path(args.austrian_gtfs_dir),
                     Path(args.austrian_sources),
+                    Path(args.austrian_artifacts) if args.austrian_artifacts else None,
                 )
             elif args.austrian_gtfs:
                 with load_gtfs_archive(args.austrian_gtfs) as austrian_archive:

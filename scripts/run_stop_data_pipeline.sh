@@ -1815,8 +1815,8 @@ run_build_stop_packages() {
     --austrian-sources "$REPO/config/austrian-sources.json"
     --external-gtfs-sources "$REPO/config/external-gtfs-sources.json"
   )
-  if [[ -d "$AUSTRIAN_DATA_ROOT" && -f "$AUSTRIAN_DATA_ROOT/.env" ]]; then
-    cmd+=(--austrian-gtfs-dir "$AUSTRIAN_DATA_ROOT")
+  if [[ -f "$RELEASE_DIR/austrian-artifacts.json" ]]; then
+    cmd+=(--austrian-gtfs-dir "$AUSTRIAN_DATA_ROOT" --austrian-artifacts "$RELEASE_DIR/austrian-artifacts.json")
   else
     cmd+=(--austrian-gtfs-url "${AUSTRIAN_GTFS_URL:-}")
   fi
@@ -2199,8 +2199,13 @@ run_static_departures_stage() {
   if [[ "$REUSE_STOP_DATA" == "1" ]]; then
     ireland_artifacts_release_root="${REUSED_STOP_DATA_SOURCE%/stop-data}"
   fi
+  local austrian_artifacts_json=""
+  if [[ -f "$ireland_artifacts_release_root/austrian-artifacts.json" ]]; then
+    austrian_artifacts_json="$ireland_artifacts_release_root/austrian-artifacts.json"
+  fi
   STATIC_FALLBACK_SHARD_PROVIDER_IDS="" \
 IRELAND_ARTIFACTS_RELEASE_ROOT="$ireland_artifacts_release_root" \
+AUSTRIAN_GTFS_ARTIFACTS_JSON="$austrian_artifacts_json" \
   EXTERNAL_GTFS_ARTIFACTS_JSON="$ARTIFACTS_JSON" \
 STOP_DATA_PATH="$BUILD_DIR" \
 NEXT_DATABASE_PATH="$RELEASE_DIR/departures-next.sqlite" \

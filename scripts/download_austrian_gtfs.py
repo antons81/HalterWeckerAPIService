@@ -320,12 +320,17 @@ def main() -> None:
     cache = GTFSArtifactCache(args.cache_root / "austria")
     results = refresh_sources(load_austrian_sources(args.registry), env, args.output, cache)
     payload = {"sources": results}
+    destinations = {args.output / "artifacts.json"}
     if args.output_json is not None:
-        args.output_json.parent.mkdir(parents=True, exist_ok=True)
-        args.output_json.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        destinations.add(args.output_json)
+    for destination in sorted(destinations):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(f".{destination.name}.{os.getpid()}.next")
+        try:
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
 

@@ -75,6 +75,11 @@ class StaticDeparturesPipelineTests(unittest.TestCase):
             f"log={str(docker_log)!r}\n"
             f"state={str(docker_state)!r}\n"
             "printf '%s\\n' \"$*\" >> \"$log\"\n"
+            "if [[ \"$1\" == image && \"${2:-}\" == inspect ]]; then\n"
+            "  reference=\"${@: -1}\"\n"
+            "  case \"$reference\" in sha256:*) printf '%s\\n' \"$reference\" ;; *) echo sha256:tested ;; esac\n"
+            "  exit 0\n"
+            "fi\n"
             "if [[ \"$1\" == inspect ]]; then\n"
             "  if [[ \"${2:-}\" == --format ]]; then echo sha256:tested; exit 0; fi\n"
             "  name=\"${2:-}\"\n"
@@ -141,6 +146,8 @@ class StaticDeparturesPipelineTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             calls = log.read_text()
             self.assertIn("compose -p haltewecker-static-release-a", calls)
+            self.assertIn("image inspect --format {{.Id}} sha256:tested", calls)
+            self.assertIn("inspect --format {{.Image}} static-departures-api", calls)
             self.assertIn("--no-build --pull never --no-deps --force-recreate", calls)
             self.assertNotIn("--build", calls)
 

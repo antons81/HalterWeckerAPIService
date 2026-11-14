@@ -47,6 +47,10 @@ from static_departures_ownership import (
     register_city_mode,
 )
 from austrian_sources import load_austrian_sources
+try:
+    from .austrian_artifacts import resolve_austrian_artifacts
+except ImportError:
+    from austrian_artifacts import resolve_austrian_artifacts
 
 
 STATIC_CONTAINER_DEFAULT = "static-departures-api"
@@ -352,12 +356,13 @@ def resolve_austrian_archive(
     directory = Path(
         environment.get("AUSTRIAN_GTFS_DIR", str(data_root / "austria"))
     )
-    candidates = sorted(directory.glob(f"{source_id}-*.zip"))
-    if not candidates:
-        raise ValueError(
-            f"No Austrian GTFS archive found for provider {source_id} in {directory}."
-        )
-    return candidates[-1]
+    manifest = environment.get("AUSTRIAN_GTFS_ARTIFACTS_JSON", "").strip()
+    registry = load_austrian_sources()
+    inputs = resolve_austrian_artifacts(
+        registry, directory, Path(manifest) if manifest else None, source_ids={source_id},
+    )
+    return inputs[source_id]
+
 
 
 def import_germany(

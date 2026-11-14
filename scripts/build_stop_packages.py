@@ -3,6 +3,11 @@
 
 from __future__ import annotations
 
+try:
+    from .austrian_artifacts import resolve_austrian_artifacts
+except ImportError:
+    from austrian_artifacts import resolve_austrian_artifacts
+
 import argparse
 import gzip
 import hashlib
@@ -3109,6 +3114,7 @@ def parse_build_stop_packages_args(argv: list[str] | None = None) -> argparse.Na
     parser.add_argument("--output", default="docs/data")
     parser.add_argument("--swiss-gtfs-url", default="")
     parser.add_argument("--austrian-gtfs-url", default="")
+    parser.add_argument("--austrian-artifacts", default="", help="Exact Austrian input manifest from the current download.")
     parser.add_argument(
         "--austrian-gtfs-dir",
         default="",
@@ -3263,11 +3269,12 @@ def main(argv: list[str] | None = None) -> None:
         austrian_registry = load_austrian_sources(Path(args.austrian_sources))
         if args.austrian_gtfs_dir.strip():
             archives: dict[str, zipfile.ZipFile] = {}
-            for source in austrian_registry:
-                candidates = sorted(Path(args.austrian_gtfs_dir).glob(f"{source['id']}-*.zip"))
-                if not candidates:
-                    raise ValueError(f"Missing downloaded Austrian GTFS for source {source['id']}")
-                archives[str(source["id"])] = load_gtfs_archive(str(candidates[-1]))
+            inputs = resolve_austrian_artifacts(
+                austrian_registry, Path(args.austrian_gtfs_dir),
+                Path(args.austrian_artifacts) if args.austrian_artifacts else None,
+            )
+            for source_id, path in inputs.items():
+                archives[source_id] = load_gtfs_archive(str(path))
             package_entries = timed_stage(
                 "austria", "packages",
                 lambda: build_austrian_stop_packages_from_sources(

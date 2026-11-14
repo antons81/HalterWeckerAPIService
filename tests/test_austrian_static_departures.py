@@ -3,7 +3,9 @@ import sys
 import tempfile
 import unittest
 import zipfile
-from datetime import date
+from datetime import date, datetime
+from functools import partial
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -18,6 +20,7 @@ from build_german_departure_index import (
 )
 from austrian_sources import load_austrian_sources
 from import_static_departures_database import configured_austrian_static_city_ids
+from static_departures_ownership import register_city_mode
 from static_departures_api import Database
 
 
@@ -144,7 +147,7 @@ trip-removed,11:00:00,11:00:00,at:49:1349:25,1
             database_path = root / "departures.sqlite"
             connection = connect(database_path)
             with zipfile.ZipFile(archive_path) as archive:
-                populate_gtfs(connection, archive, identifier_prefix="vor:")
+                populate_gtfs(connection, archive, identifier_prefix="vor:", provider_id="vor")
             resolve_canonical_stops(connection)
             populate_active_services(connection, [date(2026, 7, 30)])
             update_terminal_stops(connection)
@@ -167,26 +170,43 @@ trip-removed,11:00:00,11:00:00,at:49:1349:25,1
                     ("at:49:2000:5",),
                 ],
             )
+            # Match the provider ownership metadata produced by the real importer.
+            connection.execute(
+                "INSERT INTO provider_city_stops(provider_id, city_id, stop_id) "
+                "SELECT 'vor', city_id, stop_id FROM city_stops WHERE city_id='wien'"
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO provider_city_stops(provider_id, city_id, stop_id) "
+                "SELECT 'vor', city.city_id, raw.canonical_stop_id "
+                "FROM city_stops AS city JOIN raw_stops AS raw ON raw.stop_id=city.stop_id "
+                "WHERE city.city_id='wien' AND COALESCE(raw.canonical_stop_id,'')<>''"
+            )
+            register_city_mode(connection, "vor", "wien", "exact-stop-with-parent-fallback", "Europe/Vienna")
             connection.commit()
             connection.close()
 
             database = Database(str(database_path), ttl=0)
+            board = partial(
+                database.board,
+                from_date=datetime(2026, 7, 30, tzinfo=ZoneInfo("Europe/Vienna")),
+                to_date=datetime(2026, 7, 31, 3, tzinfo=ZoneInfo("Europe/Vienna")),
+            )
             try:
-                platform = database.board("wien", "at:49:1349:23", 10)
+                platform = board("wien", "at:49:1349:23", 10)
                 self.assertEqual([item["line"] for item in platform], ["D"])
                 self.assertEqual(platform[0]["scheduledTime"], "25:10:00")
                 self.assertEqual(platform[0]["tripID"], "vor:trip-platform")
                 self.assertEqual(platform[0]["platform"], "A")
 
-                parent_fallback = database.board("wien", "at:49:1349:24", 10)
+                parent_fallback = board("wien", "at:49:1349:24", 10)
                 self.assertEqual([item["line"] for item in parent_fallback], ["69A"])
                 self.assertEqual(parent_fallback[0]["platform"], None)
 
-                self.assertEqual(database.board("wien", "at:49:975:0:10", 10)[0]["line"], "D")
-                self.assertEqual(database.board("wien", "at:49:1349:24", 10)[0]["destination"], "Praterstern")
-                self.assertEqual(database.board("wien", "at:49:1349:25", 10), [])
+                self.assertEqual(board("wien", "at:49:975:0:10", 10)[0]["line"], "D")
+                self.assertEqual(board("wien", "at:49:1349:24", 10)[0]["destination"], "Praterstern")
+                self.assertEqual(board("wien", "at:49:1349:25", 10), [])
 
-                station_board = database.board("wien", "at:49:2000:5", 10)
+                station_board = board("wien", "at:49:2000:5", 10)
                 self.assertEqual([item["line"] for item in station_board], ["D"])
                 self.assertEqual(station_board[0]["platformStopID"], "at:49:2000:0:1")
                 self.assertEqual(

@@ -19,6 +19,7 @@ STOP_DATA_INPUTS = (
     "config/australia-cities.json",
     "config/ireland-cities.json",
     "scripts/build_stop_packages.py",
+    "scripts/austrian_artifacts.py",
     "scripts/kyiv_open_data.py",
     "scripts/external_gtfs.py",
     "scripts/build_swiss_departure_index.py",
