@@ -8,6 +8,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
+from datetime import date
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -196,7 +197,8 @@ class AustrianOutageFallbackTests(unittest.TestCase):
                         self.refresh()
                 self.assertFalse(self.output.exists())
 
-    def test_expired_cached_calendar_is_not_extended_or_rejected_for_source_outage(self) -> None:
+    def test_expired_non_vor_cache_retains_existing_outage_policy(self) -> None:
+        self.sources = [source for source in self.sources if source["id"] != "vor"]
         self.seed(through="20261024")
         with mock.patch.object(downloader, "request_json", side_effect=self.unavailable), \
                 mock.patch("builtins.print"):
@@ -285,6 +287,221 @@ class AustrianOutageFallbackTests(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError):
                     downloader.request_json("https://fixture.test/catalog")
                 self.assertEqual(request.call_count, attempts)
+
+
+class VORSelectionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="haltewecker-vor-test-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.cache = GTFSArtifactCache(self.root / "cache")
+        self.output = self.root / "output"
+        self.source = {"id": "vor", "datasetId": 52}
+        self.environment = {"MVO_API_BASE": "https://fixture.test/api"}
+        self.today = date(2026, 11, 17)
+        self.day_patch = mock.patch.object(downloader, "source_calendar_local_date", side_effect=lambda zone: self.today)
+        self.date_mock = self.day_patch.start()
+        self.addCleanup(self.day_patch.stop)
+        self.requests = []
+        self.feeds = {}
+
+    @staticmethod
+    def archive(start="20251214", end="20261212", *, exceptions="", weekday="1", trips=True, departures=True, revision=""):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.comment = b"fixture-padding" * 40
+            archive.writestr("stops.txt", "stop_id,stop_name,stop_lat,stop_lon\n1,Fixture,48,16\n")
+            archive.writestr("routes.txt", f"route_id,route_short_name,route_type\nr,U1{revision},1\n")
+            archive.writestr("trips.txt", "route_id,service_id,trip_id\n" + ("r,s,t\n" if trips else ""))
+            archive.writestr("stop_times.txt", "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n" +
+                             ("t,10:00:00,10:00:00,1,1\n" if departures else ""))
+            archive.writestr("calendar.txt", "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n" +
+                             f"s,{','.join([weekday] * 7)},{start},{end}\n")
+            archive.writestr("calendar_dates.txt", "service_id,date,exception_type\n" + exceptions)
+        return buffer.getvalue()
+
+    @staticmethod
+    def catalog(year=2027, *, created="2026-11-17T04:30:48Z", version_id="29225", size=None):
+        return [{"id": "52", "activeVersions": [{"year": str(year), "dataSetVersion": {
+            "id": version_id, "created": created,
+            "file": {"originalName": f"fixture-{year}.zip", "size": size},
+        }}]}]
+
+    def request(self, request, **kwargs):
+        year = int(request.full_url.split("/")[-2])
+        self.requests.append((year, request.get_method()))
+        payload = self.feeds.get(year)
+        if isinstance(payload, Exception):
+            raise payload
+        if payload is None:
+            raise urllib.error.HTTPError(request.full_url, 404, "not found", {}, None)
+        response = io.BytesIO(payload)
+        response.status = 200
+        response.headers = {}
+        return response
+
+    def download(self, catalog=None):
+        with mock.patch.object(urllib.request, "urlopen", side_effect=self.request):
+            return downloader.download_source(self.source, self.catalog() if catalog is None else catalog,
+                                              "fixture-token", self.output, self.environment, self.cache)
+
+    def write_archive(self, data):
+        path = self.root / "fixture.zip"
+        path.write_bytes(data)
+        return path
+
+    def test_current_year_missing_from_catalog_is_requested_and_validated(self):
+        self.feeds[2026] = self.archive()
+        result = self.download()
+        self.assertEqual(result["year"], 2026)
+        self.assertEqual(result["status"], "updated")
+        self.assertEqual(self.requests, [(2026, "GET")])
+        self.date_mock.assert_called_with("Europe/Vienna")
+        validate_artifact_entry("vor", result, base_dir=self.root)
+
+    def test_future_feed_cannot_replace_cache_or_publish_alias(self):
+        self.feeds[2026] = self.archive()
+        result = self.download()
+        state_before = self.cache.state("vor")
+        contents_before = Path(result["immutablePath"]).read_bytes()
+        # Make the existing cache ineligible without changing the raw archive.
+        self.today = date(2026, 12, 13)
+        self.feeds[2026] = self.archive("20271212", "20281210")
+        self.feeds[2027] = self.feeds[2026]
+        with self.assertRaises(downloader.NoCurrentVORService):
+            self.download()
+        self.assertEqual(self.cache.state("vor"), state_before)
+        self.assertEqual(Path(result["immutablePath"]).read_bytes(), contents_before)
+        self.assertTrue(Path(result["path"]).samefile(Path(result["immutablePath"])))
+        self.assertFalse((self.output / "vor-2027.zip").exists())
+        self.assertFalse(list(self.cache.root.rglob(".download-*")))
+
+    def test_future_feed_without_local_archive_fails_closed(self):
+        self.feeds[2027] = self.archive("20261213", "20271211")
+        with self.assertRaises(downloader.NoCurrentVORService):
+            self.download()
+        self.assertIsNone(self.cache.state("vor"))
+        self.assertFalse((self.cache.root / "vor" / "current.zip").exists())
+        self.assertFalse(self.output.exists())
+
+    def test_december_timetable_transition_uses_actual_service_day(self):
+        self.feeds = {2026: self.archive(), 2027: self.archive("20261213", "20271211")}
+        self.today = date(2026, 12, 12)
+        self.assertEqual(self.download()["year"], 2026)
+        self.today = date(2026, 12, 13)
+        result = self.download()
+        self.assertEqual(result["year"], 2027)
+        self.assertEqual(self.cache.state("vor")["sourceVersion"]["year"], 2027)
+        self.assertIn((2027, "GET"), self.requests)
+
+    def test_next_year_feed_keeps_refreshing_after_december_transition(self):
+        self.today = date(2026, 12, 13)
+        self.feeds = {2026: self.archive(), 2027: self.archive("20261213", "20271211")}
+        first = self.download()
+        self.feeds[2027] = self.archive("20261213", "20271211", revision="2")
+        updated = self.download(self.catalog(created="2026-12-14T04:30:48Z"))
+        self.assertEqual(updated["year"], 2027)
+        self.assertEqual(updated["status"], "updated")
+        self.assertNotEqual(first["sha256"], updated["sha256"])
+
+    def test_nested_metadata_change_forces_get_within_same_year(self):
+        first = self.archive()
+        self.feeds[2026] = first
+        self.download(self.catalog(2026, size=str(len(first))))
+        self.feeds[2026] = self.archive(revision="2")
+        result = self.download(self.catalog(2026, created="2026-11-18T04:30:48Z", version_id="29226",
+                                            size=str(len(self.feeds[2026]))))
+        self.assertEqual(result["status"], "updated")
+        version = self.cache.state("vor")["sourceVersion"]
+        self.assertEqual(version["versionId"], "29226")
+        self.assertEqual(version["created"], "2026-11-18T04:30:48Z")
+        self.assertEqual(version["size"], str(len(self.feeds[2026])))
+        self.assertEqual(result["originalName"], "fixture-2026.zip")
+        self.assertEqual(self.requests, [(2026, "GET"), (2026, "GET")])
+
+    def test_file_metadata_change_is_detected_even_when_version_timestamp_is_unchanged(self):
+        self.feeds[2026] = self.archive()
+        first = self.download(self.catalog(2026, size=str(len(self.feeds[2026]))))
+        self.feeds[2026] = self.archive(revision="updated-file")
+        second = self.download(self.catalog(2026, size=str(len(self.feeds[2026]))))
+        self.assertEqual(second["status"], "updated")
+        self.assertNotEqual(first["sha256"], second["sha256"])
+        self.assertEqual(self.requests, [(2026, "GET"), (2026, "GET")])
+
+    def test_missing_metadata_never_freezes_yearly_cache(self):
+        self.feeds[2026] = self.archive()
+        first = self.download([])
+        self.feeds[2026] = self.archive(revision="2")
+        second = self.download([])
+        self.assertNotEqual(first["sha256"], second["sha256"])
+        self.assertEqual(len(self.requests), 2)
+
+    def test_latest_versions_metadata_is_used_without_active_versions(self):
+        self.feeds[2026] = self.archive()
+        catalog = self.catalog(2026)
+        catalog[0]["latestVersions"] = catalog[0].pop("activeVersions")
+        self.download(catalog)
+        self.assertEqual(self.cache.state("vor")["sourceVersion"]["versionId"], "29225")
+
+    def test_invalid_update_preserves_current_valid_cache_and_manifest_provenance(self):
+        self.feeds[2026] = self.archive()
+        first = self.download([])
+        before = self.cache.state("vor")
+        self.feeds[2026] = self.archive("20261213", "20271211")
+        result = self.download([])
+        self.assertEqual(result["status"], "preserved-stale")
+        self.assertEqual(result["sha256"], first["sha256"])
+        self.assertEqual(self.cache.state("vor"), before)
+        self.assertTrue(Path(first["immutablePath"]).exists())
+        validate_artifact_entry("vor", result, base_dir=self.root)
+
+    def test_calendar_exceptions_and_referenced_departures(self):
+        cases = [
+            ({}, True),
+            ({"weekday": "0"}, False),
+            ({"exceptions": "s,20261117,2\n"}, False),
+            ({"weekday": "0", "exceptions": "s,20261117,1\n"}, True),
+            ({"exceptions": "s,20261118,2\n"}, True),
+            ({"trips": False}, False),
+            ({"departures": False}, False),
+            ({"start": "20261213", "end": "20271211"}, False),
+        ]
+        for arguments, valid in cases:
+            with self.subTest(arguments=arguments):
+                path = self.write_archive(self.archive(**arguments))
+                if valid:
+                    downloader.require_vor_service(path, self.today)
+                else:
+                    with self.assertRaises(downloader.NoCurrentVORService):
+                        downloader.require_vor_service(path, self.today)
+        path = self.write_archive(self.archive(weekday="0", exceptions="s,20261117,1\n"))
+        with zipfile.ZipFile(path, "r") as archive:
+            entries = {name: archive.read(name) for name in archive.namelist() if name != "calendar.txt"}
+        with zipfile.ZipFile(path, "w") as archive:
+            for name, value in entries.items():
+                archive.writestr(name, value)
+        downloader.require_vor_service(path, self.today)
+
+    def test_upstream_outage_preserves_valid_cache_and_provenance(self):
+        self.feeds[2026] = self.archive()
+        result = self.download([])
+        before = self.cache.state("vor")
+        self.feeds[2026] = urllib.error.HTTPError("https://fixture.test/file", 502, "unavailable", {}, None)
+        fallback = self.download([])
+        self.assertEqual(fallback["status"], "preserved-stale")
+        self.assertEqual(fallback["sha256"], result["sha256"])
+        self.assertEqual(self.cache.state("vor"), before)
+        self.assertEqual(fallback["year"], 2026)
+
+    def test_outage_rejects_ineligible_vor_before_publishing_any_alias(self):
+        path = self.write_archive(self.archive("20261213", "20271211"))
+        self.cache.resolve("vor", str(path), source_version={"datasetId": 52, "year": 2027})
+        before = self.cache.state("vor")
+        failure = urllib.error.HTTPError("https://fixture.test/catalog", 502, "unavailable", {}, None)
+        with self.assertRaisesRegex(RuntimeError, "VOR has no scheduled departures"):
+            downloader.preserve_cached_sources([self.source], self.cache, self.output, failure)
+        self.assertEqual(self.cache.state("vor"), before)
+        self.assertFalse(self.output.exists())
 
 
 class AustrianSourceRegistryTests(unittest.TestCase):

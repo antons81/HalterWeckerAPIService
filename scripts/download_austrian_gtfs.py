@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -137,6 +139,120 @@ def active_version(dataset: dict[str, object]) -> tuple[int, dict[str, object] |
     return year, version_by_year.get(year)
 
 
+class NoCurrentVORService(ValueError):
+    """The archive has no usable scheduled departure on the Vienna build date."""
+
+
+def require_vor_service(path: Path, service_date: date) -> None:
+    """Validate actual trip coverage, including GTFS weekday and date exceptions."""
+    day = service_date.strftime("%Y%m%d")
+    missing_service = f"VOR has no scheduled departures on {service_date.isoformat()}"
+    weekday = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")[service_date.weekday()]
+    with zipfile.ZipFile(path) as archive:
+        def rows(name):
+            if name not in archive.namelist():
+                return
+            with archive.open(name) as stream, io.TextIOWrapper(stream, encoding="utf-8-sig", newline="") as text:
+                yield from csv.DictReader(text)
+
+        active = {
+            row["service_id"] for row in rows("calendar.txt")
+            if row.get(weekday) == "1" and row.get("start_date", "") <= day <= row.get("end_date", "")
+        }
+        additions, removals = set(), set()
+        for row in rows("calendar_dates.txt"):
+            if row.get("date") == day:
+                if row.get("exception_type") == "1":
+                    additions.add(row["service_id"])
+                elif row.get("exception_type") == "2":
+                    removals.add(row["service_id"])
+        active = (active | additions) - removals
+        if not active:
+            raise NoCurrentVORService(missing_service)
+        trips = {row["trip_id"] for row in rows("trips.txt") if row.get("service_id") in active}
+        if not trips:
+            raise NoCurrentVORService(missing_service)
+        for row in rows("stop_times.txt"):
+            if row.get("trip_id") in trips and row.get("stop_id") and row.get("departure_time"):
+                return
+    raise NoCurrentVORService(missing_service)
+
+
+def version_metadata(source: dict[str, object], year: int, version: dict[str, object]) -> dict[str, object]:
+    """Read MVO's nested file descriptor while supporting older catalog responses."""
+    data_version = version.get("dataSetVersion")
+    data_version = data_version if isinstance(data_version, dict) else version
+    file_metadata = data_version.get("file")
+    file_metadata = file_metadata if isinstance(file_metadata, dict) else version
+    return {
+        "datasetId": int(source["datasetId"]), "year": year,
+        "versionId": data_version.get("id"), "created": data_version.get("created"),
+        "originalName": file_metadata.get("originalName") or f"{source['id']}-{year}.zip",
+        "size": file_metadata.get("size"),
+    }
+
+
+def download_vor_source(
+    source: dict[str, object], dataset: dict[str, object], token_value: str,
+    target_dir: Path, env: dict[str, str], cache: GTFSArtifactCache,
+) -> dict[str, object]:
+    """Choose a date-valid candidate before cache activation or alias publication."""
+    today = source_calendar_local_date("Europe/Vienna")
+    versions: dict[int, dict[str, object]] = {}
+    try:
+        versions[int(dataset["year"])] = dataset
+    except (KeyError, TypeError, ValueError):
+        pass
+    for key in ("activeVersions", "latestVersions"):
+        for version in dataset.get(key) or []:
+            if not isinstance(version, dict):
+                continue
+            nested = version.get("dataSetVersion") or {}
+            if isinstance(nested, dict) and nested.get("deleted"):
+                continue
+            try:
+                versions[int(version["year"])] = version
+            except (KeyError, TypeError, ValueError):
+                continue
+    # MVO can omit the still-valid timetable year from both catalog lists.
+    years = list(dict.fromkeys([today.year, today.year + 1, today.year - 1, *sorted(versions, reverse=True)]))
+    unavailable = None
+    for year in years:
+        metadata = version_metadata(source, year, versions.get(year, {}))
+        previous = (cache.state(str(source["id"])) or {}).get("sourceVersion")
+        # A year/filename alone is not a publication fingerprint. Never let it
+        # suppress retrieval of a newer archive at the same yearly endpoint.
+        force_download = not metadata["created"] or previous != metadata
+        url = f"{env['MVO_API_BASE'].rstrip('/')}/data-sets/{source['datasetId']}/{year}/file"
+        try:
+            result = cache.resolve(
+                str(source["id"]), url,
+                headers={"Authorization": f"Bearer {token_value}", "Accept": "application/zip"},
+                source_version=metadata, allow_stale=True, force_download=force_download,
+                minimum_size=int(metadata["size"]) if metadata["size"] is not None else None,
+                validator=lambda path: require_vor_service(path, today),
+            )
+        except NoCurrentVORService:
+            continue
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+            if isinstance(error, urllib.error.HTTPError) and error.code == 404:
+                continue
+            if not mvo_source_unavailable(error):
+                raise
+            unavailable = error
+            continue
+        # Fallback can return the previous year's valid archive; preserve its provenance.
+        actual = (result.state or {}).get("sourceVersion") or metadata
+        if result.status == "preserved-stale" and int(actual["year"]) != year:
+            continue
+        require_vor_service(result.path, today)
+        return publish_source_artifact(source, result, target_dir, int(actual["year"]),
+                                       str(actual["originalName"]), gtfs_calendar_horizon(result.path))
+    if unavailable is not None:
+        raise unavailable
+    raise NoCurrentVORService(f"No available VOR archive covers {today.isoformat()}")
+
+
 def download_source(
     source: dict[str, object],
     catalog: list[dict[str, object]],
@@ -146,23 +262,21 @@ def download_source(
     cache: GTFSArtifactCache,
 ) -> dict[str, object]:
     dataset = next((item for item in catalog if int(item.get("id", -1)) == int(source["datasetId"])), None)
+    if source["id"] == "vor":
+        return download_vor_source(source, dataset or {}, token_value, target_dir, env, cache)
     if dataset is None:
         raise RuntimeError(f"MVO dataset {source['datasetId']} is absent from catalog")
     year, version = active_version(dataset)
     version = version or dataset
-    original_name = str(version.get("originalName") or dataset.get("originalName") or f"{source['id']}-{year}.zip")
-    expected_size = version.get("size") or dataset.get("size")
+    metadata = version_metadata(source, year, version)
+    original_name = str(metadata["originalName"])
+    expected_size = metadata["size"]
     url = f"{env['MVO_API_BASE'].rstrip('/')}/data-sets/{source['datasetId']}/{year}/file"
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"{source['id']}-{year}.zip"
     cache_arguments = dict(
         headers={"Authorization": f"Bearer {token_value}", "Accept": "application/zip"},
-        source_version={
-            "datasetId": int(source["datasetId"]),
-            "year": year,
-            "originalName": original_name,
-            "size": expected_size,
-        },
+        source_version=metadata,
         seed_path=target,
         minimum_size=int(expected_size) if expected_size is not None else None,
     )
@@ -251,6 +365,8 @@ def preserve_cached_sources(
             if immutable.exists() and not immutable.samefile(path):
                 if validate_gtfs_archive(immutable) != (digest, size):
                     raise ValueError("immutable cached archive does not match current archive")
+            if source_id == "vor":
+                require_vor_service(path, source_calendar_local_date("Europe/Vienna"))
             horizon = gtfs_calendar_horizon(path)
             result = ArtifactResult(source_id, path, "preserved-stale", reason, state)
             original_name = str(version.get("originalName") or f"{source_id}-{year}.zip")

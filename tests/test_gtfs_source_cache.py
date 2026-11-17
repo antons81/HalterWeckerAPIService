@@ -606,37 +606,44 @@ class GTFSArtifactCacheTests(unittest.TestCase):
             self.assertIsInstance(persisted["sourceCheckedAt"], str)
 
     def test_austria_uses_mvo_version_without_downloading_again(self) -> None:
+        from datetime import date
+
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            artifact = root / "current.zip"
+            artifact = root / "source.zip"
             with zipfile.ZipFile(artifact, "w") as archive:
-                for name in ("stops.txt", "routes.txt", "trips.txt", "stop_times.txt"):
-                    archive.writestr(name, "id,name\nfixture,Fixture\n")
+                archive.writestr("stops.txt", "stop_id,stop_name,stop_lat,stop_lon\nstop,Fixture,48,16\n")
+                archive.writestr("routes.txt", "route_id,route_short_name,route_type\nroute,U1,1\n")
+                archive.writestr("trips.txt", "route_id,service_id,trip_id\nroute,service,trip\n")
+                archive.writestr("stop_times.txt", "trip_id,departure_time,stop_id,stop_sequence\ntrip,10:00:00,stop,1\n")
                 archive.writestr(
                     "calendar.txt",
                     "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
                     "service,1,1,1,1,1,1,1,20260101,20301231\n",
                 )
 
-            class FakeCache:
-                def resolve(self, source_id, url, **kwargs):
-                    self.kwargs = kwargs
-                    return ArtifactResult(source_id, artifact, "unchanged", "source-version", {"size": artifact.stat().st_size})
-
             source = {"id": "vor", "datasetId": 52}
-            catalog = [{"id": 52, "year": 2026, "originalName": "vor.zip", "size": artifact.stat().st_size}]
-            result = download_source(
-                source,
-                catalog,
-                "token",
-                root / "austria",
-                {"MVO_API_BASE": "https://example.invalid"},
-                FakeCache(),
-            )
+            created = "2026-11-17T04:30:48Z"
+            size = artifact.stat().st_size
+            catalog = [{"id": 52, "year": 2026, "originalName": "vor.zip", "size": size, "created": created}]
+            metadata = {"datasetId": 52, "year": 2026, "versionId": 52,
+                        "created": created, "originalName": "vor.zip", "size": size}
+            cache = GTFSArtifactCache(root / "cache")
+            # Seed the real cache with remote provenance, then forbid further requests.
+            with patch("urllib.request.urlopen", return_value=FakeResponse(artifact.read_bytes())):
+                first = cache.resolve("vor", "https://example.invalid/data-sets/52/2026/file",
+                                      source_version=metadata, metadata_probe=False)
+            with patch("urllib.request.urlopen", side_effect=AssertionError("unexpected download")) as request, \
+                    patch("download_austrian_gtfs.source_calendar_local_date", return_value=date(2026, 11, 17)):
+                result = download_source(source, catalog, "token", root / "austria",
+                                         {"MVO_API_BASE": "https://example.invalid"}, cache)
 
+            request.assert_not_called()
             self.assertEqual(result["status"], "unchanged")
+            self.assertEqual(result["reason"], "source-version")
             self.assertEqual(result["year"], 2026)
-            self.assertTrue((root / "austria" / "vor-2026.zip").samefile(artifact))
+            self.assertEqual(cache.state("vor"), first.state)
+            self.assertTrue((root / "austria" / "vor-2026.zip").samefile(first.path))
 
     def test_successful_update_removes_old_hash_and_keeps_new_current_pair(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

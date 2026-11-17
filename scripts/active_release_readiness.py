@@ -182,6 +182,11 @@ for city, stop in (
     start, end, zone, scheduled, sql_prewarm_seconds, scheduled_lines = smoke_expectation(
         os.environ.get("DEPARTURES_DATABASE", "/data/departures-current.sqlite"),
         city, stop, 3, required_lines)
+    if city == "wien" and not scheduled:
+        raise RuntimeError("missing required Vienna departures: " + stop)
+    missing_lines = set(required_lines) - set(scheduled_lines)
+    if missing_lines:
+        raise RuntimeError("missing required Vienna scheduled lines: " + ",".join(sorted(missing_lines)))
     if required_lines:
         print("[Readiness] city=wien scheduled_lines=%s" % (",".join(sorted(scheduled_lines)) or "none"))
     request_end = end - timedelta(microseconds=1)
