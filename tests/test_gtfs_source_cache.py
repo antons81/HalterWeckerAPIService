@@ -844,5 +844,209 @@ class GTFSArtifactCacheTests(unittest.TestCase):
                 child.wait(timeout=5)
 
 
+class GTFSConditionalRequestTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.source = self.root / "source.zip"
+        write_gtfs(self.source, "old")
+        self.cache = GTFSArtifactCache(self.root / "cache")
+        self.url = "https://example.test/source.zip"
+        self.validators = {
+            "ETag": '"old"',
+            "Last-Modified": "Mon, 16 Nov 2026 00:00:00 GMT",
+        }
+        with patch(
+            "gtfs_source_cache.urllib.request.urlopen",
+            return_value=FakeResponse(self.source.read_bytes(), headers=self.validators),
+        ):
+            self.original = self.cache.resolve("source", self.url, metadata_probe=False)
+        self.current = self.original.path
+        self.state_path = self.current.with_name("state.json")
+        self.hash_path = self.current.with_name(f"{self.original.state['sha256']}.zip")
+        os.link(self.current, self.hash_path)
+        self.state_bytes = self.state_path.read_bytes()
+        self.new_source = self.root / "new.zip"
+        write_gtfs(self.new_source, "new")
+
+    def assert_original_cache_preserved(self) -> None:
+        self.assertEqual(self.current.read_bytes(), self.source.read_bytes())
+        self.assertTrue(self.hash_path.samefile(self.current))
+        self.assertEqual(list(self.current.parent.glob(".download-*.zip")), [])
+        self.assertEqual(list(self.current.parent.glob(".state-*.json")), [])
+
+    def test_http_error_304_after_unsupported_head_reuses_valid_archive(self) -> None:
+        methods = []
+        response_body = io.BytesIO()
+
+        def respond(request, timeout=0):
+            methods.append(request.get_method())
+            if request.get_method() == "HEAD":
+                raise urllib.error.HTTPError(self.url, 404, "HEAD unsupported", {}, io.BytesIO())
+            self.assertEqual(request.get_header("If-none-match"), '"old"')
+            self.assertEqual(request.get_header("If-modified-since"), self.validators["Last-Modified"])
+            raise urllib.error.HTTPError(self.url, 304, "Not Modified", {}, response_body)
+
+        with patch("gtfs_source_cache.urllib.request.urlopen", side_effect=respond), patch(
+            "gtfs_source_cache._now", return_value="2026-11-17T00:40:00Z"
+        ), patch.object(self.cache, "_cleanup_after_activation") as cleanup:
+            result = self.cache.resolve("source", self.url, allow_stale=True)
+
+        self.assertEqual(methods, ["HEAD", "GET"])
+        self.assertEqual((result.status, result.reason), ("unchanged", "HTTP 304"))
+        for field in ["sha256", "size", "downloadedAt", "validatedAt"]:
+            self.assertEqual(result.state[field], self.original.state[field])
+        self.assertEqual(result.state["sourceCheckedAt"], "2026-11-17T00:40:00Z")
+        self.assertEqual(result.state["sourceCheckStatus"], "success")
+        self.assertTrue(response_body.closed)
+        cleanup.assert_not_called()
+        self.assert_original_cache_preserved()
+
+    def test_head_http_error_304_reuses_valid_archive(self) -> None:
+        response_body = io.BytesIO()
+        error = urllib.error.HTTPError(self.url, 304, "Not Modified", {}, response_body)
+        with patch("gtfs_source_cache.urllib.request.urlopen", side_effect=error) as request:
+            result = self.cache.resolve("source", self.url)
+        self.assertEqual((result.status, result.reason), ("unchanged", "HTTP 304"))
+        request.assert_called_once()
+        self.assertTrue(response_body.closed)
+        self.assert_original_cache_preserved()
+
+    def test_absent_validators_are_not_sent(self) -> None:
+        for value in [None, "", "  ", "None"]:
+            with self.subTest(value=value):
+                state = dict(self.original.state, etag=value, lastModified=value)
+                self.state_path.write_text(json.dumps(state))
+
+                def respond(request, timeout=0):
+                    self.assertIsNone(request.get_header("If-none-match"))
+                    self.assertIsNone(request.get_header("If-modified-since"))
+                    return FakeResponse(self.source.read_bytes())
+
+                with patch("gtfs_source_cache.urllib.request.urlopen", side_effect=respond):
+                    result = self.cache.resolve("source", self.url, metadata_probe=False)
+                self.assertEqual((result.status, result.reason), ("unchanged", "checksum"))
+                self.assert_original_cache_preserved()
+
+    def test_each_available_validator_is_sent_independently(self) -> None:
+        cases = [
+            ('"old"', None, '"old"', None),
+            (None, self.validators["Last-Modified"], None, self.validators["Last-Modified"]),
+        ]
+        for etag, modified, expected_etag, expected_modified in cases:
+            with self.subTest(etag=etag, modified=modified):
+                self.state_path.write_text(json.dumps(dict(self.original.state, etag=etag, lastModified=modified)))
+
+                def respond(request, timeout=0):
+                    self.assertEqual(request.get_header("If-none-match"), expected_etag)
+                    self.assertEqual(request.get_header("If-modified-since"), expected_modified)
+                    return FakeResponse(self.source.read_bytes())
+
+                with patch("gtfs_source_cache.urllib.request.urlopen", side_effect=respond):
+                    result = self.cache.resolve("source", self.url, metadata_probe=False)
+                self.assertEqual(result.status, "unchanged")
+
+    def test_changed_head_metadata_downloads_before_updating_state(self) -> None:
+        cases = [
+            {"ETag": '"new"'},
+            {"ETag": '"new"', "Last-Modified": self.validators["Last-Modified"]},
+            {"Last-Modified": "Tue, 17 Nov 2026 00:00:00 GMT"},
+        ]
+        for headers in cases:
+            with self.subTest(headers=headers):
+                self.state_path.write_bytes(self.state_bytes)
+                self.current.write_bytes(self.source.read_bytes())
+                methods = []
+
+                def respond(request, timeout=0):
+                    methods.append(request.get_method())
+                    if request.get_method() == "HEAD":
+                        return FakeResponse(headers=headers)
+                    self.assertEqual(self.state_path.read_bytes(), self.state_bytes)
+                    self.assertEqual(request.get_header("If-none-match"), '"old"')
+                    return FakeResponse(self.new_source.read_bytes(), headers=headers)
+
+                with patch("gtfs_source_cache.urllib.request.urlopen", side_effect=respond):
+                    result = self.cache.resolve("source", self.url)
+                self.assertEqual(methods, ["HEAD", "GET"])
+                self.assertEqual(result.status, "updated")
+                self.assertEqual(self.current.read_bytes(), self.new_source.read_bytes())
+                self.assertEqual(result.state["etag"], headers.get("ETag"))
+                self.assertEqual(result.state["lastModified"], headers.get("Last-Modified"))
+                self.assertNotEqual(result.state["sha256"], self.original.state["sha256"])
+
+    def test_failed_download_after_head_change_preserves_metadata_and_retention_pair(self) -> None:
+        for failure in ["http", "invalid-zip"]:
+            with self.subTest(failure=failure):
+                def respond(request, timeout=0):
+                    if request.get_method() == "HEAD":
+                        return FakeResponse(headers={"ETag": '"new"'})
+                    self.assertEqual(self.state_path.read_bytes(), self.state_bytes)
+                    if failure == "http":
+                        raise urllib.error.HTTPError(self.url, 503, "Unavailable", {}, io.BytesIO())
+                    return FakeResponse(b"invalid zip", headers={"ETag": '"new"'})
+
+                with patch("gtfs_source_cache.urllib.request.urlopen", side_effect=respond):
+                    result = self.cache.resolve("source", self.url, allow_stale=True)
+                self.assertEqual(result.status, "preserved-stale")
+                self.assertEqual(self.state_path.read_bytes(), self.state_bytes)
+                self.assert_original_cache_preserved()
+
+    def test_missing_archive_is_downloaded_without_cached_validators(self) -> None:
+        self.current.unlink()
+        methods = []
+
+        def respond(request, timeout=0):
+            methods.append(request.get_method())
+            self.assertIsNone(request.get_header("If-none-match"))
+            self.assertIsNone(request.get_header("If-modified-since"))
+            if request.get_method() == "HEAD":
+                raise urllib.error.HTTPError(self.url, 304, "Not Modified", {}, io.BytesIO())
+            return FakeResponse(self.new_source.read_bytes(), headers={"ETag": '"new"'})
+
+        with patch("gtfs_source_cache.urllib.request.urlopen", side_effect=respond):
+            result = self.cache.resolve("source", self.url)
+        self.assertEqual(methods, ["HEAD", "GET"])
+        self.assertEqual(result.status, "updated")
+        self.assertEqual(self.current.read_bytes(), self.new_source.read_bytes())
+
+    def test_http_error_304_without_valid_archive_fails_closed(self) -> None:
+        for archive_kind in ["missing", "corrupt"]:
+            with self.subTest(archive_kind=archive_kind):
+                if archive_kind == "missing":
+                    self.current.unlink()
+                else:
+                    self.current.write_bytes(b"corrupt zip")
+                error = urllib.error.HTTPError(self.url, 304, "Not Modified", {}, io.BytesIO())
+                with patch("gtfs_source_cache.urllib.request.urlopen", side_effect=error):
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        self.cache.resolve("source", self.url, metadata_probe=False, allow_stale=True)
+                self.assertEqual(raised.exception.code, 304)
+                self.assertEqual(self.state_path.read_bytes(), self.state_bytes)
+                self.assertEqual(list(self.current.parent.glob(".download-*.zip")), [])
+                if archive_kind == "missing":
+                    self.assertFalse(self.current.exists())
+                else:
+                    self.assertEqual(self.current.read_bytes(), b"corrupt zip")
+                error.close()
+
+    def test_forced_download_does_not_accept_304_as_unchanged(self) -> None:
+        error = urllib.error.HTTPError(self.url, 304, "Not Modified", {}, io.BytesIO())
+
+        def respond(request, timeout=0):
+            self.assertEqual(request.get_method(), "GET")
+            self.assertIsNone(request.get_header("If-none-match"))
+            self.assertIsNone(request.get_header("If-modified-since"))
+            raise error
+
+        with patch("gtfs_source_cache.urllib.request.urlopen", side_effect=respond):
+            with self.assertRaises(urllib.error.HTTPError):
+                self.cache.resolve("source", self.url, force_download=True)
+        error.close()
+        self.assertEqual(self.state_path.read_bytes(), self.state_bytes)
+        self.assert_original_cache_preserved()
+
+
 if __name__ == "__main__":
     unittest.main()

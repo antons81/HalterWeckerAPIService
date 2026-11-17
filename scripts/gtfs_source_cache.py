@@ -85,8 +85,8 @@ def _fingerprint_matches(state: Mapping[str, object], headers: Mapping[str, str]
     etag = headers.get("etag", "")
     last_modified = headers.get("last-modified", "")
     content_length = headers.get("content-length", "")
-    if etag and state.get("etag") == etag:
-        return True
+    if etag:
+        return state.get("etag") == etag
     if last_modified and state.get("lastModified") == last_modified:
         previous_length = state.get("contentLength")
         return not content_length or str(previous_length) == content_length
@@ -599,28 +599,31 @@ class GTFSArtifactCache:
                     with urllib.request.urlopen(metadata_request, timeout=30) as response:
                         metadata = _headers(response)
                     if valid_cache and (state or {}).get("url") == _state_url(url, state_url):
-                        state = self._mark_source_checked(state_path, state or {}, metadata)
-                        if _fingerprint_matches(state, metadata):
+                        if _fingerprint_matches(state or {}, metadata):
+                            state = self._mark_source_checked(state_path, state or {}, metadata)
                             return ArtifactResult(source_id, artifact, "unchanged", "remote metadata", state)
                 except urllib.error.HTTPError as error:
-                    if error.code == 304 and valid_cache:
-                        state = self._mark_source_checked(state_path, state or {}, {})
-                        return ArtifactResult(source_id, artifact, "unchanged", "HTTP 304", state)
+                    with error:
+                        if error.code == 304 and valid_cache:
+                            state = self._mark_source_checked(state_path, state or {}, _headers(error))
+                            return ArtifactResult(source_id, artifact, "unchanged", "HTTP 304", state)
                     metadata = {}
                 except (OSError, ValueError):
                     metadata = {}
             else:
                 metadata = {}
 
-            if not force_download:
+            if valid_cache and not force_download:
                 request_headers.update(
                     {
-                        key: value
+                        key: value.strip()
                         for key, value in {
-                            "If-None-Match": str((state or {}).get("etag", "")),
-                            "If-Modified-Since": str((state or {}).get("lastModified", "")),
+                            "If-None-Match": (state or {}).get("etag"),
+                            "If-Modified-Since": (state or {}).get("lastModified"),
                         }.items()
-                        if value
+                        if isinstance(value, str)
+                        and value.strip()
+                        and value.strip().casefold() != "none"
                     }
                 )
             fd, temporary_name = tempfile.mkstemp(prefix=".download-", suffix=".zip", dir=artifact.parent)
@@ -632,7 +635,13 @@ class GTFSArtifactCache:
                     try:
                         with candidate.open("wb") as output:
                             request = urllib.request.Request(url, headers=request_headers)
-                            with urllib.request.urlopen(request, timeout=180) as response:
+                            try:
+                                response = urllib.request.urlopen(request, timeout=180)
+                            except urllib.error.HTTPError as error:
+                                if error.code != 304 or not valid_cache or force_download:
+                                    raise
+                                response = error
+                            with response:
                                 status = int(getattr(response, "status", 200))
                                 if status in TRANSIENT_HTTP_STATUS_CODES:
                                     raise urllib.error.HTTPError(
