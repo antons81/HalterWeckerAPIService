@@ -28,6 +28,109 @@ INCREMENTAL_PROVIDERS = (
 BUILD_PROVIDERS = INCREMENTAL_PROVIDERS + ",germany"
 
 
+class ActivationReadinessPurposeTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="haltewecker-readiness-roles-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.previous = self.root / "old"
+        self.candidate = self.root / "candidate"
+        for root in (self.previous, self.candidate):
+            (root / "stop-data").mkdir(parents=True)
+        (self.previous / "release.json").write_text(json.dumps({"releaseID": "old-release"}))
+        (self.root / "current-release").symlink_to(self.previous, target_is_directory=True)
+
+    @staticmethod
+    def function(name):
+        text = PIPELINE.read_text()
+        start = text.index(name + "() {")
+        return text[start:text.index("\n}\n", start) + 3]
+
+    def run_gate(self, caller, expected_purpose):
+        environment = dict(os.environ)
+        environment.update({"TEST_REPO": str(REPOSITORY_ROOT), "TEST_DATA_ROOT": str(self.root),
+                            "TEST_PYTHON": sys.executable, "TEST_EXPECTED_PURPOSE": expected_purpose})
+        setup = r'''
+set -eu
+REPO="$TEST_REPO"
+DATA_ROOT="$TEST_DATA_ROOT"
+CURRENT_RELEASE="$DATA_ROOT/current-release"
+CURRENT="$CURRENT_RELEASE/stop-data"
+RELEASE_DIR="$DATA_ROOT/candidate"
+RELEASE_ID=candidate-release
+DEPARTURES_CURRENT="$DATA_ROOT/departures-current"
+VALIDATED_STATIC_IMAGE=sha256:static
+VALIDATED_ROUTE_IMAGE=sha256:route
+ROUTERECALL_ACTIVATION_IMAGE=sha256:route
+ROUTERECALL_ACTIVATION_CONTAINER_ID=old-route
+ROUTERECALL_ORIGINAL_SHARED_DATABASE=1
+ROUTERECALL_ACTIVATION_RELOAD=0
+PREVIOUS_STATIC_RUNTIME_MODE=legacy
+PREVIOUS_DEPARTURES_POINTER_PRESENT=0
+PREVIOUS_ROLLBACK_POINTER_PRESENT=0
+HALTEWECKER_ACTIVATION_DRY_RUN=0
+python3() {
+  if [[ "$1" == "$REPO/scripts/active_release_readiness.py" ]]; then
+    if [[ "$2" == haltewecker ]]; then
+      printf 'probe: %s\n' "$*"
+      [[ " $* " == *" --purpose $TEST_EXPECTED_PURPOSE "* ]] || return 77
+    elif [[ "$2" == stop-data-root ]]; then
+      printf '%s/stop-data\n' "$CURRENT_RELEASE"
+    elif [[ "$2" != restore-route ]]; then
+      return 78
+    fi
+  else
+    "$TEST_PYTHON" "$@"
+  fi
+}
+docker() {
+  case "$*" in
+    *Config.Env*) echo HALTEWECKER_STATIC_DEPARTURES_RUNTIME_MODE=legacy ;;
+    *.Image*) echo sha256:static ;;
+    *) return 1 ;;
+  esac
+}
+capture_route_recall_state() { return 0; }
+route_recall_activation() { return 0; }
+activation_disk_preflight() { return 0; }
+replace_link() { ln -sfn "$2" "$1"; }
+'''
+        script = setup + self.function("haltewecker_activation_readiness") + "\n"
+        if caller == "capture_full_sqlite_activation_state":
+            script += self.function(caller) + "\n" + caller
+        elif caller == "rollback_incremental_consumers":
+            script += self.function(caller) + '\nrollback_incremental_consumers "$DATA_ROOT/old" old-release'
+        else:
+            script += caller
+        return subprocess.run(["bash", "-c", script], env=environment, text=True, capture_output=True)
+
+    def test_pre_activation_checks_old_release_as_baseline_before_pointer_change(self):
+        result = self.run_gate("capture_full_sqlite_activation_state", "baseline")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--release-id old-release", result.stdout)
+        self.assertIn("--purpose baseline", result.stdout)
+        self.assertEqual((self.root / "current-release").resolve(), self.previous.resolve())
+
+    def test_rollback_checks_restored_release_with_rollback_purpose(self):
+        (self.root / "current-release").unlink()
+        (self.root / "current-release").symlink_to(self.candidate, target_is_directory=True)
+        result = self.run_gate("rollback_incremental_consumers", "rollback")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--release-id old-release", result.stdout)
+        self.assertIn("--purpose rollback", result.stdout)
+        self.assertEqual((self.root / "current-release").resolve(), self.previous.resolve())
+
+    def test_readiness_wrapper_defaults_to_strict_candidate_role(self):
+        result = self.run_gate('haltewecker_activation_readiness candidate-release legacy', "candidate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--purpose candidate", result.stdout)
+
+    def test_full_and_incremental_candidate_checks_remain_explicitly_strict(self):
+        text = PIPELINE.read_text()
+        self.assertEqual(text.count('haltewecker_activation_readiness "$RELEASE_ID" "legacy" "candidate"'), 2)
+        self.assertIn('haltewecker_activation_readiness "$old_release" "$PREVIOUS_STATIC_RUNTIME_MODE" "baseline"', text)
+
+
 class StopDataPipelineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()

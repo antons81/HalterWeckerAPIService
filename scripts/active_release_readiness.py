@@ -146,6 +146,10 @@ def get(path):
             raise RuntimeError("HalteWecker endpoint did not return HTTP 200")
         return json.load(response)
 expected, raw_providers = sys.argv[1:]
+purpose = os.environ.get("HALTEWECKER_READINESS_PURPOSE", "candidate")
+if purpose not in {"candidate", "baseline", "rollback"}:
+    raise RuntimeError("invalid readiness purpose")
+require_vienna_schedule = purpose == "candidate"
 providers = tuple(raw_providers.split(","))
 providers = tuple(value for value in providers if value)
 configured_providers = tuple(
@@ -182,11 +186,16 @@ for city, stop in (
     start, end, zone, scheduled, sql_prewarm_seconds, scheduled_lines = smoke_expectation(
         os.environ.get("DEPARTURES_DATABASE", "/data/departures-current.sqlite"),
         city, stop, 3, required_lines)
-    if city == "wien" and not scheduled:
+    if require_vienna_schedule and city == "wien" and not scheduled:
         raise RuntimeError("missing required Vienna departures: " + stop)
     missing_lines = set(required_lines) - set(scheduled_lines)
-    if missing_lines:
+    if require_vienna_schedule and missing_lines:
         raise RuntimeError("missing required Vienna scheduled lines: " + ",".join(sorted(missing_lines)))
+    if not require_vienna_schedule and city == "wien" and (not scheduled or missing_lines):
+        # Existing timetable gaps must not prevent replacement or restoration.
+        # HTTP, release identity and SQL/API agreement remain mandatory below.
+        print("[Readiness] purpose=%s city=wien stop=%s status=WARN scheduled=%s missing_lines=%s" % (
+            purpose, stop, scheduled, ",".join(sorted(missing_lines)) or "none"))
     if required_lines:
         print("[Readiness] city=wien scheduled_lines=%s" % (",".join(sorted(scheduled_lines)) or "none"))
     request_end = end - timedelta(microseconds=1)
@@ -324,6 +333,7 @@ def main() -> None:
     parser.add_argument("--release-id", default="")
     parser.add_argument("--providers", default="")
     parser.add_argument("--runtime-mode", choices=("legacy", "hybrid"), default="legacy")
+    parser.add_argument("--purpose", choices=("candidate", "baseline", "rollback"), default="candidate")
     parser.add_argument("--release-root", default="")
     parser.add_argument("--reload", action="store_true")
     args = parser.parse_args()
@@ -344,7 +354,7 @@ def main() -> None:
         reload_route(args.container, args.image, args.container_id)
     else:
         print(docker("exec", "-e", f"HALTEWECKER_EXPECTED_RUNTIME_MODE={args.runtime_mode}",
-                     args.container, "python3", "-c", STATIC_PROBE, args.release_id, args.providers))
+                     "-e", f"HALTEWECKER_READINESS_PURPOSE={args.purpose}", args.container, "python3", "-c", STATIC_PROBE, args.release_id, args.providers))
 
 
 if __name__ == "__main__":

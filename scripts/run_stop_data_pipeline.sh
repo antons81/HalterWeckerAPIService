@@ -1068,6 +1068,7 @@ activate_route_recall_shared_sqlite() {
 haltewecker_activation_readiness() {
   local expected_release="$1"
   local runtime_mode="${2:-legacy}"
+  local purpose="${3:-candidate}"
   if [[ "${HALTEWECKER_ACTIVATION_DRY_RUN:-0}" == "1" ]]; then
     return 0
   fi
@@ -1077,7 +1078,7 @@ haltewecker_activation_readiness() {
   fi
   python3 "$REPO/scripts/active_release_readiness.py" haltewecker \
     --container static-departures-api --release-id "$expected_release" \
-    --providers "$providers" --runtime-mode "$runtime_mode"
+    --providers "$providers" --runtime-mode "$runtime_mode" --purpose "$purpose"
 }
 
 capture_full_sqlite_activation_state() {
@@ -1167,7 +1168,7 @@ PY
     PREVIOUS_ROLLBACK_POINTER_PRESENT=0
     PREVIOUS_ROLLBACK_POINTER_TARGET=""
   fi
-  haltewecker_activation_readiness "$OLD_RELEASE_ID" "$PREVIOUS_STATIC_RUNTIME_MODE" || return 1
+  haltewecker_activation_readiness "$OLD_RELEASE_ID" "$PREVIOUS_STATIC_RUNTIME_MODE" "baseline" || return 1
   route_recall_activation || return 1
   old_stop_data_root="$(python3 "$REPO/scripts/active_release_readiness.py" stop-data-root --release-root "$CURRENT_RELEASE")" || return 1
   candidate_stop_data_root="$(python3 - "$RELEASE_DIR/stop-data" <<'PY'
@@ -1228,7 +1229,7 @@ rollback_incremental_consumers() {
     ROUTERECALL_ACTIVE_SHARED_DATABASE="$ROUTERECALL_ORIGINAL_SHARED_DATABASE"
     ROUTERECALL_PREVIOUS_CONTAINER_PRESERVED=0
   fi
-  route_recall_activation && haltewecker_activation_readiness "$previous_release" "$PREVIOUS_STATIC_RUNTIME_MODE"
+  route_recall_activation && haltewecker_activation_readiness "$previous_release" "$PREVIOUS_STATIC_RUNTIME_MODE" "rollback"
 }
 
 activation_disk_preflight() {
@@ -1316,7 +1317,7 @@ activate_incremental_production() {
     echo "[Nightly] ERROR: unsupported previous static API runtime mode: $PREVIOUS_STATIC_RUNTIME_MODE" >&2
     return 1
   fi
-  haltewecker_activation_readiness "$old_release" "$PREVIOUS_STATIC_RUNTIME_MODE" || return 1
+  haltewecker_activation_readiness "$old_release" "$PREVIOUS_STATIC_RUNTIME_MODE" "baseline" || return 1
   if [[ -e "$DEPARTURES_CURRENT" || -L "$DEPARTURES_CURRENT" ]]; then
     if [[ ! -L "$DEPARTURES_CURRENT" ]]; then
       echo "[Nightly] ERROR: departures-current is not a symlink; refusing activation" >&2
@@ -1388,7 +1389,7 @@ activate_incremental_production() {
     rollback_incremental_consumers "$old_target" "$old_release" || echo "[Nightly] ERROR: rollback readiness failed; operator recovery required" >&2
     return 1
   fi
-  if ! route_recall_activation || ! haltewecker_activation_readiness "$RELEASE_ID" "legacy"; then
+  if ! route_recall_activation || ! haltewecker_activation_readiness "$RELEASE_ID" "legacy" "candidate"; then
     rollback_incremental_consumers "$old_target" "$old_release" || echo "[Nightly] ERROR: rollback readiness failed; operator recovery required" >&2
     return 1
   fi
@@ -2615,7 +2616,7 @@ fi
 if [[ "$UNIFIED_SQLITE_PIPELINE" == "1" ]]; then
   if ! activate_route_recall_shared_sqlite || \
      ! route_recall_activation || \
-     ! haltewecker_activation_readiness "$RELEASE_ID" "legacy"; then
+     ! haltewecker_activation_readiness "$RELEASE_ID" "legacy" "candidate"; then
     echo "[StopData] ERROR: release=$RELEASE_ID shared consumer readiness failed; restoring previous release" >&2
     rollback_incremental_consumers "$OLD_RELEASE_TARGET" "$OLD_RELEASE_ID" || \
       echo "[Nightly] ERROR: rollback readiness failed; operator recovery required" >&2
